@@ -1,0 +1,14 @@
+.git
+.cursor
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+app/agent_runs.db
+app/agent_runs.db-shm
+app/agent_runs.db-wal

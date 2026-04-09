@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  agent-platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agent-platform
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Map the data explicitly to persist the SQLite DB across container restarts 
+      # (we map the whole /app/data so SQLite can write WAL files properly)
+      - agent_data:/app
+
+volumes:
+  agent_data:
