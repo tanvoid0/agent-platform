@@ -1,0 +1,28 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../llm-orchestrator"
+		}
+	],
+	"settings": {
+		"powershell.cwd": "agent-platform",
+		"terminal.integrated.defaultProfile.windows": "PowerShell 7",
+		"terminal.integrated.profiles.windows": {
+			"PowerShell 7": {
+				"path": [
+					"${env:ProgramFiles}\\PowerShell\\7\\pwsh.exe",
+					"${env:ProgramFiles}\\PowerShell\\7-preview\\pwsh.exe",
+					"${env:LOCALAPPDATA}\\Programs\\PowerShell\\pwsh.exe"
+				],
+				"icon": "terminal-powershell"
+			}
+		},
+		"terminal.integrated.automationProfile.windows": {
+			"path": "${env:ProgramFiles}\\PowerShell\\7\\pwsh.exe",
+			"args": ["-NoLogo"]
+		}
+	}
+}

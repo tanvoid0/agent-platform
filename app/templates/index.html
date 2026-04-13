@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Platform</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; max-width: 56rem; margin: 1.5rem auto; padding: 0 1rem; }
+    textarea, input[type="text"] { width: 100%; box-sizing: border-box; }
+    textarea { min-height: 6rem; }
+    pre { background: #111; color: #e4e4e7; padding: 1rem; overflow: auto; border-radius: 6px; font-size: 0.85rem; }
+    .row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; margin: 0.75rem 0; }
+    button { padding: 0.4rem 0.75rem; cursor: pointer; }
+    .muted { color: #666; font-size: 0.9rem; }
+    a { color: #2563eb; }
+  </style>
+</head>
+<body>
+  <h1>Agent Platform</h1>
+  <p class="muted">Goal → planner team (DAG) → your approval → execution. State is on the server; refresh-safe.</p>
+  <p><a href="/flow">Open graph view (React Flow)</a> · <a href="/docs">OpenAPI</a> · <a href="/api-guide">API guide</a></p>
+
+  <h2>1. New process</h2>
+  <label for="goal">Goal</label>
+  <textarea id="goal" placeholder="Describe what you want the team to accomplish…"></textarea>
+  <div class="row">
+    <button type="button" id="btnStart">Start planning</button>
+    <span id="startMsg" class="muted"></span>
+  </div>
+
+  <h2>2. Current process <span id="processIdLabel" class="muted"></span></h2>
+  <p class="muted">Polls <code>GET /processes/{id}</code> every 1.5s while not terminal.</p>
+  <div class="row">
+    <button type="button" id="btnRefresh" disabled>Refresh now</button>
+    <button type="button" id="btnCancel" disabled>Cancel</button>
+    <button type="button" id="btnRetry" disabled>Retry</button>
+  </div>
+  <p><strong>Status:</strong> <span id="status">—</span></p>
+  <p id="failureReasonWrap" class="muted" style="display: none;"><strong>Failure reason:</strong> <span id="failureReason"></span></p>
+
+  <h3>Proposal (DAG JSON)</h3>
+  <textarea id="dagEditor" rows="16" disabled></textarea>
+  <div class="row">
+    <button type="button" id="btnApprove" disabled>Approve &amp; execute</button>
+  </div>
+
+  <h3>Tasks</h3>
+  <pre id="tasks">—</pre>
+
+  <h3>Raw JSON</h3>
+  <pre id="raw">—</pre>
+
+  <script type="application/json" id="agent-platform-api-base">{{ api_base | tojson }}</script>
+  <script>
+    const apiBaseEl = document.getElementById("agent-platform-api-base");
+    let apiBase = "";
+    if (apiBaseEl) {
+      try {
+        const v = JSON.parse(apiBaseEl.textContent || "null");
+        apiBase = v == null ? "" : String(v);
+      } catch {
+        apiBase = "";
+      }
+    }
+    const api = apiBase.replace(/\/$/, "") || "";
+
+    let processId = null;
+    let pollTimer = null;
+
+    function url(path) {
+      return api + path;
+    }
+
+    async function apiJson(path, opts) {
+      const r = await fetch(url(path), {
+        ...opts,
+        headers: { "Content-Type": "application/json", ...(opts && opts.headers) },
+      });
+      const text = await r.text();
+      let data;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      if (!r.ok) throw new Error(typeof data === "object" && data.detail ? JSON.stringify(data.detail) : text);
+      return data;
+    }
+
+    function setProcess(id) {
+      processId = id;
+      document.getElementById("processIdLabel").textContent = id ? "(process #" + id + ")" : "";
+      document.getElementById("btnRefresh").disabled = !id;
+      document.getElementById("btnCancel").disabled = !id;
+      document.getElementById("btnRetry").disabled = true;
+      document.getElementById("btnApprove").disabled = !id;
+      document.getElementById("dagEditor").disabled = !id;
+    }
+
+    async function refresh() {
+      if (!processId) return;
+      const data = await apiJson("/processes/" + processId);
+      const run = data.process;
+      document.getElementById("status").textContent = run.status;
+      const fr = run.failure_reason;
+      const frWrap = document.getElementById("failureReasonWrap");
+      const frEl = document.getElementById("failureReason");
+      if (fr) {
+        frEl.textContent = fr;
+        frWrap.style.display = "";
+      } else {
+        frEl.textContent = "";
+        frWrap.style.display = "none";
+      }
+      document.getElementById("btnRetry").disabled = run.status !== "failed";
+      document.getElementById("tasks").textContent = JSON.stringify(data.tasks, null, 2);
+      document.getElementById("raw").textContent = JSON.stringify(data, null, 2);
+
+      if (run.dag_json) {
+        try {
+          const o = JSON.parse(run.dag_json);
+          document.getElementById("dagEditor").value = JSON.stringify(o, null, 2);
+        } catch {
+          document.getElementById("dagEditor").value = run.dag_json;
+        }
+      }
+
+      const terminal = ["completed", "failed", "cancelled"].includes(run.status);
+      const canApprove = run.status === "approval_required";
+      document.getElementById("btnApprove").disabled = !canApprove;
+
+      if (terminal && pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    function startPoll() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(refresh, 1500);
+    }
+
+    document.getElementById("btnStart").onclick = async () => {
+      const goal = document.getElementById("goal").value.trim();
+      if (!goal) return;
+      document.getElementById("startMsg").textContent = "Starting…";
+      try {
+        const res = await apiJson("/processes", { method: "POST", body: JSON.stringify({ goal }) });
+        setProcess(res.process_id);
+        document.getElementById("startMsg").textContent = "Created process " + res.process_id;
+        await refresh();
+        startPoll();
+      } catch (e) {
+        document.getElementById("startMsg").textContent = "Error: " + e.message;
+      }
+    };
+
+    document.getElementById("btnRefresh").onclick = () => refresh().catch((e) => alert(e.message));
+    document.getElementById("btnCancel").onclick = async () => {
+      if (!processId) return;
+      try {
+        await apiJson("/processes/" + processId + "/cancel", { method: "POST" });
+        await refresh();
+      } catch (e) {
+        alert(e.message);
+      }
+    };
+
+    document.getElementById("btnApprove").onclick = async () => {
+      if (!processId) return;
+      const dag_json = document.getElementById("dagEditor").value;
+      try {
+        await apiJson("/processes/" + processId + "/approve", {
+          method: "POST",
+          body: JSON.stringify({ dag_json }),
+        });
+        await refresh();
+        startPoll();
+      } catch (e) {
+        alert(e.message);
+      }
+    };
+
+    document.getElementById("btnRetry").onclick = async () => {
+      if (!processId) return;
+      try {
+        await apiJson("/processes/" + processId + "/retry", { method: "POST", body: "{}" });
+        await refresh();
+        startPoll();
+      } catch (e) {
+        alert(e.message);
+      }
+    };
+  </script>
+</body>
+</html>

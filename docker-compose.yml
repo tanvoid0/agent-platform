@@ -1,19 +1,68 @@
-version: '3.8'
+# llm-orchestrator + agent-platform API + Vite UI. Run from this directory:
+#   docker-compose up --build
+#   docker compose up --build
+#
+# UI: http://127.0.0.1:3000/flow/  |  API: http://127.0.0.1:18410  |  Orchestrator UI: http://127.0.0.1:18408
+#
+# SQLite + workspaces live on the named volume `agent_platform_data` (survives `docker compose build` / `up --build`).
+# Removing data: `docker compose down -v` (only then is the volume deleted). To reset DB only, stop the stack and
+# `docker volume rm <project>_agent_platform_data` or prune volumes with care.
+# If you still have an old host ./data folder with a DB to keep, copy it into the volume while containers are stopped
+# (see `docker volume inspect` / `docker run` with -v) or temporarily bind-mount ./data:/app/data to migrate.
+#
+# Requires ../llm-orchestrator/.env. agent-platform/.env must set ORCHESTRATOR_MASTER_KEY
+# to match the orchestrator (same key name in ../llm-orchestrator/.env; legacy LITELLM_MASTER_KEY accepted if still in use).
 
 services:
+  orchestrator:
+    build:
+      context: ../llm-orchestrator
+      dockerfile: ui/Dockerfile
+    ports:
+      - "127.0.0.1:18408:8080"
+    volumes:
+      - ../llm-orchestrator:/data
+    env_file:
+      - ../llm-orchestrator/.env
+    environment:
+      CONFIG_DIR: /data
+      CONFIG_PATH: /data/config.yaml
+      ORCHESTRATOR_INTERNAL_URL: http://127.0.0.1:8080
+      PROXY_PUBLIC_URL: http://127.0.0.1:18408
+    restart: unless-stopped
+
   agent-platform:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: agent-platform
+    # No --reload: bind-mount + WatchFiles on Windows often reload-loops and exits (Exited 0).
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "18410"]
     ports:
-      - "8000:8000"
+      - "127.0.0.1:18410:18410"
     env_file:
       - .env
+    environment:
+      AGENT_PLATFORM_DB_PATH: /app/data/agent_runs.db
+      AGENT_PLATFORM_WORKSPACE_ROOT: /app/data/workspaces
+      LLM_ORCHESTRATOR_BASE_URL: http://orchestrator:8080/v1
     volumes:
-      # Map the data explicitly to persist the SQLite DB across container restarts 
-      # (we map the whole /app/data so SQLite can write WAL files properly)
-      - agent_data:/app
+      - agent_platform_data:/app/data
+      - ./app:/app
+    depends_on:
+      - orchestrator
+    restart: unless-stopped
+
+  agent-platform-ui:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      AGENT_PLATFORM_PROXY_TARGET: http://agent-platform:18410
+    depends_on:
+      - agent-platform
+    restart: unless-stopped
 
 volumes:
-  agent_data:
+  agent_platform_data:

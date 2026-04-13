@@ -1,0 +1,50 @@
+/**
+ * Chat-stack readiness from the browser’s perspective: **only** `GET` on Agent Platform
+ * (`/api/v1/orchestrator/ready`). The UI never probes Ollama or any LLM host directly — the
+ * backend performs the upstream orchestrator check.
+ */
+import { agentPlatformAuthHeaders, apiUrl } from '../../api/client';
+
+export interface ChatBackendHealthResult {
+  ok: boolean;
+  latencyMs?: number;
+  error?: string;
+}
+
+const TIMEOUT_MS = 4500;
+
+export async function checkChatBackendHealth(): Promise<ChatBackendHealthResult> {
+  const url = apiUrl('/api/v1/orchestrator/ready');
+  const ctrl = new AbortController();
+  const started = performance.now();
+  const timer = window.setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      signal: ctrl.signal,
+      headers: { Accept: 'application/json', ...agentPlatformAuthHeaders() },
+    });
+    window.clearTimeout(timer);
+    const latencyMs = Math.round(performance.now() - started);
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const j = (await res.json()) as { detail?: unknown };
+        if (typeof j.detail === 'string') detail = j.detail;
+        else if (Array.isArray(j.detail)) detail = j.detail.map(String).join('; ');
+      } catch {
+        /* ignore */
+      }
+      return { ok: false, error: detail };
+    }
+    return { ok: true, latencyMs };
+  } catch (e) {
+    window.clearTimeout(timer);
+    const name = e instanceof DOMException ? e.name : e instanceof Error ? e.name : '';
+    const msg = e instanceof Error ? e.message : String(e);
+    if (name === 'AbortError' || /aborted/i.test(msg)) {
+      return { ok: false, error: `Timeout (${TIMEOUT_MS}ms)` };
+    }
+    return { ok: false, error: msg };
+  }
+}

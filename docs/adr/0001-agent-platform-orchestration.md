@@ -117,7 +117,7 @@ This is a **default** you can accept, revise, or reject after research. It is co
 
 1. **Orchestration:** Start with a **custom explicit state machine** and a **small internal DAG executor**. Execute the DAG level-by-level via a topological sort, isolating outputs on a "Blackboard" or explicit edges rather than sharing one giant context array.
 
-2. **LLM access:** **Only** via **llm-orchestrator** OpenAI-compatible **`/v1/chat/completions`**, using **model aliases** from orchestrator config and a single auth story (`LITELLM_MASTER_KEY`).
+2. **LLM access:** **Only** via **llm-orchestrator** OpenAI-compatible **`/v1/chat/completions`**, using **model aliases** from orchestrator config and a single auth story (`ORCHESTRATOR_MASTER_KEY`; legacy `LITELLM_MASTER_KEY` accepted).
 
 3. **Planner output:** Leveraged via strict JSON schema (or Ollama's `format: json`). Implement validate → optional repair pass → fail closed.
 
@@ -162,7 +162,7 @@ This is a **default** you can accept, revise, or reject after research. It is co
 ## 9. Open questions (answer before coding)
 
 1. **Minimum viable DAG (ANSWERED):** The DAG requires **parallel subagents** executing layer-by-layer (e.g. via iterative Planner-Executor split) to maximize isolated Ollama sprint tasks. Linear chain is insufficient for scaling multi-agent tasks safely within confined contexts.
-2. **Identity and tenancy (ANSWERED):** **Single-user local only** for v1, driven by `LITELLM_MASTER_KEY`.
+2. **Identity and tenancy (ANSWERED):** **Single-user local only** for v1, driven by `ORCHESTRATOR_MASTER_KEY` (legacy `LITELLM_MASTER_KEY`).
 3. **Aggregation (ANSWERED):** A **dedicated “Synthesizer” subagent template**. Relying on the "last node" mathematically breaks down when multiple parallel workers produce independent insights. The planner injects a sink node.
 4. **Edit scope at approval (ANSWERED):** **Full proposal replace (JSON overwrite).** Patch-by-id merges are too burdensome for a v1 local tool.
 5. **Retention (ANSWERED):** Indefinite storage in **SQLite checkpoints**, cleaned up manually by user command to preserve their valuable OpenClaw-like on-disk history.
@@ -187,8 +187,10 @@ Use this as a reading list; reorder by your risk tolerance.
 ## 11. Relationship to other documents
 
 - **Product brainstorm / roadmap** in the repo (e.g. `.cursor/plans/`) — product intent; **this ADR** is architecture.
-- **llm-orchestrator** — transport and provider routing only; agent logic does not belong in `proxy_routes.py`.
-- **Future ADR 0002** — tools, MCP, budgets, and sandbox boundaries (explicitly out of scope for *this* draft’s v1 non-goals).
+- **llm-orchestrator** — transport and provider routing only; agent logic does not belong in `ui/app/routes/llm.py`.
+- **[ADR 0002](./0002-ui-stack-react-typescript-vite.md)** — web shell (React+TS+Vite, TanStack Query, @xyflow/react).
+- **[ADR 0003](./0003-future-3d-simulation-boundary.md)** — optional lazy-loaded 3D module; authority stays server-side.
+- **Tools / MCP** — `app/tools_policy.py` today; a dedicated ADR when executable tools ship beyond prompts.
 
 ---
 

@@ -1,6 +1,14 @@
-fastapi==0.110.0
-uvicorn==0.29.0
+# Starlette 0.37+ required for TestClient with httpx 0.28+ (ASGITransport); aligns with litellm httpx pin.
+fastapi==0.115.14
+uvicorn[standard]==0.32.1
 sqlmodel==0.0.16
-httpx==0.27.0
-pydantic==2.6.4
+alembic>=1.13.0
+httpx==0.28.1
+mcp>=1.8.0
+# mcp 1.13+ requires pydantic>=2.11; keep <3 for sqlmodel / FastAPI.
+pydantic>=2.11.0,<3.0.0
 sse-starlette==2.0.0
+jinja2==3.1.4
+python-multipart==0.0.9
+python-dotenv==1.0.1
+tiktoken>=0.7.0

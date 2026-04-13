@@ -1,0 +1,15 @@
+{
+  "name": "agent-platform",
+  "private": true,
+  "scripts": {
+    "postinstall": "pnpm install --prefix web && python -m pip install -r app/requirements.txt",
+    "build": "pnpm --prefix web build",
+    "dev": "concurrently -k -n api,web -c blue,green \"python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410 --reload\" \"npm run dev --prefix web\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "dependencies": {
+    "pnpm": "^10.33.0"
+  }
+}

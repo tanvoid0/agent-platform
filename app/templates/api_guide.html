@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Platform API guide</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; max-width: 52rem; margin: 1.5rem auto; padding: 0 1rem; line-height: 1.5; }
+    h1 { font-size: 1.5rem; }
+    h2 { font-size: 1.1rem; margin: 0; }
+    pre { background: #111; color: #e4e4e7; padding: 0.75rem 1rem; overflow: auto; border-radius: 6px; font-size: 0.8rem; }
+    code { font-size: 0.85em; }
+    .muted { color: #666; font-size: 0.9rem; }
+    a { color: #2563eb; }
+    details { border: 1px solid #ddd; border-radius: 6px; margin-bottom: 0.5rem; padding: 0.5rem 0.75rem; background: #fafafa; }
+    summary { cursor: pointer; font-weight: 600; }
+    details[open] summary { margin-bottom: 0.5rem; }
+    ul { margin: 0.25rem 0 0.5rem 1.25rem; padding: 0; }
+  </style>
+</head>
+<body>
+  <h1>Agent Platform HTTP API</h1>
+  <p class="muted">Use this service from any UI or backend. Prefer versioned paths under <code>/api/v1</code>. Legacy unprefixed routes (<code>/processes</code>, <code>/teams</code>) behave the same.</p>
+  <p><a href="/docs">OpenAPI (Swagger)</a> · <a href="/ui">Minimal UI</a> · <a href="/flow/">Flow UI</a></p>
+
+  <details open>
+    <summary>Overview</summary>
+    <p>This server exposes a <strong>stateless chat</strong> proxy (<code>POST /api/v1/chat</code>) and <strong>multi-agent orchestration</strong> as <em>processes</em> (goal → planner DAG → optional human gates → execution). There are no required “projects” or workspaces; optional <strong>team templates</strong> only hint the planner.</p>
+  </details>
+
+  <details open>
+    <summary>Base URL and versioning</summary>
+    <p>Same origin as this page, or your deployed host (for example <code>http://127.0.0.1:18410</code>).</p>
+    <ul>
+      <li><strong>Versioned:</strong> <code>/api/v1/processes</code>, <code>/api/v1/teams</code>, <code>/api/v1/chat</code></li>
+      <li><strong>Legacy:</strong> <code>/processes</code>, <code>/teams</code> (identical behavior)</li>
+    </ul>
+  </details>
+
+  <details>
+    <summary>Authentication (optional)</summary>
+    <p>If <code>AGENT_PLATFORM_API_KEY</code> is set in the server environment, every process, team, and chat request must send:</p>
+    <pre>Authorization: Bearer &lt;your key&gt;</pre>
+    <p class="muted">This is a single shared secret for the deployment, not per-tenant keys. Stricter auth belongs behind a gateway or future work.</p>
+  </details>
+
+  <details>
+    <summary>CORS</summary>
+    <p>Set <code>CORS_ALLOW_ORIGINS</code> to a comma-separated list of browser origins (for example <code>http://localhost:5173</code>). Default when unset is <code>*</code>.</p>
+  </details>
+
+  <details>
+    <summary>Single-agent chat (stateless)</summary>
+    <p><code>POST /api/v1/chat</code> — one completion round-trip through the configured llm-orchestrator. Does not create a stored process.</p>
+    <p>JSON body (fields optional except <code>messages</code>):</p>
+    <pre>{
+  "messages": [
+    { "role": "user", "content": "Hello" }
+  ],
+  "model": "your-alias",
+  "temperature": 0.2,
+  "max_tokens": 256
+}</pre>
+    <p class="muted">Requires <code>ORCHESTRATOR_MASTER_KEY</code> on the server (same as for multi-agent runs). The orchestrator must be reachable at <code>LLM_ORCHESTRATOR_BASE_URL</code>.</p>
+    <p class="muted">Full OpenAI-compatible surface for the proxy (<code>/v1/chat/completions</code>, <code>/v1/models</code> query flags, embeddings caveats, streaming) is documented on the orchestrator: <a href="http://127.0.0.1:18408/docs" target="_blank" rel="noopener">http://127.0.0.1:18408/docs</a> — not this host’s <code>/docs</code> (that is Agent Platform’s Swagger on port 18410).</p>
+  </details>
+
+  <details>
+    <summary>Multi-agent process (no teams required)</summary>
+    <p>Start a run with only a goal. Teams and project/workspace concepts are optional.</p>
+    <p><code>POST /api/v1/processes</code></p>
+    <pre>{
+  "goal": "Research and summarize X",
+  "auto_approve": false,
+  "team_template_id": null,
+  "client_id": "my-app-namespace"
+}</pre>
+    <p>You may set <code>client_id</code> in the body or send header <code>X-Agent-Platform-Client: my-app-namespace</code> (header wins when both are set). If <code>AGENT_PLATFORM_REQUIRE_CLIENT_ID</code> is enabled, one of them is required.</p>
+    <p>Then poll <code>GET /api/v1/processes/{id}</code>, approve the DAG when status is <code>approval_required</code>, review tasks if needed, and subscribe to <code>GET /api/v1/processes/{id}/stream</code> (SSE) or <code>GET /api/v1/processes/{id}/events</code>.</p>
+  </details>
+
+  <details>
+    <summary>Logical client isolation</summary>
+    <p>Processes may store a <code>client_id</code>. List with <code>GET /api/v1/processes?client_id=my-app-namespace</code>. For any operation on a scoped process, send <code>X-Agent-Platform-Client</code> matching that process’s <code>client_id</code>, or the API returns 404 (same as unknown id).</p>
+    <p class="muted">Legacy rows with null <code>client_id</code> remain visible without the header. For hard isolation, use separate deployments or a gateway.</p>
+  </details>
+
+  <details>
+    <summary>Approval and task review</summary>
+    <p>When <code>status</code> is <code>approval_required</code>, submit the approved graph with <code>POST /api/v1/processes/{id}/approve</code> and JSON <code>{"dag_json": "..."}</code> (or use <code>auto_approve: true</code> on create for trusted environments only).</p>
+    <p>When a task requires human review, <code>status</code> becomes <code>task_review_required</code>. Use <code>POST /api/v1/processes/{id}/tasks/{task_id}/review</code> with <code>decision</code>: <code>approve</code>, <code>reject</code>, or <code>request_changes</code> (optional <code>output</code>, <code>feedback</code>, <code>instructions</code>).</p>
+  </details>
+
+  <details>
+    <summary>Events and SSE</summary>
+    <p><code>GET /api/v1/processes/{id}/events</code> — append-only event log (optional <code>after_id</code>, <code>limit</code> capped at 2000 per request, <code>event_type</code>). For exports or very large logs, page with <code>after_id</code> set to the last row’s <code>id</code> from the previous response.</p>
+    <p><code>GET /api/v1/processes/{id}/stream</code> — Server-Sent Events: the server polls the DB about every <strong>0.8s</strong>, emits JSON lines for new <code>EventLog</code> rows since the last emitted id, then repeats. Each data line is JSON, for example:</p>
+    <pre>{
+  "task_id": 12,
+  "type": "trace",
+  "content": "...",
+  "timestamp": "2026-04-12T12:00:00"
+}</pre>
+    <p>The stream <strong>ends</strong> when:</p>
+    <ul>
+      <li>Process status is <code>completed</code>, <code>failed</code>, or <code>cancelled</code> — if no new logs were pending, the server sends one terminal event <code>{"type":"terminal","content":"&lt;status&gt;"}</code> then closes.</li>
+      <li>Process status is <code>approval_required</code> or <code>task_review_required</code> — after any pending log lines, the server sends <code>{"type":"terminal","content":"approval_required"}</code> or <code>...task_review_required</code> and closes. The client must use <code>GET /api/v1/processes/{id}</code> (and approve/review endpoints) as the source of truth; reconnect SSE after the gate clears if you still want a live tail.</li>
+    </ul>
+    <p class="muted">Correctness for DAG shape and task state remains on <code>GET /api/v1/processes/{id}</code>; SSE is a convenience tail, not an approval channel.</p>
+  </details>
+
+  <details>
+    <summary>Optional teams</summary>
+    <p><code>GET/POST /api/v1/teams</code> — saved team rosters as hints for the planner. Omit <code>team_template_id</code> on process creation if you do not need them.</p>
+  </details>
+
+  <details>
+    <summary>Health</summary>
+    <p><code>GET /health</code> — no auth; public liveness.</p>
+  </details>
+</body>
+</html>
