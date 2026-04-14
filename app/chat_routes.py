@@ -1,4 +1,4 @@
-"""Stateless single-turn chat proxy to llm-orchestrator (OpenAI-compatible)."""
+"""Stateless single-turn chat via the embedded OpenAI-compatible LLM proxy."""
 
 from __future__ import annotations
 
@@ -11,13 +11,20 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 from context_budget import fit_chat_messages_for_request, max_output_tokens_default
 from dag_schema import sanitize_llm_model_alias
-from orchestrator_env import (
-    orchestrator_base_url_v1,
-    orchestrator_http_timeout_seconds,
-    orchestrator_master_key,
+from llm_proxy_env import (
+    llm_proxy_base_url_v1,
+    llm_proxy_http_timeout_seconds,
+    llm_proxy_master_key,
 )
 
 router = APIRouter(tags=["chat"])
+
+
+def _chat_resolved_defaults() -> dict[str, str]:
+    """Same provider/model as the embedded OpenAI proxy for unqualified requests (config + env)."""
+    from llm_proxy.routes.llm import get_resolved_proxy_defaults
+
+    return get_resolved_proxy_defaults()
 
 
 class ChatCompletionRequest(BaseModel):
@@ -43,52 +50,77 @@ class ChatCompletionRequest(BaseModel):
         return v
 
 
-def _orchestrator_origin() -> str:
-    base = orchestrator_base_url_v1().rstrip("/")
+def _llm_proxy_origin() -> str:
+    base = llm_proxy_base_url_v1().rstrip("/")
     return base.rsplit("/v1", 1)[0]
 
 
-@router.get("/orchestrator/ready")
-async def orchestrator_ready():
+@router.get("/llm/ready")
+async def llm_ready():
     """
-    Lightweight probe: server calls llm-orchestrator with the configured bearer key.
-    Used by the browser UI to show local stack health without exposing ORCHESTRATOR_MASTER_KEY.
+    Lightweight probe: server GETs /v1/health/readiness on the embedded LLM proxy.
+
+    Do not use GET /v1/models here: that handler may call Ollama and LM Studio (multi-second),
+    while the Flow UI times out browser fetches to this route (~4.5s) and showed LLM offline
+    even when chat and agents worked.
     """
-    key = orchestrator_master_key()
+    key = llm_proxy_master_key()
     if not key:
         raise HTTPException(
             status_code=503,
-            detail="ORCHESTRATOR_MASTER_KEY is not set.",
+            detail="AGENT_PLATFORM_MASTER_KEY is not set.",
         )
-    origin = _orchestrator_origin()
+    origin = _llm_proxy_origin()
     headers = {"Authorization": f"Bearer {key}"}
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.get(f"{origin}/v1/models", headers=headers)
+            r = await client.get(f"{origin}/v1/health/readiness", headers=headers)
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}") from e
     if r.status_code != 200:
         raise HTTPException(
             status_code=502,
-            detail=f"Orchestrator returned HTTP {r.status_code}",
+            detail=f"LLM proxy returned HTTP {r.status_code}",
         )
     return {"ok": True}
+
+
+@router.get("/chat/resolved-defaults")
+async def chat_resolved_defaults():
+    """
+    Effective LLM provider for this Agent Platform process (matches embedded proxy defaults).
+
+    Used by the Flow UI so the client does not need Vite flags to mirror server routing.
+    """
+    d = _chat_resolved_defaults()
+    return {"provider": d["provider"], "model": d["model"]}
+
+
+@router.get("/llm/ui-catalog")
+async def llm_ui_catalog():
+    """
+    Provider activation, reachability probes, chat model lists (from embedded proxy),
+    and Gemini media defaults for Flow settings and pickers.
+    """
+    from llm_ui_catalog import build_llm_ui_catalog_response
+
+    return await build_llm_ui_catalog_response()
 
 
 @router.post("/chat")
 async def chat_completions(req: ChatCompletionRequest):
     """
-    One-shot chat completion via the configured orchestrator (POST {base}/chat/completions).
-    Does not create a Process; for multi-agent orchestration use POST /api/v1/processes.
+    One-shot chat completion via the embedded LLM proxy (POST {base}/chat/completions).
+    Does not create a Process; for multi-agent runs use POST /api/v1/processes.
     """
-    key = orchestrator_master_key()
+    key = llm_proxy_master_key()
     if not key:
         raise HTTPException(
             status_code=503,
-            detail="ORCHESTRATOR_MASTER_KEY is not set.",
+            detail="AGENT_PLATFORM_MASTER_KEY is not set.",
         )
 
-    base = orchestrator_base_url_v1()
+    base = llm_proxy_base_url_v1()
     fitted_messages, _ = fit_chat_messages_for_request([dict(m) for m in req.messages])
     payload: dict[str, Any] = {"messages": fitted_messages}
     if req.model is not None and req.model.strip():
@@ -114,7 +146,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
     try:
-        async with httpx.AsyncClient(timeout=orchestrator_http_timeout_seconds()) as client:
+        async with httpx.AsyncClient(timeout=llm_proxy_http_timeout_seconds()) as client:
             r = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}") from e

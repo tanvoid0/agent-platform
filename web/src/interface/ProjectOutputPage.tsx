@@ -7,6 +7,7 @@ import { useActiveTeam } from '../integration/store/teamStore'
 import { TeamOutputBadge } from './components/TeamOutputBadge'
 import { FinalOutputBody } from './projectOutput/FinalOutputBody'
 import { FinalOutputFooter } from './projectOutput/FinalOutputFooter'
+import { ProjectStatsSection } from './projectView/ProjectStatsSection'
 
 export function ProjectOutputPage() {
   const navigate = useNavigate()
@@ -17,6 +18,9 @@ export function ProjectOutputPage() {
     finalAssetContent,
     isGeneratingAsset,
     referenceImages,
+    tasks,
+    actionLog,
+    taskExecution,
   } = useCoreStore()
   const [copied, setCopied] = useState(false)
 
@@ -53,6 +57,13 @@ export function ProjectOutputPage() {
       </header>
 
       <main className="mx-auto max-w-4xl px-4 py-8 sm:px-8">
+        <ProjectStatsSection
+          tasks={tasks}
+          actionLog={actionLog}
+          taskExecution={taskExecution}
+          className="mb-6"
+        />
+
         <div className="overflow-hidden rounded-[32px] border border-black/10 bg-white shadow-xl">
           <div className="border-b border-black/5 px-6 py-5 sm:px-8">
             <h2 className="flex flex-wrap items-center gap-2 text-sm font-black uppercase tracking-widest text-darkDelegation">

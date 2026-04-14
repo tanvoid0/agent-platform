@@ -87,7 +87,7 @@ def test_chat_completions_missing_key():
     async def _():
         with patch.dict(
             os.environ,
-            {"ORCHESTRATOR_MASTER_KEY": ""},
+            {"AGENT_PLATFORM_MASTER_KEY": ""},
             clear=False,
         ):
             out = await run_tool_async(

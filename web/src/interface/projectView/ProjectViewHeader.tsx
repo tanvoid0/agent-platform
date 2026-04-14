@@ -1,7 +1,29 @@
-import { Eraser, FolderOpen } from 'lucide-react'
+import {
+  Activity,
+  Bell,
+  CheckCircle2,
+  CircleDashed,
+  Eraser,
+  FolderOpen,
+  Moon,
+  Pause,
+} from 'lucide-react'
 import React from 'react'
 import { Button } from '@/components/ui/button'
-import type { ProjectStatusBadgeStyle } from './projectStatusBadge'
+import { InfoTooltip } from '../components/InfoTooltip'
+import type { ProjectStatusBadgeIcon, ProjectStatusBadgeStyle } from './projectStatusBadge'
+
+const BADGE_ICONS: Record<
+  ProjectStatusBadgeIcon,
+  React.ComponentType<{ className?: string; strokeWidth?: number; size?: number }>
+> = {
+  'circle-dashed': CircleDashed,
+  'check-circle': CheckCircle2,
+  pause: Pause,
+  activity: Activity,
+  bell: Bell,
+  moon: Moon,
+}
 
 export const ProjectViewHeader: React.FC<{
   badge: ProjectStatusBadgeStyle
@@ -9,7 +31,9 @@ export const ProjectViewHeader: React.FC<{
   onRequestCleanSlate?: () => void
   /** When set (e.g. phase done), shows a primary control to open the full project output page. */
   onViewProjectOutput?: () => void
-}> = ({ badge, onRequestCleanSlate, onViewProjectOutput }) => (
+}> = ({ badge, onRequestCleanSlate, onViewProjectOutput }) => {
+  const BadgeGlyph = BADGE_ICONS[badge.icon]
+  return (
   <div className="mb-6">
     <div className="flex flex-wrap items-center justify-between mb-2 gap-3">
       <h2 className="text-xl font-black text-darkDelegation leading-tight">Project Info</h2>
@@ -39,22 +63,26 @@ export const ProjectViewHeader: React.FC<{
             Clean slate
           </Button>
         ) : null}
-        <div
-          className="px-2.5 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-1.5 transition-colors border border-transparent"
-          style={{
-            backgroundColor: badge.backgroundColor,
-            color: badge.color,
-            borderColor: badge.borderColor,
-          }}
-        >
+        <InfoTooltip text={badge.detail} maxWidth={260}>
           <div
-            className={`w-1.5 h-1.5 rounded-full ${
-              badge.pulse ? 'bg-white animate-pulse' : 'bg-white opacity-40'
-            }`}
-          />
-          {badge.label}
-        </div>
+            className="px-2.5 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-1.5 transition-colors border border-transparent cursor-default"
+            style={{
+              backgroundColor: badge.backgroundColor,
+              color: badge.color,
+              borderColor: badge.borderColor,
+            }}
+          >
+            <BadgeGlyph className="size-3.5 shrink-0 opacity-95" strokeWidth={2.25} aria-hidden />
+            <div
+              className={`w-1.5 h-1.5 rounded-full ${
+                badge.pulse ? 'bg-white animate-pulse' : 'bg-white opacity-40'
+              }`}
+            />
+            {badge.label}
+          </div>
+        </InfoTooltip>
       </div>
     </div>
   </div>
-)
+  )
+}

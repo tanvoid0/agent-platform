@@ -1,5 +1,6 @@
 import { Circle, CircleOff, MessageCircle, Minus, Moon } from 'lucide-react';
 import React, { useEffect, useMemo, useState } from 'react';
+import { InfoTooltip } from './InfoTooltip';
 import type { PresenceKind } from '../../integration/presence/resolveAgentPresence';
 import { resolveAgentPresence } from '../../integration/presence/resolveAgentPresence';
 import { useCoreStore } from '../../integration/store/coreStore';
@@ -134,13 +135,17 @@ export const AgentPresenceBadge: React.FC<{
 
   if (compact) {
     return (
-      <span
-        className={`inline-flex items-center justify-center shrink-0 ${className}`}
-        title={p.label}
-        aria-label={p.label}
+      <InfoTooltip
+        text={`${p.label} — simulation/UI presence (not “last seen” on the server).`}
+        maxWidth={240}
       >
-        {pipOrIcon}
-      </span>
+        <span
+          className={`inline-flex items-center justify-center shrink-0 ${className}`}
+          aria-label={p.label}
+        >
+          {pipOrIcon}
+        </span>
+      </InfoTooltip>
     );
   }
 

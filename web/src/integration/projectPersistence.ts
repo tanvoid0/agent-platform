@@ -17,6 +17,7 @@ import { clearProjectScopedUi } from './store/uiStore';
 
 let bootstrapComplete = false;
 const afterBootstrapQueue: Array<() => void> = [];
+const EMPTY_PROJECTS_RETRY_DELAY_MS = 500;
 
 /**
  * Runs after project bootstrap (server rehydration). When the API is off, runs immediately so
@@ -49,11 +50,23 @@ export function isProjectBootstrapComplete(): boolean {
   return bootstrapComplete;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 async function pickOrCreateProjectId(): Promise<string> {
   try {
     const { projects } = await listRemoteProjects(100, 0);
     const cached = getCachedProjectId();
     if (projects.length === 0) {
+      // Startup can briefly return an empty list before the catalog is fully ready.
+      // Prefer a known cached id and avoid prompting until we confirm emptiness.
+      if (cached) return cached;
+      await sleep(EMPTY_PROJECTS_RETRY_DELAY_MS);
+      const retry = await listRemoteProjects(100, 0);
+      if (retry.projects.length > 0) {
+        return retry.projects[0].id;
+      }
       const title = await requestProjectTitle('Name your first project');
       const { id } = await createRemoteProject(title);
       if (!id) throw new Error('Server did not return project id');

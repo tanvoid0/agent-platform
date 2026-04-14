@@ -247,7 +247,7 @@ export function SubagentInspector({
                 </div>
               )}
               <div className="space-y-1">
-                <span className="text-xs text-muted-foreground">LLM alias (orchestrator)</span>
+                <span className="text-xs text-muted-foreground">LLM alias (proxy)</span>
                 <div className="text-sm">{task.llm_model ?? "— (default from env / proxy)"}</div>
                 <p className="text-muted-foreground text-xs leading-snug">
                   Per-task override for the proxy <code className="text-xs">model</code> field; not the same as{" "}

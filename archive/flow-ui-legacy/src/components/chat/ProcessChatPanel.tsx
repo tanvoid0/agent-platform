@@ -63,7 +63,7 @@ export function ProcessChatPanel({ processId, process, mode, clientUuid, subagen
       } catch (e) {
         const msg =
           e instanceof ApiError
-            ? `${e.message}${e.status === 503 ? " — Is ORCHESTRATOR_MASTER_KEY set on the agent-platform server?" : ""}`
+            ? `${e.message}${e.status === 503 ? " — Is AGENT_PLATFORM_MASTER_KEY set on the agent-platform server?" : ""}`
             : e instanceof Error
               ? e.message
               : String(e);

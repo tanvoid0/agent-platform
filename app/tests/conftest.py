@@ -9,7 +9,27 @@ from sqlmodel import create_engine
 
 import models  # noqa: F401 — register tables on SQLModel.metadata
 from database import create_db_and_tables
+from llm_proxy.core.provider_config import clear_runtime_provider_bases
 from main import app
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_runtime_bases(monkeypatch):
+    """Prevent TestClient lifespan discovery from leaking across tests."""
+    monkeypatch.setenv("LOCAL_LLM_AUTO_DISCOVER", "0")
+    clear_runtime_provider_bases()
+    yield
+    clear_runtime_provider_bases()
+
+
+@pytest.fixture(autouse=True)
+def _api_routes_without_bearer_by_default(monkeypatch):
+    """Match CI: HTTP APIs do not require Bearer unless a key is configured.
+
+    Developers with AGENT_PLATFORM_MASTER_KEY set in the shell would otherwise
+    get 401 on every TestClient call. Tests that need a key set it explicitly.
+    """
+    monkeypatch.delenv("AGENT_PLATFORM_MASTER_KEY", raising=False)
 
 
 @pytest.fixture

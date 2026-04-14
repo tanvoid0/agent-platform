@@ -1,6 +1,26 @@
-import { MessageSquare, Zap } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
+import {
+  Activity,
+  AlertTriangle,
+  Ban,
+  CircleDashed,
+  ClipboardCheck,
+  Clock,
+  HeartPulse,
+  Inbox,
+  ListTodo,
+  MessageCircle,
+  MessageSquare,
+  MessageSquareWarning,
+  PauseCircle,
+  RotateCcw,
+  Sparkles,
+  XCircle,
+  Zap,
+} from 'lucide-react';
 import React, { useEffect, useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
+import { InfoTooltip } from './components/InfoTooltip';
 import { getAllCharacters } from '../data/agents';
 import { agentNeedsChatAttention } from '../integration/chat/agentChatAttention';
 import { useDelegationConnectivity } from '../integration/hooks/useDelegationConnectivity';
@@ -10,6 +30,82 @@ import { useActiveTeam } from '../integration/store/teamStore';
 import { useUiStore } from '../integration/store/uiStore';
 import { useSceneManager } from '../simulation/SceneContext';
 import { AgentPresenceBadge } from './components/AgentPresenceBadge';
+import { Avatar } from './components/Avatar';
+
+function agentTaskStatusBadgeMeta(label: string): { Icon: LucideIcon; tooltip: string } {
+  switch (label) {
+    case 'Idle':
+      return {
+        Icon: CircleDashed,
+        tooltip: 'No open board tasks assigned to this agent.',
+      };
+    case 'Paused':
+      return {
+        Icon: PauseCircle,
+        tooltip: 'Orchestration is paused while this agent had work in progress.',
+      };
+    case 'Failed':
+      return {
+        Icon: XCircle,
+        tooltip: 'The latest task run reported failure — use Retry if shown.',
+      };
+    case 'Retry queued':
+      return {
+        Icon: RotateCcw,
+        tooltip: 'A retry has been scheduled for a failed or stalled run.',
+      };
+    case 'Stalled':
+      return {
+        Icon: AlertTriangle,
+        tooltip: 'Runner heartbeat is stale — the task may be stuck.',
+      };
+    case 'Working':
+      return {
+        Icon: Activity,
+        tooltip: 'This agent has a task in progress or an active runner.',
+      };
+    case 'Needs input':
+      return {
+        Icon: MessageSquareWarning,
+        tooltip: 'Approval or instructions are required before work continues.',
+      };
+    case 'Waiting review':
+      return {
+        Icon: ClipboardCheck,
+        tooltip: 'Output is waiting for review on the board.',
+      };
+    case 'Blocked':
+      return {
+        Icon: Ban,
+        tooltip: 'A dependency or hold is blocking this agent’s tasks.',
+      };
+    case 'Backlog':
+      return {
+        Icon: Inbox,
+        tooltip: 'Tasks are queued but not yet scheduled.',
+      };
+    case 'Queued':
+      return {
+        Icon: ListTodo,
+        tooltip: 'Tasks are scheduled and will run when ready.',
+      };
+    case 'Responding':
+      return {
+        Icon: Sparkles,
+        tooltip: 'The model is generating a chat reply.',
+      };
+    case 'In chat':
+      return {
+        Icon: MessageCircle,
+        tooltip: 'You have an open chat session with this agent.',
+      };
+    default:
+      return {
+        Icon: CircleDashed,
+        tooltip: label,
+      };
+  }
+}
 
 export function ProjectAgentsPanel() {
   const agentsOrchestrationPaused = useCoreStore((s) => s.agentsOrchestrationPaused);
@@ -25,7 +121,6 @@ export function ProjectAgentsPanel() {
   const selectedNpcIndex = useUiStore((s) => s.selectedNpcIndex);
   const isChatting = useUiStore((s) => s.isChatting);
   const isThinking = useUiStore((s) => s.isThinking);
-  const setSelectedNpc = useUiStore((s) => s.setSelectedNpc);
   const { backendBlocksChat, backendReason, projectsDown } = useDelegationConnectivity();
 
   const orchestrationActive = useMemo(
@@ -305,6 +400,8 @@ export function ProjectAgentsPanel() {
                 ? 'Chat while this agent has board work — messages are handled when the agent can reply; task execution continues.'
                 : undefined;
           const showChatAttentionBadge = agentNeedsChatAttention(agent.index, chatAttentionCtx);
+          const taskStatusBadgeUi = statusMeta ? agentTaskStatusBadgeMeta(statusMeta.label) : null;
+          const TaskStatusGlyph = taskStatusBadgeUi?.Icon;
           return (
             <li key={`agent-chat-${agent.index}`}>
               <div
@@ -315,12 +412,14 @@ export function ProjectAgentsPanel() {
                 }`}
               >
                 <div className="flex items-start justify-between gap-2 min-w-0">
-                  <div className="flex gap-2 min-w-0 flex-1">
-                    <span
-                      className="h-2 w-2 shrink-0 rounded-full mt-0.5"
-                      style={{ backgroundColor: agent.color }}
-                      aria-hidden
-                    />
+                  <div className="flex gap-2 min-w-0 flex-1 items-start">
+                    <div className="shrink-0 rounded-lg border border-zinc-100 bg-zinc-50/80 p-0.5 mt-0.5">
+                      <Avatar
+                        type={agent.index === activeTeam.leadAgent.index ? 'lead' : 'sub'}
+                        color={agent.color}
+                        size={28}
+                      />
+                    </div>
                     <span
                       className="text-[11px] font-black uppercase tracking-tight text-darkDelegation leading-snug break-words [overflow-wrap:anywhere]"
                       title={agent.name}
@@ -334,22 +433,40 @@ export function ProjectAgentsPanel() {
                 {statusMeta && (
                   <>
                     <div className="flex flex-wrap items-center gap-1.5 gap-y-1 min-w-0">
-                      <span
-                        className={`px-2 py-0.5 rounded-md border text-[9px] font-black uppercase tracking-wide ${statusMeta.labelClass}`}
-                      >
-                        {statusMeta.label}
-                      </span>
-                      <span className="text-[10px] font-semibold text-zinc-400 tabular-nums shrink-0">
-                        {statusMeta.taskCountLabel}
-                      </span>
+                      <InfoTooltip text={taskStatusBadgeUi?.tooltip ?? ''} maxWidth={260}>
+                        <span
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[9px] font-black uppercase tracking-wide cursor-default ${statusMeta.labelClass}`}
+                        >
+                          {TaskStatusGlyph ? (
+                            <TaskStatusGlyph size={11} strokeWidth={2.5} className="shrink-0" aria-hidden />
+                          ) : null}
+                          {statusMeta.label}
+                        </span>
+                      </InfoTooltip>
+                      <InfoTooltip text="Open tasks on this agent’s board (excludes completed).">
+                        <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-zinc-400 tabular-nums shrink-0 cursor-default">
+                          <ListTodo size={11} strokeWidth={2.25} className="text-zinc-300 shrink-0" aria-hidden />
+                          {statusMeta.taskCountLabel}
+                        </span>
+                      </InfoTooltip>
                     </div>
                     {statusMeta.showHeartbeat && (
-                      <p
-                        className="text-[10px] text-zinc-500 leading-snug font-medium"
-                        title={statusMeta.heartbeatTitle}
-                      >
-                        {statusMeta.heartbeatLabel}
-                      </p>
+                      <div className="flex items-start gap-1.5 text-[10px] text-zinc-500 leading-snug font-medium min-w-0">
+                        <InfoTooltip text={statusMeta.heartbeatTitle} maxWidth={280}>
+                          <span className="inline-flex shrink-0 text-rose-500 mt-0.5 cursor-default" aria-hidden>
+                            <HeartPulse size={12} strokeWidth={2.5} />
+                          </span>
+                        </InfoTooltip>
+                        <InfoTooltip
+                          text="Elapsed time since the task runner last reported a heartbeat (execution signal, not network connectivity)."
+                          maxWidth={280}
+                        >
+                          <span className="inline-flex items-center gap-1 min-w-0 cursor-default">
+                            <Clock size={12} strokeWidth={2.25} className="text-zinc-400 shrink-0 mt-0.5" aria-hidden />
+                            <span className="tabular-nums">{statusMeta.heartbeatLabel}</span>
+                          </span>
+                        </InfoTooltip>
+                      </div>
                     )}
                     {statusMeta.currentStep && (
                       <p
@@ -398,7 +515,6 @@ export function ProjectAgentsPanel() {
                       type="button"
                       disabled={chatOpenLocked}
                       onClick={() => {
-                        setSelectedNpc(agent.index);
                         scene?.startChat(agent.index);
                       }}
                       className={`relative w-full flex items-center justify-center gap-1.5 overflow-visible min-h-9 rounded-lg px-2 py-2 text-[9px] font-black uppercase tracking-widest active:scale-[0.98] min-w-0 ${

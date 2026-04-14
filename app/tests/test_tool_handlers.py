@@ -32,11 +32,11 @@ def test_tools_filtered_by_allowlist():
 @pytest.mark.parametrize(
     ("url", "prefixes", "expected"),
     [
-        ("http://127.0.0.1:18408/health", ["http://127.0.0.1:18408"], True),
-        ("http://127.0.0.1:18408/v1/models", ["http://127.0.0.1:18408"], True),
+        ("http://127.0.0.1:18410/v1/health", ["http://127.0.0.1:18410"], True),
+        ("http://127.0.0.1:18410/v1/models", ["http://127.0.0.1:18410"], True),
         ("https://example.com/api/x", ["https://example.com"], True),
-        ("http://evil.com", ["http://127.0.0.1:18408"], False),
-        ("ftp://127.0.0.1:18408/x", ["http://127.0.0.1:18408"], False),
+        ("http://evil.com", ["http://127.0.0.1:18410"], False),
+        ("ftp://127.0.0.1:18410/x", ["http://127.0.0.1:18410"], False),
     ],
 )
 def test_url_allowed_for_http_fetch(url, prefixes, expected):
@@ -78,10 +78,10 @@ def test_http_fetch_get(mock_client_cls):
     mock_instance.get.assert_called_once()
 
 
-def test_orchestrator_connection_info_tool():
-    out = run_tool("orchestrator_connection_info", "{}")
+def test_llm_proxy_connection_info_tool():
+    out = run_tool("llm_proxy_connection_info", "{}")
     data = json.loads(out)
-    assert "orchestrator_origin" in data
-    assert "LLM_ORCHESTRATOR_BASE_URL" in data
-    assert data["LLM_ORCHESTRATOR_BASE_URL"].endswith("/v1")
-    assert "orchestrator_api_key_set" in data
+    assert "llm_proxy_origin" in data
+    assert "llm_proxy_base_url_v1" in data
+    assert data["llm_proxy_base_url_v1"].endswith("/v1")
+    assert "llm_proxy_api_key_set" in data

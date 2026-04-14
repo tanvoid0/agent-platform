@@ -61,6 +61,10 @@ export interface SimulationUiState {
   /** Bumped to focus the chat textarea when chat is open (e.g. after opening consultant chat). */
   chatInputFocusNonce: number;
   bumpChatInputFocusRequest: () => void;
+
+  /** Bumped so the app shell can expand the project sidebar when chat is opened from the office (rail may be collapsed). */
+  projectRailExpandRequestNonce: number;
+  bumpProjectRailExpandRequest: () => void;
 }
 
 /** @deprecated Use {@link SimulationUiState}. */

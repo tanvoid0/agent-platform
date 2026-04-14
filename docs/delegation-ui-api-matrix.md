@@ -16,4 +16,4 @@
 
 **Live updates:** Process and project state use **SSE + REST** on Agent Platform (no separate WebSocket project channel).
 
-**Status:** The Flow UI uses Agent Platform for projects, teams, processes, finance-style rollups from in-browser usage ledgers, and `POST /api/v1/chat` for orchestrator-backed chat. Full graph/approve flows remain available via `/ui`, `/docs`, or API clients; use `GET /processes` directly when you need a raw process list.
+**Status:** The Flow UI uses Agent Platform for projects, teams, processes, finance-style rollups from in-browser usage ledgers, and `POST /api/v1/chat` for server-backed (embedded LLM proxy) chat. Full graph/approve flows remain available via `/ui`, `/docs`, or API clients; use `GET /processes` directly when you need a raw process list.

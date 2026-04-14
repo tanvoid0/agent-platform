@@ -23,6 +23,11 @@ def _agent_platform_dotenv_path() -> Path:
 # Load agent-platform/.env before any os.getenv used for DB path (uvicorn + Alembic + tests).
 load_dotenv(_agent_platform_dotenv_path())
 
+from platform_config import apply_platform_yaml_defaults
+
+# Non-secret defaults from config/agent_platform.yaml (env and .env still win).
+apply_platform_yaml_defaults()
+
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect, text
@@ -43,11 +48,12 @@ _ALEMBIC_CFG = Config(str(_APP_DIR / "alembic.ini"))
 
 
 def _ensure_sqlite_columns() -> None:
-    """Legacy: add columns introduced before Alembic (create_all did not migrate)."""
-    with engine.begin() as conn:
-        from process_table_sqlite import apply_process_table_sqlite
+    """Legacy: add columns introduced before Alembic (create_all did not migrate).
 
-        apply_process_table_sqlite(conn)
+    Does not call ``apply_process_table_sqlite`` (run→process rename): Alembic revisions
+    still reference the ``run`` table name until the rename migration runs.
+    """
+    with engine.begin() as conn:
         target = None
         for tbl in ("process", "run"):
             rows = conn.exec_driver_sql(f"PRAGMA table_info({tbl})").fetchall()
@@ -63,19 +69,12 @@ def _ensure_sqlite_columns() -> None:
             conn.exec_driver_sql(f"ALTER TABLE {target} ADD COLUMN total_cost REAL DEFAULT 0")
         if "tool_invocations_used" not in col_names:
             conn.exec_driver_sql(f"ALTER TABLE {target} ADD COLUMN tool_invocations_used INTEGER DEFAULT 0")
-        if "client_id" not in col_names:
-            conn.exec_driver_sql(f"ALTER TABLE {target} ADD COLUMN client_id VARCHAR(256)")
-            conn.exec_driver_sql(
-                f"CREATE INDEX IF NOT EXISTS ix_{target}_client_id ON {target} (client_id)"
-            )
+        # client_id is added by Alembic revision h2i3j4k5l6m7 after ``run`` → ``process`` rename.
 
 
 def create_db_and_tables() -> None:
-    """Apply Alembic migrations; legacy DBs without alembic_version are stamped after column ensures."""
+    """Apply Alembic migrations; legacy DBs without alembic_version get column patches then upgrade."""
     from process_table_sqlite import apply_process_table_sqlite
-
-    with engine.begin() as conn:
-        apply_process_table_sqlite(conn)
 
     with engine.connect() as conn:
         inspector = inspect(conn)
@@ -87,9 +86,8 @@ def create_db_and_tables() -> None:
 
     if (has_process or has_run) and not has_alembic:
         _ensure_sqlite_columns()
-        command.stamp(_ALEMBIC_CFG, "head")
-    else:
-        command.upgrade(_ALEMBIC_CFG, "head")
+
+    command.upgrade(_ALEMBIC_CFG, "head")
 
     with engine.begin() as conn:
         apply_process_table_sqlite(conn)
@@ -98,14 +96,13 @@ def create_db_and_tables() -> None:
         conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
         conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
 
-    _ensure_team_template_schema_and_seed()
+    _seed_team_templates_if_empty()
 
 
-def _ensure_team_template_schema_and_seed() -> None:
+def _seed_team_templates_if_empty() -> None:
     """
-    Default teams come from Alembic revision e5f6a7b8c9d0. Legacy DBs were stamped to head without
-    running upgrades, so `teamtemplate` may be missing or empty. Idempotently create schema and
-    insert SEED_TEAM_TEMPLATES when the table has no rows.
+    Default teams come from Alembic migrations. Runtime startup only seeds data when
+    `teamtemplate` exists and is empty; it no longer mutates schema.
     """
     from default_team_templates import SEED_TEAM_TEMPLATES
 
@@ -118,33 +115,7 @@ def _ensure_team_template_schema_and_seed() -> None:
         }
 
         if "teamtemplate" not in tables:
-            conn.execute(
-                text(
-                    """
-                    CREATE TABLE teamtemplate (
-                        id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                        name VARCHAR(256) NOT NULL,
-                        description VARCHAR(4096),
-                        color VARCHAR(32),
-                        category VARCHAR(128),
-                        roster_json VARCHAR NOT NULL,
-                        created_at DATETIME NOT NULL,
-                        updated_at DATETIME NOT NULL
-                    )
-                    """
-                )
-            )
-        else:
-            cols = {row[1] for row in conn.execute(text("PRAGMA table_info(teamtemplate)")).fetchall()}
-            if "category" not in cols:
-                conn.execute(text("ALTER TABLE teamtemplate ADD COLUMN category VARCHAR(128)"))
-
-        if "process" in tables:
-            pcols = {row[1] for row in conn.execute(text("PRAGMA table_info(process)")).fetchall()}
-            if "team_template_id" not in pcols:
-                conn.execute(text("ALTER TABLE process ADD COLUMN team_template_id INTEGER"))
-            if "team_snapshot_json" not in pcols:
-                conn.execute(text("ALTER TABLE process ADD COLUMN team_snapshot_json VARCHAR"))
+            return
 
         row = conn.execute(text("SELECT COUNT(*) FROM teamtemplate")).fetchone()
         n = int(row[0]) if row else 0

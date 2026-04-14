@@ -7,7 +7,7 @@ import { useProjectsApiStatus } from './useProjectsApiStatus';
 /**
  * “Can the delegation UI use Agent Platform?” The browser **never** talks to an LLM or Ollama
  * directly; it only calls Agent Platform. For the server chat path, LLM readiness comes from
- * `GET /api/v1/orchestrator/ready` (backend probes upstream). Cloud chat key checks are separate.
+ * `GET /api/v1/llm/ready` (backend probes the embedded LLM proxy). Cloud chat key checks are separate.
  */
 export function useDelegationConnectivity() {
   const projectsStatus = useProjectsApiStatus();
@@ -33,7 +33,7 @@ export function useDelegationConnectivity() {
         backendBlocksChat = true;
         backendReason =
           serverChatHealthDetail.trim() ||
-          'LLM stack unreachable — Agent Platform could not reach the orchestrator (browser only uses Agent Platform).';
+          'LLM stack unreachable — Agent Platform could not reach the embedded LLM proxy (browser only uses Agent Platform).';
       }
     } else if (llmSetup.chatRequiresStoredApiKey && !hasStoredOrEnvKey) {
       backendBlocksChat = true;

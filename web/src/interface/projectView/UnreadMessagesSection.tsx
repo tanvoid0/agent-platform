@@ -1,6 +1,6 @@
-import { MessageSquare } from 'lucide-react'
 import React from 'react'
 import { Button } from '@/components/ui/button'
+import { Avatar } from '../components/Avatar'
 
 export type UnreadChatRow = {
   agentIndex: number
@@ -12,10 +12,11 @@ export type UnreadChatRow = {
 export const UnreadMessagesSection: React.FC<{
   rows: UnreadChatRow[]
   totalUnread: number
+  leadAgentIndex: number
   selectedNpcIndex: number | null
   isChatting: boolean
   onOpenAgentChat: (agentIndex: number) => void
-}> = ({ rows, totalUnread, selectedNpcIndex, isChatting, onOpenAgentChat }) => (
+}> = ({ rows, totalUnread, leadAgentIndex, selectedNpcIndex, isChatting, onOpenAgentChat }) => (
   <div className="mb-6">
     <div className="flex items-center gap-2 mb-4">
       <p className="text-[10px] font-black uppercase tracking-widest text-zinc-400">Unread messages</p>
@@ -37,15 +38,15 @@ export const UnreadMessagesSection: React.FC<{
                   : 'border-zinc-100 bg-white/80 hover:border-zinc-200 hover:bg-white'
               }`}
             >
-              <div className="shrink-0 w-8 h-8 rounded-lg flex items-center justify-center border border-sky-100 bg-sky-50 text-sky-600">
-                <MessageSquare size={18} strokeWidth={2.5} />
+              <div className="shrink-0 rounded-lg border border-zinc-100 bg-zinc-50/80 p-0.5">
+                <Avatar
+                  type={row.agentIndex === leadAgentIndex ? 'lead' : 'sub'}
+                  color={row.color}
+                  size={28}
+                />
               </div>
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 mb-0.5">
-                  <span
-                    className="w-1.5 h-1.5 rounded-full shrink-0"
-                    style={{ backgroundColor: row.color }}
-                  />
                   <span className="text-[10px] font-black text-darkDelegation uppercase tracking-tight truncate">
                     {row.name}
                   </span>

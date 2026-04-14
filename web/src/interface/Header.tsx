@@ -13,6 +13,7 @@ import { ProjectSwitcher } from './ProjectSwitcher';
 import { useProjectStatusBadge } from './projectView/useProjectStatusBadge';
 
 const version = packageJson.version;
+const logoSrc = `${import.meta.env.BASE_URL}images/the-delegation.svg`;
 
 function trafficDotClass(kind: 'green' | 'yellow' | 'red', pulse = false): string {
   const pulseCls = pulse ? ' animate-pulse' : '';
@@ -32,8 +33,8 @@ const Header: React.FC = () => {
   const { projectsTraffic, projectsTitle, llmTraffic, llmTitle } = useDelegationConnectivity();
   const { projects: projectsReadout, llm: llmReadout } = useConnectivityReadout();
 
-  const byokTitle = useMemo(
-    () => `${llmTitle} — click for AI settings\n${llmReadout.detail}`,
+  const llmSettingsTitle = useMemo(
+    () => `${llmTitle} — open AI & models settings\n${llmReadout.detail}`,
     [llmTitle, llmReadout.detail],
   );
 
@@ -56,7 +57,7 @@ const Header: React.FC = () => {
       {/* Left: Project Title */}
       <div className="flex items-center min-w-0">
         <img
-          src="images/the-delegation.svg"
+          src={logoSrc}
           alt="The Delegation"
           className="h-10 w-auto shrink-0"
         />
@@ -184,20 +185,14 @@ const Header: React.FC = () => {
             </span>
           )}
 
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            onClick={() => setBYOKOpen(true)}
-            className="relative h-9 w-9 text-zinc-400 hover:text-darkDelegation"
-            title={byokTitle}
-            aria-label={byokTitle}
-          >
-            <Bot size={17} strokeWidth={2} className="opacity-90" />
-            <span
-              className={`absolute bottom-1 right-1 size-2 rounded-full border-2 border-white ${trafficDotClass(llmTraffic, llmTraffic === 'yellow')}`}
-              aria-hidden
-            />
+          <Button asChild variant="ghost" size="icon-sm" className="relative h-9 w-9 text-zinc-400 hover:text-darkDelegation">
+            <Link to="/settings/ai" title={llmSettingsTitle} aria-label={llmSettingsTitle}>
+              <Bot size={17} strokeWidth={2} className="opacity-90" />
+              <span
+                className={`absolute bottom-1 right-1 size-2 rounded-full border-2 border-white ${trafficDotClass(llmTraffic, llmTraffic === 'yellow')}`}
+                aria-hidden
+              />
+            </Link>
           </Button>
         </div>
       </div>

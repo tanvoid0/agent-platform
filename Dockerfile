@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ .
 
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data/llm
 
 EXPOSE 18410
 

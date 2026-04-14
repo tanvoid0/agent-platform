@@ -37,7 +37,7 @@ export function normalizeLlmConfig(raw: unknown): LLMConfig {
   }
 
   return {
-    // Never hydrate Gemini keys from browser storage (use VITE_GEMINI_API_KEY only).
+    // Never hydrate API keys from browser storage; backend owns credentials.
     apiKey: '',
     baseUrl: typeof r.baseUrl === 'string' ? r.baseUrl : undefined,
     chatModelsByBackend,
@@ -69,19 +69,4 @@ export function readLlmConfigFromStorage(): LLMConfig | null {
 export function persistLlmConfigToStorage(cfg: LLMConfig): void {
   const { apiKey: _omit, ...rest } = cfg;
   localStorage.setItem(BYOK_CONFIG_STORAGE_KEY, JSON.stringify(rest));
-}
-
-/** Remove any legacy cached Gemini key from localStorage (one-time hygiene per load). */
-export function purgeCachedGeminiApiKeyFromStorage(): void {
-  try {
-    const raw = localStorage.getItem(BYOK_CONFIG_STORAGE_KEY);
-    if (!raw) return;
-    const o = JSON.parse(raw) as Record<string, unknown>;
-    if (typeof o.apiKey === 'string' && o.apiKey.length > 0) {
-      delete o.apiKey;
-      localStorage.setItem(BYOK_CONFIG_STORAGE_KEY, JSON.stringify(o));
-    }
-  } catch {
-    /* ignore */
-  }
 }

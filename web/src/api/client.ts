@@ -70,9 +70,9 @@ export function getAgentPlatformApiOriginForDisplay(): string {
   return "";
 }
 
-/** Merged into Flow API requests when `VITE_AGENT_PLATFORM_API_KEY` is set (server `AGENT_PLATFORM_API_KEY`). */
+/** Merged into Flow API requests when `VITE_AGENT_PLATFORM_MASTER_KEY` is set. */
 export function agentPlatformAuthHeaders(): Record<string, string> {
-  const key = import.meta.env.VITE_AGENT_PLATFORM_API_KEY as string | undefined;
+  const key = import.meta.env.VITE_AGENT_PLATFORM_MASTER_KEY as string | undefined;
   if (typeof key === "string" && key.trim() !== "") {
     return { Authorization: `Bearer ${key.trim()}` };
   }
@@ -534,7 +534,7 @@ function extractChatAssistantContent(data: unknown): string {
   return "";
 }
 
-/** Stateless chat completion via agent-platform → orchestrator (POST /api/v1/chat). */
+/** Stateless chat completion via the embedded LLM proxy (POST /api/v1/chat). */
 export async function postChatCompletion(body: {
   messages: ChatCompletionMessage[];
   model?: string | null;
@@ -557,4 +557,110 @@ export async function postChatCompletion(body: {
   const data = await parseJson<unknown>(r);
   if (!r.ok) throw new ApiError(detailMessage(data), r.status, data);
   return { content: extractChatAssistantContent(data), raw: data };
+}
+
+/** Effective chat provider/model from Agent Platform (embedded proxy defaults). Same auth as other /api/v1 routes. */
+export async function fetchChatResolvedDefaults(): Promise<{ provider: string; model: string }> {
+  const r = await apiFetch("/api/v1/chat/resolved-defaults");
+  const data = await parseJson<unknown>(r);
+  if (!r.ok) throw new ApiError(detailMessage(data), r.status, data);
+  const body = data as { provider?: string; model?: string };
+  return {
+    provider: typeof body.provider === "string" ? body.provider : "",
+    model: typeof body.model === "string" ? body.model : "",
+  };
+}
+
+/** Server-driven LLM provider lists and status (falls back to `model-config.ts` if fetch fails). */
+export type LlmUiCatalogProviderJson = {
+  id: string;
+  label: string;
+  configured: boolean;
+  reachable: boolean | null;
+  chat: { default_model: string; options: string[] };
+};
+
+export type LlmUiCatalogMediaSliceJson = {
+  default_model: string;
+  options: string[];
+};
+
+export type LlmUiCatalogJson = {
+  resolved_defaults: { provider: string; model: string };
+  providers: LlmUiCatalogProviderJson[];
+  gemini_media: {
+    image: LlmUiCatalogMediaSliceJson;
+    music: LlmUiCatalogMediaSliceJson;
+    video: LlmUiCatalogMediaSliceJson;
+  };
+};
+
+export async function fetchLlmUiCatalog(): Promise<LlmUiCatalogJson> {
+  const r = await apiFetch("/api/v1/llm/ui-catalog");
+  const data = await parseJson<unknown>(r);
+  if (!r.ok) throw new ApiError(detailMessage(data), r.status, data);
+  return data as LlmUiCatalogJson;
+}
+
+/** Embedded OpenAI-compatible proxy: server env + config (Settings → LLM proxy). */
+export type LlmProxyEnvKeyMeta =
+  | { set: boolean; masked: string }
+  | { set: boolean; value: string };
+
+export async function fetchLlmProxyEnv(): Promise<{
+  keys: Record<string, LlmProxyEnvKeyMeta>;
+  effective_defaults?: { OLLAMA_API_BASE?: string; LM_STUDIO_API_BASE?: string; AIMLAPI_OPENAI_BASE?: string };
+  /** Same provider/model the embedded proxy uses for unqualified requests (config.yaml + env + first configured provider). */
+  resolved_defaults?: { provider: string; model: string };
+}> {
+  const r = await apiFetch("/api/v1/llm-proxy/env");
+  const data = await parseJson<unknown>(r);
+  if (!r.ok) throw new ApiError(detailMessage(data), r.status, data);
+  const body = data as {
+    keys?: Record<string, LlmProxyEnvKeyMeta>;
+    effective_defaults?: { OLLAMA_API_BASE?: string; LM_STUDIO_API_BASE?: string; AIMLAPI_OPENAI_BASE?: string };
+    resolved_defaults?: { provider: string; model: string };
+  };
+  return {
+    keys: body.keys ?? {},
+    effective_defaults: body.effective_defaults,
+    resolved_defaults: body.resolved_defaults,
+  };
+}
+
+export async function postLlmProxyEnv(body: {
+  AGENT_PLATFORM_MASTER_KEY?: string | null;
+  GEMINI_API_KEY?: string | null;
+  AIMLAPI_API_KEY?: string | null;
+  AIMLAPI_OPENAI_BASE?: string | null;
+  OLLAMA_API_BASE?: string | null;
+  LM_STUDIO_API_BASE?: string | null;
+  LM_STUDIO_API_KEY?: string | null;
+  DEFAULT_PROVIDER?: string | null;
+  DEFAULT_MODEL?: string | null;
+}): Promise<{ ok: boolean; message?: string }> {
+  const r = await apiFetch("/api/v1/llm-proxy/env", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await parseJson<unknown>(r);
+  if (!r.ok) throw new ApiError(detailMessage(data), r.status, data);
+  return data as { ok: boolean; message?: string };
+}
+
+export async function fetchLlmProxyConfigYaml(): Promise<{ content: string }> {
+  const r = await apiFetch("/api/v1/llm-proxy/config-yaml");
+  const data = await parseJson<unknown>(r);
+  if (!r.ok) throw new ApiError(detailMessage(data), r.status, data);
+  const body = data as { content?: string };
+  return { content: body.content ?? "" };
+}
+
+export async function fetchLlmProxySnippet(): Promise<{ public_base: string; snippet: string }> {
+  const r = await apiFetch("/api/v1/llm-proxy/snippet");
+  const data = await parseJson<unknown>(r);
+  if (!r.ok) throw new ApiError(detailMessage(data), r.status, data);
+  const body = data as { public_base?: string; snippet?: string };
+  return { public_base: body.public_base ?? "", snippet: body.snippet ?? "" };
 }

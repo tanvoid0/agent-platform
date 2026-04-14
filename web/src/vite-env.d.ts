@@ -17,12 +17,10 @@ interface ImportMetaEnv {
   readonly VITE_API_FETCH_TIMEOUT_MS?: string;
   /** Optional wall-clock ms for POST /api/v1/chat (default 600000). */
   readonly VITE_API_CHAT_TIMEOUT_MS?: string;
-  /** Must match server `AGENT_PLATFORM_API_KEY` when the API requires Bearer auth. */
-  readonly VITE_AGENT_PLATFORM_API_KEY?: string;
-  /** When `1` or `true`, use cloud (Gemini) for agent chat during `vite` dev (default: server chat via Agent Platform). */
-  readonly VITE_USE_GEMINI_IN_DEV?: string;
-  /** Google Gemini API key for chat (when backend is Gemini) and cloud media. Not read from browser storage. */
-  readonly VITE_GEMINI_API_KEY?: string;
-  /** Model tag for local-stack chat in dev (orchestrator alias), e.g. `gemma4`. */
+  /** Must match server `AGENT_PLATFORM_MASTER_KEY` when the API requires Bearer auth. */
+  readonly VITE_AGENT_PLATFORM_MASTER_KEY?: string;
+  /** Model tag for local-stack chat in dev (proxy alias), e.g. `gemma4`. */
   readonly VITE_OLLAMA_MODEL?: string;
+  /** Optional override for LM Studio model id when that backend is active. */
+  readonly VITE_LM_STUDIO_MODEL?: string;
 }

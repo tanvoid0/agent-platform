@@ -136,7 +136,7 @@ _FUTURE_FILM_STUDIO_ROSTER: dict[str, Any] = {
 }
 
 
-# --- Seeded templates (text output; matches agents.ts unboring-net, consultant-workshop, pr-agency) ---
+# --- Seeded templates (text output; matches agents.ts unboring-net, consultant-workshop, pr-agency, cv-reviewer-agency) ---
 
 SEED_TEAM_TEMPLATES: list[dict[str, Any]] = [
     {
@@ -261,6 +261,51 @@ SEED_TEAM_TEMPLATES: list[dict[str, Any]] = [
                     "modality": "text",
                     "parent_id": "media-strategist",
                     "accent_color": "#5E888E",
+                },
+            ]
+        },
+    },
+    {
+        "name": "CV Reviewer Agency",
+        "description": (
+            "A sequential review pipeline for résumés/CVs: structure and ATS alignment, then narrative "
+            "and impact, with a lead synthesizing clear, actionable feedback."
+        ),
+        "color": "#4F46E5",
+        "roster": {
+            "roles": [
+                {
+                    "id": "cv-review-lead",
+                    "name": "Career Review Lead",
+                    "description": (
+                        "Frames the review goals (role, seniority, geography), reconciles specialist input, "
+                        "and delivers a prioritized, actionable summary for the candidate."
+                    ),
+                    "modality": "text",
+                    "parent_id": None,
+                    "accent_color": "#4F46E5",
+                },
+                {
+                    "id": "cv-structure-ats",
+                    "name": "Structure & ATS Specialist",
+                    "description": (
+                        "Checks layout, section order, headings, and keyword fit for applicant tracking systems; "
+                        "flags parse risks, density issues, and missing standard sections."
+                    ),
+                    "modality": "text",
+                    "parent_id": "cv-review-lead",
+                    "accent_color": "#6366F1",
+                },
+                {
+                    "id": "cv-narrative-impact",
+                    "name": "Narrative & Impact Editor",
+                    "description": (
+                        "Improves bullets for outcomes and metrics, clarity and tone, and the story arc from "
+                        "summary through experience; suggests concrete rewrites."
+                    ),
+                    "modality": "text",
+                    "parent_id": "cv-structure-ats",
+                    "accent_color": "#818CF8",
                 },
             ]
         },

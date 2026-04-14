@@ -33,7 +33,7 @@ _UNICODE_HYPHENS = str.maketrans(
 
 def sanitize_llm_model_alias(value: str | None) -> str | None:
     """
-    Return a model name safe to send to the orchestrator, or None to use the server default.
+    Return a model name safe to send to the embedded LLM proxy, or None to use the server default.
 
     Strips common planner mistakes: skill-style slugs that are not real proxy aliases.
     """
@@ -45,7 +45,7 @@ def sanitize_llm_model_alias(value: str | None) -> str | None:
     s = s.translate(_UNICODE_HYPHENS)
     if _HALLUCINATED_ROLE_SLUG.fullmatch(s.lower()):
         logger.warning(
-            "Ignoring llm model %r (looks like a role/skill slug, not an orchestrator alias)",
+            "Ignoring llm model %r (looks like a role/skill slug, not a proxy model alias)",
             s,
         )
         return None
@@ -65,7 +65,7 @@ class SubagentSpec(BaseModel):
         default=None,
         alias="model",
         description=(
-            "Optional llm-orchestrator OpenAI `model` alias for this task's chat/completions call. "
+            "Optional OpenAI `model` alias for this task's chat/completions call (embedded LLM proxy). "
             "Omit to use SUBAGENT_MODEL / PLANNER_MODEL / server default. "
             "Not an agent persona or skill label (use `role` and prompts for that)."
         ),

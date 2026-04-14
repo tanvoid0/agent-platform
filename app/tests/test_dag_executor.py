@@ -1,4 +1,4 @@
-"""DAGExecutor paths with mocked LLM (no live orchestrator)."""
+"""DAGExecutor paths with mocked LLM (no live LLM proxy)."""
 
 from __future__ import annotations
 

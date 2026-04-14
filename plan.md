@@ -4,7 +4,7 @@ Handoff for the **agent-platform** package. Broader brainstorm may live under `.
 
 ## What it is
 
-FastAPI service that orchestrates multi-agent **processes** (DAG runs) via **llm-orchestrator**’s OpenAI-compatible API (HTTP only; no embedded proxy logic).
+FastAPI service that orchestrates multi-agent **processes** (DAG runs) via an **embedded** OpenAI-compatible LLM proxy (`app/llm_proxy/`, same process).
 
 **Loop:** goal → planner DAG → **`approval_required`** → human approves/edits → topological execution → terminal state. Optional **`requires_review`** per task pauses until **`POST .../processes/{id}/tasks/{task_id}/review`**.
 
@@ -15,7 +15,7 @@ FastAPI service that orchestrates multi-agent **processes** (DAG runs) via **llm
 | HTTP API | `http://127.0.0.1:18410` — **`/processes/...`** (same routes also under **`/api/v1/processes/...`**). Team templates: **`/teams`** and **`/api/v1/teams`**. |
 | React app (Vite, `base: "/flow/"`) | **`/flow/`** — built to `app/static/dist`, served under **`/flow`**. Client routes live under `/flow/...`. |
 | Jinja shell | **`/ui`** — lightweight HTML host; **`/`** redirects to **`/ui`**. |
-| Orchestrator (dependency) | `http://127.0.0.1:18408/v1` |
+| Embedded LLM proxy (`/v1`) | same host as API — default `http://127.0.0.1:18410/v1` |
 
 OpenAPI is available from the FastAPI app on the same port (paths depend on router mounts above).
 
@@ -50,18 +50,18 @@ OpenAPI is available from the FastAPI app on the same port (paths depend on rout
 
 ```bash
 cd agent-platform
-cp .env.example .env   # ORCHESTRATOR_MASTER_KEY matches llm-orchestrator
+cp .env.example .env   # set AGENT_PLATFORM_MASTER_KEY (Bearer for /v1)
 pip install -r app/requirements.txt
-cd web && npm install && npm run build && cd ..
+cd web && pnpm install && pnpm run build && cd ..
 uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
 ```
 
 - Migrations: `alembic upgrade head` on startup; new rev: `cd app && alembic revision --autogenerate -m "msg"`.
 - **SSE:** `GET /processes/{id}/stream` tails new `EventLog` rows (~0.8s poll loop). The stream **closes** on terminal status (`completed` / `failed` / `cancelled`) or when the process needs a human gate (`approval_required`, `task_review_required`) after emitting a **`terminal`** JSON event — clients must refresh via **`GET /processes/{id}`** and approve/review as needed. See **`/api-guide`** (`app/templates/api_guide.html`).
-- Web dev: `npm run dev` in `web/` with proxy to 18410; ship with `npm run build`.
+- Web dev: `pnpm run dev` in `web/` with proxy to 18410; ship with `pnpm run build`.
 - Optional: **pixel-agents raster assets** (MIT) for the full pixel office: run `python scripts/sync_pixel_agents_assets.py` from the repo root (downloads upstream `webview-ui/public/assets` into `web/public/pixel-agents/`), or pass `--source /path/to/pixel-agents` if you already have a clone. Committed PNGs in-repo match `web/public/pixel-agents/NOTICE.txt`.
-- Optional: seed default team templates into an existing DB if `teamtemplate` is empty: `python scripts/seed_team_template_once.py` (expects `data/agent_runs.db`; see script).
-- Tests: `pip install -r requirements-dev.txt` → `pytest`; `cd web && npm run test` (Vitest).
+- Optional: seed default team templates into an existing DB if `teamtemplate` is empty: `python scripts/seed_team_template_once.py` (expects `data/agent_platform.db`; see script).
+- Tests: `pip install -r requirements-dev.txt` → `pytest`; `cd web && pnpm run test` (Vitest).
 
 ## Implemented (summary)
 
@@ -69,7 +69,7 @@ REST: processes list/create/detail, approve, cancel, retry, task review, **`GET 
 
 ## Team templates page — Delegation as reference (not a port)
 
-**Today:** **Teams** (`TeamsPage` route) is `web/src/components/TeamsPage.tsx`: library + editor backed by **`GET/POST/PATCH/DELETE`** on **`/teams`** (and **`/api/v1/teams`**) — `app/teams_routes.py`, `team_schema.py`, DB templates. Roster is JSON (**roles** with `id`, `name`, `description`, optional `parent_id`, `default_model`, optional **`accent_color`**) for planner/orchestrator use — no simulation state.
+**Today:** **Teams** (`TeamsPage` route) is `web/src/components/TeamsPage.tsx`: library + editor backed by **`GET/POST/PATCH/DELETE`** on **`/teams`** (and **`/api/v1/teams`**) — `app/teams_routes.py`, `team_schema.py`, DB templates. Roster is JSON (**roles** with `id`, `name`, `description`, optional `parent_id`, `default_model`, optional **`accent_color`**) for planner / LLM alias use — no simulation state.
 
 **Reference UX (The Delegation):** `the-delegation/src/interface/TeamManagementPage.tsx` → **`VisualConfigurator`** (`VisualConfigurator.tsx`): React Flow roster graph, **`TeamsPanel`** (library + “Create New Team”), **`VisualFlowNode`** (border + **`Avatar`** + LEAD/SUB tags + model line), **`TeamCard`** density. Avatars live in **`the-delegation/src/interface/components/Avatar.tsx`** (`user` | `lead` | `sub`, tint `color`). Brand tints: **`the-delegation/src/theme/brand.ts`** (`USER_COLOR`, etc.). Our port stays **lean**: reuse **visual patterns** (palette, node chrome, tags), not `AgenticSystem` or client-only persistence.
 
@@ -77,7 +77,7 @@ REST: processes list/create/detail, approve, cancel, retry, task review, **`GET 
 
 1. **Roster chrome (done / in flight):** optional per-role **`accent_color`** in API schema; roster map uses a **fixed palette** (Delegation-like blues/greens/purples/yellows/reds) when unset. Custom Flow node: avatar strip, LEAD vs SUB badge (first root = lead), monospace model hint.
 2. **Library cards:** compact list; **category** (optional API field) + **agent count** on cards; **Filter by category** in the library sidebar; subtitle from **description**.
-3. **Starter templates:** ship **preset JSON** in the web app (`teamTemplatePresets.ts`) aligned with **orchestrator model aliases** (e.g. `gemini-flash`, `local` — not vendor-specific IDs unless documented in `.env.example`). **Apply preset** fills the editor (new template or confirm overwrite). Optional DB seed script: `scripts/seed_team_template_once.py`.
+3. **Starter templates:** ship **preset JSON** in the web app (`teamTemplatePresets.ts`) aligned with **proxy model aliases** (e.g. `gemini-flash`, `local` — not vendor-specific IDs unless documented in `.env.example`). **Apply preset** fills the editor (new template or confirm overwrite). Optional DB seed script: `scripts/seed_team_template_once.py`.
 4. **Not in scope (short term):** human-in-the-loop toggles, capabilities checklist, separate “User (You)” node — those belong to a richer agent model than `RosterRole` today.
 
 **Deep links:** `?team=<id>` / `?team=new` + **Copy link** (see `web/src/lib/teamUrl.ts`).
@@ -98,7 +98,7 @@ REST: processes list/create/detail, approve, cancel, retry, task review, **`GET 
 
 ## Notes
 
-- Workspace **`AGENTS.md`**: orchestrator **18408**; agent-platform **18410**; agent-platform UI at **`/ui`**, **`/flow`**, API on **18410**; REST uses **`processes`** / **`teams`** (and **`/api/v1/...`** mirrors). Orchestration before heavy visual coupling.
+- Workspace **`AGENTS.md`**: agent-platform **18410** (API + embedded LLM proxy); UI at **`/ui`**, **`/flow`**; REST uses **`processes`** / **`teams`** (and **`/api/v1/...`** mirrors). Orchestration before heavy visual coupling.
 
 ---
 

@@ -60,9 +60,9 @@ export function apiUrl(path: string): string {
   return origin ? `${origin}${p}` : p;
 }
 
-/** Merged into Flow API requests when `VITE_AGENT_PLATFORM_API_KEY` is set (server `AGENT_PLATFORM_API_KEY`). */
+/** Merged into Flow API requests when `VITE_AGENT_PLATFORM_MASTER_KEY` is set. */
 export function agentPlatformAuthHeaders(): Record<string, string> {
-  const key = import.meta.env.VITE_AGENT_PLATFORM_API_KEY as string | undefined;
+  const key = import.meta.env.VITE_AGENT_PLATFORM_MASTER_KEY as string | undefined;
   if (typeof key === "string" && key.trim() !== "") {
     return { Authorization: `Bearer ${key.trim()}` };
   }
@@ -369,7 +369,7 @@ function extractChatAssistantContent(data: unknown): string {
   return "";
 }
 
-/** Stateless chat completion via agent-platform → orchestrator (POST /api/v1/chat). */
+/** Stateless chat completion via the embedded LLM proxy (POST /api/v1/chat). */
 export async function postChatCompletion(body: {
   messages: ChatCompletionMessage[];
   model?: string | null;

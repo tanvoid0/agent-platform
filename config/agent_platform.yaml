@@ -1,0 +1,36 @@
+# Non-secret Agent Platform defaults. Precedence: shell env > `.env` > this file.
+# Secrets stay in `agent-platform/.env` only: AGENT_PLATFORM_MASTER_KEY, GEMINI_API_KEY,
+# LM_STUDIO_API_KEY (optional).
+#
+# Override path: AGENT_PLATFORM_CONFIG_YAML=/path/to/custom.yaml
+
+version: 1
+
+env:
+  # Embedded OpenAI proxy / self-call base (must end with /v1).
+  LLM_ORCHESTRATOR_BASE_URL: "http://127.0.0.1:18410/v1"
+
+  # Local LLM upstreams (embedded proxy forwards here). In Docker, 127.0.0.1/localhost are
+  # rewritten to host.docker.internal at runtime (AGENT_PLATFORM_LOCAL_LLM_DOCKER_FIX, default on).
+  # You may instead set a LAN IP here (e.g. LM Studio "Serve on Local Network") — no rewrite needed.
+  OLLAMA_API_BASE: "http://127.0.0.1:11434"
+  LM_STUDIO_API_BASE: "http://127.0.0.1:1234"
+
+  # Internal HTTP timeout to the embedded LLM proxy (seconds); aligns with long Ollama generations.
+  AGENT_PLATFORM_ORCHESTRATOR_TIMEOUT_SECONDS: 600
+
+  # Storage
+  AGENT_PLATFORM_DB_PATH: "data/agent_platform.db"
+
+  # Planner retries and sub-DAG expansion
+  AGENT_PLATFORM_PLAN_MAX_ATTEMPTS: 3
+  AGENT_PLATFORM_AUTO_APPROVE: 0
+  AGENT_PLATFORM_SUBDECOMP_MAX_EXPANSIONS: 48
+  AGENT_PLATFORM_SUBDECOMP_MAX_NEW_TASKS: 48
+
+  # Uncomment or add more keys as needed (same names as former `.env` — see app/*.py).
+  # AGENT_PLATFORM_WORKSPACE_ROOT: "data/workspaces"
+  # CORS_ALLOW_ORIGINS: "http://127.0.0.1:3333"
+  # AGENT_PLATFORM_PUBLIC_API: "http://127.0.0.1:18410"
+  # AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX: 0
+  # LOCAL_LLM_AUTO_DISCOVER: 1

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
-from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
@@ -23,6 +21,27 @@ from database import engine, get_session
 from models import EventLog, Process, Project, TaskNode, TeamTemplate
 from orchestrator import DAGExecutor
 from process_approval import apply_validated_planner_to_process
+from shared_enums import ReviewDecision
+from services.process_approval_service import (
+    apply_process_approval,
+    is_idempotent_approval_status,
+)
+from services.process_mutation_service import (
+    append_process_event,
+    reset_failed_task_for_retry,
+)
+from services.process_review_service import apply_task_review_decision
+from services.process_sync_service import (
+    align_running_process_to_review_required,
+    reset_running_tasks_to_pending,
+    sync_review_gate_detail,
+    sync_terminal_detail,
+    task_status_counts,
+)
+from services.process_retry_service import (
+    mark_process_for_execution_retry,
+    mark_process_for_replanning,
+)
 from team_schema import (
     build_process_team_snapshot,
     parse_team_roster_json,
@@ -46,7 +65,7 @@ class ApproveDagRequest(BaseModel):
 
 
 class ReviewTaskRequest(BaseModel):
-    decision: Literal["approve", "reject", "request_changes"]
+    decision: ReviewDecision
     output: str | None = None
     feedback: str | None = None
     instructions: str | None = None
@@ -176,7 +195,7 @@ async def approve_dag(
         raise HTTPException(status_code=404, detail="Process not found")
     assert_process_client_access(proc, client_hdr)
 
-    if proc.status in ("running", "completed", "approved"):
+    if is_idempotent_approval_status(proc.status):
         # "approved" covers duplicate POST after commit but before status moves to "running"
         return {
             "status": proc.status,
@@ -191,16 +210,9 @@ async def approve_dag(
         )
 
     try:
-        raw = json.loads(req.dag_json)
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON for approved DAG: {e}") from e
-
-    try:
-        validated = validate_planner_dag(raw)
+        apply_process_approval(session, process_id=process_id, dag_json=req.dag_json)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-
-    apply_validated_planner_to_process(session, process_id, validated)
     proc.status = "approved"
     session.add(proc)
     session.commit()
@@ -229,7 +241,7 @@ async def review_task(
     if not task or task.process_id != process_id:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if task.status == "completed" and req.decision == "approve":
+    if task.status == "completed" and req.decision == ReviewDecision.APPROVE:
         return {"status": "completed", "idempotent": True}
 
     if task.status != "awaiting_review":
@@ -244,87 +256,36 @@ async def review_task(
             detail=f"Process has finished (status={proc.status}); cannot review tasks",
         )
 
-    if req.decision == "request_changes":
-        fb = (req.feedback or "").strip()
-        if not fb:
-            raise HTTPException(status_code=400, detail="feedback is required for request_changes")
-
-        task.draft_output = task.output
-        task.output = None
-        task.review_feedback = fb
-        task.reviewer_client_uuid = None
-        task.revision_count += 1
-        if req.instructions is not None:
-            task.instructions = req.instructions
-        task.status = "pending"
-        task.failure_debug_json = None
-        task.started_at = None
-        task.completed_at = None
-        task.tokens_used = 0
-        proc.status = "running"
-        proc.failure_reason = None
-        session.add(task)
-        session.add(proc)
-        session.add(
-            EventLog(
-                process_id=process_id,
-                task_id=task_id,
-                event_type="status_change",
-                content=f"Task {task.client_uuid} requeued for revision (revision {task.revision_count})",
-            )
+    try:
+        mutation = apply_task_review_decision(
+            task=task,
+            process=proc,
+            decision=req.decision,
+            output=req.output,
+            feedback=req.feedback,
+            instructions=req.instructions,
         )
-        session.commit()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
-        executor = DAGExecutor(process_id)
-        background_tasks.add_task(executor.execute_dag)
-        return {"status": "requeued", "revision_count": task.revision_count}
-
-    if req.decision == "reject":
-        task.reviewer_client_uuid = None
-        task.status = "failed"
-        task.failure_debug_json = json.dumps(
-            {
-                "source": "review_reject",
-                "message": "Human reviewer rejected this task at the review gate.",
-            },
-            ensure_ascii=False,
-        )
-        proc.status = "failed"
-        proc.failure_reason = f"Task {task.client_uuid} rejected at review"
-        session.add(task)
-        session.add(proc)
-        session.add(
-            EventLog(
-                process_id=process_id,
-                task_id=task_id,
-                event_type="status_change",
-                content=f"Task {task.client_uuid} rejected at review",
-            )
-        )
-        session.commit()
-        return {"status": "rejected"}
-
-    # approve
-    if req.output is not None:
-        task.output = req.output
-    task.reviewer_client_uuid = None
-    task.status = "completed"
-    task.completed_at = datetime.utcnow()
-    task.draft_output = None
-    task.review_feedback = None
-    proc.status = "running"
-    proc.failure_reason = None
     session.add(task)
     session.add(proc)
-    session.add(
-        EventLog(
-            process_id=process_id,
-            task_id=task_id,
-            event_type="status_change",
-            content=f"Task {task.client_uuid} approved",
-        )
+    append_process_event(
+        session,
+        process_id=process_id,
+        task_id=task_id,
+        event_type="status_change",
+        content=mutation.event_content,
     )
     session.commit()
+
+    if mutation.status == "requeued":
+        executor = DAGExecutor(process_id)
+        background_tasks.add_task(executor.execute_dag)
+        return {"status": "requeued", "revision_count": mutation.revision_count}
+
+    if mutation.status == "rejected":
+        return {"status": "rejected"}
 
     executor = DAGExecutor(process_id)
     background_tasks.add_task(executor.expand_after_review_approval_and_continue, task_id)
@@ -380,28 +341,15 @@ async def sync_process(
 
     tasks = session.exec(select(TaskNode).where(TaskNode.process_id == process_id)).all()
 
-    def task_counts() -> dict[str, int]:
-        out: dict[str, int] = {}
-        for t in tasks:
-            out[t.status] = out.get(t.status, 0) + 1
-        return out
-
-    counts = task_counts()
+    counts = task_status_counts(tasks)
     terminal = ("completed", "failed", "cancelled")
 
     if proc.status in terminal:
-        if proc.status == "failed":
-            fin_detail = (
-                "Process failed; use POST /retry to re-plan or re-run execution, "
-                "or retry individual failed tasks — sync does not apply."
-            )
-        else:
-            fin_detail = "Process is already finished; sync does nothing."
         return {
             "process_id": process_id,
             "process_status": proc.status,
             "action": "none",
-            "detail": fin_detail,
+            "detail": sync_terminal_detail(proc.status),
             "task_counts": counts,
         }
 
@@ -420,21 +368,19 @@ async def sync_process(
             "process_id": process_id,
             "process_status": proc.status,
             "action": "blocked",
-            "detail": f"Waiting for human task review ({awaiting} task(s) in awaiting_review). Use the review actions on each task.",
+            "detail": sync_review_gate_detail(awaiting),
             "task_counts": counts,
         }
 
     # Inconsistent: executor should have set task_review_required when any task awaits review
     if proc.status == "running" and counts.get("awaiting_review", 0) > 0:
-        proc.status = "task_review_required"
-        proc.failure_reason = None
+        align_running_process_to_review_required(proc)
         session.add(proc)
-        session.add(
-            EventLog(
-                process_id=process_id,
-                event_type="status_change",
-                content="Sync: aligned process status to task_review_required (review gate open)",
-            )
+        append_process_event(
+            session,
+            process_id=process_id,
+            event_type="status_change",
+            content="Sync: aligned process status to task_review_required (review gate open)",
         )
         session.commit()
         return {
@@ -442,19 +388,18 @@ async def sync_process(
             "process_status": proc.status,
             "action": "aligned_status",
             "detail": "Process status was running while tasks awaited review; updated to task_review_required.",
-            "task_counts": task_counts(),
+            "task_counts": task_status_counts(tasks),
         }
 
     if proc.status in ("pending", "planning"):
         team_context = team_context_from_snapshot_json(proc.team_snapshot_json)
         executor = DAGExecutor(process_id)
         background_tasks.add_task(executor.plan, proc.goal, team_context)
-        session.add(
-            EventLog(
-                process_id=process_id,
-                event_type="status_change",
-                content="Sync: re-scheduled planning",
-            )
+        append_process_event(
+            session,
+            process_id=process_id,
+            event_type="status_change",
+            content="Sync: re-scheduled planning",
         )
         session.commit()
         return {
@@ -473,12 +418,11 @@ async def sync_process(
             )
         executor = DAGExecutor(process_id)
         background_tasks.add_task(executor.execute_dag)
-        session.add(
-            EventLog(
-                process_id=process_id,
-                event_type="status_change",
-                content="Sync: re-scheduled DAG execution",
-            )
+        append_process_event(
+            session,
+            process_id=process_id,
+            event_type="status_change",
+            content="Sync: re-scheduled DAG execution",
         )
         session.commit()
         return {
@@ -490,28 +434,16 @@ async def sync_process(
         }
 
     if proc.status == "running":
-        reset_n = 0
-        for t in tasks:
-            if t.status == "running":
-                t.status = "pending"
-                t.output = None
-                t.draft_output = None
-                t.review_feedback = None
-                t.reviewer_client_uuid = None
-                t.failure_debug_json = None
-                t.started_at = None
-                t.completed_at = None
-                t.tokens_used = 0
-                session.add(t)
-                reset_n += 1
+        reset_n = reset_running_tasks_to_pending(tasks)
+        for task in tasks:
+            session.add(task)
         proc.failure_reason = None
         session.add(proc)
-        session.add(
-            EventLog(
-                process_id=process_id,
-                event_type="status_change",
-                content=f"Sync: reset {reset_n} stuck running task(s) to pending; re-scheduled DAG execution",
-            )
+        append_process_event(
+            session,
+            process_id=process_id,
+            event_type="status_change",
+            content=f"Sync: reset {reset_n} stuck running task(s) to pending; re-scheduled DAG execution",
         )
         session.commit()
 
@@ -524,7 +456,7 @@ async def sync_process(
             "detail": "DAG execution was scheduled again."
             + (f" Reset {reset_n} task(s) that were still marked running." if reset_n else ""),
             "reset_running_tasks": reset_n,
-            "task_counts": task_counts(),
+            "task_counts": task_status_counts(tasks),
         }
 
     return {
@@ -557,15 +489,13 @@ async def retry_process(
     existing_tasks = session.exec(select(TaskNode).where(TaskNode.process_id == process_id)).all()
 
     if not existing_tasks:
-        proc.failure_reason = None
-        proc.status = "planning"
+        mark_process_for_replanning(proc)
         session.add(proc)
-        session.add(
-            EventLog(
-                process_id=process_id,
-                event_type="status_change",
-                content="Retry: re-planning scheduled",
-            )
+        append_process_event(
+            session,
+            process_id=process_id,
+            event_type="status_change",
+            content="Retry: re-planning scheduled",
         )
         session.commit()
 
@@ -591,15 +521,13 @@ async def retry_process(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     apply_validated_planner_to_process(session, process_id, validated)
-    proc.status = "approved"
-    proc.failure_reason = None
+    mark_process_for_execution_retry(proc)
     session.add(proc)
-    session.add(
-        EventLog(
-            process_id=process_id,
-            event_type="status_change",
-            content="Retry: execution re-scheduled",
-        )
+    append_process_event(
+        session,
+        process_id=process_id,
+        event_type="status_change",
+        content="Retry: execution re-scheduled",
     )
     session.commit()
 
@@ -641,27 +569,15 @@ async def retry_failed_task(
             detail="Process has no stored DAG JSON; use full process retry instead",
         )
 
-    task.status = "pending"
-    task.output = None
-    task.draft_output = None
-    task.review_feedback = None
-    task.reviewer_client_uuid = None
-    task.failure_debug_json = None
-    task.revision_count = 0
-    task.started_at = None
-    task.completed_at = None
-    task.tokens_used = 0
-    proc.failure_reason = None
-    proc.status = "approved"
+    reset_failed_task_for_retry(task=task, process=proc)
     session.add(task)
     session.add(proc)
-    session.add(
-        EventLog(
-            process_id=process_id,
-            task_id=task_id,
-            event_type="status_change",
-            content=f"Retry: task {task.client_uuid} reset to pending; execution re-scheduled",
-        )
+    append_process_event(
+        session,
+        process_id=process_id,
+        task_id=task_id,
+        event_type="status_change",
+        content=f"Retry: task {task.client_uuid} reset to pending; execution re-scheduled",
     )
     session.commit()
 

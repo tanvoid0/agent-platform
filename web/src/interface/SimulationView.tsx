@@ -76,7 +76,6 @@ const SimulationView: React.FC<SimulationViewProps> = ({
 
     useUiStore.getState().setChatting(false);
     requestAnimationFrame(() => {
-      useUiStore.getState().setChatting(true);
       scene.startChat(leadIdx);
       useUiStore.getState().bumpChatInputFocusRequest();
     });

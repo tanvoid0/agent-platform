@@ -9,7 +9,7 @@ from fastapi import Header, HTTPException
 
 
 def agent_platform_api_key_expected() -> str | None:
-    v = (os.getenv("AGENT_PLATFORM_API_KEY") or "").strip()
+    v = (os.getenv("AGENT_PLATFORM_MASTER_KEY") or "").strip()
     return v or None
 
 

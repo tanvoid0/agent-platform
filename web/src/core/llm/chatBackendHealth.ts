@@ -1,7 +1,8 @@
 /**
  * Chat-stack readiness from the browser’s perspective: **only** `GET` on Agent Platform
- * (`/api/v1/orchestrator/ready`). The UI never probes Ollama or any LLM host directly — the
- * backend performs the upstream orchestrator check.
+ * (`/api/v1/llm/ready`). The UI never probes Ollama or any LLM host directly — the
+ * backend checks the embedded LLM proxy via `/v1/health/readiness` (fast), not a full
+ * `/v1/models` fan-out (can exceed this request’s timeout).
  */
 import { agentPlatformAuthHeaders, apiUrl } from '../../api/client';
 
@@ -14,7 +15,7 @@ export interface ChatBackendHealthResult {
 const TIMEOUT_MS = 4500;
 
 export async function checkChatBackendHealth(): Promise<ChatBackendHealthResult> {
-  const url = apiUrl('/api/v1/orchestrator/ready');
+  const url = apiUrl('/api/v1/llm/ready');
   const ctrl = new AbortController();
   const started = performance.now();
   const timer = window.setTimeout(() => ctrl.abort(), TIMEOUT_MS);
@@ -27,15 +28,24 @@ export async function checkChatBackendHealth(): Promise<ChatBackendHealthResult>
     window.clearTimeout(timer);
     const latencyMs = Math.round(performance.now() - started);
     if (!res.ok) {
-      let detail = `HTTP ${res.status}`;
+      let detail: string | null = null;
+      const requestId = res.headers.get('x-request-id');
       try {
         const j = (await res.json()) as { detail?: unknown };
         if (typeof j.detail === 'string') detail = j.detail;
         else if (Array.isArray(j.detail)) detail = j.detail.map(String).join('; ');
       } catch {
-        /* ignore */
+        try {
+          const raw = (await res.text()).trim();
+          if (raw) detail = raw.slice(0, 400);
+        } catch {
+          /* ignore */
+        }
       }
-      return { ok: false, error: detail };
+      const parts = [`HTTP ${res.status}`];
+      if (detail) parts.push(detail);
+      if (requestId) parts.push(`request_id=${requestId}`);
+      return { ok: false, error: parts.join(' | ') };
     }
     return { ok: true, latencyMs };
   } catch (e) {

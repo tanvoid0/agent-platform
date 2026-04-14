@@ -1,4 +1,4 @@
-import { ArrowLeft, BarChart3 } from 'lucide-react';
+import { ArrowLeft, BarChart3, FolderOpen } from 'lucide-react';
 import React, { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
@@ -18,14 +18,26 @@ export const FinanceProjectPage: React.FC = () => {
   const agents = getAllAgents(activeTeam);
 
   const usageLedger = useCoreStore((s) => s.usageLedger);
+  const actionLog = useCoreStore((s) => s.actionLog);
   const totalTokenUsage = useCoreStore((s) => s.totalTokenUsage);
   const totalEstimatedCost = useCoreStore((s) => s.totalEstimatedCost);
   const budgetLimitUsd = useCoreStore((s) => s.budgetLimitUsd);
   const setBudgetLimitUsd = useCoreStore((s) => s.setBudgetLimitUsd);
+  const tasks = useCoreStore((s) => s.tasks);
+  const finalOutput = useCoreStore((s) => s.finalOutput);
+  const finalAssetType = useCoreStore((s) => s.finalAssetType);
+  const finalAssetContent = useCoreStore((s) => s.finalAssetContent);
+  const isGeneratingAsset = useCoreStore((s) => s.isGeneratingAsset);
+  const referenceImages = useCoreStore((s) => s.referenceImages);
+  const phase = useCoreStore((s) => s.phase);
 
   const [budgetDraft, setBudgetDraft] = useState(() =>
     budgetLimitUsd != null && budgetLimitUsd > 0 ? String(budgetLimitUsd) : '',
   );
+  const [ledgerPage, setLedgerPage] = useState(1);
+  const [activityPage, setActivityPage] = useState(1);
+  const LEDGER_PAGE_SIZE = 12;
+  const ACTIVITY_PAGE_SIZE = 10;
 
   React.useEffect(() => {
     setBudgetDraft(budgetLimitUsd != null && budgetLimitUsd > 0 ? String(budgetLimitUsd) : '');
@@ -34,6 +46,10 @@ export const FinanceProjectPage: React.FC = () => {
   const ledgerDesc = useMemo(
     () => [...usageLedger].sort((a, b) => b.timestamp - a.timestamp),
     [usageLedger],
+  );
+  const activityDesc = useMemo(
+    () => [...actionLog].sort((a, b) => b.timestamp - a.timestamp),
+    [actionLog],
   );
 
   const byModel = useMemo(() => {
@@ -83,6 +99,26 @@ export const FinanceProjectPage: React.FC = () => {
   }, [usageLedger]);
 
   const maxDayCost = Math.max(...last7Days.map((d) => d.cost), 0.0001);
+  const totalLedgerPages = Math.max(1, Math.ceil(ledgerDesc.length / LEDGER_PAGE_SIZE));
+  const totalActivityPages = Math.max(1, Math.ceil(activityDesc.length / ACTIVITY_PAGE_SIZE));
+  const safeLedgerPage = Math.min(ledgerPage, totalLedgerPages);
+  const safeActivityPage = Math.min(activityPage, totalActivityPages);
+  const ledgerRows = ledgerDesc.slice(
+    (safeLedgerPage - 1) * LEDGER_PAGE_SIZE,
+    safeLedgerPage * LEDGER_PAGE_SIZE,
+  );
+  const activityRows = activityDesc.slice(
+    (safeActivityPage - 1) * ACTIVITY_PAGE_SIZE,
+    safeActivityPage * ACTIVITY_PAGE_SIZE,
+  );
+  const uniqueActivityAgents = new Set(actionLog.map((row) => row.agentIndex)).size;
+  const doneTasks = tasks.filter((task) => task.status === 'done').length;
+  const lastActivityAt = activityDesc[0]?.timestamp ?? null;
+  const finalOutputPreview = (finalOutput || '').trim().slice(0, 320);
+  const finalOutputWordCount = (finalOutput || '').trim()
+    ? (finalOutput || '').trim().split(/\s+/).length
+    : 0;
+  const hasDeliverableAsset = Boolean(finalAssetContent);
 
   const applyBudget = () => {
     const t = budgetDraft.trim();
@@ -142,6 +178,62 @@ export const FinanceProjectPage: React.FC = () => {
               <p className="text-[10px] font-bold text-zinc-400 uppercase mb-1">Estimated cost</p>
               <p className="text-3xl font-mono font-black text-emerald-700">${totalEstimatedCost.toFixed(4)}</p>
             </div>
+          </div>
+        </section>
+
+        <section className="bg-white border border-zinc-200 rounded-xl p-5 shadow-sm">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <h2 className="text-[10px] font-black uppercase tracking-widest text-zinc-400">
+              Deliverables & final output
+            </h2>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5 text-[9px] font-black uppercase tracking-wider"
+              asChild
+            >
+              <Link to="/project-output">
+                <FolderOpen size={13} />
+                Open full output
+              </Link>
+            </Button>
+          </div>
+
+          <div className="grid gap-2 rounded-lg border border-zinc-100 bg-zinc-50/70 p-2.5 sm:grid-cols-2 lg:grid-cols-4">
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Project phase</p>
+              <p className="text-[11px] font-semibold capitalize text-zinc-700">{phase}</p>
+            </div>
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Deliverable type</p>
+              <p className="text-[11px] font-semibold uppercase text-zinc-700">{finalAssetType}</p>
+            </div>
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Asset status</p>
+              <p className="text-[11px] font-semibold text-zinc-700">
+                {isGeneratingAsset ? 'Generating' : hasDeliverableAsset ? 'Generated' : 'Not generated'}
+              </p>
+            </div>
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Reference images</p>
+              <p className="text-[11px] font-semibold text-zinc-700">{referenceImages.length}</p>
+            </div>
+          </div>
+
+          <div className="mt-3 rounded-lg border border-zinc-100 bg-white p-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Final output preview</p>
+              <p className="text-[10px] font-mono text-zinc-400">{finalOutputWordCount} words</p>
+            </div>
+            {finalOutputPreview ? (
+              <p className="text-xs leading-relaxed text-zinc-700">
+                {finalOutputPreview}
+                {(finalOutput || '').trim().length > finalOutputPreview.length ? '…' : ''}
+              </p>
+            ) : (
+              <p className="text-xs text-zinc-500">No final output saved yet.</p>
+            )}
           </div>
         </section>
 
@@ -274,7 +366,7 @@ export const FinanceProjectPage: React.FC = () => {
                 </tr>
               </thead>
               <tbody>
-                {ledgerDesc.map((row) => (
+                {ledgerRows.map((row) => (
                   <tr key={row.id} className="border-b border-zinc-50 hover:bg-zinc-50/50">
                     <td className="px-4 py-2 font-mono text-zinc-600 whitespace-nowrap">
                       {new Date(row.timestamp).toLocaleString()}
@@ -292,8 +384,130 @@ export const FinanceProjectPage: React.FC = () => {
               </tbody>
             </table>
           </div>
+          {ledgerDesc.length > 0 && (
+            <div className="flex items-center justify-between border-t border-zinc-100 px-4 py-3">
+              <p className="text-[10px] text-zinc-500">
+                Showing {(safeLedgerPage - 1) * LEDGER_PAGE_SIZE + 1}-
+                {Math.min(safeLedgerPage * LEDGER_PAGE_SIZE, ledgerDesc.length)} of {ledgerDesc.length}
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={safeLedgerPage <= 1}
+                  onClick={() => setLedgerPage((p) => Math.max(1, p - 1))}
+                  className="h-7 px-2 text-[9px] font-bold uppercase"
+                >
+                  Prev
+                </Button>
+                <span className="text-[10px] font-mono text-zinc-500">
+                  {safeLedgerPage}/{totalLedgerPages}
+                </span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={safeLedgerPage >= totalLedgerPages}
+                  onClick={() => setLedgerPage((p) => Math.min(totalLedgerPages, p + 1))}
+                  className="h-7 px-2 text-[9px] font-bold uppercase"
+                >
+                  Next
+                </Button>
+              </div>
+            </div>
+          )}
           {ledgerDesc.length === 0 && (
             <p className="px-5 py-8 text-sm text-zinc-500 text-center">No API calls with usage logged yet.</p>
+          )}
+        </section>
+
+        <section className="bg-white border border-zinc-200 rounded-xl overflow-hidden shadow-sm">
+          <h3 className="text-[10px] font-black uppercase tracking-widest text-zinc-400 px-5 pt-5 pb-4">
+            Activity log
+          </h3>
+          <div className="grid gap-2 border-y border-zinc-100 bg-zinc-50/70 px-4 py-3 sm:grid-cols-4">
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Events</p>
+              <p className="text-sm font-black text-darkDelegation">{actionLog.length}</p>
+            </div>
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Agents active</p>
+              <p className="text-sm font-black text-darkDelegation">{uniqueActivityAgents}</p>
+            </div>
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Tasks done</p>
+              <p className="text-sm font-black text-darkDelegation">
+                {doneTasks}/{tasks.length}
+              </p>
+            </div>
+            <div>
+              <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Last event</p>
+              <p className="truncate text-[11px] font-mono font-semibold text-zinc-600">
+                {lastActivityAt ? new Date(lastActivityAt).toLocaleString() : '—'}
+              </p>
+            </div>
+          </div>
+          <div className="max-h-[460px] overflow-auto">
+            {activityRows.length > 0 ? (
+              <ul className="divide-y divide-zinc-100">
+                {activityRows.map((row) => {
+                  const agent = agents.find((a) => a.index === row.agentIndex);
+                  const agentName = agent?.name ?? `Agent ${row.agentIndex}`;
+                  return (
+                    <li key={row.id} className="px-4 py-3">
+                      <div className="mb-1 flex items-center justify-between gap-2">
+                        <p className="truncate text-[11px] font-black uppercase tracking-wide text-zinc-600">
+                          {agentName}
+                        </p>
+                        <p className="shrink-0 text-[10px] font-mono text-zinc-400">
+                          {new Date(row.timestamp).toLocaleString()}
+                        </p>
+                      </div>
+                      <p className="text-xs leading-relaxed text-zinc-700">{row.action}</p>
+                      {row.taskId ? (
+                        <p className="mt-1 text-[10px] font-mono text-zinc-400">Task: {row.taskId}</p>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <p className="px-5 py-8 text-sm text-zinc-500 text-center">No project activity logged yet.</p>
+            )}
+          </div>
+          {activityDesc.length > 0 && (
+            <div className="flex items-center justify-between border-t border-zinc-100 px-4 py-3">
+              <p className="text-[10px] text-zinc-500">
+                Showing {(safeActivityPage - 1) * ACTIVITY_PAGE_SIZE + 1}-
+                {Math.min(safeActivityPage * ACTIVITY_PAGE_SIZE, activityDesc.length)} of {activityDesc.length}
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={safeActivityPage <= 1}
+                  onClick={() => setActivityPage((p) => Math.max(1, p - 1))}
+                  className="h-7 px-2 text-[9px] font-bold uppercase"
+                >
+                  Prev
+                </Button>
+                <span className="text-[10px] font-mono text-zinc-500">
+                  {safeActivityPage}/{totalActivityPages}
+                </span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={safeActivityPage >= totalActivityPages}
+                  onClick={() => setActivityPage((p) => Math.min(totalActivityPages, p + 1))}
+                  className="h-7 px-2 text-[9px] font-bold uppercase"
+                >
+                  Next
+                </Button>
+              </div>
+            </div>
           )}
         </section>
 

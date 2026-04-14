@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { hasRemoteProjectBackend } from '../integration/api/projectRemoteApi'
 import { unreadAssistantTurnsForAgent } from '../integration/chat/chatReadWatermark'
@@ -11,6 +11,11 @@ import { useActiveTeam } from '../integration/store/teamStore'
 import { useUiStore } from '../integration/store/uiStore'
 import { getAllCharacters } from '../data/agents'
 import { useSceneManager } from '../simulation/SceneContext'
+import { useHeartbeatNow } from '../integration/hooks/useHeartbeatNow'
+import {
+  persistProjectSideTab,
+  readStoredProjectSideTab,
+} from '../integration/ui/projectSideTabStorage'
 import PricingModal from './PricingModal'
 import ResetModal from './ResetModal'
 import type { InputRequestItem } from './projectView/buildInputRequestList'
@@ -19,24 +24,11 @@ import { ExecutionMonitorSection } from './projectView/ExecutionMonitorSection'
 import { InputRequestsSection } from './projectView/InputRequestsSection'
 import { ProjectResetActions } from './projectView/ProjectResetActions'
 import { ProjectSideTabs, type ProjectSideTab } from './projectView/ProjectSideTabs'
+import { ProjectStatsSection } from './projectView/ProjectStatsSection'
 import { ProjectViewHeader } from './projectView/ProjectViewHeader'
 import { TokenUsageSection } from './projectView/TokenUsageSection'
 import { UnreadMessagesSection } from './projectView/UnreadMessagesSection'
 import { UserBriefSection } from './projectView/UserBriefSection'
-
-const PROJECT_SIDE_TAB_KEY = 'ui:project-side-tab'
-
-function readStoredProjectSideTab(): ProjectSideTab {
-  try {
-    const raw = localStorage.getItem(PROJECT_SIDE_TAB_KEY)
-    if (raw === 'overview' || raw === 'activity') return raw
-    // "agents" is inspector-only; project body has no agents tab in this view.
-    if (raw === 'agents') return 'overview'
-  } catch {
-    /* ignore */
-  }
-  return 'overview'
-}
 
 export type ProjectViewProps = {
   sideTab?: ProjectSideTab
@@ -70,7 +62,9 @@ const ProjectView: React.FC<ProjectViewProps> = ({
   const agentEstimatedCost = useCoreStore((s) => s.agentEstimatedCost)
   const [isResetModalOpen, setIsResetModalOpen] = useState(false)
   const [isPricingModalOpen, setIsPricingModalOpen] = useState(false)
-  const [internalSideTab, setInternalSideTab] = useState<ProjectSideTab>(readStoredProjectSideTab)
+  const [internalSideTab, setInternalSideTab] = useState<ProjectSideTab>(() =>
+    readStoredProjectSideTab(['overview', 'activity'], 'overview'),
+  )
   const activeTeam = useActiveTeam()
   const navigate = useNavigate()
   const scene = useSceneManager()
@@ -90,11 +84,7 @@ const ProjectView: React.FC<ProjectViewProps> = ({
         controlledOnSideTab!(tab)
       } else {
         setInternalSideTab(tab)
-        try {
-          localStorage.setItem(PROJECT_SIDE_TAB_KEY, tab)
-        } catch {
-          /* ignore */
-        }
+        persistProjectSideTab(tab)
       }
     },
     [isControlled, controlledOnSideTab],
@@ -104,18 +94,12 @@ const ProjectView: React.FC<ProjectViewProps> = ({
 
   const characters = useMemo(() => getAllCharacters(activeTeam), [activeTeam])
 
-  const [nowTs, setNowTs] = useState(() => Date.now())
   const hasExecutionRows = useMemo(
     () => tasks.some((task) => Boolean(taskExecution[task.id])),
     [tasks, taskExecution],
   )
 
-  useEffect(() => {
-    const shouldTrackHeartbeat = sideTab === 'activity' && hasExecutionRows
-    if (!shouldTrackHeartbeat) return
-    const id = window.setInterval(() => setNowTs(Date.now()), 1000)
-    return () => window.clearInterval(id)
-  }, [sideTab, hasExecutionRows])
+  const nowTs = useHeartbeatNow(sideTab === 'activity' && hasExecutionRows)
 
   const handleInputRequestClick = useCallback(
     (item: InputRequestItem) => {
@@ -230,10 +214,15 @@ const ProjectView: React.FC<ProjectViewProps> = ({
         />
       )}
 
+      {sideTab === 'overview' && (
+        <ProjectStatsSection tasks={tasks} actionLog={actionLog} taskExecution={taskExecution} />
+      )}
+
       {sideTab === 'activity' && unreadChatByAgent.length > 0 && (
         <UnreadMessagesSection
           rows={unreadChatByAgent}
           totalUnread={activityAttentionCount - inputRequests.length}
+          leadAgentIndex={activeTeam.leadAgent.index}
           selectedNpcIndex={selectedNpcIndex}
           isChatting={isChatting}
           onOpenAgentChat={(agentIndex) => {

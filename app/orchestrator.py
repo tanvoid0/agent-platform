@@ -4,15 +4,11 @@ import logging
 import os
 import time
 import traceback
-from datetime import datetime
 from typing import Any
 
 from sqlmodel import Session, select
 
 from dag_schema import (
-    merge_planner_with_new_subagents,
-    planner_dag_to_json_dict,
-    sanitize_llm_model_alias,
     validate_planner_dag,
 )
 from database import engine
@@ -28,8 +24,25 @@ from llm_client import (
     generate_planner_dag,
     generate_subdag_expansion,
 )
-from models import EventLog, Process, TaskNode
+from models import Process, TaskNode
 from process_approval import apply_validated_planner_to_process
+from services.review_assignment_service import sync_review_assignments
+from services.process_runtime_service import (
+    complete_process,
+    fail_process,
+    pause_process_for_task_review,
+    set_process_running_or_review_required,
+)
+from services.dag_runtime_service import load_dag_task_snapshot, select_ready_task_ids
+from services.task_result_service import apply_task_failure, apply_task_success
+from services.subdag_service import merge_and_persist_subdag_expansion
+from services.event_log_service import append_event
+from services.planner_runtime_service import (
+    apply_planner_failure,
+    apply_planner_success,
+    mark_process_planning,
+)
+from time_utils import utc_now_naive
 from tool_context import ToolContext
 from tools_policy import load_policy
 
@@ -146,100 +159,6 @@ def _revision_user_preamble(task: TaskNode) -> str:
     return "\n\n---\n".join(parts) + "\n\nRevise your output to address the feedback above.\n\n"
 
 
-def _deps_all_completed_for_task(t: TaskNode, tasks_by_uuid: dict[str, TaskNode]) -> bool:
-    for dep in t.dependencies:
-        dep_row = tasks_by_uuid.get(dep)
-        if not dep_row or dep_row.status != "completed":
-            return False
-    return True
-
-
-def _can_serve_as_reviewer(rt: TaskNode, tasks_by_uuid: dict[str, TaskNode]) -> bool:
-    """True when this peer is idle enough to take a review (not the author’s runnable work)."""
-    if rt.status == "completed":
-        return True
-    if rt.status != "pending":
-        return False
-    if not rt.dependencies:
-        return False
-    return not _deps_all_completed_for_task(rt, tasks_by_uuid)
-
-
-def _role_word_overlap(r1: str, r2: str) -> int:
-    w1 = set(r1.lower().replace("-", " ").split())
-    w2 = set(r2.lower().replace("-", " ").split())
-    return len(w1 & w2)
-
-
-def pick_reviewer_client_uuid(
-    subject: TaskNode,
-    subagents: list,
-    tasks_by_uuid: dict[str, TaskNode],
-) -> str | None:
-    """
-    Choose a peer subagent to “hold” the review: prefers downstream consumers of the author’s
-    output, then role overlap; only considers idle peers (completed, or pending but blocked).
-    """
-    author = subject.client_uuid
-    spec_by_uuid = {a.client_uuid: a for a in subagents}
-    if author not in spec_by_uuid:
-        return None
-    author_spec = spec_by_uuid[author]
-    downstream = {a.client_uuid for a in subagents if author in (a.dependencies or [])}
-    upstream = set(author_spec.dependencies or [])
-
-    scored: list[tuple[int, str]] = []
-    for a in subagents:
-        cu = a.client_uuid
-        if cu == author:
-            continue
-        rt = tasks_by_uuid.get(cu)
-        if not rt or not _can_serve_as_reviewer(rt, tasks_by_uuid):
-            continue
-        score = 0
-        if cu in downstream:
-            score += 100
-        if author in (a.dependencies or []):
-            score += 80
-        if cu in upstream:
-            score += 40
-        score += _role_word_overlap(author_spec.role, a.role)
-        scored.append((score, cu))
-
-    if not scored:
-        return None
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return scored[0][1]
-
-
-def sync_review_assignments(session: Session, process_id: int) -> None:
-    """Fill or refresh reviewer_client_uuid on tasks in awaiting_review."""
-    run = session.get(Process, process_id)
-    if not run or not run.dag_json:
-        return
-    try:
-        planner = validate_planner_dag(json.loads(run.dag_json))
-    except (json.JSONDecodeError, ValueError):
-        return
-    tasks = session.exec(select(TaskNode).where(TaskNode.process_id == process_id)).all()
-    tasks_by_uuid = {t.client_uuid: t for t in tasks}
-    subagents = planner.subagents
-    for t in tasks:
-        if t.status != "awaiting_review":
-            continue
-        rid = t.reviewer_client_uuid
-        if rid:
-            rt = tasks_by_uuid.get(rid)
-            if not rt or not _can_serve_as_reviewer(rt, tasks_by_uuid):
-                t.reviewer_client_uuid = None
-                session.add(t)
-        if not t.reviewer_client_uuid:
-            pick = pick_reviewer_client_uuid(t, subagents, tasks_by_uuid)
-            if pick:
-                t.reviewer_client_uuid = pick
-                session.add(t)
-
-
 class DAGExecutor:
     def __init__(self, process_id: int, auto_approve: bool = False):
         self.process_id = process_id
@@ -255,16 +174,111 @@ class DAGExecutor:
         return self._auto_approve or _env_auto_approve()
 
     def log_event(self, session: Session, event_type: str, content: str, task_id: int = None):
-        log = EventLog(process_id=self.process_id, task_id=task_id, event_type=event_type, content=content)
-        session.add(log)
-        session.commit()
+        append_event(
+            session,
+            process_id=self.process_id,
+            task_id=task_id,
+            event_type=event_type,
+            content=content,
+        )
+
+    def _load_task_execution_inputs(self, task_id: int) -> tuple[TaskNode | None, list[str], str, str]:
+        with Session(engine) as session:
+            task = session.get(TaskNode, task_id)
+            if not task:
+                return None, [], "", ""
+            task.status = "running"
+            task.started_at = utc_now_naive()
+            task.failure_debug_json = None
+            session.commit()
+            self.log_event(session, "status_change", f"Task {task.client_uuid} started executing", task.id)
+
+            deps_texts: list[str] = []
+            if task.dependencies:
+                dep_tasks = session.exec(
+                    select(TaskNode)
+                    .where(TaskNode.process_id == self.process_id)
+                    .where(TaskNode.client_uuid.in_(task.dependencies))
+                ).all()
+                for dt in dep_tasks:
+                    deps_texts.append(f"Output from {dt.client_uuid} ({dt.role}):\n{dt.output or ''}")
+
+            system_message = task.system_prompt
+            user_message = task.instructions
+            if task.parent_client_uuid:
+                parent_row = session.exec(
+                    select(TaskNode)
+                    .where(TaskNode.process_id == self.process_id)
+                    .where(TaskNode.client_uuid == task.parent_client_uuid)
+                ).first()
+                if parent_row:
+                    user_message = (
+                        f"This is a subtask spawned after `{parent_row.role}` "
+                        f"({task.parent_client_uuid}) completed. Deliver one focused outcome.\n\n"
+                        + user_message
+                    )
+            return task, deps_texts, system_message, user_message
+
+    async def _build_user_message_with_context(
+        self,
+        *,
+        task: TaskNode,
+        deps_texts: list[str],
+        system_message: str,
+        user_message: str,
+    ) -> str:
+        rev_pre = _revision_user_preamble(task)
+        if rev_pre:
+            user_message = rev_pre + user_message
+
+        if deps_texts:
+            dep_budget = dependency_context_token_budget(
+                system_message=system_message or "",
+                instructions_and_preamble=user_message,
+            )
+            condensed: list[str] = []
+            for chunk in deps_texts:
+                condensed.append(
+                    await maybe_condense_text_for_context(chunk, model=task.llm_model)
+                )
+            fitted_deps = fit_dependency_outputs_to_budget(condensed, dep_budget)
+            user_message += "\n\nContext from previous steps:\n" + "\n---\n".join(fitted_deps)
+        return user_message
+
+    async def _invoke_task_llm(
+        self,
+        *,
+        llm_model: str | None,
+        base_messages: list[dict[str, str]],
+    ) -> tuple[str, int, float, int]:
+        policy = load_policy()
+        with Session(engine) as session:
+            run = session.get(Process, self.process_id)
+            used_tools = int(run.tool_invocations_used or 0) if run else 0
+            proj_id: int | None = int(run.project_id) if run and run.project_id is not None else None
+        remaining_tool_budget = 0
+        if policy.enabled and policy.allowlist and policy.budget_per_run > 0:
+            remaining_tool_budget = max(0, policy.budget_per_run - used_tools)
+
+        if remaining_tool_budget > 0:
+            tool_ctx = ToolContext(process_id=self.process_id, project_id=proj_id)
+            content, tokens, task_cost, tool_calls = await call_llm_with_tools(
+                base_messages,
+                model=llm_model,
+                allowed_tool_names=policy.allowlist,
+                tool_budget=remaining_tool_budget,
+                temperature=0.7,
+                tool_context=tool_ctx,
+            )
+            return content, tokens, task_cost, tool_calls
+
+        content, tokens, task_cost = await call_llm(base_messages, model=llm_model)
+        return content, tokens, task_cost, 0
 
     async def plan(self, goal: str, team_context: str | None = None):
         # Generates the planner DAG and saves tasks to DB
         with Session(engine) as session:
-            run = session.get(Process, self.process_id)
-            run.status = "planning"
-            session.commit()
+            mark_process_planning(session, process_id=self.process_id)
             self.log_event(session, "status_change", "Process status updated to planning")
 
         plan_timeout = _plan_timeout_seconds()
@@ -278,27 +292,13 @@ class DAGExecutor:
                 dag, tokens, plan_cost = await generate_planner_dag(goal, team_context)
 
             with Session(engine) as session:
-                run = session.get(Process, self.process_id)
-                run.dag_json = json.dumps(dag)
-                run.total_tokens += tokens
-                run.total_cost += plan_cost
-                run.failure_reason = None
-                run.status = "approval_required" # Human in the loop gate
-                
-                for agent in dag.get("subagents", []):
-                    task = TaskNode(
-                        process_id=self.process_id,
-                        client_uuid=agent["client_uuid"],
-                        role=agent["role"],
-                        system_prompt=agent["system_prompt"],
-                        instructions=agent["instructions"],
-                        llm_model=sanitize_llm_model_alias(agent.get("model")),
-                        requires_review=bool(agent.get("requires_review", False)),
-                    )
-                    task.dependencies = agent.get("dependencies", [])
-                    session.add(task)
-                
-                session.commit()
+                apply_planner_success(
+                    session,
+                    process_id=self.process_id,
+                    dag=dag,
+                    tokens=tokens,
+                    plan_cost=plan_cost,
+                )
                 self.log_event(session, "status_change", "Process requires approval to execute DAG")
 
             if self._should_auto_approve():
@@ -311,10 +311,7 @@ class DAGExecutor:
                 else "Planning timed out"
             )
             with Session(engine) as session:
-                run = session.get(Process, self.process_id)
-                run.status = "failed"
-                run.failure_reason = reason
-                session.commit()
+                apply_planner_failure(session, process_id=self.process_id, reason=reason)
                 self.log_event(session, "error", f"Planning failed: {reason}")
         except (
             LLMConfigurationError,
@@ -324,18 +321,20 @@ class DAGExecutor:
             ValueError,
         ) as e:
             with Session(engine) as session:
-                run = session.get(Process, self.process_id)
-                run.status = "failed"
-                run.failure_reason = _truncate_reason(f"Planning failed: {e}")
-                session.commit()
+                apply_planner_failure(
+                    session,
+                    process_id=self.process_id,
+                    reason=_truncate_reason(f"Planning failed: {e}"),
+                )
                 self.log_event(session, "error", f"Planning failed: {e}")
         except Exception:
             logging.exception("Planning failed (unexpected)")
             with Session(engine) as session:
-                run = session.get(Process, self.process_id)
-                run.status = "failed"
-                run.failure_reason = "Planning failed: unexpected error"
-                session.commit()
+                apply_planner_failure(
+                    session,
+                    process_id=self.process_id,
+                    reason="Planning failed: unexpected error",
+                )
                 self.log_event(session, "error", "Planning failed: unexpected error")
 
     async def _auto_approve_and_execute(self) -> None:
@@ -359,131 +358,42 @@ class DAGExecutor:
         await self.execute_dag()
 
     async def execute_task(self, task_id: int):
-        with Session(engine) as session:
-            task = session.get(TaskNode, task_id)
-            if not task:
-                return
-            task.status = "running"
-            task.started_at = datetime.utcnow()
-            task.failure_debug_json = None
-            session.commit()
-            self.log_event(session, "status_change", f"Task {task.client_uuid} started executing", task.id)
-
-            deps_texts: list[str] = []
-            if task.dependencies:
-                dep_tasks = session.exec(
-                    select(TaskNode)
-                    .where(TaskNode.process_id == self.process_id)
-                    .where(TaskNode.client_uuid.in_(task.dependencies))
-                ).all()
-                for dt in dep_tasks:
-                    deps_texts.append(
-                        f"Output from {dt.client_uuid} ({dt.role}):\n{dt.output or ''}"
-                    )
-
-            system_message = task.system_prompt
-            user_message = task.instructions
-            if task.parent_client_uuid:
-                parent_row = session.exec(
-                    select(TaskNode)
-                    .where(TaskNode.process_id == self.process_id)
-                    .where(TaskNode.client_uuid == task.parent_client_uuid)
-                ).first()
-                if parent_row:
-                    user_message = (
-                        f"This is a subtask spawned after `{parent_row.role}` "
-                        f"({task.parent_client_uuid}) completed. Deliver one focused outcome.\n\n"
-                        + user_message
-                    )
-            llm_model = task.llm_model
-            client_uuid = task.client_uuid
-
-        rev_pre = _revision_user_preamble(task)
-        if rev_pre:
-            user_message = rev_pre + user_message
-
-        if deps_texts:
-            dep_budget = dependency_context_token_budget(
-                system_message=system_message or "",
-                instructions_and_preamble=user_message,
-            )
-            condensed: list[str] = []
-            for chunk in deps_texts:
-                condensed.append(
-                    await maybe_condense_text_for_context(chunk, model=llm_model)
-                )
-            fitted_deps = fit_dependency_outputs_to_budget(condensed, dep_budget)
-            user_message += "\n\nContext from previous steps:\n" + "\n---\n".join(fitted_deps)
-
-        base_messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_message},
-        ]
+        task, deps_texts, system_message, user_message = self._load_task_execution_inputs(task_id)
+        if not task:
+            return
+        llm_model = task.llm_model
+        client_uuid = task.client_uuid
+        user_message = await self._build_user_message_with_context(
+            task=task,
+            deps_texts=deps_texts,
+            system_message=system_message,
+            user_message=user_message,
+        )
+        base_messages = [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}]
 
         try:
-            policy = load_policy()
+            content, tokens, task_cost, tool_calls = await self._invoke_task_llm(
+                llm_model=llm_model,
+                base_messages=base_messages,
+            )
+
             with Session(engine) as session:
-                run = session.get(Process, self.process_id)
-                used_tools = int(run.tool_invocations_used or 0) if run else 0
-                proj_id: int | None = (
-                    int(run.project_id) if run and run.project_id is not None else None
+                task, _run, needs_expand = apply_task_success(
+                    session,
+                    process_id=self.process_id,
+                    task_id=task_id,
+                    output=content,
+                    tokens=tokens,
+                    task_cost=task_cost,
+                    tool_calls=tool_calls,
                 )
-            remaining_tool_budget = 0
-            if policy.enabled and policy.allowlist and policy.budget_per_run > 0:
-                remaining_tool_budget = max(0, policy.budget_per_run - used_tools)
-
-            if remaining_tool_budget > 0:
-                tool_ctx = ToolContext(process_id=self.process_id, project_id=proj_id)
-                content, tokens, task_cost, tool_calls = await call_llm_with_tools(
-                    base_messages,
-                    model=llm_model,
-                    allowed_tool_names=policy.allowlist,
-                    tool_budget=remaining_tool_budget,
-                    temperature=0.7,
-                    tool_context=tool_ctx,
+                self.log_event(
+                    session,
+                    "status_change",
+                    f"Task {client_uuid} awaiting review" if task.requires_review else f"Task {client_uuid} completed",
+                    task.id,
                 )
-            else:
-                content, tokens, task_cost = await call_llm(
-                    [
-                        {"role": "system", "content": system_message},
-                        {"role": "user", "content": user_message},
-                    ],
-                    model=llm_model,
-                )
-                tool_calls = 0
-
-            needs_expand = False
-            with Session(engine) as session:
-                task = session.get(TaskNode, task_id)
-                task.output = content
-                task.tokens_used = tokens
-
-                run = session.get(Process, self.process_id)
-                run.total_tokens += tokens
-                run.total_cost += task_cost
-                run.tool_invocations_used = int(run.tool_invocations_used or 0) + int(tool_calls)
-
-                if task.requires_review:
-                    task.status = "awaiting_review"
-                    task.completed_at = None
-                    run.status = "task_review_required"
-                    sync_review_assignments(session, self.process_id)
-                    session.commit()
-                    self.log_event(
-                        session,
-                        "status_change",
-                        f"Task {client_uuid} awaiting review",
-                        task.id,
-                    )
-                    self.log_event(session, "trace", content, task.id)
-                else:
-                    task.status = "completed"
-                    task.completed_at = datetime.utcnow()
-                    needs_expand = True
-                    sync_review_assignments(session, self.process_id)
-                    session.commit()
-                    self.log_event(session, "status_change", f"Task {client_uuid} completed", task.id)
-                    self.log_event(session, "trace", content, task.id)  # Trace LLM output
+                self.log_event(session, "trace", content, task.id)
 
             if needs_expand:
                 await self._maybe_expand_subdag_after_success(task_id)
@@ -495,13 +405,14 @@ class DAGExecutor:
             LLMRequestError,
         ) as e:
             with Session(engine) as session:
-                task = session.get(TaskNode, task_id)
-                task.status = "failed"
-                task.failure_debug_json = _task_failure_debug_json(source="llm", exc=e)
-                run = session.get(Process, self.process_id)
-                run.status = "failed"
-                run.failure_reason = _truncate_reason(f"Task {task.client_uuid} failed: {e}")
-                session.commit()
+                fail_msg = _truncate_reason(f"Task {client_uuid} failed: {e}")
+                task, _run = apply_task_failure(
+                    session,
+                    process_id=self.process_id,
+                    task_id=task_id,
+                    failure_debug_json=_task_failure_debug_json(source="llm", exc=e),
+                    failure_reason=fail_msg,
+                )
                 self.log_event(
                     session,
                     "error",
@@ -512,19 +423,20 @@ class DAGExecutor:
             logging.exception("Task %s failed (unexpected)", task_id)
             tb = traceback.format_exc()
             with Session(engine) as session:
-                task = session.get(TaskNode, task_id)
-                task.status = "failed"
-                task.failure_debug_json = _task_failure_debug_json(
-                    source="unexpected",
-                    exc=e,
-                    extra={"traceback": _truncate_reason(tb, max_len=12000)},
+                fail_msg = _truncate_reason(
+                    f"Task {client_uuid} failed: unexpected error"
                 )
-                run = session.get(Process, self.process_id)
-                run.status = "failed"
-                run.failure_reason = _truncate_reason(
-                    f"Task {task.client_uuid} failed: unexpected error"
+                task, _run = apply_task_failure(
+                    session,
+                    process_id=self.process_id,
+                    task_id=task_id,
+                    failure_debug_json=_task_failure_debug_json(
+                        source="unexpected",
+                        exc=e,
+                        extra={"traceback": _truncate_reason(tb, max_len=12000)},
+                    ),
+                    failure_reason=fail_msg,
                 )
-                session.commit()
                 self.log_event(
                     session,
                     "error",
@@ -597,59 +509,35 @@ class DAGExecutor:
             if len(new_raw) > remaining_slots:
                 new_raw = new_raw[:remaining_slots]
 
-            try:
-                merged = merge_planner_with_new_subagents(planner, new_raw)
-            except Exception as e:
-                logging.warning("Sub-DAG merge validation failed: %s", e)
-                with Session(engine) as session:
-                    self.log_event(session, "error", f"Sub-DAG expansion merge failed: {e}")
-                return
-
-            merged_json = json.dumps(planner_dag_to_json_dict(merged))
-
             with Session(engine) as session:
-                run = session.get(Process, self.process_id)
-                if not run or run.status != "running":
-                    return
-                run.dag_json = merged_json
-                run.total_tokens += add_tokens
-                run.total_cost += add_cost
-
-                for agent in new_raw:
-                    cu = agent["client_uuid"]
-                    exists = session.exec(
-                        select(TaskNode)
-                        .where(TaskNode.process_id == self.process_id)
-                        .where(TaskNode.client_uuid == cu)
-                    ).first()
-                    if exists:
-                        continue
-                    tnode = TaskNode(
+                try:
+                    created = merge_and_persist_subdag_expansion(
+                        session,
                         process_id=self.process_id,
-                        client_uuid=cu,
-                        parent_client_uuid=parent_uuid,
-                        role=agent["role"],
-                        system_prompt=agent["system_prompt"],
-                        instructions=agent["instructions"],
-                        llm_model=sanitize_llm_model_alias(agent.get("model")),
-                        requires_review=bool(agent.get("requires_review", False)),
+                        planner=planner,
+                        new_raw=new_raw,
+                        add_tokens=add_tokens,
+                        add_cost=add_cost,
+                        parent_uuid=parent_uuid,
                     )
-                    tnode.dependencies = agent.get("dependencies", [])
-                    session.add(tnode)
+                except Exception as e:
+                    logging.warning("Sub-DAG merge validation failed: %s", e)
+                    with Session(engine) as err_session:
+                        self.log_event(err_session, "error", f"Sub-DAG expansion merge failed: {e}")
+                    return
 
                 self._subdecomp_expansions_used += 1
-                self._subdecomp_new_tasks_added += len(new_raw)
+                self._subdecomp_new_tasks_added += created
                 child_depth = self._subdecomp_uuid_depth.get(parent_uuid, 0) + 1
                 for agent in new_raw:
                     cu = agent.get("client_uuid")
                     if isinstance(cu, str) and cu:
                         self._subdecomp_uuid_depth[cu] = child_depth
 
-                session.commit()
                 self.log_event(
                     session,
                     "status_change",
-                    f"Sub-DAG expansion added {len(new_raw)} task(s) after {parent_uuid}",
+                    f"Sub-DAG expansion added {created} task(s) after {parent_uuid}",
                 )
 
     async def execute_dag(self):
@@ -660,7 +548,6 @@ class DAGExecutor:
         )
 
         with Session(engine) as session:
-            run = session.get(Process, self.process_id)
             awaiting_left = (
                 session.exec(
                     select(TaskNode.id)
@@ -669,11 +556,11 @@ class DAGExecutor:
                 ).first()
                 is not None
             )
-            # Parallel tasks can both land in awaiting_review; approving one resumes execute_dag,
-            # which must not report "running" while another review gate is still open.
-            run.status = "task_review_required" if awaiting_left else "running"
-            run.failure_reason = None
-            session.commit()
+            set_process_running_or_review_required(
+                session,
+                process_id=self.process_id,
+                awaiting_review=awaiting_left,
+            )
             self.log_event(
                 session,
                 "status_change",
@@ -698,66 +585,40 @@ class DAGExecutor:
                     self._execution_deadline is not None
                     and time.monotonic() > self._execution_deadline
                 ):
-                    run.status = "failed"
-                    run.failure_reason = (
-                        "Process exceeded execution budget (AGENT_PLATFORM_RUN_MAX_SECONDS)"
+                    fail_process(
+                        session,
+                        process_id=self.process_id,
+                        reason="Process exceeded execution budget (AGENT_PLATFORM_RUN_MAX_SECONDS)",
                     )
-                    session.commit()
                     self.log_event(
                         session,
                         "error",
-                        run.failure_reason,
+                        "Process exceeded execution budget (AGENT_PLATFORM_RUN_MAX_SECONDS)",
                     )
                     break
 
-                pending_tasks = session.exec(
-                    select(TaskNode).where(TaskNode.process_id == self.process_id).where(TaskNode.status == "pending")
-                ).all()
+                snapshot = load_dag_task_snapshot(session, process_id=self.process_id)
 
-                awaiting_review_exists = (
-                    session.exec(
-                        select(TaskNode.id)
-                        .where(TaskNode.process_id == self.process_id)
-                        .where(TaskNode.status == "awaiting_review")
-                    ).first()
-                    is not None
-                )
-
-                completed_tasks = session.exec(
-                    select(TaskNode).where(TaskNode.process_id == self.process_id).where(TaskNode.status == "completed")
-                ).all()
-                completed_uuids = {t.client_uuid for t in completed_tasks}
-
-            if not pending_tasks:
-                if awaiting_review_exists:
+            if not snapshot.pending_tasks:
+                if snapshot.awaiting_review_exists:
                     with Session(engine) as session:
-                        run = session.get(Process, self.process_id)
-                        run.status = "task_review_required"
-                        run.failure_reason = None
-                        session.commit()
+                        pause_process_for_task_review(session, process_id=self.process_id)
                         self.log_event(session, "status_change", "Process paused for task review")
                     break
                 with Session(engine) as session:
-                    run = session.get(Process, self.process_id)
-                    run.status = "completed"
-                    run.failure_reason = None
-                    session.commit()
+                    complete_process(session, process_id=self.process_id)
                     self.log_event(session, "status_change", "Process execution fully completed")
                 break
 
-            # Find tasks where all dependencies are met
-            ready_tasks = []
-            for task in pending_tasks:
-                if all(dep in completed_uuids for dep in task.dependencies):
-                    ready_tasks.append(task)
-
-            if not ready_tasks:
-                if awaiting_review_exists:
+            ready_task_ids = select_ready_task_ids(
+                pending_tasks=snapshot.pending_tasks,
+                completed_uuids=snapshot.completed_uuids,
+                max_concurrent=_max_concurrent_tasks(),
+            )
+            if not ready_task_ids:
+                if snapshot.awaiting_review_exists:
                     with Session(engine) as session:
-                        run = session.get(Process, self.process_id)
-                        run.status = "task_review_required"
-                        run.failure_reason = None
-                        session.commit()
+                        pause_process_for_task_review(session, process_id=self.process_id)
                         self.log_event(session, "status_change", "Process paused for task review")
                     break
                 # Deadlock detection if there are pending tasks but none are ready
@@ -766,17 +627,11 @@ class DAGExecutor:
                     "(cycle or unsatisfied dependencies)"
                 )
                 with Session(engine) as session:
-                    run = session.get(Process, self.process_id)
-                    run.status = "failed"
-                    run.failure_reason = deadlock_msg
-                    session.commit()
+                    fail_process(session, process_id=self.process_id, reason=deadlock_msg)
                     self.log_event(session, "error", deadlock_msg)
                 break
 
-            ready_sorted = sorted(ready_tasks, key=lambda t: t.id)
-            max_c = _max_concurrent_tasks()
-            batch = ready_sorted if max_c is None else ready_sorted[:max_c]
-            await asyncio.gather(*(self.execute_task(t.id) for t in batch))
+            await asyncio.gather(*(self.execute_task(task_id) for task_id in ready_task_ids))
 
     async def expand_after_review_approval_and_continue(self, task_id: int) -> None:
         """Sub-DAG expansion after a reviewed task is approved, then continue execution."""

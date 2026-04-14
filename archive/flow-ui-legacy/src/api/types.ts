@@ -22,7 +22,7 @@ export interface SubagentNode {
   instructions: string;
   dependencies?: string[];
   /**
-   * Optional llm-orchestrator chat `model` alias (same as OpenAI `model` on POST /v1/chat/completions).
+   * Optional embedded LLM proxy chat `model` alias (same as OpenAI `model` on POST /v1/chat/completions).
    * Not the agent’s “persona” or skill — that is `role` / prompts. Omit to use server/env defaults.
    */
   model?: string | null;
@@ -85,7 +85,7 @@ export interface RosterRole {
   id: string;
   name: string;
   description?: string;
-  /** Declared output modality; orchestrator resolves LLM later. Defaults to `text`. */
+  /** Declared output modality; the server maps to concrete models later. Defaults to `text`. */
   modality?: RoleModality;
   parent_id?: string | null;
   /** Optional #hex for map chrome; planner ignores. */

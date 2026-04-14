@@ -236,7 +236,15 @@ export class SceneManager {
     new InputManager(
       this.engine.renderer.domElement, this.stage.camera,
       () => this.controller!.getCPUPositions(), () => this.controller!.getCount(),
-      (idx) => { if (useUiStore.getState().isChatting) useUiStore.getState().setChatting(false); this.selectedIndex = idx !== activeSet.user.index ? idx : null; useUiStore.getState().setSelectedNpc(this.selectedIndex); },
+      (idx) => {
+        if (useUiStore.getState().isChatting) useUiStore.getState().setChatting(false);
+        this.selectedIndex = idx !== activeSet.user.index ? idx : null;
+        if (this.selectedIndex !== null) {
+          this.startChat(this.selectedIndex, { expandProjectRail: true });
+        } else {
+          useUiStore.getState().setSelectedNpc(null);
+        }
+      },
       (x, z) => this.driverManager?.getPlayerDriver().onFloorClick(x, z),
       (idx, pos) => useUiStore.getState().setHoveredNpc(idx, pos),
       () => this.poiManager.getAllPois(),
@@ -380,8 +388,18 @@ export class SceneManager {
     });
   }
 
-  public startChat(npcIndex: number): void {
+  public startChat(
+    npcIndex: number,
+    options?: {
+      /** When true, ask the app shell to expand the right project rail (e.g. user picked an agent in the 3D office). */
+      expandProjectRail?: boolean;
+    },
+  ): void {
+    useUiStore.getState().setSelectedNpc(npcIndex);
     useUiStore.getState().setChatting(true);
+    if (options?.expandProjectRail) {
+      useUiStore.getState().bumpProjectRailExpandRequest();
+    }
   }
 
 

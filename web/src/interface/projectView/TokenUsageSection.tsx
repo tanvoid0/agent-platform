@@ -3,6 +3,7 @@ import React from 'react'
 import { Button } from '@/components/ui/button'
 import { getAllAgents, type AgenticSystem } from '../../data/agents'
 import { AgentPresenceBadge } from '../components/AgentPresenceBadge'
+import { Avatar } from '../components/Avatar'
 import { formatTokens } from '../formatTokens'
 
 export const TokenUsageSection: React.FC<{
@@ -79,10 +80,19 @@ export const TokenUsageSection: React.FC<{
               className="flex items-center justify-between py-2 px-2 hover:bg-zinc-100/50 rounded-lg transition-colors group"
             >
               <div className="flex items-center gap-3">
-                <div
-                  className="w-1.5 h-1.5 rounded-full shadow-[0_0_8px_rgba(0,0,0,0.1)]"
-                  style={{ backgroundColor: agent.color }}
-                />
+                <div className="shrink-0 rounded-lg border border-zinc-100 bg-zinc-50/80 p-0.5">
+                  <Avatar
+                    type={
+                      agentIndex < 0
+                        ? 'user'
+                        : agentIndex === activeTeam.leadAgent.index
+                          ? 'lead'
+                          : 'sub'
+                    }
+                    color={agent.color}
+                    size={28}
+                  />
+                </div>
                 <div className="flex min-w-0 flex-col gap-0.5">
                   <span className="text-[11px] font-bold uppercase tracking-tight text-zinc-600 transition-colors group-hover:text-darkDelegation">
                     {agent.name}

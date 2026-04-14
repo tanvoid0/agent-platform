@@ -1,4 +1,4 @@
-"""Alembic applies on startup; legacy DBs without alembic_version get stamped after column ensures."""
+"""Alembic applies on startup; legacy DBs without alembic_version get column patches then upgrade."""
 
 from sqlalchemy import inspect
 from sqlalchemy.pool import StaticPool
@@ -46,7 +46,7 @@ def test_upgrade_creates_tables_and_version(monkeypatch):
 
 
 def test_legacy_db_without_alembic_version_gets_stamped(monkeypatch):
-    """Simulate pre-Alembic SQLite: legacy `run` table exists, no alembic_version."""
+    """Simulate pre-Alembic SQLite: legacy ``run`` table exists, no ``alembic_version`` row."""
     eng = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},

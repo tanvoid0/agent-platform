@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-platform.local/llm-proxy-config.schema.json",
+  "title": "Agent Platform embedded LLM proxy config",
+  "description": "Configuration for the slim OpenAI-compatible proxy (Ollama, LM Studio, Gemini). Use with config.yaml; editors can associate this schema for validation.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["ollama", "gemini", "lm_studio", "aimlapi"],
+          "description": "Default backend when the client omits model or uses an unlisted raw id."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Default backend model id for the default provider."
+        }
+      }
+    },
+    "providers": {
+      "type": "array",
+      "description": "Named backends and the client-visible model routes under each.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "models"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["ollama", "gemini", "lm_studio", "aimlapi"],
+            "description": "Upstream provider for all models in this block."
+          },
+          "models": {
+            "type": "array",
+            "description": "Routes exposed as OpenAI model ids. Use a string when alias and backend id are the same; use an object when the client alias differs from the upstream model name.",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Client model id and backend model id are identical."
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["model_name", "model"],
+                  "properties": {
+                    "model_name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Value sent as model in client requests (alias)."
+                    },
+                    "model": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Backend model id passed to the provider API."
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "model_list": {
+      "type": "array",
+      "description": "Optional flat list of model entries. Prefer the providers block for new configs.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["model_name", "provider", "model"],
+        "properties": {
+          "model_name": { "type": "string", "minLength": 1 },
+          "provider": { "type": "string", "enum": ["ollama", "gemini", "lm_studio", "aimlapi"] },
+          "model": { "type": "string", "minLength": 1 },
+          "litellm_params": { "type": "object" }
+        }
+      }
+    }
+  }
+}

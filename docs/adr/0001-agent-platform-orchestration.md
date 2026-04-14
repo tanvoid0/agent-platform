@@ -1,6 +1,6 @@
-# ADR 0001 (Draft): Agent platform — orchestration, observation, and boundaries
+# ADR 0001 (Accepted): Agent platform — orchestration, observation, and boundaries
 
-**Status:** Draft — intended for further research before implementation  
+**Status:** Accepted  
 **Date:** 2026-04-10  
 **Deciders:** (fill when decided)  
 **Tags:** multi-agent, HITL, Ollama, OpenAI-compatible proxy, reliability
@@ -9,7 +9,7 @@
 
 ## 1. Context
 
-You already expose models through an **OpenAI-compatible** surface (`/v1/chat/completions`) via **llm-orchestrator**, with **Ollama-first** routing and optional cloud providers. The missing product is not another LLM proxy: it is an **agentic orchestration layer** that implements a narrow, high-value loop:
+The Agent Platform process exposes models through an **OpenAI-compatible** surface (`/v1/chat/completions`) via an **embedded LLM proxy**, with **Ollama-first** routing and optional cloud providers. The missing product is not another LLM proxy: it is an **agentic orchestration layer** that implements a narrow, high-value loop:
 
 **user goal → planner proposes a team (roles + task DAG) → human reviews/edits → subagents execute → aggregated results + trace.**
 
@@ -43,7 +43,7 @@ Non-problems for v1: 3D offices, navmesh, asset pipelines, or “bots that write
 
 ### 3.1 Goals
 
-- **Thin coupling to llm-orchestrator:** All model traffic uses the existing proxy and its **model aliases** / env configuration.
+- **Thin coupling to the embedded LLM proxy:** All model traffic uses the same-process proxy and its **model aliases** / env configuration.
 - **Human-in-the-loop & Guardrails:** Core flows have an approval gate (approve or edit-then-approve). The system must inherently support an **"Auto-approve"** fast-path for trusted execution.
 - **Cost & Token Tracking:** Persist token and usage cost metadata for every agent invocation, aggregated per-run.
 - **Observable runs (SSE):** Operators can view live LLM traces and tool calls via Server-Sent Events, creating a reactive UI bridging a state manager (e.g. Zustand) with streaming AI triggers.
@@ -63,7 +63,7 @@ Non-problems for v1: 3D offices, navmesh, asset pipelines, or “bots that write
 - **Ollama-first** for cost and locality; cloud models are **optional** via the same proxy.
 - **Structured Output Reliability:** Do NOT just prompt for JSON. Leverage Ollama's `format: "json"` strictly, or integrate grammar-based sampling at the client level.
 - Local models may emit **invalid or partial JSON** for structured planner output despite schema configurations — design must assume **validation + retry + fallback model** for planning output.
-- The orchestrator is **stateless per request**; **all run state** for the agent platform lives in **your** persistence layer.
+- The LLM proxy is **stateless per request**; **all run state** for the agent platform lives in **your** persistence layer.
 - Host port preferences (e.g. uncommon localhost ports) apply to **how** you deploy, not to this ADR’s logic.
 
 ---
@@ -106,8 +106,8 @@ Use this section as a **research matrix**. Nothing here commits you to a library
 
 | Option | Strengths | Risks |
 |--------|-----------|-------|
-| **Separate process** (recommended default in this ADR) | Clear boundary: orchestrator stays a **proxy**; agent platform owns runs | One more deployable |
-| **Mounted inside FastAPI** of llm-orchestrator | Single binary | Blurs responsibilities; proxy upgrades risk agent state |
+| **Separate process** (optional split deploy) | Clear boundary: LLM proxy as its own service; agent platform owns runs | One more deployable |
+| **Embedded in Agent Platform FastAPI** (default in this repo) | Single binary; proxy and runs share one process | Proxy upgrades require app deploy coordination |
 
 ---
 
@@ -117,7 +117,7 @@ This is a **default** you can accept, revise, or reject after research. It is co
 
 1. **Orchestration:** Start with a **custom explicit state machine** and a **small internal DAG executor**. Execute the DAG level-by-level via a topological sort, isolating outputs on a "Blackboard" or explicit edges rather than sharing one giant context array.
 
-2. **LLM access:** **Only** via **llm-orchestrator** OpenAI-compatible **`/v1/chat/completions`**, using **model aliases** from orchestrator config and a single auth story (`ORCHESTRATOR_MASTER_KEY`; legacy `LITELLM_MASTER_KEY` accepted).
+2. **LLM access:** **Only** via the embedded OpenAI-compatible **`/v1/chat/completions`**, using **model aliases** from proxy `config.yaml` and a single auth story (`AGENT_PLATFORM_MASTER_KEY`).
 
 3. **Planner output:** Leveraged via strict JSON schema (or Ollama's `format: json`). Implement validate → optional repair pass → fail closed.
 
@@ -142,7 +142,7 @@ This is a **default** you can accept, revise, or reject after research. It is co
 ### 7.2 Negative / costs
 
 - You must implement **DAG correctness** (cycle detection, topological order, parallel boundaries) yourself if you stay on a custom executor.
-- **Two services** to deploy unless you consciously collapse them (trade clarity for convenience).
+- Single-process embedded deployment keeps operator overhead low while preserving internal boundaries.
 - **Structured output** from small local models may require **prompt engineering + retries** — plan time for that.
 
 ---
@@ -162,7 +162,7 @@ This is a **default** you can accept, revise, or reject after research. It is co
 ## 9. Open questions (answer before coding)
 
 1. **Minimum viable DAG (ANSWERED):** The DAG requires **parallel subagents** executing layer-by-layer (e.g. via iterative Planner-Executor split) to maximize isolated Ollama sprint tasks. Linear chain is insufficient for scaling multi-agent tasks safely within confined contexts.
-2. **Identity and tenancy (ANSWERED):** **Single-user local only** for v1, driven by `ORCHESTRATOR_MASTER_KEY` (legacy `LITELLM_MASTER_KEY`).
+2. **Identity and tenancy (ANSWERED):** **Single-user local only** for v1, driven by `AGENT_PLATFORM_MASTER_KEY`.
 3. **Aggregation (ANSWERED):** A **dedicated “Synthesizer” subagent template**. Relying on the "last node" mathematically breaks down when multiple parallel workers produce independent insights. The planner injects a sink node.
 4. **Edit scope at approval (ANSWERED):** **Full proposal replace (JSON overwrite).** Patch-by-id merges are too burdensome for a v1 local tool.
 5. **Retention (ANSWERED):** Indefinite storage in **SQLite checkpoints**, cleaned up manually by user command to preserve their valuable OpenClaw-like on-disk history.
@@ -187,7 +187,7 @@ Use this as a reading list; reorder by your risk tolerance.
 ## 11. Relationship to other documents
 
 - **Product brainstorm / roadmap** in the repo (e.g. `.cursor/plans/`) — product intent; **this ADR** is architecture.
-- **llm-orchestrator** — transport and provider routing only; agent logic does not belong in `ui/app/routes/llm.py`.
+- **Embedded LLM proxy** (`app/llm_proxy/`) — transport and provider routing only; agent logic stays in Agent Platform routes and the DAG executor.
 - **[ADR 0002](./0002-ui-stack-react-typescript-vite.md)** — web shell (React+TS+Vite, TanStack Query, @xyflow/react).
 - **[ADR 0003](./0003-future-3d-simulation-boundary.md)** — optional lazy-loaded 3D module; authority stays server-side.
 - **Tools / MCP** — `app/tools_policy.py` today; a dedicated ADR when executable tools ship beyond prompts.
@@ -198,6 +198,7 @@ Use this as a reading list; reorder by your risk tolerance.
 
 | Date | Change |
 |------|--------|
-| 2026-04-10 | Initial draft: FSM + HTTP-first + SQLite + orchestrator-only LLM |
+| 2026-04-10 | Initial draft: FSM + HTTP-first + SQLite + LLM via embedded proxy |
+| 2026-04-14 | Accepted with embedded single-process deployment as default; removed split-service framing from consequences |
 
 When you accept or reject Section 6, update **Status** to **Accepted** or **Superseded**, fill **Deciders**, and add a row here.

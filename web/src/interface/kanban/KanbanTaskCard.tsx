@@ -8,6 +8,7 @@ import { useCoreStore, type Task } from '../../integration/store/coreStore'
 import { getActiveAgentSet } from '../../integration/store/teamStore'
 import { useUiKanbanTaskActions } from '../../integration/store/uiSelectors'
 import DeleteTaskModal from '../DeleteTaskModal'
+import { Avatar } from '../components/Avatar'
 import { AgentPresenceBadge } from '../components/AgentPresenceBadge'
 import { formatTaskAge } from './kanbanUtils'
 
@@ -165,12 +166,9 @@ export function KanbanTaskCard({ task }: { task: Task }) {
                   className="inline-flex flex-col items-start gap-0.5 text-[10px] font-bold"
                   style={{ color: USER_COLOR }}
                 >
-                  <span className="inline-flex items-center gap-1">
-                    <span
-                      className="h-1.5 w-1.5 shrink-0 rounded-full"
-                      style={{ backgroundColor: USER_COLOR }}
-                    />
-                    {USER_NAME}
+                  <span className="inline-flex items-center gap-1.5 min-w-0">
+                    <Avatar type="user" color={USER_COLOR} size={18} className="shrink-0" />
+                    <span className="truncate">{USER_NAME}</span>
                   </span>
                   <AgentPresenceBadge agentIndex={system.user.index} size="sm" />
                 </span>
@@ -178,23 +176,21 @@ export function KanbanTaskCard({ task }: { task: Task }) {
             }
             const agent = getAllAgents(system).find((a) => a.index === agentIndex)
             if (!agent) return null
+            const avatarType = agentIndex === system.leadAgent.index ? 'lead' : 'sub'
             return (
               <Button
                 key={agentIndex}
                 type="button"
                 variant="ghost"
                 onClick={(e) => handleSelectAgent(e, agentIndex)}
-                className="-mx-1 inline-flex h-auto max-w-[10rem] flex-col items-stretch gap-0.5 rounded-md px-1 py-1 text-[10px] font-normal text-zinc-500 hover:bg-zinc-100 hover:text-darkDelegation"
+                className="-mx-1 inline-flex h-auto max-w-[11rem] flex-row items-start gap-1.5 rounded-md px-1 py-1 text-[10px] font-normal text-zinc-500 hover:bg-zinc-100 hover:text-darkDelegation"
                 title={`Focus ${agent.name} in workspace`}
               >
-                <span className="flex min-w-0 items-center gap-1">
-                  <span
-                    className="h-1.5 w-1.5 shrink-0 rounded-full"
-                    style={{ backgroundColor: agent.color }}
-                  />
-                  <span className="truncate">{agent.name}</span>
+                <Avatar type={avatarType} color={agent.color} size={18} className="shrink-0 mt-0.5" />
+                <span className="flex min-w-0 flex-1 flex-col items-stretch gap-0.5">
+                  <span className="truncate text-left">{agent.name}</span>
+                  <AgentPresenceBadge agentIndex={agentIndex} size="sm" className="self-start" />
                 </span>
-                <AgentPresenceBadge agentIndex={agentIndex} size="sm" className="self-start pl-2.5" />
               </Button>
             )
           })}

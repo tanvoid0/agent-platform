@@ -22,18 +22,10 @@ import { ReferenceImages } from './components/ReferenceImages';
 import { ProjectSideIconRail } from './projectView/ProjectSideIconRail';
 import type { ProjectSideTab } from './projectView/ProjectSideTabs';
 import { useActivityAttentionCount } from './projectView/useActivityAttentionCount';
-
-const PROJECT_SIDE_TAB_KEY = 'ui:project-side-tab';
-
-function readStoredProjectSideTab(): ProjectSideTab {
-  try {
-    const raw = localStorage.getItem(PROJECT_SIDE_TAB_KEY);
-    if (raw === 'overview' || raw === 'activity' || raw === 'agents') return raw;
-  } catch {
-    /* ignore */
-  }
-  return 'overview';
-}
+import {
+  persistProjectSideTab,
+  readStoredProjectSideTab,
+} from '@/integration/ui/projectSideTabStorage';
 
 interface InspectorPanelProps {
   isFloating?: boolean;
@@ -82,7 +74,9 @@ const InspectorPanel: React.FC<InspectorPanelProps> = ({
   const agent = selectedNpcIndex !== null ? agents.find(a => a.index === selectedNpcIndex) ?? null : null;
 
   const { activityAttentionCount } = useActivityAttentionCount();
-  const [projectSideTab, setProjectSideTab] = useState<ProjectSideTab>(readStoredProjectSideTab);
+  const [projectSideTab, setProjectSideTab] = useState<ProjectSideTab>(() =>
+    readStoredProjectSideTab(['overview', 'activity', 'agents'], 'overview'),
+  );
 
   const orchestrationActive = useMemo(
     () =>
@@ -132,11 +126,7 @@ const InspectorPanel: React.FC<InspectorPanelProps> = ({
         useUiStore.getState().setChatting(false);
       }
       setProjectSideTab(tab);
-      try {
-        localStorage.setItem(PROJECT_SIDE_TAB_KEY, tab);
-      } catch {
-        /* ignore */
-      }
+      persistProjectSideTab(tab);
     },
     [isChatting],
   );

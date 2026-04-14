@@ -90,8 +90,8 @@ export function FinalOutputBody({
       <div className="space-y-3 rounded-2xl border border-dashed border-violet-200 bg-violet-50/40 p-8 text-center">
         <p className="text-[10px] font-black uppercase tracking-widest text-violet-600">Mock audio deliverable</p>
         <p className="text-sm leading-relaxed text-zinc-600">
-          No audio was generated. Set <code className="font-mono text-[10px]">VITE_GEMINI_API_KEY</code> and rebuild to
-          produce real output, or keep using this placeholder for local testing without spending tokens.
+          No audio was generated. Configure backend Gemini credentials to produce real output, or keep using this
+          placeholder for local testing without spending tokens.
         </p>
       </div>
     )

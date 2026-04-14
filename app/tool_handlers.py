@@ -3,12 +3,12 @@ Built-in tool implementations for Phase 3 (OpenAI-compatible tool_calls).
 
 Register names here; `llm_client` exposes OpenAPI tool definitions filtered by allowlist.
 
-Includes MCP-parity helpers (same behavior as llm-orchestrator MCP tools) and `http_fetch`
+Includes MCP-parity helpers (legacy tool names) and `http_fetch`
 with a strict URL prefix allowlist (`AGENT_PLATFORM_HTTP_FETCH_ALLOWLIST`).
 
 `mcp_call` / `mcp_list_tools` use the official MCP Streamable HTTP client (`mcp` package)
 against URLs allowed by `AGENT_PLATFORM_MCP_ENDPOINT_ALLOWLIST`. Optional nested
-`chat_completions` calls the orchestrator proxy (high spend risk; allowlist only).
+`chat_completions` calls the embedded LLM proxy (high spend risk; allowlist only).
 
 `workspace_list` / `workspace_read` / `workspace_write` use `ToolContext.project_id` from the
 DAG executor (never model-supplied ids); omit or null project → JSON error from the handler.
@@ -31,10 +31,10 @@ from mcp_streamable_client import (
     mcp_endpoint_allowlist_prefixes,
 )
 
-from orchestrator_env import (
-    orchestrator_base_url_v1,
-    orchestrator_http_timeout_seconds,
-    orchestrator_master_key,
+from llm_proxy_env import (
+    llm_proxy_base_url_v1,
+    llm_proxy_http_timeout_seconds,
+    llm_proxy_master_key,
 )
 from tool_context import ToolContext
 from workspace_service import (
@@ -47,7 +47,7 @@ from workspace_service import (
 )
 
 
-def _orchestrator_default_model_from_env() -> str | None:
+def _llm_proxy_default_model_from_env() -> str | None:
     """SUBAGENT_MODEL, else PLANNER_MODEL — same resolution as llm_client (no import cycle)."""
     sub = (os.getenv("SUBAGENT_MODEL") or "").strip()
     if sub:
@@ -60,12 +60,12 @@ def _orchestrator_default_model_from_env() -> str | None:
     return None
 
 
-def _orchestrator_origin() -> str:
-    """Orchestrator base URL without /v1 (same convention as llm_client)."""
-    raw = orchestrator_base_url_v1().rstrip("/")
+def _llm_proxy_origin() -> str:
+    """LLM proxy base URL without /v1 (same convention as llm_client)."""
+    raw = llm_proxy_base_url_v1().rstrip("/")
     if raw.endswith("/v1"):
         raw = raw[: -len("/v1")].rstrip("/")
-    return raw or "http://127.0.0.1:18408"
+    return raw or "http://127.0.0.1:18410"
 
 
 def http_fetch_allowlist_prefixes() -> list[str]:
@@ -186,9 +186,9 @@ def openapi_tool_definitions() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "orchestrator_health",
+                "name": "llm_proxy_health",
                 "description": (
-                    "MCP-parity: GET the LLM orchestrator /health (no API key). "
+                    "GET the embedded LLM proxy /v1/health (no API key). "
                     "Uses LLM_ORCHESTRATOR_BASE_URL."
                 ),
                 "parameters": {"type": "object", "properties": {}},
@@ -199,9 +199,9 @@ def openapi_tool_definitions() -> list[dict[str, Any]]:
             "function": {
                 "name": "list_models",
                 "description": (
-                    "MCP-parity: GET /v1/models from the orchestrator proxy. "
-                    "Uses ORCHESTRATOR_MASTER_KEY when set. "
-                    "Optional providers/provider match llm-orchestrator /docs (e.g. providers=all for full catalog)."
+                    "GET /v1/models from the embedded LLM proxy. "
+                    "Uses AGENT_PLATFORM_MASTER_KEY when set. "
+                    "Optional providers/provider filter the catalog (e.g. providers=all for full catalog)."
                 ),
                 "parameters": {
                     "type": "object",
@@ -209,19 +209,23 @@ def openapi_tool_definitions() -> list[dict[str, Any]]:
                         "providers": {
                             "description": (
                                 "Omit for default (effective provider only). Use the string \"all\" for every "
-                                "alias plus live Ollama tags, or an array of ollama and/or gemini."
+                                "alias plus live Ollama tags and LM Studio models, or an array of "
+                                "ollama, lm_studio, aimlapi, and/or gemini."
                             ),
                             "oneOf": [
                                 {"type": "string", "enum": ["all"]},
                                 {
                                     "type": "array",
-                                    "items": {"type": "string", "enum": ["ollama", "gemini"]},
+                                    "items": {
+                                        "type": "string",
+                                        "enum": ["ollama", "gemini", "lm_studio", "aimlapi"],
+                                    },
                                 },
                             ],
                         },
                         "provider": {
                             "type": "string",
-                            "enum": ["ollama", "gemini"],
+                            "enum": ["ollama", "gemini", "lm_studio", "aimlapi"],
                             "description": "Single-provider filter when providers is omitted.",
                         },
                     },
@@ -231,9 +235,9 @@ def openapi_tool_definitions() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "orchestrator_connection_info",
+                "name": "llm_proxy_connection_info",
                 "description": (
-                    "MCP-parity: show orchestrator base URL and whether the API key is set "
+                    "Show LLM proxy base URL and whether the API key is set "
                     "(no secret values)."
                 ),
                 "parameters": {"type": "object", "properties": {}},
@@ -291,10 +295,9 @@ def openapi_tool_definitions() -> list[dict[str, Any]]:
             "function": {
                 "name": "chat_completions",
                 "description": (
-                    "HIGH COST / SPEND RISK: POST /v1/chat/completions to the orchestrator proxy "
-                    "(nested LLM). Requires ORCHESTRATOR_MASTER_KEY. "
-                    "Same shape as llm-orchestrator MCP "
-                    "tool chat_completions."
+                    "HIGH COST / SPEND RISK: POST /v1/chat/completions to the embedded LLM proxy "
+                    "(nested LLM). Requires AGENT_PLATFORM_MASTER_KEY. "
+                    "OpenAI-compatible chat_completions body."
                 ),
                 "parameters": {
                     "type": "object",
@@ -442,37 +445,37 @@ def _run_http_fetch(args: dict[str, Any]) -> str:
 
 
 def _v1_models_query_params(args: dict[str, Any]) -> list[tuple[str, str]]:
-    """Query string for GET /v1/models (llm-orchestrator /docs)."""
+    """Query string for GET /v1/models."""
     raw_providers = args.get("providers")
     if raw_providers is not None:
         if isinstance(raw_providers, str):
             s = raw_providers.strip().lower()
             if s == "all":
                 return [("providers", "all")]
-            if s in ("ollama", "gemini"):
+            if s in ("ollama", "gemini", "lm_studio", "aimlapi"):
                 return [("providers", s)]
         if isinstance(raw_providers, list):
             out: list[tuple[str, str]] = []
             for p in raw_providers:
                 if isinstance(p, str) and p.strip():
                     pl = p.strip().lower()
-                    if pl in ("ollama", "gemini"):
+                    if pl in ("ollama", "gemini", "lm_studio", "aimlapi"):
                         out.append(("providers", pl))
             if out:
                 return out
     prov = args.get("provider")
     if isinstance(prov, str) and prov.strip():
         p = prov.strip().lower()
-        if p in ("ollama", "gemini"):
+        if p in ("ollama", "gemini", "lm_studio", "aimlapi"):
             return [("provider", p)]
     return []
 
 
-def _run_orchestrator_health() -> str:
-    base = _orchestrator_origin()
+def _run_llm_proxy_health() -> str:
+    base = _llm_proxy_origin()
     try:
         with httpx.Client(timeout=20.0) as client:
-            r = client.get(f"{base}/health")
+            r = client.get(f"{base}/v1/health")
         body = r.text
         try:
             parsed = r.json()
@@ -489,9 +492,9 @@ def _run_orchestrator_health() -> str:
 
 def _run_list_models(args: dict[str, Any] | None = None) -> str:
     args = args or {}
-    base = _orchestrator_origin()
+    base = _llm_proxy_origin()
     headers: dict[str, str] = {"Content-Type": "application/json"}
-    key = orchestrator_master_key()
+    key = llm_proxy_master_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
     qparams = _v1_models_query_params(args)
@@ -512,30 +515,29 @@ def _run_list_models(args: dict[str, Any] | None = None) -> str:
         return json.dumps({"error": str(e), "base_url": base}, indent=2)
 
 
-def _run_orchestrator_connection_info() -> str:
-    origin = _orchestrator_origin()
-    base_v1 = orchestrator_base_url_v1()
+def _run_llm_proxy_connection_info() -> str:
+    origin = _llm_proxy_origin()
+    base_v1 = llm_proxy_base_url_v1()
     return json.dumps(
         {
-            "orchestrator_origin": origin,
-            "LLM_ORCHESTRATOR_BASE_URL": base_v1,
-            "orchestrator_api_key_set": bool(orchestrator_master_key()),
+            "llm_proxy_origin": origin,
+            "llm_proxy_base_url_v1": base_v1,
+            "llm_proxy_api_key_set": bool(llm_proxy_master_key()),
             "openai_base_for_clients": base_v1,
-            "note": "Same shape as llm-orchestrator MCP tool orchestrator_connection_info.",
         },
         indent=2,
     )
 
 
 async def _run_chat_completions_async(args: dict[str, Any]) -> str:
-    """POST /v1/chat/completions — mirrors llm-orchestrator MCP chat_completions tool."""
-    base = _orchestrator_origin()
-    key = orchestrator_master_key()
+    """POST /v1/chat/completions on the embedded LLM proxy."""
+    base = _llm_proxy_origin()
+    key = llm_proxy_master_key()
     if not key:
         return json.dumps(
             {
                 "error": "missing_key",
-                "detail": "ORCHESTRATOR_MASTER_KEY is required for chat_completions.",
+                "detail": "AGENT_PLATFORM_MASTER_KEY is required for chat_completions.",
             }
         )
 
@@ -546,7 +548,7 @@ async def _run_chat_completions_async(args: dict[str, Any]) -> str:
     if not isinstance(messages, list):
         return json.dumps({"error": "invalid_messages", "detail": "messages must be a JSON array"})
 
-    resolved_model = sanitize_llm_model_alias(model.strip()) or _orchestrator_default_model_from_env()
+    resolved_model = sanitize_llm_model_alias(model.strip()) or _llm_proxy_default_model_from_env()
     if not resolved_model:
         return json.dumps(
             {
@@ -573,7 +575,7 @@ async def _run_chat_completions_async(args: dict[str, Any]) -> str:
 
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
     try:
-        async with httpx.AsyncClient(timeout=orchestrator_http_timeout_seconds()) as client:
+        async with httpx.AsyncClient(timeout=llm_proxy_http_timeout_seconds()) as client:
             r = await client.post(f"{base}/v1/chat/completions", headers=headers, json=payload)
     except httpx.RequestError as e:
         return json.dumps({"error": "request_failed", "detail": str(e), "base_url": base}, indent=2)
@@ -680,14 +682,18 @@ def run_tool(name: str, arguments_json: str) -> str:
     if name == "http_fetch":
         return _run_http_fetch(args)
 
+    if name == "llm_proxy_health":
+        return _run_llm_proxy_health()
     if name == "orchestrator_health":
-        return _run_orchestrator_health()
+        return _run_llm_proxy_health()
 
     if name == "list_models":
         return _run_list_models(args)
 
+    if name == "llm_proxy_connection_info":
+        return _run_llm_proxy_connection_info()
     if name == "orchestrator_connection_info":
-        return _run_orchestrator_connection_info()
+        return _run_llm_proxy_connection_info()
 
     if name in ("mcp_call", "mcp_list_tools", "chat_completions"):
         return json.dumps(

@@ -1,8 +1,6 @@
 import { create } from 'zustand';
-import { getGeminiApiKeyFromEnv } from '../../core/llm/geminiApiKeyEnv';
 import {
   normalizeLlmConfig,
-  purgeCachedGeminiApiKeyFromStorage,
   readLlmConfigFromStorage,
 } from '../../core/llm/llmConfigStorage';
 import type { LLMConfig } from '../../core/llm/types';
@@ -18,14 +16,12 @@ interface LlmSessionState {
 
 export const useLlmSessionStore = create<LlmSessionState>()((set) => ({
   llmConfig: (() => {
-    purgeCachedGeminiApiKeyFromStorage();
     const stored = readLlmConfigFromStorage();
-    const base = stored ?? normalizeLlmConfig(null);
-    return { ...base, apiKey: getGeminiApiKeyFromEnv() };
+    return stored ?? normalizeLlmConfig(null);
   })(),
   setLlmConfig: (config) =>
     set((s) => ({
-      llmConfig: { ...s.llmConfig, ...config, apiKey: getGeminiApiKeyFromEnv() },
+      llmConfig: { ...s.llmConfig, ...config, apiKey: '' },
     })),
 }));
 

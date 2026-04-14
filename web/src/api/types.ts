@@ -3,16 +3,20 @@
  * Keep aligned with `agent-platform/app/models.py` and route payloads.
  */
 
-export type ProcessStatus =
-  | "pending"
-  | "planning"
-  | "approval_required"
-  | "approved"
-  | "task_review_required"
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled";
+import type {
+  ProcessRetryMode,
+  ProcessStatus,
+  ProcessSyncAction,
+  ReviewDecision,
+  TaskStatus,
+} from "./enums";
+export type {
+  ProcessRetryMode,
+  ProcessStatus,
+  ProcessSyncAction,
+  ReviewDecision,
+  TaskStatus,
+} from "./enums";
 
 /** Planner DAG JSON (validated on the server; mirrors `app/dag_schema.py`). */
 export interface SubagentNode {
@@ -22,7 +26,7 @@ export interface SubagentNode {
   instructions: string;
   dependencies?: string[];
   /**
-   * Optional llm-orchestrator chat `model` alias (same as OpenAI `model` on POST /v1/chat/completions).
+   * Optional embedded LLM proxy chat `model` alias (same as OpenAI `model` on POST /v1/chat/completions).
    * Not the agent’s “persona” or skill — that is `role` / prompts. Omit to use server/env defaults.
    */
   model?: string | null;
@@ -102,7 +106,7 @@ export interface RosterRole {
   id: string;
   name: string;
   description?: string;
-  /** Declared output modality; orchestrator resolves LLM later. Defaults to `text`. */
+  /** Declared output modality; the server maps to concrete models later. Defaults to `text`. */
   modality?: RoleModality;
   parent_id?: string | null;
   /** Optional #hex for map chrome; planner ignores. */
@@ -145,7 +149,7 @@ export interface TaskNodeRecord {
   instructions: string;
   llm_model: string | null;
   dependencies_json: string;
-  status: string;
+  status: TaskStatus;
   requires_review?: boolean;
   /** Peer subagent assigned to review this output (server picks idle, DAG-relevant peer). */
   reviewer_client_uuid?: string | null;
@@ -201,19 +205,14 @@ export interface CancelProcessResponse {
 export interface RetryProcessResponse {
   process_id: number;
   status: string;
-  retry: "planning" | "execution";
+  retry: ProcessRetryMode;
 }
 
 /** POST /processes/{id}/sync — recover stuck background work or explain human gates. */
 export interface SyncProcessResponse {
   process_id: number;
   process_status: ProcessStatus | string;
-  action:
-    | "none"
-    | "blocked"
-    | "aligned_status"
-    | "requeued_plan"
-    | "requeued_execution";
+  action: ProcessSyncAction;
   detail: string;
   task_counts?: Record<string, number>;
   reset_running_tasks?: number;
@@ -223,14 +222,12 @@ export interface RetryTaskResponse {
   process_id: number;
   task_id: number;
   status: string;
-  retry: "task";
+  retry: ProcessRetryMode;
 }
 
 export interface ApiErrorBody {
   detail?: string | string[];
 }
-
-export type ReviewDecision = "approve" | "reject" | "request_changes";
 
 export interface ReviewTaskBody {
   decision: ReviewDecision;

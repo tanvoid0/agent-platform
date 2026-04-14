@@ -1,12 +1,13 @@
-export function useGeminiInDev(): boolean {
-  const v = import.meta.env.VITE_USE_GEMINI_IN_DEV;
-  return v === '1' || v === 'true';
-}
+import { useChatPathStore } from '../../integration/store/chatPathStore';
+import type { ChatCompletionBackendId } from './providerRegistry';
+export type { ChatCompletionBackendId } from './providerRegistry';
 
-export type ChatCompletionBackendId = 'gemini' | 'ollama';
-
-/** Which backend handles `LLMProvider.generateCompletion` / agent tool loop for this build/session. */
+/** Which backend handles `LLMProvider.generateCompletion` / agent tool loop for this session. */
 export function resolveChatCompletionBackend(): ChatCompletionBackendId {
-  if (import.meta.env.PROD || useGeminiInDev()) return 'gemini';
-  return 'ollama';
+  const s = useChatPathStore.getState();
+  if (s.status === 'ok' && s.serverProvider) {
+    return s.serverProvider;
+  }
+  // Deterministic bootstrap backend until server defaults are loaded.
+  return 'lm_studio';
 }

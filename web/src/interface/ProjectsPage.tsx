@@ -1,4 +1,4 @@
-import { ArrowLeft, FolderPlus, Loader2, Pencil, Trash2, Wallet } from 'lucide-react';
+import { ArrowLeft, Eye, FolderPlus, Loader2, Pencil, Trash2, Wallet } from 'lucide-react';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
@@ -92,6 +92,19 @@ export const ProjectsPage: React.FC = () => {
       await switchActiveProject(id);
       useCoreStore.getState().bumpSimSceneReset();
       navigate('/');
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleViewDetails = async (id: string) => {
+    setBusyId(id);
+    setActionError(null);
+    try {
+      await switchActiveProject(id);
+      navigate('/finance/project');
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -245,132 +258,150 @@ export const ProjectsPage: React.FC = () => {
             <Loader2 size={18} className="animate-spin" />
             Loading projects…
           </div>
+        ) : rows.length === 0 ? (
+          <div className="rounded-xl border border-zinc-200 bg-white p-10 text-center shadow-sm">
+            <p className="text-sm text-zinc-500">No projects yet. Create your first one to get started.</p>
+          </div>
         ) : (
-          <div className="bg-white border border-zinc-200 rounded-xl overflow-hidden shadow-sm overflow-x-auto">
-            <table className="w-full text-left text-sm min-w-[640px]">
-              <thead>
-                <tr className="border-b border-zinc-100 bg-zinc-50/80">
-                  <th className="px-4 py-3 font-black text-[10px] uppercase tracking-widest text-zinc-500">Project</th>
-                  <th className="px-4 py-3 font-black text-[10px] uppercase tracking-widest text-zinc-500">Team</th>
-                  <th className="px-4 py-3 font-black text-[10px] uppercase tracking-widest text-zinc-500">Phase</th>
-                  <th className="px-4 py-3 font-black text-[10px] uppercase tracking-widest text-zinc-500 text-right">
-                    Tokens
-                  </th>
-                  <th className="px-4 py-3 font-black text-[10px] uppercase tracking-widest text-zinc-500 text-right">
-                    Est. cost
-                  </th>
-                  <th className="px-4 py-3 font-black text-[10px] uppercase tracking-widest text-zinc-500">Updated</th>
-                  <th className="px-4 py-3 font-black text-[10px] uppercase tracking-widest text-zinc-500 text-right">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((p) => {
-                  const fin = p.meta.finance ?? { estimatedCostUsd: 0, totalTokens: 0 };
-                  const isActive = activeId === p.id;
-                  const rowBusy = busyId === p.id;
-                  const isEditing = editingId === p.id;
-                  return (
-                    <tr
-                      key={p.id}
-                      id={`project-row-${p.id}`}
-                      className={`border-b border-zinc-50 hover:bg-zinc-50/50 align-top ${focusedProjectId === p.id ? 'bg-indigo-50/60' : ''}`}
-                    >
-                      <td className="px-4 py-3">
-                        {isEditing ? (
-                          <div className="flex flex-col gap-2 max-w-xs">
-                            <Input
-                              value={editTitle}
-                              onChange={(e) => setEditTitle(e.target.value)}
-                              className="h-auto w-full rounded-lg border-zinc-200 px-2 py-1.5 text-xs"
-                              autoFocus
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter') void saveRename(p.id);
-                                if (e.key === 'Escape') setEditingId(null);
-                              }}
-                            />
-                            <div className="flex justify-end gap-2">
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                className="h-auto px-0 text-[9px] font-bold uppercase text-zinc-500 hover:bg-transparent"
-                                onClick={() => setEditingId(null)}
-                              >
-                                Cancel
-                              </Button>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                className="h-auto px-0 text-[9px] font-black uppercase text-darkDelegation hover:bg-transparent"
-                                onClick={() => void saveRename(p.id)}
-                                disabled={rowBusy}
-                              >
-                                Save
-                              </Button>
-                            </div>
-                          </div>
-                        ) : (
-                          <div>
-                            <span className="font-bold text-zinc-800">{p.meta.title}</span>
-                            {isActive && (
-                              <span className="ml-2 text-[9px] font-black uppercase text-emerald-600">Active</span>
-                            )}
-                            {p.meta.briefPreview ? (
-                              <p className="text-[10px] text-zinc-400 mt-1 line-clamp-2 max-w-md">{p.meta.briefPreview}</p>
-                            ) : null}
-                          </div>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-zinc-600 text-xs">{teamLabel(p.meta.teamId, customSystems)}</td>
-                      <td className="px-4 py-3 text-zinc-600 capitalize">{p.meta.phase}</td>
-                      <td className="px-4 py-3 text-right font-mono text-zinc-800">{formatTokens(fin.totalTokens)}</td>
-                      <td className="px-4 py-3 text-right font-mono text-emerald-700 font-bold">
-                        ${fin.estimatedCostUsd.toFixed(4)}
-                      </td>
-                      <td className="px-4 py-3 text-zinc-500 text-xs font-mono">
-                        {typeof p.updatedAt === 'string' ? p.updatedAt.slice(0, 10) : '—'}
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <div className="flex flex-wrap items-center justify-end gap-1">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {rows.map((p) => {
+              const fin = p.meta.finance ?? { estimatedCostUsd: 0, totalTokens: 0 };
+              const isActive = activeId === p.id;
+              const rowBusy = busyId === p.id;
+              const isEditing = editingId === p.id;
+              return (
+                <article
+                  key={p.id}
+                  id={`project-row-${p.id}`}
+                  className={`rounded-xl border bg-white p-4 shadow-sm transition-colors ${
+                    focusedProjectId === p.id
+                      ? 'border-indigo-300 bg-indigo-50/40'
+                      : 'border-zinc-200 hover:border-zinc-300'
+                  }`}
+                >
+                  <div className="mb-3 flex items-start justify-between gap-2">
+                    {isEditing ? (
+                      <div className="flex min-w-0 flex-1 flex-col gap-2">
+                        <Input
+                          value={editTitle}
+                          onChange={(e) => setEditTitle(e.target.value)}
+                          className="h-auto w-full rounded-lg border-zinc-200 px-2 py-1.5 text-xs"
+                          autoFocus
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') void saveRename(p.id);
+                            if (e.key === 'Escape') setEditingId(null);
+                          }}
+                        />
+                        <div className="flex justify-end gap-2">
                           <Button
                             type="button"
-                            variant="secondary"
-                            disabled={rowBusy || busyId === '__new__'}
-                            onClick={() => void handleOpen(p.id)}
-                            className="rounded-lg bg-zinc-100 px-2 py-1 text-[9px] font-black uppercase text-zinc-700 hover:bg-zinc-200 disabled:opacity-40"
+                            variant="ghost"
+                            className="h-auto px-0 text-[9px] font-bold uppercase text-zinc-500 hover:bg-transparent"
+                            onClick={() => setEditingId(null)}
                           >
-                            {rowBusy ? '…' : 'Open'}
+                            Cancel
                           </Button>
                           <Button
                             type="button"
                             variant="ghost"
-                            size="icon-sm"
-                            disabled={rowBusy || busyId === '__new__' || isEditing}
-                            onClick={() => startRename(p)}
-                            className="text-zinc-400 hover:bg-zinc-100 hover:text-darkDelegation disabled:opacity-30"
-                            title="Rename"
+                            className="h-auto px-0 text-[9px] font-black uppercase text-darkDelegation hover:bg-transparent"
+                            onClick={() => void saveRename(p.id)}
+                            disabled={rowBusy}
                           >
-                            <Pencil size={14} />
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-sm"
-                            disabled={rowBusy || busyId === '__new__' || isEditing}
-                            onClick={() => openDeleteConfirm(p)}
-                            className="text-zinc-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-30"
-                            title="Delete"
-                          >
-                            <Trash2 size={14} />
+                            Save
                           </Button>
                         </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                      </div>
+                    ) : (
+                      <div className="min-w-0">
+                        <h2 className="truncate text-sm font-bold text-zinc-800">{p.meta.title}</h2>
+                        {p.meta.briefPreview ? (
+                          <p className="mt-1 line-clamp-2 text-[10px] text-zinc-400">{p.meta.briefPreview}</p>
+                        ) : null}
+                      </div>
+                    )}
+                    {isActive ? (
+                      <span className="rounded-md bg-emerald-50 px-2 py-0.5 text-[9px] font-black uppercase text-emerald-600">
+                        Active
+                      </span>
+                    ) : null}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 rounded-lg border border-zinc-100 bg-zinc-50/70 p-2.5">
+                    <div>
+                      <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Team</p>
+                      <p className="truncate text-[11px] font-semibold text-zinc-700">
+                        {teamLabel(p.meta.teamId, customSystems)}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Phase</p>
+                      <p className="text-[11px] font-semibold capitalize text-zinc-700">{p.meta.phase}</p>
+                    </div>
+                    <div>
+                      <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Tokens</p>
+                      <p className="text-[11px] font-mono font-semibold text-zinc-700">{formatTokens(fin.totalTokens)}</p>
+                    </div>
+                    <div>
+                      <p className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Est. cost</p>
+                      <p className="text-[11px] font-mono font-bold text-emerald-700">${fin.estimatedCostUsd.toFixed(4)}</p>
+                    </div>
+                  </div>
+
+                  <p className="mt-2 text-[10px] font-mono text-zinc-400">
+                    Updated: {typeof p.updatedAt === 'string' ? p.updatedAt.slice(0, 10) : '—'}
+                  </p>
+
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-1">
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        disabled={rowBusy || busyId === '__new__'}
+                        onClick={() => void handleOpen(p.id)}
+                        className="rounded-lg bg-zinc-100 px-2.5 py-1 text-[9px] font-black uppercase text-zinc-700 hover:bg-zinc-200 disabled:opacity-40"
+                      >
+                        {rowBusy ? '…' : 'Open'}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={rowBusy || busyId === '__new__'}
+                        onClick={() => void handleViewDetails(p.id)}
+                        className="rounded-lg px-2.5 py-1 text-[9px] font-black uppercase"
+                      >
+                        <Eye className="mr-1 size-3" />
+                        View
+                      </Button>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        disabled={rowBusy || busyId === '__new__' || isEditing}
+                        onClick={() => startRename(p)}
+                        className="text-zinc-400 hover:bg-zinc-100 hover:text-darkDelegation disabled:opacity-30"
+                        title="Rename"
+                      >
+                        <Pencil size={14} />
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        disabled={rowBusy || busyId === '__new__' || isEditing}
+                        onClick={() => openDeleteConfirm(p)}
+                        className="text-zinc-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-30"
+                        title="Delete"
+                      >
+                        <Trash2 size={14} />
+                      </Button>
+                    </div>
+                  </div>
+                </article>
+              );
+            })}
           </div>
         )}
       </main>

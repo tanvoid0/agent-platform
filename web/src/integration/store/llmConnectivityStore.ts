@@ -1,8 +1,8 @@
 /**
  * Server chat path reachability (3D rack visual + settings). **Browser → Agent Platform only.**
  *
- * - **Server (orchestrator) chat:** `checkChatBackendHealth` → `GET /api/v1/orchestrator/ready`.
- *   The UI never contacts Ollama or the orchestrator origin directly; only the FastAPI app does.
+ * - **Server (embedded LLM proxy) chat:** `checkChatBackendHealth` → `GET /api/v1/llm/ready`.
+ *   The UI never contacts Ollama or an upstream LLM host directly; only the FastAPI app does.
  * - **Cloud (Gemini) chat:** This store stays idle — no background health calls to Google from here.
  */
 import { create } from 'zustand';
@@ -16,7 +16,8 @@ const POLL_MS = 12_000;
 let pollTimer: number | null = null;
 
 function shouldTrackServerChatHealth(): boolean {
-  return getActiveChatBackendId() === 'ollama';
+  const id = getActiveChatBackendId();
+  return id === 'ollama' || id === 'lm_studio';
 }
 
 async function probeServerChatHealth(): Promise<void> {

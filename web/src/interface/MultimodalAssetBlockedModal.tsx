@@ -25,11 +25,13 @@ export function MultimodalAssetBlockedModal() {
   const backendLabel =
     blocked.backend === 'gemini'
       ? 'Cloud'
-      : blocked.backend === 'ollama'
-        ? 'Server'
-        : blocked.backend === 'disabled'
-          ? 'Disabled'
-          : 'Configured backend';
+      : blocked.backend === 'lm_studio'
+        ? 'LM Studio'
+        : blocked.backend === 'ollama'
+          ? 'Server'
+          : blocked.backend === 'disabled'
+            ? 'Disabled'
+            : 'Configured backend';
 
   return (
     <ModalRoot
@@ -125,8 +127,8 @@ export function MultimodalAssetBlockedModal() {
                 Decide later
               </span>
               <span className="block text-[11px] text-zinc-500 mt-0.5">
-                Stay here without auto-retry. Set <code className="text-[9px] font-mono">VITE_GEMINI_API_KEY</code> when
-                needed for Gemini, or switch routing/backend in <code className="text-[9px] font-mono">model-config.ts</code>.
+                Stay here without auto-retry. Configure backend credentials for Gemini, or switch routing/backend in{' '}
+                <code className="text-[9px] font-mono">model-config.ts</code>.
               </span>
             </span>
           </Button>

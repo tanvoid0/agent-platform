@@ -3,14 +3,16 @@
  * App code should not branch on vendor names; use this facade for capabilities, routing, and error shape.
  */
 import { BudgetExceededError } from '../finance/budgetPolicy';
-import { resolveChatCompletionBackend, useGeminiInDev, type ChatCompletionBackendId } from './chatBackendEnv';
+import type { ChatCompletionBackendId } from './chatBackendEnv';
+import { getChatProviderMeta } from './providerRegistry';
 import { GeminiProvider } from './providers/GeminiProvider';
-import { OrchestratorProxyProvider } from './providers/OrchestratorProxyProvider';
-import { getProviderModelCatalog } from './providerModelCatalog';
+import { ServerLlmProxyProvider } from './providers/ServerLlmProxyProvider';
+import { getActiveChatBackendId, getProviderModelCatalog } from './providerModelCatalog';
 import type { LLMConfig, LLMProvider } from './types';
 import { MODEL_CONFIG } from '../../../model-config';
 
 export type { ChatCompletionBackendId } from './chatBackendEnv';
+export { getActiveChatBackendId };
 
 export class LlmError extends Error {
   declare readonly cause?: unknown;
@@ -38,27 +40,21 @@ export function describeLlmSetup(): {
   /** Short label for pickers: "Server" vs "Cloud" style. */
   chatBackendLabel: string;
   chatRequiresStoredApiKey: boolean;
-  /** When true, show server-side chat readiness (Agent Platform → orchestrator probe). */
+  /** When true, show server-side chat readiness (`GET /api/v1/llm/ready`). */
   showServerChatHealth: boolean;
   apiKeyOptionalForChat: boolean;
-  geminiChatForcedInDev: boolean;
 } {
-  const id = resolveChatCompletionBackend();
+  const id = getActiveChatBackendId();
+  const providerMeta = getChatProviderMeta(id);
+  const isServerPath = providerMeta.pathKind === 'server';
   return {
     chatBackendId: id,
-    chatBackendLabel: id === 'gemini' ? 'Cloud' : 'Server',
-    /** Cloud chat needs `VITE_GEMINI_API_KEY` (not browser-stored). */
-    chatRequiresStoredApiKey: id === 'gemini',
-    showServerChatHealth: id === 'ollama',
-    apiKeyOptionalForChat: id === 'ollama',
-    geminiChatForcedInDev: import.meta.env.DEV && useGeminiInDev(),
+    chatBackendLabel: providerMeta.label,
+    /** Frontend no longer manages API keys; backend owns credentials. */
+    chatRequiresStoredApiKey: false,
+    showServerChatHealth: isServerPath,
+    apiKeyOptionalForChat: isServerPath,
   };
-}
-
-export function getActiveChatBackendId(): ChatCompletionBackendId {
-  const configured = MODEL_CONFIG.routing.chat as 'auto' | 'gemini' | 'ollama';
-  if (configured === 'gemini' || configured === 'ollama') return configured;
-  return resolveChatCompletionBackend();
 }
 
 /**
@@ -69,13 +65,18 @@ export function resolveChatModelForSession(
   llmConfig: Pick<LLMConfig, 'chatModelsByBackend'>,
   agentModel: string | undefined
 ): string {
-  const id = resolveChatCompletionBackend();
+  const id = getActiveChatBackendId();
   const slice = getProviderModelCatalog(id).chat;
   const settingsModel = llmConfig.chatModelsByBackend[id]?.trim() ?? '';
   const agent = agentModel?.trim() ?? '';
 
-  if (id === 'ollama') {
-    const envModel = import.meta.env.VITE_OLLAMA_MODEL?.trim();
+  if (id === 'ollama' || id === 'lm_studio' || id === 'aimlapi') {
+    const envModel =
+      id === 'ollama'
+        ? import.meta.env.VITE_OLLAMA_MODEL?.trim()
+        : id === 'lm_studio'
+          ? import.meta.env.VITE_LM_STUDIO_MODEL?.trim()
+          : undefined;
     if (envModel) return envModel;
     if (agent && !agent.toLowerCase().includes('gemini')) return agent;
     if (settingsModel && !settingsModel.toLowerCase().includes('gemini')) return settingsModel;
@@ -92,8 +93,8 @@ export function resolveChatModelForSession(
 /**
  * Builds the chat `LLMProvider` for the current environment. Throws `LlmError` if credentials are missing.
  *
- * **Network boundary:** `OrchestratorProxyProvider` (local / server stack) only uses
- * `POST {Agent Platform}/api/v1/chat` — the browser never talks to Ollama or the orchestrator host.
+ * **Network boundary:** `ServerLlmProxyProvider` (local / server stack) only uses
+ * `POST {Agent Platform}/api/v1/chat` — the browser never talks to Ollama or an upstream LLM host.
  * `GeminiProvider` uses `@google/genai` in the browser to Google; if product policy requires
  * that only the backend may call any LLM, Gemini chat must be moved behind a FastAPI proxy.
  */
@@ -106,7 +107,7 @@ export function createChatLlmProvider(apiKey: string | undefined): LLMProvider {
     }
     return new GeminiProvider(k);
   }
-  return new OrchestratorProxyProvider();
+  return new ServerLlmProxyProvider();
 }
 
 /** When true, chat completion should count toward cloud budget policy. */
@@ -114,20 +115,26 @@ export function chatCompletionUsesCloudBilling(): boolean {
   return getActiveChatBackendId() === 'gemini';
 }
 
-/** Cloud pipeline (Gemini) can run final image/audio/video when `VITE_GEMINI_API_KEY` is set. */
+/** Cloud pipeline (Gemini) can run final image/audio/video when credentials are present. */
 export function isCloudMediaPipelineReady(apiKey: string | undefined | null): boolean {
   return Boolean(apiKey?.trim());
 }
 
 export type MediaOutputKind = 'image' | 'music' | 'video';
-export type MediaBackendId = 'gemini' | 'ollama' | 'disabled';
+export type MediaBackendId = 'gemini' | 'ollama' | 'lm_studio' | 'aimlapi' | 'disabled';
 
 export function resolveMediaBackend(kind: MediaOutputKind): MediaBackendId {
   const configured = MODEL_CONFIG.routing[kind] as MediaBackendId | 'follow-chat';
   if (configured === 'follow-chat') {
     return getActiveChatBackendId();
   }
-  if (configured === 'gemini' || configured === 'ollama' || configured === 'disabled') {
+  if (
+    configured === 'gemini' ||
+    configured === 'ollama' ||
+    configured === 'lm_studio' ||
+    configured === 'aimlapi' ||
+    configured === 'disabled'
+  ) {
     return configured;
   }
   return getActiveChatBackendId();

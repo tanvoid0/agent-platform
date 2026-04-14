@@ -18,6 +18,10 @@ from dotenv import load_dotenv
 
 load_dotenv(_root / ".env")
 
+from platform_config import apply_platform_yaml_defaults
+
+apply_platform_yaml_defaults()
+
 from default_team_templates import SEED_TEAM_TEMPLATES
 
 _db_raw = (os.getenv("AGENT_PLATFORM_DB_PATH") or "data/agent_platform.db").strip()

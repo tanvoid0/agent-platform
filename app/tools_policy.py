@@ -7,15 +7,15 @@ v1 execution path is prompt-only (no tools). When tools are enabled:
 - AGENT_PLATFORM_TOOL_BUDGET_PER_RUN=max tool invocations per run (default 0 = disabled)
 
 Wire these checks into the executor before any tool call. When tools are enabled, `DAGExecutor`
-passes an allowlisted OpenAPI tool list to the orchestrator and counts invocations against
+passes an allowlisted OpenAPI tool list to the LLM and counts invocations against
 `AGENT_PLATFORM_TOOL_BUDGET_PER_RUN` minus `Process.tool_invocations_used`.
 
 The `http_fetch` tool additionally requires `AGENT_PLATFORM_HTTP_FETCH_ALLOWLIST` (URL prefixes).
 `mcp_call` and `mcp_list_tools` require `AGENT_PLATFORM_MCP_ENDPOINT_ALLOWLIST` and use the
 official MCP Streamable HTTP client (`mcp` package). Optional `chat_completions` calls the
-orchestrator proxy (nested LLM; allowlist explicitly). Orchestrator helper tools
-(`orchestrator_health`, `list_models`, …) use the same env as `llm_client`
-(`LLM_ORCHESTRATOR_BASE_URL`, `ORCHESTRATOR_MASTER_KEY`).
+embedded LLM proxy (nested LLM; allowlist explicitly). LLM helper tools
+(`llm_proxy_health`, `list_models`, …) use the same env as `llm_client`
+(`LLM_ORCHESTRATOR_BASE_URL`, `AGENT_PLATFORM_MASTER_KEY`).
 
 `workspace_list`, `workspace_read`, and `workspace_write` operate on the process's linked
 project sandbox (`Process.project_id`); add them to the allowlist when tools are enabled.

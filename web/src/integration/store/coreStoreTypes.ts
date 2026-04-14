@@ -99,7 +99,7 @@ export type { UsageLedgerEntry, UsageLedgerKind } from '../finance/usageLedger';
 export interface MultimodalAssetBlockedPayload {
   summaryPrompt: string;
   outputType: MultimodalOutputKind;
-  backend?: 'gemini' | 'ollama' | 'disabled';
+  backend?: 'gemini' | 'ollama' | 'lm_studio' | 'aimlapi' | 'disabled';
   reason?: string;
 }
 

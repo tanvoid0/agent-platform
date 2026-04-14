@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { describeLlmSetup } from '../../core/llm/llmFacade';
-import { useLlmSessionStore } from '../store/llmSessionStore';
+import { useHeartbeatNow } from './useHeartbeatNow';
 import { useLlmConnectivityStore } from '../store/llmConnectivityStore';
 import { useProjectsApiReachabilityStore } from '../store/projectsApiReachabilityStore';
 
@@ -31,11 +31,7 @@ export function useConnectivityReadout(): {
   llm: ConnectivityLineReadout | null;
   now: number;
 } {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
+  const now = useHeartbeatNow(true);
 
   const status = useProjectsApiReachabilityStore((s) => s.status);
   const checkStartedAt = useProjectsApiReachabilityStore((s) => s.checkStartedAt);
@@ -52,8 +48,6 @@ export function useConnectivityReadout(): {
   const llmLastLatencyMs = useLlmConnectivityStore((s) => s.llmLastLatencyMs);
   const llmLastError = useLlmConnectivityStore((s) => s.llmLastError);
 
-  const apiKey = useLlmSessionStore((s) => s.llmConfig.apiKey);
-  const hasStoredOrEnvKey = !!apiKey?.trim();
   const llmSetup = describeLlmSetup();
 
   return useMemo(() => {
@@ -100,7 +94,7 @@ export function useConnectivityReadout(): {
         const hbPart = hb != null ? ` · HB ${hb}s` : '';
         llm = {
           short: `OK${hbPart}${lat}`,
-          detail: `Agent Platform reports the orchestrator path is up. The browser never calls Ollama or the LLM directly.${llmLastLatencyMs != null ? ` Probe RTT ${llmLastLatencyMs}ms.` : ''}`,
+          detail: `Agent Platform reports the server LLM path is up. The browser never calls Ollama or the LLM directly.${llmLastLatencyMs != null ? ` Probe RTT ${llmLastLatencyMs}ms.` : ''}`,
           tone: 'ok',
         };
       } else if (serverChatHealth === 'error') {
@@ -111,7 +105,7 @@ export function useConnectivityReadout(): {
           detail:
             serverChatHealthDetail ||
             llmLastError ||
-            'Agent Platform could not verify the orchestrator path (browser still only talked to Agent Platform).',
+            'Agent Platform could not verify the server LLM path (browser still only talked to Agent Platform).',
           tone: 'bad',
         };
       } else {
@@ -119,25 +113,17 @@ export function useConnectivityReadout(): {
         llm = {
           short: `Connecting…${s != null ? ` ${s}s` : ''}`,
           detail:
-            'Browser → Agent Platform only (GET /api/v1/orchestrator/ready). The server checks upstream; no direct LLM calls from the UI.',
+            'Browser → Agent Platform only (GET /api/v1/llm/ready). The server checks the embedded LLM proxy; no direct LLM calls from the UI.',
           tone: 'warn',
         };
       }
     } else {
-      if (llmSetup.chatRequiresStoredApiKey && !hasStoredOrEnvKey) {
-        llm = {
-          short: 'API key missing',
-          detail: 'Set VITE_GEMINI_API_KEY or open AI settings.',
-          tone: 'bad',
-        };
-      } else {
-        llm = {
-          short: 'Cloud · key OK',
-          detail:
-            'Gemini chat uses the Google GenAI SDK in the browser. Agent Platform is not in that path for text chat — only the orchestrator stack is probed above. For strict backend-only LLM access, chat would need a server proxy.',
-          tone: 'muted',
-        };
-      }
+      llm = {
+        short: 'Cloud provider',
+        detail:
+          'Credentials are backend-managed. Frontend no longer reads or stores AI API keys.',
+        tone: 'muted',
+      };
     }
 
     return { projects, llm, now };
@@ -156,8 +142,6 @@ export function useConnectivityReadout(): {
     llmLastLatencyMs,
     llmLastError,
     llmSetup.showServerChatHealth,
-    llmSetup.chatRequiresStoredApiKey,
-    hasStoredOrEnvKey,
     now,
   ]);
 }

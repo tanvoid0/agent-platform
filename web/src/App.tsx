@@ -86,6 +86,7 @@ const App: React.FC = () => {
   const { isLogOpen, isKanbanOpen, setKanbanOpen, setIsResizing } = useCoreStore();
   const activeAuditTaskId = useUiStore((s) => s.activeAuditTaskId);
   const setActiveAuditTaskId = useUiStore((s) => s.setActiveAuditTaskId);
+  const projectRailExpandRequestNonce = useUiStore((s) => s.projectRailExpandRequestNonce);
 
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [kanbanHeight, setKanbanHeight] = useState(220);
@@ -271,6 +272,12 @@ const App: React.FC = () => {
       document.body.style.overflow = '';
     };
   }, [activeAuditTaskId]);
+
+  useEffect(() => {
+    if (projectRailExpandRequestNonce > 0) {
+      setRightProjectRailExpanded(true);
+    }
+  }, [projectRailExpandRequestNonce]);
 
   useEffect(() => {
     if (canvasRef.current && !managerRef.current) {

@@ -6,7 +6,7 @@
 
 ## Context
 
-Long-term product ideas may include **spatial / embodied** visualization (office metaphor, avatars, environment). Prior experiments show that **coupling** orchestration to simulation editing or client-side authority causes **scope explosion** and **stuck-state** bugs. The platform already separates **LLM routing** (orchestrator) from **run lifecycle** (agent-platform API).
+Long-term product ideas may include **spatial / embodied** visualization (office metaphor, avatars, environment). Prior experiments show that **coupling** orchestration to simulation editing or client-side authority causes **scope explosion** and **stuck-state** bugs. The platform already separates **LLM routing** (embedded proxy `/v1`) from **run lifecycle** (agent-platform API).
 
 This ADR defines how a **future** 3D viewport may attach **without** entangling Phase 1–2 orchestration UI or run state.
 

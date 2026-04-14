@@ -11,6 +11,7 @@ import { ColorPicker } from './ColorPicker';
 import { InfoBubble } from '../components/InfoBubble';
 import { getBrightness, MAX_BRIGHTNESS } from './colorUtils';
 import { getActiveChatCompletionSlice } from '../../core/llm/providerModelCatalog';
+import { useLlmUiCatalogStore } from '../../integration/store/llmUiCatalogStore';
 
 interface AgentConfigPanelProps {
   agent: AgentNode;
@@ -30,7 +31,8 @@ export const AgentConfigPanel: React.FC<AgentConfigPanelProps> = ({
   mode = 'edit'
 }) => {
   const isView = mode === 'view';
-  const chatCompletionModels = useMemo(() => getActiveChatCompletionSlice(), []);
+  const llmCatalogStatus = useLlmUiCatalogStore((s) => s.status);
+  const chatCompletionModels = useMemo(() => getActiveChatCompletionSlice(), [llmCatalogStatus]);
   const { saveCustomSystem } = useTeamStore();
 
   const [editData, setEditData] = useState<AgentNode>(agent);
@@ -188,14 +190,26 @@ export const AgentConfigPanel: React.FC<AgentConfigPanelProps> = ({
                   {editData.model || chatCompletionModels.defaultModel}
                 </div>
               ) : (
-                <select
-                  value={editData.model || chatCompletionModels.defaultModel}
-                  onChange={(e) => updateDraft({ model: e.target.value })}
-                  className="w-full px-3 py-2 bg-zinc-50 border border-zinc-200 rounded-xl text-xs font-mono focus:outline-none focus:ring-2 focus:ring-black/5 cursor-pointer lowercase"
-                >
-                  {chatCompletionModels.options.map(m => <option key={m} value={m} className="lowercase">{m}</option>)}
-                </select>
-              ), 'Chat model id. Leave as default to use the active LLM session model from Settings; override per agent if needed.')}
+                <>
+                  <Input
+                    id="agent-llm-model"
+                    list="agent-llm-model-suggestions"
+                    value={editData.model ?? ''}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      updateDraft({ model: v.trim() === '' ? undefined : v });
+                    }}
+                    placeholder={chatCompletionModels.defaultModel}
+                    autoComplete="off"
+                    className="w-full px-3 py-2 bg-zinc-50 border border-zinc-200 rounded-xl text-xs font-mono focus:outline-none focus:ring-2 focus:ring-black/5 lowercase"
+                  />
+                  <datalist id="agent-llm-model-suggestions">
+                    {chatCompletionModels.options.map((m) => (
+                      <option key={m} value={m} />
+                    ))}
+                  </datalist>
+                </>
+              ), 'Chat model id. Leave empty to use the active LLM session model from Settings; type any id or pick a suggestion.')}
             </div>
 
             {/* Content Group */}

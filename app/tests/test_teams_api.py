@@ -38,6 +38,7 @@ def test_teams_list_includes_seed(client, test_engine):
     assert len(data["teams"]) >= 3
     names = {t["name"] for t in data["teams"]}
     assert "Autonomous Product Engineering Team" in names
+    assert "CV Reviewer Agency" in names
     seed = next(
         t for t in data["teams"] if t["name"] == "Autonomous Product Engineering Team"
     )

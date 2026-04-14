@@ -7,7 +7,7 @@ This document tracks [ADR 0001 Section 6](adr/0001-agent-platform-orchestration.
 | # | ADR decision | Implementation status | Notes |
 |---|----------------|----------------------|--------|
 | 1 | Custom FSM + small DAG executor | **Aligned** | [`DAGExecutor`](../app/orchestrator.py) runs the planner DAG with topological layers; task state on [`Process` / `TaskNode`](../app/models.py). |
-| 2 | LLM only via llm-orchestrator `/v1/chat/completions` | **Aligned** | [`llm_client.py`](../app/llm_client.py) uses `orchestrator_base_url_v1()` + `orchestrator_master_key()`. Stateless chat: [`chat_routes.py`](../app/chat_routes.py). |
+| 2 | LLM only via embedded proxy `/v1/chat/completions` | **Aligned** | [`llm_client.py`](../app/llm_client.py) uses `llm_proxy_base_url_v1()` + `llm_proxy_master_key()`. Stateless chat: [`chat_routes.py`](../app/chat_routes.py). |
 | 3 | Planner: validate → repair/fail closed | **Aligned** | `validate_planner_dag`, env-driven planner retries (see tests e.g. `test_planner_retries.py`). |
 | 4 | SQLite + “state lives on disk” | **Aligned** | [`database.py`](../app/database.py): `AGENT_PLATFORM_DB_PATH` (default `data/agent_platform.db`), `PRAGMA journal_mode=WAL`, `synchronous=NORMAL`. |
 | 5 | HTTP-first reconciliation; SSE for live traces | **Aligned** | `GET /processes/{id}` and `GET /processes/{id}/events` are authoritative; [`useProcessQueries.ts`](../web/src/agent-platform/hooks/useProcessQueries.ts) polls with faster interval when SSE is off, slower backup when SSE is on. SSE: `GET /processes/{id}/stream` — comment in route matches ADR (“correctness remains on GET”). |

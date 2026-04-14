@@ -21,10 +21,10 @@ from context_budget import (
     tool_result_soft_cap_tokens,
     truncate_text_to_tokens,
 )
-from orchestrator_env import (
-    orchestrator_base_url_v1,
-    orchestrator_http_timeout_seconds,
-    orchestrator_master_key,
+from llm_proxy_env import (
+    llm_proxy_base_url_v1,
+    llm_proxy_http_timeout_seconds,
+    llm_proxy_master_key,
 )
 from tool_context import ToolContext
 from tool_handlers import run_tool_async, tools_filtered_by_allowlist
@@ -96,7 +96,7 @@ def usage_cost_from_completion_response(data: Dict[str, Any]) -> float:
 
 
 def _default_planner_model() -> str | None:
-    """Planner model from env, or None to omit `model` and use orchestrator default."""
+    """Planner model from env, or None to omit `model` and use the proxy default."""
     v = (os.getenv("PLANNER_MODEL") or "").strip()
     if not v:
         return None
@@ -144,19 +144,19 @@ class LLMConfigurationError(RuntimeError):
 
 
 class LLMAuthenticationError(RuntimeError):
-    """Orchestrator rejected credentials (no secrets in message)."""
+    """LLM proxy rejected credentials (no secrets in message)."""
 
 
 class LLMTransportError(RuntimeError):
-    """Network or unreachable orchestrator (no secrets in message)."""
+    """Network or unreachable LLM proxy (no secrets in message)."""
 
 
 class LLMRequestError(RuntimeError):
-    """Orchestrator returned an error HTTP status (message may include a truncated response body)."""
+    """LLM proxy returned an error HTTP status (message may include a truncated response body)."""
 
 
-def _orchestrator_http_error_message(status_code: int, response: httpx.Response) -> str:
-    parts = [f"Orchestrator request failed with HTTP {status_code}."]
+def _llm_proxy_http_error_message(status_code: int, response: httpx.Response) -> str:
+    parts = [f"LLM proxy request failed with HTTP {status_code}."]
     if status_code == 404:
         model_missing = False
         try:
@@ -170,13 +170,13 @@ def _orchestrator_http_error_message(status_code: int, response: httpx.Response)
         if model_missing:
             parts.append(
                 "Unknown model alias: set PLANNER_MODEL / SUBAGENT_MODEL to a name from "
-                "GET /v1/models on the orchestrator, or define that alias in llm-orchestrator config.yaml, "
-                "or unset those env vars to use the orchestrator default. "
+                "GET /v1/models, or define that alias in the embedded proxy config.yaml, "
+                "or unset those env vars to use the proxy default. "
                 "Wrong LLM_ORCHESTRATOR_BASE_URL (not ending in /v1) also returns 404 — see .env.example."
             )
         else:
             parts.append(
-                "Use LLM_ORCHESTRATOR_BASE_URL ending in /v1 (e.g. http://127.0.0.1:18408/v1). "
+                "Use LLM_ORCHESTRATOR_BASE_URL ending in /v1 (e.g. http://127.0.0.1:18410/v1). "
                 "If the URL is correct, the upstream may return 404 for an unknown model."
             )
     try:
@@ -198,18 +198,18 @@ async def call_llm(
     max_output_tokens: int | None = None,
 ) -> tuple[str, int, float]:
     """
-    Calls the orchestrator proxy and returns (content, total_tokens, cost_usd).
+    Calls the embedded LLM proxy and returns (content, total_tokens, cost_usd).
 
     cost_usd is 0.0 when the upstream response omits cost fields (e.g. plain Ollama).
     """
-    key = orchestrator_master_key()
+    key = llm_proxy_master_key()
     if not key:
         raise LLMConfigurationError(
-            "ORCHESTRATOR_MASTER_KEY is not set. Add it to agent-platform/.env (same value as "
-            "on llm-orchestrator). See .env.example."
+            "AGENT_PLATFORM_MASTER_KEY is not set. Add it to agent-platform/.env (Bearer for /v1). "
+            "See .env.example."
         )
 
-    base = orchestrator_base_url_v1()
+    base = llm_proxy_base_url_v1()
     url = f"{base}/chat/completions"
     headers = {
         "Authorization": f"Bearer {key}",
@@ -242,7 +242,7 @@ async def call_llm(
     if require_json:
         payload["response_format"] = {"type": "json_object"}
 
-    _timeout = orchestrator_http_timeout_seconds()
+    _timeout = llm_proxy_http_timeout_seconds()
     try:
         async with httpx.AsyncClient(timeout=_timeout) as client:
             response = await client.post(url, headers=headers, json=payload)
@@ -250,16 +250,16 @@ async def call_llm(
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             raise LLMAuthenticationError(
-                "Orchestrator returned 401: set ORCHESTRATOR_MASTER_KEY in agent-platform/.env to "
-                "exactly match llm-orchestrator."
+                "LLM proxy returned 401: set AGENT_PLATFORM_MASTER_KEY in agent-platform/.env to match "
+                "the value used for Bearer auth on /v1."
             ) from None
-        raise LLMRequestError(_orchestrator_http_error_message(e.response.status_code, e.response)) from None
+        raise LLMRequestError(_llm_proxy_http_error_message(e.response.status_code, e.response)) from None
     except httpx.RequestError as e:
         raise LLMTransportError(
-            f"Could not reach the LLM orchestrator at {base}. "
-            "Start llm-orchestrator (e.g. docker compose in llm-orchestrator on port 18408). "
-            "In Docker, use http://host.docker.internal:18408/v1 or leave "
-            "LLM_ORCHESTRATOR_BASE_URL=http://127.0.0.1:18408/v1 (auto-rewritten in containers)."
+            f"Could not reach the LLM proxy at {base}. "
+            "Ensure the embedded LLM proxy is reachable (same process; default port 18410). "
+            "In Docker with loopback rewrite, use host.docker.internal or set "
+            "LLM_ORCHESTRATOR_BASE_URL=http://127.0.0.1:18410/v1 (AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX=0 for same-container)."
         ) from e
 
     data = response.json()
@@ -312,14 +312,14 @@ async def call_llm_with_tools(
         content, tokens, cost = await call_llm(slim, model=model, temperature=temperature)
         return content, tokens, cost, 0
 
-    key = orchestrator_master_key()
+    key = llm_proxy_master_key()
     if not key:
         raise LLMConfigurationError(
-            "ORCHESTRATOR_MASTER_KEY is not set. Add it to agent-platform/.env (same value as "
-            "on llm-orchestrator). See .env.example."
+            "AGENT_PLATFORM_MASTER_KEY is not set. Add it to agent-platform/.env (Bearer for /v1). "
+            "See .env.example."
         )
 
-    base = orchestrator_base_url_v1()
+    base = llm_proxy_base_url_v1()
     url = f"{base}/chat/completions"
     headers = {
         "Authorization": f"Bearer {key}",
@@ -329,7 +329,7 @@ async def call_llm_with_tools(
     raw_model = (model or "").strip() or _default_subagent_model()
     resolved_model = sanitize_llm_model_alias(raw_model)
     conversation: List[Dict[str, Any]] = [dict(m) for m in messages]
-    http_timeout = orchestrator_http_timeout_seconds()
+    http_timeout = llm_proxy_http_timeout_seconds()
 
     total_tokens = 0
     total_cost = 0.0
@@ -356,18 +356,18 @@ async def call_llm_with_tools(
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
                 raise LLMAuthenticationError(
-                    "Orchestrator returned 401: set ORCHESTRATOR_MASTER_KEY in agent-platform/.env to "
-                    "exactly match llm-orchestrator."
+                    "LLM proxy returned 401: set AGENT_PLATFORM_MASTER_KEY in agent-platform/.env to match "
+                    "the value used for Bearer auth on /v1."
                 ) from None
             raise LLMRequestError(
-                _orchestrator_http_error_message(e.response.status_code, e.response)
+                _llm_proxy_http_error_message(e.response.status_code, e.response)
             ) from None
         except httpx.RequestError as e:
             raise LLMTransportError(
-                f"Could not reach the LLM orchestrator at {base}. "
-                "Start llm-orchestrator (e.g. docker compose in llm-orchestrator on port 18408). "
-                "In Docker, use http://host.docker.internal:18408/v1 or leave "
-                "LLM_ORCHESTRATOR_BASE_URL=http://127.0.0.1:18408/v1 (auto-rewritten in containers)."
+                f"Could not reach the LLM proxy at {base}. "
+                "Ensure the embedded LLM proxy is reachable (same process; default port 18410). "
+                "In Docker with loopback rewrite, use host.docker.internal or set "
+                "LLM_ORCHESTRATOR_BASE_URL=http://127.0.0.1:18410/v1 (AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX=0 for same-container)."
             ) from e
 
         data = response.json()
@@ -435,7 +435,7 @@ async def generate_subdag_expansion(
       "system_prompt": "identity and boundaries",
       "instructions": "single, concrete deliverable for this subagent",
       "dependencies": ["must include "{parent_uuid}" and may include other new UUIDs"],
-      "model": "optional real orchestrator alias only; omit unless you know the proxy name (never role slugs like typescript-expert or react-scaffolder)",
+      "model": "optional real model alias only; omit unless you know the proxy name (never role slugs like typescript-expert or react-scaffolder)",
       "subdecompose": "optional boolean; true if this subagent's output may justify further split tasks later",
       "requires_review": "optional boolean; true only if human gate needed before dependents run"
     }}
@@ -536,7 +536,7 @@ async def generate_planner_dag(
     On invalid JSON or schema validation failure, retries up to ``AGENT_PLATFORM_PLAN_MAX_ATTEMPTS``
     (default 3). The last attempt uses ``PLANNER_FALLBACK_MODEL`` when set and distinct from
     ``PLANNER_MODEL`` when that is set (ADR: stronger model for structured output). If ``PLANNER_MODEL``
-    is unset, requests use the orchestrator default unless a fallback alias is configured.
+    is unset, requests use the proxy default unless a fallback alias is configured.
     """
     system_prompt = """You are an elite Agentic Team Planner. Decompose the user's goal into a DAG of subagents.
 
@@ -548,7 +548,7 @@ outcome (research slice, integration step, doc section, test pass, refactor chun
 work in **separate** nodes with **empty or minimal** dependencies so they can run in parallel in the
 same wave when possible. Use dependencies only for true ordering (B needs A's output).
 
-**model field:** Omit `model` unless you use a real orchestrator alias from the server. Never put role titles,
+**model field:** Omit `model` unless you use a real model alias from the server. Never put role titles,
 programming languages, or skill labels (e.g. `typescript-expert`, `react-scaffolder`) in `model`—those belong in `role` / prompts only.
 
 **subdecompose:** Set `subdecompose`: true on nodes whose deliverable is likely to reveal follow-on work
@@ -566,7 +566,7 @@ Output valid JSON strictly adhering to this schema:
       "system_prompt": "Identity and boundaries of the agent",
       "instructions": "Specific task for this agent. Mention that it will receive context from dependencies.",
       "dependencies": ["client_uuid_of_prior_agent"],
-      "model": "optional; real orchestrator alias only (e.g. gemma4, gemini-flash). Omit to use server default. Never use role or skill slugs (e.g. typescript-expert, react-scaffolder).",
+      "model": "optional; real model alias only (e.g. gemma4, gemini-flash). Omit to use server default. Never use role or skill slugs (e.g. typescript-expert, react-scaffolder).",
       "subdecompose": "optional boolean; if true, after this node completes the server may append child subtasks from its output (within AGENT_PLATFORM_SUBDECOMP_* limits).",
       "requires_review": "optional boolean; if true, execution pauses for human review after this node's output."
     }

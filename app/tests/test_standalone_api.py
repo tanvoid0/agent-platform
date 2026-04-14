@@ -1,6 +1,14 @@
 """Versioned API, chat proxy, optional API key, and client_id scope."""
 
 import json
+import os
+
+
+def _api_auth_headers() -> dict[str, str]:
+    key = os.environ.get("AGENT_PLATFORM_MASTER_KEY", "").strip()
+    if not key:
+        return {}
+    return {"Authorization": f"Bearer {key}"}
 
 
 def test_api_v1_processes_mirrors_legacy_post(client):
@@ -30,7 +38,8 @@ def test_api_v1_teams_list_matches_legacy(client):
 
 def test_chat_completions_proxies_upstream(client, monkeypatch):
     c, _mock_cls, _mock_inst = client
-    monkeypatch.setenv("ORCHESTRATOR_MASTER_KEY", "test-orch-key")
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "test-orch-key")
+    auth = {"Authorization": "Bearer test-orch-key"}
 
     class FakeResp:
         status_code = 200
@@ -57,15 +66,65 @@ def test_chat_completions_proxies_upstream(client, monkeypatch):
     r = c.post(
         "/api/v1/chat",
         json={"messages": [{"role": "user", "content": "Hello"}]},
+        headers=auth,
     )
     assert r.status_code == 200
     data = r.json()
     assert data["choices"][0]["message"]["content"] == "hi"
 
 
-def test_orchestrator_ready_proxies_upstream(client, monkeypatch):
+def test_chat_resolved_defaults_returns_provider_model(client):
     c, _mock_cls, _mock_inst = client
-    monkeypatch.setenv("ORCHESTRATOR_MASTER_KEY", "test-orch-key")
+    r = c.get("/api/v1/chat/resolved-defaults", headers=_api_auth_headers())
+    assert r.status_code == 200
+    j = r.json()
+    assert "provider" in j and "model" in j
+    assert j["provider"] in ("ollama", "lm_studio", "gemini", "aimlapi")
+    assert isinstance(j["model"], str)
+
+
+def test_llm_proxy_env_provider_switch_applies_without_restart(client, monkeypatch, tmp_path):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    env_path = tmp_path / ".env"
+    env_path.write_text("DEFAULT_PROVIDER=lm_studio\n", encoding="utf-8")
+
+    r_before = c.get("/api/v1/chat/resolved-defaults", headers=_api_auth_headers())
+    assert r_before.status_code == 200
+    assert r_before.json()["provider"] == "lm_studio"
+
+    r_set = c.post("/api/v1/llm-proxy/env", json={"DEFAULT_PROVIDER": "ollama"}, headers=_api_auth_headers())
+    assert r_set.status_code == 200
+
+    r_after = c.get("/api/v1/chat/resolved-defaults", headers=_api_auth_headers())
+    assert r_after.status_code == 200
+    assert r_after.json()["provider"] == "ollama"
+
+
+def test_llm_ui_catalog_returns_providers_and_media(client):
+    c, _mock_cls, _mock_inst = client
+    r = c.get("/api/v1/llm/ui-catalog")
+    assert r.status_code == 200
+    j = r.json()
+    assert "resolved_defaults" in j
+    assert "providers" in j
+    providers = j["providers"]
+    assert len(providers) == 4
+    assert [p["id"] for p in providers] == ["ollama", "lm_studio", "aimlapi", "gemini"]
+    for p in providers:
+        assert "configured" in p
+        assert "reachable" in p
+        assert "chat" in p
+        assert "default_model" in p["chat"]
+        assert isinstance(p["chat"]["options"], list)
+    gm = j["gemini_media"]
+    assert "image" in gm and "music" in gm and "video" in gm
+
+
+def test_llm_ready_proxies_upstream(client, monkeypatch):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "test-orch-key")
+    auth = {"Authorization": "Bearer test-orch-key"}
 
     class FakeResp:
         status_code = 200
@@ -78,28 +137,28 @@ def test_orchestrator_ready_proxies_upstream(client, monkeypatch):
             return None
 
         async def get(self, url, headers=None):
-            assert "/v1/models" in url
+            assert "/v1/health/readiness" in url
             assert headers and "Bearer test-orch-key" in headers.get("Authorization", "")
             return FakeResp()
 
     monkeypatch.setattr("chat_routes.httpx.AsyncClient", lambda *a, **k: FakeClient())
 
-    r = c.get("/api/v1/orchestrator/ready")
+    r = c.get("/api/v1/llm/ready", headers=auth)
     assert r.status_code == 200
     assert r.json() == {"ok": True}
 
 
-def test_orchestrator_ready_requires_orchestrator_key(client, monkeypatch):
+def test_llm_ready_requires_proxy_key(client, monkeypatch):
     c, _mock_cls, _mock_inst = client
-    monkeypatch.delenv("ORCHESTRATOR_MASTER_KEY", raising=False)
+    monkeypatch.delenv("AGENT_PLATFORM_MASTER_KEY", raising=False)
 
-    r = c.get("/api/v1/orchestrator/ready")
+    r = c.get("/api/v1/llm/ready")
     assert r.status_code == 503
 
 
-def test_chat_requires_orchestrator_key(client, monkeypatch):
+def test_chat_requires_proxy_key(client, monkeypatch):
     c, _mock_cls, _mock_inst = client
-    monkeypatch.delenv("ORCHESTRATOR_MASTER_KEY", raising=False)
+    monkeypatch.delenv("AGENT_PLATFORM_MASTER_KEY", raising=False)
 
     r = c.post(
         "/api/v1/chat",
@@ -110,7 +169,7 @@ def test_chat_requires_orchestrator_key(client, monkeypatch):
 
 def test_api_key_required_when_set(client, monkeypatch):
     c, _mock_cls, _mock_inst = client
-    monkeypatch.setenv("AGENT_PLATFORM_API_KEY", "secret-apk")
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "secret-apk")
 
     r = c.get("/processes")
     assert r.status_code == 401

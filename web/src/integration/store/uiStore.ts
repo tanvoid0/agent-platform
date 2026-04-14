@@ -109,6 +109,10 @@ export const useUiStore = create<SimulationUiState>()(
     bumpConsultantChatKick: () => set((s) => ({ consultantChatKick: s.consultantChatKick + 1 })),
     chatInputFocusNonce: 0,
     bumpChatInputFocusRequest: () => set((s) => ({ chatInputFocusNonce: s.chatInputFocusNonce + 1 })),
+
+    projectRailExpandRequestNonce: 0,
+    bumpProjectRailExpandRequest: () =>
+      set((s) => ({ projectRailExpandRequestNonce: s.projectRailExpandRequestNonce + 1 })),
   })
 );
 

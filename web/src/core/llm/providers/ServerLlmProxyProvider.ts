@@ -1,6 +1,6 @@
 import { agentPlatformAuthHeaders, apiUrl } from '../../../api/client';
 import { mapMessagesToOpenAI, normalizeToolCallsFromOpenAI, openAiToolsFromDefinitions } from '../openAiChatMessages';
-import { getProviderModelCatalog } from '../providerModelCatalog';
+import { getActiveChatBackendId, getProviderModelCatalog } from '../providerModelCatalog';
 import {
   LLMMessage,
   LLMProvider,
@@ -10,9 +10,9 @@ import {
 
 /**
  * Chat completions **only** via Agent Platform (`POST /api/v1/chat`). The UI does not call
- * Ollama, the orchestrator, or any LLM host directly — only this origin + path from the browser.
+ * Ollama or any upstream LLM host directly — only this origin + path from the browser.
  */
-export class OrchestratorProxyProvider implements LLMProvider {
+export class ServerLlmProxyProvider implements LLMProvider {
   async generateCompletion(
     messages: LLMMessage[],
     tools?: LLMToolDefinition[],
@@ -21,7 +21,7 @@ export class OrchestratorProxyProvider implements LLMProvider {
   ): Promise<LLMResponse> {
     const openaiMessages = mapMessagesToOpenAI(messages, systemInstruction);
     const body: Record<string, unknown> = {
-      model: modelName || getProviderModelCatalog('ollama').chat.defaultModel,
+      model: modelName || getProviderModelCatalog(getActiveChatBackendId()).chat.defaultModel,
       messages: openaiMessages,
       stream: false,
     };

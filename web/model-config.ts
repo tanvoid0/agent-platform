@@ -8,20 +8,22 @@ export const MODEL_CONFIG = {
   /**
    * Backend routing by modality.
    * - `chat`: `auto` keeps env behavior (dev: server chat via Agent Platform, prod: cloud).
-   * - `image`/`music`/`video`: pick which backend should handle final deliverables.
-   *   Use `disabled` to intentionally block only that modality.
+   * - `image`/`music`/`video`: only Gemini implements generation here; use `gemini`, `follow-chat` (inherits active chat — useful when chat is already cloud), or `disabled`.
    */
   routing: {
-    chat: 'auto', // 'auto' | 'gemini' | 'ollama'
-    /** Same backend as resolved chat (`auto` → dev server path / prod cloud). Avoids mixing server chat with paid cloud media. */
-    image: 'follow-chat', // 'follow-chat' | 'gemini' | 'ollama' | 'disabled'
-    music: 'follow-chat',
-    video: 'follow-chat',
+    chat: 'auto', // 'auto' | 'gemini' | 'ollama' | 'lm_studio' | 'aimlapi'
+    /**
+     * Image / music / video: only Gemini exposes those APIs in this app.
+     * `follow-chat` uses the active chat backend — Ollama and LM Studio are chat-only (no media APIs), so those paths stay not-ready until you route to `gemini` or `disabled`.
+     */
+    image: 'follow-chat', // 'follow-chat' | 'gemini' | 'disabled'
+    music: 'follow-chat', // 'follow-chat' | 'gemini' | 'disabled'
+    video: 'follow-chat', // 'follow-chat' | 'gemini' | 'disabled'
   },
   ollama: {
     /**
-     * Default models when chat is routed to the server path (`ChatCompletionBackendId` `ollama` — Agent Platform → orchestrator).
-     * Vision-in-chat works if the orchestrator serves a vision-capable model alias.
+     * Default models when chat is routed to the server path (`ChatCompletionBackendId` `ollama` — embedded LLM proxy).
+     * Vision-in-chat works if the proxy serves a vision-capable model alias.
      */
     chat: {
       // Good default for high-end local hardware.
@@ -32,21 +34,28 @@ export const MODEL_CONFIG = {
         'qwen2.5vl:7b',
       ],
     },
+  },
+  lm_studio: {
     /**
-     * Media model lists are populated so config stays shape-compatible.
-     * Runtime media on the server path is still gated by integration status.
+     * Defaults when chat is routed to LM Studio (server-resolved or `model-config` override). Requests go to
+     * Agent Platform → embedded `/v1` proxy; ids should match LM Studio / proxy `config.yaml`.
      */
-    image: {
-      defaultModel: 'gemma4:latest',
-      options: ['gemma4:latest', 'qwen2.5vl:7b'],
+    chat: {
+      defaultModel: 'google/gemma-4-e4b',
+      options: ['google/gemma-4-e4b'],
     },
-    music: {
-      defaultModel: 'gemma4:latest',
-      options: ['gemma4:latest'],
-    },
-    video: {
-      defaultModel: 'gemma4:latest',
-      options: ['gemma4:latest'],
+  },
+  aimlapi: {
+    /**
+     * Defaults when chat is routed to AIMLAPI via the embedded server proxy.
+     */
+    chat: {
+      defaultModel: 'openai/gpt-4.1-mini',
+      options: [
+        'openai/gpt-4.1-mini',
+        'openai/gpt-4.1',
+        'anthropic/claude-3.7-sonnet',
+      ],
     },
   },
   gemini: {

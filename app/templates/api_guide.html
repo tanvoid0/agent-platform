@@ -25,21 +25,44 @@
 
   <details open>
     <summary>Overview</summary>
-    <p>This server exposes a <strong>stateless chat</strong> proxy (<code>POST /api/v1/chat</code>) and <strong>multi-agent orchestration</strong> as <em>processes</em> (goal → planner DAG → optional human gates → execution). There are no required “projects” or workspaces; optional <strong>team templates</strong> only hint the planner.</p>
+    <p>You can use this host <strong>without the Flow UI</strong>. There are several independent surfaces:</p>
+    <ul>
+      <li><strong>OpenAI-compatible LLM</strong> — <code>/v1/chat/completions</code>, <code>/v1/models</code>, <code>/v1/embeddings</code>, <code>/v1/health</code> (direct to the embedded proxy; no stored process).</li>
+      <li><strong>Single completion helper</strong> — <code>POST /api/v1/chat</code> (one round-trip through the same proxy; no process row).</li>
+      <li><strong>Multi-agent orchestration</strong> — <code>/api/v1/processes</code> (goal → planner DAG → optional human gates → task execution). Optional <strong>projects</strong> and <strong>workspace</strong> APIs for file sandboxes on the server.</li>
+      <li><strong>Planner roster hints</strong> — <code>/api/v1/teams</code> — saved team templates; the only required extra field on <code>POST /api/v1/processes</code> is <code>team_template_id</code> so the planner knows which roles to consider.</li>
+    </ul>
+    <p>Authoritative route list and request bodies: <a href="/docs">OpenAPI</a>.</p>
   </details>
 
   <details open>
     <summary>Base URL and versioning</summary>
     <p>Same origin as this page, or your deployed host (for example <code>http://127.0.0.1:18410</code>).</p>
     <ul>
-      <li><strong>Versioned:</strong> <code>/api/v1/processes</code>, <code>/api/v1/teams</code>, <code>/api/v1/chat</code></li>
-      <li><strong>Legacy:</strong> <code>/processes</code>, <code>/teams</code> (identical behavior)</li>
+      <li><strong>Versioned REST:</strong> <code>/api/v1/processes</code>, <code>/api/v1/teams</code>, <code>/api/v1/projects</code>, <code>/api/v1/projects/{id}/workspace/…</code>, <code>/api/v1/chat</code>, <code>/api/v1/llm-proxy/…</code></li>
+      <li><strong>Legacy (same behavior):</strong> <code>/processes</code>, <code>/teams</code>, <code>/projects</code>, workspace under <code>/projects/{id}/workspace/…</code></li>
+      <li><strong>LLM proxy (OpenAI-style):</strong> <code>/v1/chat/completions</code> etc. — not under <code>/api/v1</code></li>
+    </ul>
+  </details>
+
+  <details>
+    <summary>API surface (headless checklist)</summary>
+    <p>Everything below works over HTTP with the same deployment; you do not need the Flow SPA.</p>
+    <ul>
+      <li><strong>Liveness</strong> — <code>GET /health</code> (no auth).</li>
+      <li><strong>Embedded LLM</strong> — <code>/v1/chat/completions</code>, <code>/v1/models</code>, <code>/v1/embeddings</code>, <code>/v1/health</code>. Use when you only need a model call and manage prompts yourself.</li>
+      <li><strong>Planner chat</strong> — <code>POST /api/v1/chat</code> — one completion via the configured proxy.</li>
+      <li><strong>Processes</strong> — <code>GET/POST /api/v1/processes</code>, <code>GET /api/v1/processes/{id}</code>, <code>GET …/events</code>, <code>GET …/stream</code>, <code>POST …/approve</code>, <code>POST …/tasks/{task_id}/review</code>, <code>POST …/cancel</code>, <code>POST …/sync</code>, <code>POST …/retry</code>, <code>POST …/tasks/{task_id}/retry</code>. See <a href="/docs">/docs</a> for parameters.</li>
+      <li><strong>Projects</strong> — <code>GET/POST /api/v1/projects</code>, <code>GET/PATCH/DELETE /api/v1/projects/{id}</code> — optional grouping for processes.</li>
+      <li><strong>Workspace</strong> — <code>/api/v1/projects/{project_id}/workspace/…</code> — list/read/write files under the server’s project sandbox (see <a href="/docs">/docs</a>); pair with <code>project_id</code> on process creation if tasks should read files from disk.</li>
+      <li><strong>Team templates</strong> — <code>GET/POST /api/v1/teams</code>, <code>GET/PATCH/DELETE /api/v1/teams/{id}</code> — define planner rosters; pass <code>team_template_id</code> when starting a process.</li>
+      <li><strong>LLM proxy (admin)</strong> — <code>/api/v1/llm-proxy/*</code> — read/update <code>config.yaml</code>, env, and catalog helpers; same auth as other <code>/api/v1</code> routes when the master key is set.</li>
     </ul>
   </details>
 
   <details>
     <summary>Authentication (optional)</summary>
-    <p>If <code>AGENT_PLATFORM_API_KEY</code> is set in the server environment, every process, team, and chat request must send:</p>
+    <p>If <code>AGENT_PLATFORM_MASTER_KEY</code> is set in the server environment, every process, team, and chat request must send:</p>
     <pre>Authorization: Bearer &lt;your key&gt;</pre>
     <p class="muted">This is a single shared secret for the deployment, not per-tenant keys. Stricter auth belongs behind a gateway or future work.</p>
   </details>
@@ -51,7 +74,7 @@
 
   <details>
     <summary>Single-agent chat (stateless)</summary>
-    <p><code>POST /api/v1/chat</code> — one completion round-trip through the configured llm-orchestrator. Does not create a stored process.</p>
+    <p><code>POST /api/v1/chat</code> — one completion round-trip through the embedded LLM proxy. Does not create a stored process.</p>
     <p>JSON body (fields optional except <code>messages</code>):</p>
     <pre>{
   "messages": [
@@ -61,22 +84,36 @@
   "temperature": 0.2,
   "max_tokens": 256
 }</pre>
-    <p class="muted">Requires <code>ORCHESTRATOR_MASTER_KEY</code> on the server (same as for multi-agent runs). The orchestrator must be reachable at <code>LLM_ORCHESTRATOR_BASE_URL</code>.</p>
-    <p class="muted">Full OpenAI-compatible surface for the proxy (<code>/v1/chat/completions</code>, <code>/v1/models</code> query flags, embeddings caveats, streaming) is documented on the orchestrator: <a href="http://127.0.0.1:18408/docs" target="_blank" rel="noopener">http://127.0.0.1:18408/docs</a> — not this host’s <code>/docs</code> (that is Agent Platform’s Swagger on port 18410).</p>
+    <p class="muted">Requires <code>AGENT_PLATFORM_MASTER_KEY</code> on the server (same as for multi-agent runs). The embedded LLM proxy must be reachable at <code>LLM_ORCHESTRATOR_BASE_URL</code> (default same process, port 18410).</p>
+    <p class="muted">OpenAI-compatible surface: <code>/v1/chat/completions</code>, <code>/v1/models</code>, <code>/v1/embeddings</code>, <code>/v1/health</code> on this host. Configure providers and <code>config.yaml</code> via Flow → Settings → LLM proxy or <code>/api/v1/llm-proxy/*</code>. This page’s <code>/docs</code> is Agent Platform’s Swagger.</p>
   </details>
 
   <details>
-    <summary>Multi-agent process (no teams required)</summary>
-    <p>Start a run with only a goal. Teams and project/workspace concepts are optional.</p>
+    <summary>Multi-agent process</summary>
+    <p>Pick a team template id from <code>GET /api/v1/teams</code> (each item has <code>id</code> and <code>name</code>), or create one with <code>POST /api/v1/teams</code>. Then start a run:</p>
     <p><code>POST /api/v1/processes</code></p>
     <pre>{
   "goal": "Research and summarize X",
   "auto_approve": false,
-  "team_template_id": null,
+  "team_template_id": 1,
   "client_id": "my-app-namespace"
 }</pre>
+    <p><code>team_template_id</code> is <strong>required</strong> (integer). Put your document text or instructions in <code>goal</code>, or combine with a <code>project_id</code> and workspace paths your app manages.</p>
     <p>You may set <code>client_id</code> in the body or send header <code>X-Agent-Platform-Client: my-app-namespace</code> (header wins when both are set). If <code>AGENT_PLATFORM_REQUIRE_CLIENT_ID</code> is enabled, one of them is required.</p>
-    <p>Then poll <code>GET /api/v1/processes/{id}</code>, approve the DAG when status is <code>approval_required</code>, review tasks if needed, and subscribe to <code>GET /api/v1/processes/{id}/stream</code> (SSE) or <code>GET /api/v1/processes/{id}/events</code>.</p>
+    <p>Then poll <code>GET /api/v1/processes/{id}</code>, approve the DAG when status is <code>approval_required</code>, review tasks if needed, and subscribe to <code>GET /api/v1/processes/{id}/stream</code> (SSE) or <code>GET /api/v1/processes/{id}/events</code>. Task results appear on each task’s <code>output</code> in the <code>tasks</code> array when completed.</p>
+  </details>
+
+  <details>
+    <summary>Headless API and external microservices</summary>
+    <p>The same process runs with or without the Flow UI build: orchestration is HTTP-only. Deploy with <code>AGENT_PLATFORM_MASTER_KEY</code>, LLM <code>config.yaml</code> under <code>CONFIG_DIR</code>, and <code>LLM_ORCHESTRATOR_BASE_URL</code> pointing at this service’s <code>/v1</code> when using the embedded proxy.</p>
+    <p>Pick an integration style:</p>
+    <ul>
+      <li><strong>LLM only</strong> — call <code>/v1/chat/completions</code> (or <code>POST /api/v1/chat</code>) from your service; you own prompts, tools, and storage.</li>
+      <li><strong>Full orchestration</strong> — <code>POST /api/v1/processes</code> with <code>goal</code>, <code>team_template_id</code>, optional <code>project_id</code>, <code>client_id</code>, and <code>auto_approve</code> / review policy; optionally upload inputs via <strong>workspace</strong> APIs first, then reference paths in the goal.</li>
+      <li><strong>Hybrid</strong> — use the platform for long-running DAG runs and keep your own app DB; correlate with <code>client_id</code> and your external ids.</li>
+    </ul>
+    <p>For orchestration, the usual loop is: create process → poll <code>GET /api/v1/processes/{id}</code> (and approve/review endpoints when gates open) → read task <code>output</code> in the response or tail <code>…/events</code> / <code>…/stream</code>.</p>
+    <p class="muted">Server-to-server calls do not need CORS. Browser clients from other origins require <code>CORS_ALLOW_ORIGINS</code>. A runnable example that uses team templates + processes is <code>scripts/external_microservice_example.py</code> in the repository.</p>
   </details>
 
   <details>
@@ -110,8 +147,9 @@
   </details>
 
   <details>
-    <summary>Optional teams</summary>
-    <p><code>GET/POST /api/v1/teams</code> — saved team rosters as hints for the planner. Omit <code>team_template_id</code> on process creation if you do not need them.</p>
+    <summary>Team templates</summary>
+    <p><code>GET /api/v1/teams</code> — list templates (use <code>id</code> as <code>team_template_id</code> on <code>POST /api/v1/processes</code>). <code>GET /api/v1/teams/{id}</code> — full roster. <code>POST /api/v1/teams</code> — create a template for your own agent definitions.</p>
+    <p class="muted">Process creation always references a template id; there is no <code>null</code> team on the API.</p>
   </details>
 
   <details>

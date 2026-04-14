@@ -7,6 +7,8 @@ interface InfoModalProps {
   onClose: () => void;
 }
 
+const logoSrc = `${import.meta.env.BASE_URL}images/the-delegation.svg`;
+
 const InfoModal: React.FC<InfoModalProps> = ({ onClose }) => {
   return (
     <ModalRoot paddingClassName="p-6" className="pointer-events-auto overflow-hidden">
@@ -33,7 +35,7 @@ const InfoModal: React.FC<InfoModalProps> = ({ onClose }) => {
         <div className="max-w-md mx-auto">
           <div className="flex justify-center mb-8">
             <img
-              src="images/the-delegation.svg"
+              src={logoSrc}
               alt="The Delegation Logo"
               width={256}
               className="h-auto"

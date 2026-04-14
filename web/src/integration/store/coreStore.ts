@@ -27,10 +27,18 @@ import {
 } from './coreStoreTypes';
 import {
   backfillChatReadWatermarks,
-  visibleChatTurnCount,
 } from '../chat/chatReadWatermark';
 import { createProjectScopedCoreStorage } from './projectScopedStorage';
 import { clearProjectScopedUi } from './uiStore';
+import {
+  completeTaskForApproval,
+  rejectTaskForRevision,
+  updateTaskStatusWithDoneGuard,
+} from './coreTaskMutations';
+import {
+  appendHistoryMessage,
+  chatReadWatermarkForHistory,
+} from './coreHistoryMutations';
 
 export type {
   ActionLogEntry,
@@ -320,22 +328,9 @@ export const useCoreStore = create<CoreState>()(
         set((s) => {
           const task = s.tasks.find((t) => t.id === taskId);
           if (!task) return {};
-
-          // Safety check: Cannot move back into active columns if already 'done'
-          if (
-            task.status === 'done' &&
-            (status === 'in_progress' ||
-              status === 'review' ||
-              status === 'on_hold' ||
-              status === 'backlog' ||
-              status === 'scheduled')
-          ) {
-            return {};
-          }
-
-          const newTasks = s.tasks.map((t) =>
-            t.id === taskId ? { ...t, status, updatedAt: Date.now() } : t
-          );
+          const updated = updateTaskStatusWithDoneGuard(task, status, Date.now());
+          if (!updated) return {};
+          const newTasks = s.tasks.map((t) => (t.id === taskId ? updated : t));
 
           return {
             tasks: newTasks,
@@ -376,19 +371,11 @@ export const useCoreStore = create<CoreState>()(
         set((s) => {
           const task = s.tasks.find(t => t.id === taskId);
           if (task) useUiStore.getState().setAgentStatus(task.assignedAgentId, 'idle');
+          const now = Date.now();
           
           return {
             tasks: s.tasks.map((t) =>
-              t.id === taskId ? { 
-                ...t, 
-                status: 'done', 
-                output: t.draftOutput || t.output,
-                revisions: t.draftOutput 
-                  ? [...t.revisions, { output: t.draftOutput, timestamp: Date.now() }] 
-                  : t.revisions,
-                draftOutput: undefined,
-                updatedAt: Date.now() 
-              } : t
+              t.id === taskId ? completeTaskForApproval(t, now) : t
             ),
           };
         });
@@ -419,16 +406,7 @@ export const useCoreStore = create<CoreState>()(
             if (t.status === 'review') {
               any = true;
               ui.setAgentStatus(t.assignedAgentId, 'idle');
-              return {
-                ...t,
-                status: 'done' as const,
-                output: t.draftOutput || t.output,
-                revisions: t.draftOutput
-                  ? [...t.revisions, { output: t.draftOutput, timestamp: Date.now() }]
-                  : t.revisions,
-                draftOutput: undefined,
-                updatedAt: Date.now(),
-              };
+              return completeTaskForApproval(t, Date.now());
             }
             return t;
           });
@@ -508,16 +486,7 @@ export const useCoreStore = create<CoreState>()(
 
           return {
             tasks: s.tasks.map((t) =>
-              t.id === taskId ? { 
-                ...t, 
-                status: 'scheduled', 
-                reviewComments: comments,
-                revisions: t.draftOutput 
-                  ? [...t.revisions, { output: t.draftOutput, feedback: comments, timestamp: Date.now() }] 
-                  : t.revisions,
-                draftOutput: undefined,
-                updatedAt: Date.now() 
-              } : t
+              t.id === taskId ? rejectTaskForRevision(t, comments, Date.now()) : t
             ),
             agentHistories: {
               ...s.agentHistories,
@@ -706,18 +675,10 @@ export const useCoreStore = create<CoreState>()(
 
       appendAgentHistory: (agentIndex, role, parts) =>
         set((s) => {
-          const nextHist = [
-            ...(s.agentHistories[agentIndex] ?? []),
-            {
-              role,
-              content: Array.isArray(parts)
-                ? parts.map((p) => (typeof p === 'string' ? p : JSON.stringify(p))).join(' ')
-                : String(parts),
-            },
-          ];
+          const nextHist = appendHistoryMessage(s.agentHistories[agentIndex], role, parts);
           const ui = useUiStore.getState();
           const viewing = ui.isChatting && ui.selectedNpcIndex === agentIndex;
-          const vis = visibleChatTurnCount(nextHist);
+          const vis = chatReadWatermarkForHistory(nextHist);
           return {
             agentHistories: {
               ...s.agentHistories,
@@ -746,13 +707,7 @@ export const useCoreStore = create<CoreState>()(
         set((s) => ({
           boardroomHistories: {
             ...s.boardroomHistories,
-            [taskId]: [
-              ...(s.boardroomHistories[taskId] ?? []),
-              {
-                role,
-                content: Array.isArray(parts) ? parts.map(p => typeof p === 'string' ? p : JSON.stringify(p)).join(' ') : String(parts),
-              },
-            ],
+            [taskId]: appendHistoryMessage(s.boardroomHistories[taskId], role, parts),
           },
         })),
 
@@ -774,7 +729,7 @@ export const useCoreStore = create<CoreState>()(
 
       markAgentChatRead: (agentIndex) =>
         set((s) => {
-          const vis = visibleChatTurnCount(s.agentHistories[agentIndex]);
+          const vis = chatReadWatermarkForHistory(s.agentHistories[agentIndex]);
           return {
             chatReadVisibleLength: {
               ...s.chatReadVisibleLength,
@@ -793,7 +748,7 @@ export const useCoreStore = create<CoreState>()(
         set((s) => {
           const ui = useUiStore.getState();
           const viewing = ui.isChatting && ui.selectedNpcIndex === agentIndex;
-          const vis = visibleChatTurnCount(history);
+          const vis = chatReadWatermarkForHistory(history);
           return {
             agentHistories: { ...s.agentHistories, [agentIndex]: history },
             ...(viewing
