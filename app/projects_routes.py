@@ -9,8 +9,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select, update
 
+from crud_helpers import require_one
 from database import get_session
 from models import Process, Project
+from schema_fields import ResourceName, ResourceDescription, ResourceColor
 from workspace_service import delete_project_workspace
 from todos.services.planning_context import get_planning_context, patch_planning_context
 
@@ -18,17 +20,17 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 
 
 class ProjectCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=4096)
-    color: str | None = Field(default=None, max_length=32)
+    name: str = ResourceName
+    description: str | None = ResourceDescription
+    color: str | None = ResourceColor
 
 
 class ProjectUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     name: str | None = Field(default=None, min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=4096)
-    color: str | None = Field(default=None, max_length=32)
+    description: str | None = ResourceDescription
+    color: str | None = ResourceColor
 
 
 class ProjectOut(BaseModel):
@@ -120,9 +122,7 @@ def create_project(req: ProjectCreate, session: Session = Depends(get_session)):
 
 @router.get("/{project_id}")
 def get_project(project_id: int, session: Session = Depends(get_session)):
-    row = session.get(Project, project_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Project not found")
+    row = require_one(session, Project, project_id, "Project")
     return ProjectOut(
         id=row.id,
         name=row.name,
@@ -139,9 +139,7 @@ def update_project(
     req: ProjectUpdate,
     session: Session = Depends(get_session),
 ):
-    row = session.get(Project, project_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Project not found")
+    row = require_one(session, Project, project_id, "Project")
     if req.name is not None:
         row.name = req.name.strip()
     if req.description is not None:
@@ -164,9 +162,7 @@ def update_project(
 
 @router.get("/{project_id}/workspace-state")
 def get_project_workspace_state(project_id: int, session: Session = Depends(get_session)):
-    row = session.get(Project, project_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Project not found")
+    row = require_one(session, Project, project_id, "Project")
     payload = None
     if row.workspace_payload_json:
         try:
@@ -184,9 +180,7 @@ def put_project_workspace_state(
     req: ProjectWorkspaceStatePut,
     session: Session = Depends(get_session),
 ):
-    row = session.get(Project, project_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Project not found")
+    row = require_one(session, Project, project_id, "Project")
     row.workspace_payload_json = json.dumps(req.payload, ensure_ascii=False)
     row.updated_at = datetime.utcnow()
     session.add(row)
@@ -221,9 +215,7 @@ def patch_project_planning_context(
 
 @router.delete("/{project_id}")
 def delete_project(project_id: int, session: Session = Depends(get_session)):
-    row = session.get(Project, project_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Project not found")
+    row = require_one(session, Project, project_id, "Project")
     session.exec(update(Process).where(Process.project_id == project_id).values(project_id=None))
     session.delete(row)
     session.commit()

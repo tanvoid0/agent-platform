@@ -8,18 +8,20 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select, update
 
+from crud_helpers import require_one
 from database import get_session
 from models import Process, TeamTemplate
+from schema_fields import ResourceName, ResourceDescription, ResourceColor, ResourceCategory
 from team_schema import TeamRoster, parse_team_roster_json, roster_to_json
 
 router = APIRouter(prefix="/teams", tags=["teams"])
 
 
 class TeamTemplateCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=4096)
-    color: str | None = Field(default=None, max_length=32)
-    category: str | None = Field(default=None, max_length=128)
+    name: str = ResourceName
+    description: str | None = ResourceDescription
+    color: str | None = ResourceColor
+    category: str | None = ResourceCategory
     roster: TeamRoster
 
 
@@ -27,9 +29,9 @@ class TeamTemplateUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     name: str | None = Field(default=None, min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=4096)
-    color: str | None = Field(default=None, max_length=32)
-    category: str | None = Field(default=None, max_length=128)
+    description: str | None = ResourceDescription
+    color: str | None = ResourceColor
+    category: str | None = ResourceCategory
     roster: TeamRoster | None = None
 
 
@@ -122,9 +124,7 @@ def create_team(req: TeamTemplateCreate, session: Session = Depends(get_session)
 
 @router.get("/{team_id}")
 def get_team(team_id: int, session: Session = Depends(get_session)):
-    row = session.get(TeamTemplate, team_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Team template not found")
+    row = require_one(session, TeamTemplate, team_id, "Team template")
     return _row_to_out(row)
 
 
@@ -134,9 +134,7 @@ def update_team(
     req: TeamTemplateUpdate,
     session: Session = Depends(get_session),
 ):
-    row = session.get(TeamTemplate, team_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Team template not found")
+    row = require_one(session, TeamTemplate, team_id, "Team template")
     patch = req.model_dump(exclude_unset=True)
     if req.name is not None:
         row.name = req.name.strip()
@@ -158,9 +156,7 @@ def update_team(
 
 @router.delete("/{team_id}")
 def delete_team(team_id: int, session: Session = Depends(get_session)):
-    row = session.get(TeamTemplate, team_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Team template not found")
+    row = require_one(session, TeamTemplate, team_id, "Team template")
     session.exec(update(Process).where(Process.team_template_id == team_id).values(team_template_id=None))
     session.delete(row)
     session.commit()
