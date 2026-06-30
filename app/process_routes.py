@@ -80,6 +80,13 @@ def list_processes(
     project_id: int | None = None,
     unassigned_only: bool = False,
 ):
+    # Require explicit scope: must filter by project_id, client_id, or unassigned_only
+    if not (client_id or project_id is not None or unassigned_only):
+        raise HTTPException(
+            status_code=400,
+            detail="Must specify one of: project_id, client_id, or unassigned_only=true"
+        )
+
     q = select(Process).order_by(Process.id.desc())
     if client_id is not None and client_id.strip():
         q = q.where(Process.client_id == client_id.strip()[:256])

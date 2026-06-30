@@ -202,6 +202,22 @@ def patch_project_planning_context(
     return ProjectPlanningContextOut(**ctx)
 
 
+@router.get("/{project_id}/processes")
+def list_project_processes(
+    project_id: int,
+    session: Session = Depends(get_session),
+    limit: int = 50,
+):
+    require_one(session, Project, project_id, "Project")
+    q = (
+        select(Process)
+        .where(Process.project_id == project_id)
+        .order_by(Process.id.desc())
+    )
+    rows = session.exec(q.limit(min(limit, 200))).all()
+    return {"processes": rows}
+
+
 @router.delete("/{project_id}")
 def delete_project(project_id: int, session: Session = Depends(get_session)):
     row = require_one(session, Project, project_id, "Project")
