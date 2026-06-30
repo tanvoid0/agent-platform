@@ -12,6 +12,7 @@ from sqlmodel import Session, select, update
 from crud_helpers import require_one
 from database import get_session
 from models import Process, Project
+from schema_converter import to_schemas
 from schema_fields import ResourceName, ResourceDescription, ResourceColor
 from workspace_service import delete_project_workspace
 from todos.services.planning_context import get_planning_context, patch_planning_context
@@ -82,19 +83,7 @@ class ProjectPlanningContextPatch(BaseModel):
 @router.get("/")
 def list_projects(session: Session = Depends(get_session)):
     rows = session.exec(select(Project).order_by(Project.id.asc())).all()
-    return {
-        "projects": [
-            ProjectSummary(
-                id=r.id,
-                name=r.name,
-                description=r.description,
-                color=r.color,
-                created_at=r.created_at,
-                updated_at=r.updated_at,
-            )
-            for r in rows
-        ]
-    }
+    return {"projects": to_schemas(rows, ProjectSummary)}
 
 
 @router.post("/", status_code=201)
