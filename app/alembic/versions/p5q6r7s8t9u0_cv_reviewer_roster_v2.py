@@ -41,7 +41,7 @@ def upgrade() -> None:
                 color = :color,
                 category = :category,
                 roster_json = :roster_json,
-                updated_at = datetime('now')
+                updated_at = now()
             WHERE name = :name
             """
         ),
@@ -101,7 +101,7 @@ def downgrade() -> None:
             SET description = :description,
                 category = NULL,
                 roster_json = :roster_json,
-                updated_at = datetime('now')
+                updated_at = now()
             WHERE name = :name
             """
         ),

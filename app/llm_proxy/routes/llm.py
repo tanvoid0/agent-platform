@@ -35,6 +35,7 @@ from llm_proxy.core.provider_config import (
     is_supported_provider,
 )
 from llm_proxy.services.local_backends import coerce_local_model_if_needed
+from llm_proxy.services.model_catalog_cache import get_catalog_cache
 from llm_proxy.services.upstream_http import (
     aclose_stream,
     classify_httpx_error,
@@ -308,8 +309,10 @@ def _require_auth(request: Request) -> None:
 @router.get("/v1/health")
 async def health(provider: str | None = None, model: str | None = None) -> JSONResponse:
     """
-    LLM health: uses defaults from config/env when provider/model omitted.
+    LLM liveness: quick check that provider is reachable.
+    Uses defaults from config/env when provider/model omitted.
     Optional query: ?provider=ollama|lm_studio|gemini|aimlapi&model=<id> to check a specific route.
+    Does NOT block on model catalog checks; uses cached model list.
     """
     dp, dm = _effective_defaults()
 
@@ -327,6 +330,7 @@ async def health(provider: str | None = None, model: str | None = None) -> JSONR
 
     started = time.perf_counter()
     detail: dict[str, Any] = {"provider": p, "model": m}
+    cache = get_catalog_cache()
 
     if p == "ollama":
         if not ollama_configured():
@@ -342,7 +346,7 @@ async def health(provider: str | None = None, model: str | None = None) -> JSONR
         base = ollama_api_base().rstrip("/")
         url = f"{base}/api/version"
         try:
-            r = await get_with_retry(url, timeout=10.0, context="health_ollama_version")
+            r = await get_with_retry(url, timeout=4.0, context="health_ollama_version")
         except LlmProxyError as e:
             return JSONResponse(
                 status_code=503,
@@ -364,19 +368,15 @@ async def health(provider: str | None = None, model: str | None = None) -> JSONR
                     "elapsed_ms": int((time.perf_counter() - started) * 1000),
                 },
             )
-        try:
-            tr = await get_with_retry(f"{base}/api/tags", timeout=10.0, context="health_ollama_tags")
-            if tr.status_code == 200:
-                payload = tr.json()
-                names: list[str] = []
-                for item in payload.get("models") or []:
-                    if isinstance(item, dict) and isinstance(item.get("name"), str):
-                        names.append(item["name"])
-                detail["model_present"] = any(
-                    n == m or n.split(":")[0] == m.split(":")[0] for n in names
-                )
-        except LlmProxyError:
+        names = cache.get_ollama_tags()
+        if names:
+            detail["model_present"] = any(
+                n == m or n.split(":")[0] == m.split(":")[0] for n in names
+            )
+            detail["model_list_age_sec"] = int(cache.ollama_tag_age_sec())
+        else:
             detail["model_present"] = None
+            detail["model_list_age_sec"] = None
 
         return JSONResponse(
             content={
@@ -406,8 +406,8 @@ async def health(provider: str | None = None, model: str | None = None) -> JSONR
             r = await get_with_retry(
                 f"{base}/v1/models",
                 headers=ls_headers,
-                timeout=10.0,
-                context="health_lm_studio_models",
+                timeout=4.0,
+                context="health_lm_studio_version",
             )
         except LlmProxyError as e:
             return JSONResponse(
@@ -430,15 +430,13 @@ async def health(provider: str | None = None, model: str | None = None) -> JSONR
                     "elapsed_ms": int((time.perf_counter() - started) * 1000),
                 },
             )
-        try:
-            payload = r.json()
-            ids: list[str] = []
-            for item in payload.get("data") or []:
-                if isinstance(item, dict) and isinstance(item.get("id"), str):
-                    ids.append(item["id"])
-            detail["model_present"] = m in ids if ids else None
-        except (TypeError, ValueError):
+        ids = cache.get_lm_studio_models()
+        if ids:
+            detail["model_present"] = m in ids
+            detail["model_list_age_sec"] = int(cache.lm_studio_models_age_sec())
+        else:
             detail["model_present"] = None
+            detail["model_list_age_sec"] = None
 
         return JSONResponse(
             content={
@@ -464,7 +462,7 @@ async def health(provider: str | None = None, model: str | None = None) -> JSONR
             r = await get_with_retry(
                 f"{aimlapi_openai_base()}/models",
                 headers=a_headers,
-                timeout=15.0,
+                timeout=4.0,
                 context="health_aimlapi_models",
             )
         except LlmProxyError as e:
@@ -504,7 +502,7 @@ async def health(provider: str | None = None, model: str | None = None) -> JSONR
         r = await get_with_retry(
             meta_url,
             params={"key": gkey},
-            timeout=15.0,
+            timeout=4.0,
             context="health_gemini_meta",
         )
     except LlmProxyError as e:
@@ -531,6 +529,7 @@ async def health(provider: str | None = None, model: str | None = None) -> JSONR
 
 @router.get("/v1/health/readiness")
 async def health_readiness() -> dict[str, str]:
+    """Always returns ok. Use this for Kubernetes readiness probes to avoid timeout."""
     return {"status": "ok"}
 
 

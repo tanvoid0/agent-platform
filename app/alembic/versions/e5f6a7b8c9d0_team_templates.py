@@ -57,7 +57,7 @@ def upgrade() -> None:
             sa.text(
                 """
                 INSERT INTO teamtemplate (name, description, color, roster_json, created_at, updated_at)
-                VALUES (:name, :description, :color, :roster_json, datetime('now'), datetime('now'))
+                VALUES (:name, :description, :color, :roster_json, now(), now())
                 """
             ),
             {

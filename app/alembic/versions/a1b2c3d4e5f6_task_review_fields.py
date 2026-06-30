@@ -20,7 +20,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.add_column(
         "tasknode",
-        sa.Column("requires_review", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+        sa.Column("requires_review", sa.Boolean(), nullable=False, server_default=sa.text("false")),
     )
     op.add_column("tasknode", sa.Column("review_feedback", sa.String(), nullable=True))
     op.add_column(

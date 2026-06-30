@@ -47,7 +47,7 @@ def upgrade() -> None:
             )
             VALUES (
                 :name, :description, :color, :category, :roster_json,
-                datetime('now'), datetime('now')
+                now(), now()
             )
             """
         ),

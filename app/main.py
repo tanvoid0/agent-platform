@@ -16,6 +16,7 @@ from llm_proxy.admin_routes import router as llm_proxy_admin_router
 from llm_proxy.core.errors import register_exception_handlers
 from llm_proxy.core.middleware import RequestIdMiddleware
 from llm_proxy.routes.llm import router as llm_proxy_router
+from llm_proxy.services.model_catalog_cache import get_catalog_cache
 from llm_proxy_env import llm_proxy_master_key
 from process_routes import router as process_router
 from projects_routes import router as projects_router
@@ -34,7 +35,12 @@ async def lifespan(app: FastAPI):
         logger.warning(
             "AGENT_PLATFORM_MASTER_KEY is not set; LLM proxy /v1 calls and planner chat will fail until it is set."
         )
-    yield
+    cache = get_catalog_cache()
+    await cache.start_background_refresh()
+    try:
+        yield
+    finally:
+        await cache.stop_background_refresh()
 
 
 app = FastAPI(title="Agent Platform", version="0.1.0", lifespan=lifespan)

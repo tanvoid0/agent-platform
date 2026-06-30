@@ -3,6 +3,7 @@ fastapi==0.115.14
 uvicorn[standard]==0.32.1
 sqlmodel==0.0.16
 alembic>=1.13.0
+psycopg2-binary==2.9.9
 httpx==0.28.1
 mcp>=1.8.0
 # mcp 1.13+ requires pydantic>=2.11; keep <3 for sqlmodel / FastAPI.

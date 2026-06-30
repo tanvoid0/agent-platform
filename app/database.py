@@ -39,35 +39,48 @@ from alembic.config import Config
 from sqlalchemy import event, inspect, text
 from sqlmodel import Session, create_engine
 
-_db_raw = (os.getenv("AGENT_PLATFORM_DB_PATH") or "data/agent_platform.db").strip()
-_db_path = Path(_db_raw)
-if _db_path.parent != Path("."):
-    _db_path.parent.mkdir(parents=True, exist_ok=True)
+# Support PostgreSQL or SQLite
+_db_url = (os.getenv("DATABASE_URL") or "").strip()
+if _db_url:
+    # PostgreSQL via DATABASE_URL
+    db_url = _db_url
+    connect_args = {}
+else:
+    # Fall back to SQLite
+    _db_raw = (os.getenv("AGENT_PLATFORM_DB_PATH") or "data/agent_platform.db").strip()
+    _db_path = Path(_db_raw)
+    if _db_path.parent != Path("."):
+        _db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_url = f"sqlite:///{_db_path.as_posix()}"
+    # busy_timeout (seconds) reduces "database is locked" under concurrent writers.
+    _sqlite_busy_timeout_s = float(os.getenv("AGENT_PLATFORM_SQLITE_BUSY_TIMEOUT_SECONDS", "30"))
+    connect_args = {"check_same_thread": False, "timeout": _sqlite_busy_timeout_s}
 
-sqlite_url = f"sqlite:///{_db_path.as_posix()}"
-
-# busy_timeout (seconds) reduces "database is locked" under concurrent writers (e.g. multiple uvicorn workers).
-_sqlite_busy_timeout_s = float(os.getenv("AGENT_PLATFORM_SQLITE_BUSY_TIMEOUT_SECONDS", "30"))
-connect_args = {"check_same_thread": False, "timeout": _sqlite_busy_timeout_s}
-engine = create_engine(sqlite_url, connect_args=connect_args)
+engine = create_engine(db_url, connect_args=connect_args)
 
 
 @event.listens_for(engine, "connect")
-def _sqlite_on_connect(dbapi_connection, _connection_record) -> None:
-    if engine.url.get_backend_name() != "sqlite":
-        return
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL;")
-    cursor.execute("PRAGMA synchronous=NORMAL;")
-    cursor.close()
+def _on_connect(dbapi_connection, _connection_record) -> None:
+    if engine.url.get_backend_name() == "sqlite":
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.close()
 
 _APP_DIR = Path(__file__).resolve().parent
 _ALEMBIC_CFG = Config(str(_APP_DIR / "alembic.ini"))
+
+_IS_SQLITE = engine.url.get_backend_name() == "sqlite"
+if _IS_SQLITE:
+    _db_path = Path(engine.url.database or "data/agent_platform.db")
 
 
 @contextmanager
 def _sqlite_startup_migration_lock():
     """Serialize schema work across uvicorn workers (each runs lifespan on SQLite)."""
+    if not _IS_SQLITE:
+        yield  # PostgreSQL handles this natively
+        return
     lock_path = _db_path.with_name(f"{_db_path.name}.startup.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+b")  # noqa: SIM115 — short-lived lock file handle
@@ -127,11 +140,14 @@ def _sqlite_startup_migration_lock():
 
 
 def _ensure_sqlite_columns() -> None:
-    """Legacy: add columns introduced before Alembic (create_all did not migrate).
+    """Legacy: add columns introduced before Alembic (SQLite only).
 
     Does not call ``apply_process_table_sqlite`` (run→process rename): Alembic revisions
     still reference the ``run`` table name until the rename migration runs.
     """
+    if not _IS_SQLITE:
+        return  # PostgreSQL handled by Alembic
+
     with engine.begin() as conn:
         target = None
         for tbl in ("process", "run"):
@@ -153,8 +169,6 @@ def _ensure_sqlite_columns() -> None:
 
 def create_db_and_tables() -> None:
     """Apply Alembic migrations; legacy DBs without alembic_version get column patches then upgrade."""
-    from process_table_sqlite import apply_process_table_sqlite
-
     with _sqlite_startup_migration_lock():
         with engine.connect() as conn:
             inspector = inspect(conn)
@@ -164,20 +178,31 @@ def create_db_and_tables() -> None:
         has_run = "run" in table_names
         has_alembic = "alembic_version" in table_names
 
-        if (has_process or has_run) and not has_alembic:
-            _ensure_sqlite_columns()
+        if _IS_SQLITE:
+            if (has_process or has_run) and not has_alembic:
+                _ensure_sqlite_columns()
 
-        logger.info("Starting Alembic migrations (SKIPPED due to hang on command.upgrade)")
-        # TODO: Fix Alembic upgrade hanging indefinitely on Windows
-        # command.upgrade(_ALEMBIC_CFG, "head")
-        logger.info("Alembic migrations skipped")
+            logger.info("Starting Alembic migrations (SKIPPED due to hang on command.upgrade)")
+            # TODO: Fix Alembic upgrade hanging indefinitely on Windows
+            # command.upgrade(_ALEMBIC_CFG, "head")
+            logger.info("Alembic migrations skipped")
 
-        with engine.begin() as conn:
-            apply_process_table_sqlite(conn)
+            from process_table_sqlite import apply_process_table_sqlite
+            with engine.begin() as conn:
+                apply_process_table_sqlite(conn)
 
-        with engine.connect() as conn:
-            conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
-            conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
+            with engine.connect() as conn:
+                conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
+                conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
+        else:
+            # PostgreSQL: run full Alembic migrations
+            logger.info("Running Alembic migrations for PostgreSQL...")
+            try:
+                command.upgrade(_ALEMBIC_CFG, "head")
+                logger.info("Alembic migrations complete")
+            except Exception as e:
+                logger.error(f"Migration failed: {e}")
+                raise
 
         logger.info("Starting team template seeding...")
         _seed_team_templates_if_empty()
@@ -205,12 +230,24 @@ def _seed_team_templates_if_empty() -> None:
     from default_team_templates import SEED_TEAM_TEMPLATES
 
     with engine.begin() as conn:
-        tables = {
-            r[0]
-            for r in conn.execute(
-                text("SELECT name FROM sqlite_master WHERE type='table'")
-            ).fetchall()
-        }
+        # Get table names compatible with both SQLite and PostgreSQL
+        if _IS_SQLITE:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table'")
+                ).fetchall()
+            }
+        else:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    text("""
+                        SELECT table_name FROM information_schema.tables
+                        WHERE table_schema = 'public'
+                    """)
+                ).fetchall()
+            }
 
         if "teamtemplate" not in tables:
             return
@@ -220,16 +257,19 @@ def _seed_team_templates_if_empty() -> None:
         if n > 0:
             return
 
+        # Get appropriate NOW function based on database
+        now_func = "datetime('now')" if _IS_SQLITE else "now()"
+
         for tmpl in SEED_TEAM_TEMPLATES:
             conn.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO teamtemplate (
                         name, description, color, category, roster_json, created_at, updated_at
                     )
                     VALUES (
                         :name, :description, :color, :category, :roster_json,
-                        datetime('now'), datetime('now')
+                        {now_func}, {now_func}
                     )
                     """
                 ),
