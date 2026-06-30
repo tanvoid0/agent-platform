@@ -21,6 +21,16 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # FKs inlined for SQLite — separate op.create_foreign_key is unsupported for this dialect.
+    from sqlalchemy import inspect, text
+
+    # Check if tables already exist (for idempotency with existing DBs)
+    bind = op.get_context().bind
+    inspector = inspect(bind)
+    existing_tables = {t.lower() for t in inspector.get_table_names()}
+
+    if "action_sets" in existing_tables:
+        return  # Tables already exist, skip
+
     op.create_table(
         "action_sets",
         sa.Column("id", sa.Integer(), nullable=False, primary_key=True),

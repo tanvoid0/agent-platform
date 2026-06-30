@@ -34,9 +34,6 @@ async def lifespan(app: FastAPI):
         logger.warning(
             "AGENT_PLATFORM_MASTER_KEY is not set; LLM proxy /v1 calls and planner chat will fail until it is set."
         )
-    from llm_proxy.services.local_backends import discover_local_llm_bases
-
-    await discover_local_llm_bases()
     yield
 
 

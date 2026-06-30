@@ -6,9 +6,13 @@
     "docker:up": "npm run sync:contract-enums && docker compose up --build",
     "docker:up:agent-only": "npm run sync:contract-enums && docker compose up --build",
     "postinstall": "python -m pip install -r app/requirements.txt",
-    "dev": "python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410"
+    "predev": "kill-port 18410 --silent",
+    "dev:server": "pnpm predev && python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410",
+    "dev:client": "cd ../flow-ui && pnpm dev",
+    "dev": "concurrently \"pnpm run dev:server\" \"pnpm run dev:client\""
   },
   "devDependencies": {
-    "concurrently": "^9.1.2"
+    "concurrently": "^9.1.2",
+    "kill-port": "^2.0.1"
   }
 }
