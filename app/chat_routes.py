@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -18,6 +19,9 @@ from llm_proxy_env import (
 )
 
 router = APIRouter(tags=["chat"])
+
+# Limit concurrent LLM proxy requests to prevent "too many concurrent requests" errors
+_llm_semaphore = asyncio.Semaphore(8)
 
 
 def _chat_resolved_defaults() -> dict[str, str]:
@@ -112,6 +116,7 @@ async def chat_completions(req: ChatCompletionRequest):
     """
     One-shot chat completion via the embedded LLM proxy (POST {base}/chat/completions).
     Does not create a Process; for multi-agent runs use POST /api/v1/processes.
+    Limited to 8 concurrent requests to prevent upstream "too many concurrent requests" errors.
     """
     key = llm_proxy_master_key()
     if not key:
@@ -120,39 +125,40 @@ async def chat_completions(req: ChatCompletionRequest):
             detail="AGENT_PLATFORM_MASTER_KEY is not set.",
         )
 
-    base = llm_proxy_base_url_v1()
-    fitted_messages, _ = fit_chat_messages_for_request([dict(m) for m in req.messages])
-    payload: dict[str, Any] = {"messages": fitted_messages}
-    if req.model is not None and req.model.strip():
-        sm = sanitize_llm_model_alias(req.model.strip())
-        if sm:
-            payload["model"] = sm
-    if req.tools is not None:
-        payload["tools"] = req.tools
-    if req.tool_choice is not None:
-        payload["tool_choice"] = req.tool_choice
-    if req.temperature is not None:
-        payload["temperature"] = req.temperature
-    if req.max_tokens is not None:
-        payload["max_tokens"] = req.max_tokens
-    else:
-        payload["max_tokens"] = max_output_tokens_default()
-    if req.top_p is not None:
-        payload["top_p"] = req.top_p
-    if req.response_format is not None:
-        payload["response_format"] = req.response_format
-    if req.stream is not None:
-        payload["stream"] = req.stream
+    async with _llm_semaphore:
+        base = llm_proxy_base_url_v1()
+        fitted_messages, _ = fit_chat_messages_for_request([dict(m) for m in req.messages])
+        payload: dict[str, Any] = {"messages": fitted_messages}
+        if req.model is not None and req.model.strip():
+            sm = sanitize_llm_model_alias(req.model.strip())
+            if sm:
+                payload["model"] = sm
+        if req.tools is not None:
+            payload["tools"] = req.tools
+        if req.tool_choice is not None:
+            payload["tool_choice"] = req.tool_choice
+        if req.temperature is not None:
+            payload["temperature"] = req.temperature
+        if req.max_tokens is not None:
+            payload["max_tokens"] = req.max_tokens
+        else:
+            payload["max_tokens"] = max_output_tokens_default()
+        if req.top_p is not None:
+            payload["top_p"] = req.top_p
+        if req.response_format is not None:
+            payload["response_format"] = req.response_format
+        if req.stream is not None:
+            payload["stream"] = req.stream
 
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
-    try:
-        async with httpx.AsyncClient(timeout=llm_proxy_http_timeout_seconds()) as client:
-            r = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}") from e
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+        try:
+            async with httpx.AsyncClient(timeout=llm_proxy_http_timeout_seconds()) as client:
+                r = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}") from e
 
-    try:
-        data = r.json()
-    except Exception:
-        return JSONResponse(content={"raw": r.text}, status_code=r.status_code)
-    return JSONResponse(content=data, status_code=r.status_code)
+        try:
+            data = r.json()
+        except Exception:
+            return JSONResponse(content={"raw": r.text}, status_code=r.status_code)
+        return JSONResponse(content=data, status_code=r.status_code)
