@@ -70,18 +70,25 @@ def _on_connect(dbapi_connection, _connection_record) -> None:
 _APP_DIR = Path(__file__).resolve().parent
 _ALEMBIC_CFG = Config(str(_APP_DIR / "alembic.ini"))
 
-_IS_SQLITE = engine.url.get_backend_name() == "sqlite"
-if _IS_SQLITE:
-    _db_path = Path(engine.url.database or "data/agent_platform.db")
+
+def _is_sqlite() -> bool:
+    """Checked against the *current* ``engine`` global, not cached at import.
+
+    Tests monkeypatch ``database.engine`` to an in-memory SQLite engine after this
+    module loads (e.g. when ``DATABASE_URL`` points at PostgreSQL); callers must
+    re-check the live engine rather than a value frozen at import time.
+    """
+    return engine.url.get_backend_name() == "sqlite"
 
 
 @contextmanager
 def _sqlite_startup_migration_lock():
     """Serialize schema work across uvicorn workers (each runs lifespan on SQLite)."""
-    if not _IS_SQLITE:
+    if not _is_sqlite():
         yield  # PostgreSQL handles this natively
         return
-    lock_path = _db_path.with_name(f"{_db_path.name}.startup.lock")
+    db_path = Path(engine.url.database or "data/agent_platform.db")
+    lock_path = db_path.with_name(f"{db_path.name}.startup.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+b")  # noqa: SIM115 — short-lived lock file handle
     timeout_s = float(os.getenv("AGENT_PLATFORM_SQLITE_STARTUP_LOCK_TIMEOUT_SECONDS", "120"))
@@ -145,7 +152,7 @@ def _ensure_sqlite_columns() -> None:
     Does not call ``apply_process_table_sqlite`` (run→process rename): Alembic revisions
     still reference the ``run`` table name until the rename migration runs.
     """
-    if not _IS_SQLITE:
+    if not _is_sqlite():
         return  # PostgreSQL handled by Alembic
 
     with engine.begin() as conn:
@@ -178,14 +185,23 @@ def create_db_and_tables() -> None:
         has_run = "run" in table_names
         has_alembic = "alembic_version" in table_names
 
-        if _IS_SQLITE:
+        if _is_sqlite():
             if (has_process or has_run) and not has_alembic:
                 _ensure_sqlite_columns()
 
-            logger.info("Starting Alembic migrations (SKIPPED due to hang on command.upgrade)")
-            # TODO: Fix Alembic upgrade hanging indefinitely on Windows
-            # command.upgrade(_ALEMBIC_CFG, "head")
-            logger.info("Alembic migrations skipped")
+            # The Windows hang (commit ca51947) was only ever observed against the
+            # on-disk DB file, plausibly an interaction with _sqlite_startup_migration_lock's
+            # file lock. In-memory DBs (pytest's `sqlite://` fixture) have no file to
+            # contend over, so run migrations normally there — skipping them left test
+            # runs with no schema at all ("no such table: ...").
+            is_memory_db = not engine.url.database
+            if is_memory_db:
+                logger.info("Running Alembic migrations for in-memory SQLite...")
+                command.upgrade(_ALEMBIC_CFG, "head")
+                logger.info("Alembic migrations complete")
+            else:
+                logger.info("Alembic migrations SKIPPED (command.upgrade hangs on Windows file-based SQLite)")
+                # TODO: Investigate and fix the root cause; see commit ca51947.
 
             from process_table_sqlite import apply_process_table_sqlite
             with engine.begin() as conn:
@@ -230,8 +246,9 @@ def _seed_team_templates_if_empty() -> None:
     from default_team_templates import SEED_TEAM_TEMPLATES
 
     with engine.begin() as conn:
+        is_sqlite = _is_sqlite()
         # Get table names compatible with both SQLite and PostgreSQL
-        if _IS_SQLITE:
+        if is_sqlite:
             tables = {
                 r[0]
                 for r in conn.execute(
@@ -258,7 +275,7 @@ def _seed_team_templates_if_empty() -> None:
             return
 
         # Get appropriate NOW function based on database
-        now_func = "datetime('now')" if _IS_SQLITE else "now()"
+        now_func = "datetime('now')" if is_sqlite else "now()"
 
         for tmpl in SEED_TEAM_TEMPLATES:
             conn.execute(

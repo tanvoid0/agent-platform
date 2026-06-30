@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence, Union
 
@@ -39,6 +40,7 @@ def upgrade() -> None:
     ).fetchone()
     if row is not None:
         return
+    now = datetime.now(timezone.utc)
     conn.execute(
         sa.text(
             """
@@ -47,7 +49,7 @@ def upgrade() -> None:
             )
             VALUES (
                 :name, :description, :color, :category, :roster_json,
-                now(), now()
+                :created_at, :updated_at
             )
             """
         ),
@@ -57,6 +59,8 @@ def upgrade() -> None:
             "color": tmpl["color"],
             "category": tmpl.get("category"),
             "roster_json": json.dumps(tmpl["roster"]),
+            "created_at": now,
+            "updated_at": now,
         },
     )
 

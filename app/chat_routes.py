@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 import httpx
@@ -20,8 +21,22 @@ from llm_proxy_env import (
 
 router = APIRouter(tags=["chat"])
 
-# Limit concurrent LLM proxy requests to prevent "too many concurrent requests" errors
-_llm_semaphore = asyncio.Semaphore(8)
+
+def _chat_max_concurrent_requests() -> int:
+    """
+    Caps requests in flight to the upstream LLM proxy at once. Many simulated agents
+    can fire chat calls in the same tick; this throttles them to what the configured
+    upstream (Ollama, AIML API, etc.) can actually sustain, queueing the rest instead
+    of letting them all hit the upstream and bounce off its own rate limiting.
+    """
+    raw = (os.getenv("AGENT_PLATFORM_CHAT_MAX_CONCURRENT") or "8").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 8
+
+
+_llm_semaphore = asyncio.Semaphore(_chat_max_concurrent_requests())
 
 
 def _chat_resolved_defaults() -> dict[str, str]:
@@ -116,7 +131,9 @@ async def chat_completions(req: ChatCompletionRequest):
     """
     One-shot chat completion via the embedded LLM proxy (POST {base}/chat/completions).
     Does not create a Process; for multi-agent runs use POST /api/v1/processes.
-    Limited to 8 concurrent requests to prevent upstream "too many concurrent requests" errors.
+    Concurrency capped by AGENT_PLATFORM_CHAT_MAX_CONCURRENT (default 8); excess
+    requests from simulated agents queue here instead of hitting the upstream at once.
+    The upstream call itself also retries on rate-limit responses (see upstream_http.py).
     """
     key = llm_proxy_master_key()
     if not key:

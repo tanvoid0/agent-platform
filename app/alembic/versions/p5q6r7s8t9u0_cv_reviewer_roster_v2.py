@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence, Union
 
@@ -41,7 +42,7 @@ def upgrade() -> None:
                 color = :color,
                 category = :category,
                 roster_json = :roster_json,
-                updated_at = now()
+                updated_at = :updated_at
             WHERE name = :name
             """
         ),
@@ -51,6 +52,7 @@ def upgrade() -> None:
             "color": tmpl["color"],
             "category": tmpl.get("category"),
             "roster_json": json.dumps(tmpl["roster"]),
+            "updated_at": datetime.now(timezone.utc),
         },
     )
 
@@ -101,7 +103,7 @@ def downgrade() -> None:
             SET description = :description,
                 category = NULL,
                 roster_json = :roster_json,
-                updated_at = now()
+                updated_at = :updated_at
             WHERE name = :name
             """
         ),
@@ -112,5 +114,6 @@ def downgrade() -> None:
                 "and impact, with a lead synthesizing clear, actionable feedback."
             ),
             "roster_json": json.dumps(legacy_roster),
+            "updated_at": datetime.now(timezone.utc),
         },
     )

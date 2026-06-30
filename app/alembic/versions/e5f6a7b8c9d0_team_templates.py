@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence, Union
 
@@ -52,12 +53,13 @@ def upgrade() -> None:
         )
 
     conn = op.get_bind()
+    now = datetime.now(timezone.utc)
     for tmpl in SEED_TEAM_TEMPLATES:
         conn.execute(
             sa.text(
                 """
                 INSERT INTO teamtemplate (name, description, color, roster_json, created_at, updated_at)
-                VALUES (:name, :description, :color, :roster_json, now(), now())
+                VALUES (:name, :description, :color, :roster_json, :created_at, :updated_at)
                 """
             ),
             {
@@ -65,6 +67,8 @@ def upgrade() -> None:
                 "description": tmpl["description"],
                 "color": tmpl["color"],
                 "roster_json": json.dumps(tmpl["roster"]),
+                "created_at": now,
+                "updated_at": now,
             },
         )
 

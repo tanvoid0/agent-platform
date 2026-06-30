@@ -86,6 +86,22 @@ def should_retry_transport(exc: httpx.RequestError, attempt: int, max_attempts: 
     )
 
 
+# Upstream providers (Ollama, AIML API, etc.) reject request bursts from many
+# concurrent agents with these status codes, or with a 4xx whose body names the
+# limit explicitly (e.g. AIML API returns "too many concurrent requests").
+_RATE_LIMIT_STATUSES = frozenset({429, 503})
+_RATE_LIMIT_PHRASES = ("too many concurrent", "rate limit", "rate_limit_exceeded", "too many requests")
+
+
+def is_rate_limited_response(status_code: int, body_text: str | None) -> bool:
+    if status_code in _RATE_LIMIT_STATUSES:
+        return True
+    if status_code >= 400 and body_text:
+        lowered = body_text.lower()
+        return any(p in lowered for p in _RATE_LIMIT_PHRASES)
+    return False
+
+
 def llm_proxy_error_from_httpx(exc: httpx.RequestError, context: str = "") -> LlmProxyError:
     code, msg = classify_httpx_error(exc, context)
     return LlmProxyError(502, code, msg)
@@ -124,6 +140,8 @@ class UpstreamHttpClient:
         *,
         max_retries: int | None = None,
         backoff_ms: int | None = None,
+        rate_limit_max_retries: int | None = None,
+        rate_limit_backoff_ms: int | None = None,
     ) -> None:
         self._max_retries = max(
             1,
@@ -133,11 +151,35 @@ class UpstreamHttpClient:
             10,
             backoff_ms if backoff_ms is not None else int(os.environ.get("ORCHESTRATOR_HTTP_RETRY_BACKOFF_MS", "120")),
         )
+        # Separate, more generous budget for "many agents at once" rate-limit responses
+        # (HTTP 429/503, or a 4xx body naming the limit) vs. raw connection failures.
+        self._rate_limit_max_retries = max(
+            1,
+            rate_limit_max_retries
+            if rate_limit_max_retries is not None
+            else int(os.environ.get("ORCHESTRATOR_HTTP_RATE_LIMIT_MAX_RETRIES", "6")),
+        )
+        self._rate_limit_backoff_ms = max(
+            10,
+            rate_limit_backoff_ms
+            if rate_limit_backoff_ms is not None
+            else int(os.environ.get("ORCHESTRATOR_HTTP_RATE_LIMIT_BACKOFF_MS", "400")),
+        )
 
-    def _backoff_seconds(self, attempt: int) -> float:
-        base = (self._backoff_ms / 1000.0) * (2**attempt)
+    def _backoff_seconds(self, attempt: int, backoff_ms: int | None = None) -> float:
+        base = ((backoff_ms if backoff_ms is not None else self._backoff_ms) / 1000.0) * (2**attempt)
         jitter = random.uniform(0, base * 0.25)
         return min(base + jitter, 30.0)
+
+    def _rate_limit_delay_seconds(self, response: httpx.Response, attempt: int) -> float:
+        """Prefer the upstream's own Retry-After hint when present."""
+        retry_after = response.headers.get("retry-after")
+        if retry_after:
+            try:
+                return min(max(float(retry_after), 0.0), 30.0)
+            except ValueError:
+                pass
+        return self._backoff_seconds(attempt, self._rate_limit_backoff_ms)
 
     async def get(
         self,
@@ -182,32 +224,53 @@ class UpstreamHttpClient:
         json_body: Any = None,
         timeout: float = 300.0,
         context: str = "POST",
+        retry_rate_limits: bool = True,
     ) -> httpx.Response:
-        last: httpx.RequestError | None = None
-        for attempt in range(self._max_retries):
+        transport_attempt = 0
+        rate_limit_attempt = 0
+        safe = _sanitize_url_for_log(url)
+        while True:
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
-                    return await client.post(url, headers=headers, json=json_body)
+                    response = await client.post(url, headers=headers, json=json_body)
             except httpx.RequestError as e:
-                last = e
-                safe = _sanitize_url_for_log(url)
-                if should_retry_transport(e, attempt, self._max_retries):
-                    delay = self._backoff_seconds(attempt)
+                if should_retry_transport(e, transport_attempt, self._max_retries):
+                    delay = self._backoff_seconds(transport_attempt)
                     logger.warning(
                         "retry %s attempt=%s/%s delay=%.2fs url=%s err=%s",
                         context,
-                        attempt + 1,
+                        transport_attempt + 1,
                         self._max_retries,
                         delay,
                         safe,
                         e.__class__.__name__,
                     )
                     await asyncio.sleep(delay)
+                    transport_attempt += 1
                     continue
                 logger.warning("post_failed %s url=%s err=%s", context, safe, e.__class__.__name__)
                 raise llm_proxy_error_from_httpx(e, context) from e
-        assert last is not None
-        raise llm_proxy_error_from_httpx(last, context) from last
+
+            if (
+                retry_rate_limits
+                and rate_limit_attempt < self._rate_limit_max_retries - 1
+                and is_rate_limited_response(response.status_code, response.text)
+            ):
+                delay = self._rate_limit_delay_seconds(response, rate_limit_attempt)
+                logger.warning(
+                    "rate_limited %s attempt=%s/%s delay=%.2fs url=%s status=%s",
+                    context,
+                    rate_limit_attempt + 1,
+                    self._rate_limit_max_retries,
+                    delay,
+                    safe,
+                    response.status_code,
+                )
+                await asyncio.sleep(delay)
+                rate_limit_attempt += 1
+                continue
+
+            return response
 
     async def open_stream(
         self,
@@ -218,35 +281,60 @@ class UpstreamHttpClient:
         timeout: float = 300.0,
         context: str = "chat_stream",
     ) -> tuple[httpx.Response, httpx.AsyncClient]:
-        """Open a streaming POST. Caller must drain the body and call ``aclose_stream``."""
-        last: httpx.RequestError | None = None
-        for attempt in range(self._max_retries):
+        """
+        Open a streaming POST. Caller must drain the body and call ``aclose_stream``.
+
+        Retries transport failures and upstream rate-limit responses (status only —
+        the body is unread at this point, so a 429/503 is closed and retried without
+        sniffing the message text).
+        """
+        transport_attempt = 0
+        rate_limit_attempt = 0
+        safe = _sanitize_url_for_log(url)
+        while True:
             client = httpx.AsyncClient(timeout=timeout)
             try:
                 req = client.build_request("POST", url, headers=headers, json=json_body)
                 response = await client.send(req, stream=True)
-                return response, client
             except httpx.RequestError as e:
                 await client.aclose()
-                last = e
-                safe = _sanitize_url_for_log(url)
-                if should_retry_transport(e, attempt, self._max_retries):
-                    delay = self._backoff_seconds(attempt)
+                if should_retry_transport(e, transport_attempt, self._max_retries):
+                    delay = self._backoff_seconds(transport_attempt)
                     logger.warning(
                         "retry %s attempt=%s/%s delay=%.2fs url=%s err=%s",
                         context,
-                        attempt + 1,
+                        transport_attempt + 1,
                         self._max_retries,
                         delay,
                         safe,
                         e.__class__.__name__,
                     )
                     await asyncio.sleep(delay)
+                    transport_attempt += 1
                     continue
                 logger.warning("stream_open_failed %s url=%s err=%s", context, safe, e.__class__.__name__)
                 raise llm_proxy_error_from_httpx(e, context) from e
-        assert last is not None
-        raise llm_proxy_error_from_httpx(last, context) from last
+
+            if (
+                rate_limit_attempt < self._rate_limit_max_retries - 1
+                and response.status_code in _RATE_LIMIT_STATUSES
+            ):
+                delay = self._rate_limit_delay_seconds(response, rate_limit_attempt)
+                logger.warning(
+                    "rate_limited %s attempt=%s/%s delay=%.2fs url=%s status=%s",
+                    context,
+                    rate_limit_attempt + 1,
+                    self._rate_limit_max_retries,
+                    delay,
+                    safe,
+                    response.status_code,
+                )
+                await aclose_stream(response, client)
+                await asyncio.sleep(delay)
+                rate_limit_attempt += 1
+                continue
+
+            return response, client
 
 
 default_upstream_client = UpstreamHttpClient()
