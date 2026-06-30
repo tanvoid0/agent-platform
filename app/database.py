@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 import time
@@ -6,6 +7,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 
 def _agent_platform_dotenv_path() -> Path:
@@ -164,7 +167,10 @@ def create_db_and_tables() -> None:
         if (has_process or has_run) and not has_alembic:
             _ensure_sqlite_columns()
 
-        command.upgrade(_ALEMBIC_CFG, "head")
+        logger.info("Starting Alembic migrations (SKIPPED due to hang on command.upgrade)")
+        # TODO: Fix Alembic upgrade hanging indefinitely on Windows
+        # command.upgrade(_ALEMBIC_CFG, "head")
+        logger.info("Alembic migrations skipped")
 
         with engine.begin() as conn:
             apply_process_table_sqlite(conn)
@@ -173,8 +179,13 @@ def create_db_and_tables() -> None:
             conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
             conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
 
+        logger.info("Starting team template seeding...")
         _seed_team_templates_if_empty()
+        logger.info("Team templates seeded")
+
+        logger.info("Starting todo domain seeding...")
         _seed_todo_domain_if_empty()
+        logger.info("Todo domain seeded")
 
 
 def _seed_todo_domain_if_empty() -> None:
