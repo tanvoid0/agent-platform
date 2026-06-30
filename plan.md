@@ -13,7 +13,7 @@ FastAPI service that orchestrates multi-agent **processes** (DAG runs) via an **
 | Surface | URL |
 |--------|-----|
 | HTTP API | `http://127.0.0.1:18410` — **`/processes/...`** (same routes also under **`/api/v1/processes/...`**). Team templates: **`/teams`** and **`/api/v1/teams`**. |
-| React app (Vite, `base: "/flow/"`) | **`/flow/`** — built to `app/static/dist`, served under **`/flow`**. Client routes live under `/flow/...`. |
+| React app (Vite, `base: "/app/"`) | **`/app/`** — built to `app/static/dist`, served under **`/app`**. Client routes live under `/app/...` (e.g. `/app/projects/:id` workspace). |
 | Jinja shell | **`/ui`** — lightweight HTML host; **`/`** redirects to **`/ui`**. |
 | Embedded LLM proxy (`/v1`) | same host as API — default `http://127.0.0.1:18410/v1` |
 
@@ -31,13 +31,13 @@ OpenAPI is available from the FastAPI app on the same port (paths depend on rout
 | Team templates | `app/teams_routes.py`, `app/team_schema.py`, `web/src/components/TeamsPage.tsx` |
 | Approve / retry / auto-approve | `app/process_approval.py` |
 | Tools, MCP client | `app/tools_policy.py`, `app/tool_handlers.py`, `app/mcp_streamable_client.py` |
-| Frontend | `web/src/` (TanStack Query, `@xyflow/react`; entry under **`/flow/`**) |
+| Frontend | `web/src/` (TanStack Query, `@xyflow/react`; entry under **`/app/`**) |
 | ADRs | `docs/adr/` |
 
 ## ADRs
 
 1. `0001` — orchestration FSM, HTTP-first, SQLite.
-2. `0002` — React + Vite + TanStack Query + `@xyflow/react` (app served at **`/flow/`**).
+2. `0002` — React + Vite + TanStack Query + `@xyflow/react` (app served at **`/app/`**).
 3. `0003` — **future** 3D/R3F boundary (lazy load, server authority); see **Visual layer** below.
 
 ## Visual layer: pixel art first, 3D later
@@ -65,7 +65,7 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
 
 ## Implemented (summary)
 
-REST: processes list/create/detail, approve, cancel, retry, task review, **`GET /processes/{id}/events`** (filterable; `limit` capped server-side, `after_id` for pagination), **`GET /processes/{id}/stream`** (SSE). Duplicate **`/api/v1/...`** paths for the same routers. Statuses: process (`planning` … `completed`/`failed`/`cancelled`); task (`pending`, `running`, `awaiting_review`, …). Planner JSON validated (Pydantic, acyclicity) on plan and approve. Task review + sub-DAG expansion after approval; failure fields, `total_cost`, tool invocations, optional timeouts and auto-approve. SQLite + Alembic (legacy stamp path). **Web UI (`/flow/`):** graph/board/timeline/**events**, inspector, approve DAG, cancel, retry, review mutations, recent processes, 2D polish (edges, minimap, status visuals), **graph lineage** (`parent_client_uuid`: depth layout, tint, parent hint, visibility **All / ≤1 / Roots**). **Export JSON** in `ProcessMainPane` (`downloadProcessExport` → process + tasks + **all** events via paginated fetch). Tools: echo, http_fetch, MCP streamable, optional nested chat; planner/expansion retries and subdecompose env knobs. Tests under `app/tests/` and `web/src/**/*.test.ts`.
+REST: processes list/create/detail, approve, cancel, retry, task review, **`GET /processes/{id}/events`** (filterable; `limit` capped server-side, `after_id` for pagination), **`GET /processes/{id}/stream`** (SSE). Duplicate **`/api/v1/...`** paths for the same routers. Statuses: process (`planning` … `completed`/`failed`/`cancelled`); task (`pending`, `running`, `awaiting_review`, …). Planner JSON validated (Pydantic, acyclicity) on plan and approve. Task review + sub-DAG expansion after approval; failure fields, `total_cost`, tool invocations, optional timeouts and auto-approve. SQLite + Alembic (legacy stamp path). **Web UI (`/app/`):** graph/board/timeline/**events**, inspector, approve DAG, cancel, retry, review mutations, recent processes, 2D polish (edges, minimap, status visuals), **graph lineage** (`parent_client_uuid`: depth layout, tint, parent hint, visibility **All / ≤1 / Roots**). **Export JSON** in `ProcessMainPane` (`downloadProcessExport` → process + tasks + **all** events via paginated fetch). Tools: echo, http_fetch, MCP streamable, optional nested chat; planner/expansion retries and subdecompose env knobs. Tests under `app/tests/` and `web/src/**/*.test.ts`.
 
 ## Team templates page — Delegation as reference (not a port)
 
@@ -81,6 +81,21 @@ REST: processes list/create/detail, approve, cancel, retry, task review, **`GET 
 4. **Not in scope (short term):** human-in-the-loop toggles, capabilities checklist, separate “User (You)” node — those belong to a richer agent model than `RosterRole` today.
 
 **Deep links:** `?team=<id>` / `?team=new` + **Copy link** (see `web/src/lib/teamUrl.ts`).
+
+## Backlog (product)
+
+See **`docs/practical-assistant-roadmap.md`** for the phased plan toward a practical multi-agent daily planning assistant (domain templates, interactive forms, server authority).
+
+- **Project sub-groups:** `Project` is a flat folder today (no `parent_id`, `category`, or tags). For career workflows, consider nested groups (e.g. *Job search 2026* → *Acme SWE*, *Beta PM*) with list/filter in `/app/projects` and optional default `project_id` on new processes. Schema: `parent_project_id` + `category` (or tags JSON); API + UI filters mirror team template **category** chips.
+- **Document routing (later):** per-model native PDF/vision vs derived markdown (capability flags on providers); optional page PNGs for vision models.
+
+## Documents (implemented)
+
+- **`POST /api/v1/projects/{id}/workspace/upload`** — multipart PDF / `.txt` / `.md`; PDF → `pymupdf` extract to `<path>.derived/structured.md` + `manifest.json`.
+- **`GET .../workspace/file`** — PDF paths return derived markdown (`content_kind: pdf_derived_markdown`).
+- **DAG `workspace_read`** — same derived content for PDFs when tools are enabled.
+- **Chat** — paperclip on `ChatComposer`; requires server project for PDFs; text can inline without project. Content is injected into the user turn for agents.
+- **Dependency:** `pymupdf` in `app/requirements.txt`.
 
 ## Next steps
 
@@ -98,7 +113,7 @@ REST: processes list/create/detail, approve, cancel, retry, task review, **`GET 
 
 ## Notes
 
-- Workspace **`AGENTS.md`**: agent-platform **18410** (API + embedded LLM proxy); UI at **`/ui`**, **`/flow`**; REST uses **`processes`** / **`teams`** (and **`/api/v1/...`** mirrors). Orchestration before heavy visual coupling.
+- Workspace **`AGENTS.md`**: agent-platform **18410** (API + embedded LLM proxy); UI at **`/ui`**, **`/app`**; REST uses **`processes`** / **`teams`** (and **`/api/v1/...`** mirrors). Orchestration before heavy visual coupling.
 
 ---
 

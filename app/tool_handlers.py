@@ -37,6 +37,7 @@ from llm_proxy_env import (
     llm_proxy_master_key,
 )
 from tool_context import ToolContext
+from document_service import read_workspace_file_for_llm
 from workspace_service import (
     WorkspaceError,
     ensure_process_workspace,
@@ -635,8 +636,8 @@ def _run_workspace_tools(name: str, args: dict[str, Any], context: ToolContext |
             if not isinstance(path, str) or not path.strip():
                 return json.dumps({"error": "invalid_arguments", "detail": "path is required"})
             full = _dag_workspace_relative(path.strip(), context)
-            text = read_text_file(pid, full)
-            return json.dumps({"path": full, "content": text})
+            payload = read_workspace_file_for_llm(pid, full)
+            return json.dumps(payload)
         if name == "workspace_write":
             path = args.get("path", "")
             content = args.get("content", "")

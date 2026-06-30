@@ -1,29 +1,31 @@
-# Agent Platform API + embedded LLM proxy + Vite UI. Run from this directory:
-#   docker-compose up --build
+# Agent Platform API + embedded LLM proxy (backend only).
 #   docker compose up --build
 #
-# UI: http://127.0.0.1:3333/flow/  |  API + OpenAI-compatible /v1: http://127.0.0.1:18410
+# Config UI: http://127.0.0.1:18410/config  |  API: http://127.0.0.1:18410/docs
+# Optional Flow UI (React): from repo root — `docker compose --profile ui up --build`
 #
-# SQLite + workspaces live on the named volume `agent_platform_data` (survives `docker compose build` / `up --build`).
-# LLM proxy config + .env live under /app/data/llm (config.yaml, .env). Override with CONFIG_DIR / CONFIG_PATH.
-# Removing data: `docker compose down -v` (only then is the volume deleted). To reset DB only, stop the stack and
-# `docker volume rm <project>_agent_platform_data` or prune volumes with care.
-#
-# Set AGENT_PLATFORM_MASTER_KEY in agent-platform/.env (bearer for /v1). Flow Settings → LLM proxy edits the same keys on disk.
+# SQLite + workspaces live on the named volume `agent_platform_data`.
+# LLM proxy config + .env live under /app/data/llm (config.yaml, .env).
 
 services:
   agent-platform:
     build:
       context: .
       dockerfile: Dockerfile
-    # No --reload: bind-mount + WatchFiles on Windows often reload-loops and exits (Exited 0).
-    # Use env-tuned workers/threads; defaults target high-core desktops.
     command: >
-      sh -c "uvicorn main:app --host 0.0.0.0 --port 18410
-      --workers ${AGENT_PLATFORM_UVICORN_WORKERS:-8}
-      --timeout-keep-alive ${AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS:-30}"
+      sh -c "workers=$${AGENT_PLATFORM_UVICORN_WORKERS:-1};
+      db=$${AGENT_PLATFORM_DB_PATH:-/app/data/agent_platform.db};
+      case \"$$db\" in *.db|*.sqlite|*.sqlite3)
+        if [ \"$$workers\" != \"1\" ]; then
+          echo \"WARNING: SQLite ($$db) — clamping uvicorn workers to 1 ($$workers requested). Set AGENT_PLATFORM_UVICORN_WORKERS=1 or use Postgres for multi-worker.\";
+          workers=1;
+        fi;;
+      esac;
+      exec uvicorn main:app --host 0.0.0.0 --port 18410
+      --workers $$workers
+      --timeout-keep-alive $${AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS:-30}"
     ports:
-      - "127.0.0.1:18410:18410"
+      - "18410:18410"
     env_file:
       - .env
     environment:
@@ -40,9 +42,6 @@ services:
       OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-16}
       MKL_NUM_THREADS: ${MKL_NUM_THREADS:-16}
       NUMEXPR_NUM_THREADS: ${NUMEXPR_NUM_THREADS:-16}
-      # Leave orchestrator fix off so HTTP self-calls to :18410 stay on loopback inside the container.
-      # LM Studio / Ollama on the host: keep config/agent_platform.yaml (or env) as 127.0.0.1 —
-      # the server rewrites those to host.docker.internal when /.dockerenv is present.
       AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX: "0"
       AGENT_PLATFORM_LOCAL_LLM_DOCKER_FIX: "1"
     volumes:
@@ -59,30 +58,6 @@ services:
             - "*.pyc"
         - action: rebuild
           path: ./app/requirements.txt
-    restart: unless-stopped
-
-  agent-platform-ui:
-    build:
-      context: ./web
-      dockerfile: Dockerfile
-    ports:
-      - "127.0.0.1:3333:3333"
-    environment:
-      AGENT_PLATFORM_PROXY_TARGET: http://agent-platform:18410
-    develop:
-      watch:
-        - action: sync
-          path: ./web
-          target: /app
-          ignore:
-            - node_modules/
-            - dist/
-        - action: rebuild
-          path: ./web/package.json
-        - action: rebuild
-          path: ./web/pnpm-lock.yaml
-    depends_on:
-      - agent-platform
     restart: unless-stopped
 
 volumes:

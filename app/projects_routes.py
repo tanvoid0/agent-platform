@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from sqlmodel import Session, select
+from sqlmodel import Session, select, update
 
 from database import get_session
 from models import Process, Project
 from workspace_service import delete_project_workspace
+from todos.services.planning_context import get_planning_context, patch_planning_context
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -49,6 +51,30 @@ class ProjectSummary(BaseModel):
     color: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class ProjectWorkspaceStateOut(BaseModel):
+    payload: dict | None = None
+    updated_at: datetime | None = None
+
+
+class ProjectWorkspaceStatePut(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    payload: dict = Field(default_factory=dict)
+
+
+class ProjectPlanningContextOut(BaseModel):
+    project_id: int
+    last_todo_board_id: int | None
+    onboarding_dismissed: bool = False
+
+
+class ProjectPlanningContextPatch(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    last_todo_board_id: int | None = None
+    onboarding_dismissed: bool | None = None
 
 
 @router.get("/")
@@ -136,14 +162,69 @@ def update_project(
     )
 
 
+@router.get("/{project_id}/workspace-state")
+def get_project_workspace_state(project_id: int, session: Session = Depends(get_session)):
+    row = session.get(Project, project_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    payload = None
+    if row.workspace_payload_json:
+        try:
+            parsed = json.loads(row.workspace_payload_json)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except json.JSONDecodeError:
+            payload = None
+    return ProjectWorkspaceStateOut(payload=payload, updated_at=row.updated_at)
+
+
+@router.put("/{project_id}/workspace-state")
+def put_project_workspace_state(
+    project_id: int,
+    req: ProjectWorkspaceStatePut,
+    session: Session = Depends(get_session),
+):
+    row = session.get(Project, project_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    row.workspace_payload_json = json.dumps(req.payload, ensure_ascii=False)
+    row.updated_at = datetime.utcnow()
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return ProjectWorkspaceStateOut(payload=req.payload, updated_at=row.updated_at)
+
+
+@router.get("/{project_id}/planning-context", response_model=ProjectPlanningContextOut)
+def get_project_planning_context(project_id: int, session: Session = Depends(get_session)):
+    ctx = get_planning_context(session, project_id)
+    return ProjectPlanningContextOut(**ctx)
+
+
+@router.patch("/{project_id}/planning-context", response_model=ProjectPlanningContextOut)
+def patch_project_planning_context(
+    project_id: int,
+    req: ProjectPlanningContextPatch,
+    session: Session = Depends(get_session),
+):
+    fields = req.model_dump(exclude_unset=True)
+    last_set = "last_todo_board_id" in fields
+    ctx = patch_planning_context(
+        session,
+        project_id,
+        last_todo_board_id=fields.get("last_todo_board_id"),
+        last_todo_board_set=last_set,
+        onboarding_dismissed=fields.get("onboarding_dismissed"),
+    )
+    return ProjectPlanningContextOut(**ctx)
+
+
 @router.delete("/{project_id}")
 def delete_project(project_id: int, session: Session = Depends(get_session)):
     row = session.get(Project, project_id)
     if not row:
         raise HTTPException(status_code=404, detail="Project not found")
-    for proc in session.exec(select(Process).where(Process.project_id == project_id)).all():
-        proc.project_id = None
-        session.add(proc)
+    session.exec(update(Process).where(Process.project_id == project_id).values(project_id=None))
     session.delete(row)
     session.commit()
     delete_project_workspace(project_id)

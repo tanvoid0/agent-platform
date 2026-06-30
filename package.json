@@ -4,15 +4,11 @@
   "scripts": {
     "sync:contract-enums": "python scripts/sync_contract_enums.py",
     "docker:up": "npm run sync:contract-enums && docker compose up --build",
-    "docker:up:agent-only": "npm run sync:contract-enums && docker compose -f docker-compose.agent-only.yml up --build",
-    "postinstall": "pnpm install --prefix web && python -m pip install -r app/requirements.txt",
-    "build": "pnpm --prefix web build",
-    "dev": "concurrently -k -n api,web -c blue,green \"python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410 --reload\" \"npm run dev --prefix web\""
+    "docker:up:agent-only": "npm run sync:contract-enums && docker compose up --build",
+    "postinstall": "python -m pip install -r app/requirements.txt",
+    "dev": "python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410 --reload"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
-  },
-  "dependencies": {
-    "pnpm": "^10.33.0"
   }
 }

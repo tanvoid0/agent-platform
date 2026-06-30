@@ -8,6 +8,8 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import create_engine
 
 import models  # noqa: F401 — register tables on SQLModel.metadata
+import todos.models  # noqa: F401 — todo board tables
+import assistant.models  # noqa: F401 — assistant tables
 from database import create_db_and_tables
 from llm_proxy.core.provider_config import clear_runtime_provider_bases
 from main import app

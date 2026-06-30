@@ -269,6 +269,77 @@ async def call_llm(
     return content, tokens, cost
 
 
+async def call_llm_tool_proposals(
+    messages: List[Dict[str, Any]],
+    model: str | None = None,
+    *,
+    tools: list[dict[str, Any]],
+    temperature: float = 0.7,
+) -> tuple[str, list[dict[str, Any]], int, float]:
+    """
+    Single chat completion with tools. Returns proposed tool calls without executing them.
+
+    Returns (assistant_content, tool_calls, total_tokens, cost_usd).
+    """
+    if not tools:
+        content, tokens, cost = await call_llm(messages, model=model, temperature=temperature)
+        return content, [], tokens, cost
+
+    key = llm_proxy_master_key()
+    if not key:
+        raise LLMConfigurationError(
+            "AGENT_PLATFORM_MASTER_KEY is not set. Add it to agent-platform/.env (Bearer for /v1). "
+            "See .env.example."
+        )
+
+    base = llm_proxy_base_url_v1()
+    url = f"{base}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+    raw_model = (model or "").strip() or _default_subagent_model()
+    resolved_model = sanitize_llm_model_alias(raw_model)
+    conversation, _ = fit_chat_messages_for_request([dict(m) for m in messages])
+    payload: Dict[str, Any] = {
+        "messages": conversation,
+        "temperature": temperature,
+        "max_tokens": max_output_tokens_default(),
+        "tools": tools,
+        "tool_choice": "auto",
+    }
+    if resolved_model:
+        payload["model"] = resolved_model
+
+    http_timeout = llm_proxy_http_timeout_seconds()
+    try:
+        async with httpx.AsyncClient(timeout=http_timeout) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            raise LLMAuthenticationError(
+                "LLM proxy returned 401: set AGENT_PLATFORM_MASTER_KEY in agent-platform/.env to match "
+                "the value used for Bearer auth on /v1."
+            ) from None
+        raise LLMRequestError(_llm_proxy_http_error_message(e.response.status_code, e.response)) from None
+    except httpx.RequestError as e:
+        raise LLMTransportError(
+            f"Could not reach the LLM proxy at {base}. "
+            "Ensure the embedded LLM proxy is reachable (same process; default port 18410)."
+        ) from e
+
+    data = response.json()
+    usage = data.get("usage") or {}
+    tokens = int(usage.get("total_tokens", 0) or 0)
+    cost = usage_cost_from_completion_response(data)
+    msg = data["choices"][0]["message"]
+    content = str(msg.get("content") or "")
+    tool_calls = msg.get("tool_calls") or []
+    return content, tool_calls, tokens, cost
+
+
 def _truncate_for_prompt(text: str, max_tokens: int | None = None) -> str:
     mt = subdag_parent_output_max_tokens() if max_tokens is None else max_tokens
     return truncate_text_to_tokens(str(text).strip(), mt)

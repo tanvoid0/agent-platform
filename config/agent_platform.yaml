@@ -15,6 +15,8 @@ env:
   # You may instead set a LAN IP here (e.g. LM Studio "Serve on Local Network") — no rewrite needed.
   OLLAMA_API_BASE: "http://127.0.0.1:11434"
   LM_STUDIO_API_BASE: "http://127.0.0.1:1234"
+  # Embedded OpenAI-compatible proxy default when clients omit model / YAML has no defaults block.
+  DEFAULT_PROVIDER: "ollama"
 
   # Internal HTTP timeout to the embedded LLM proxy (seconds); aligns with long Ollama generations.
   AGENT_PLATFORM_ORCHESTRATOR_TIMEOUT_SECONDS: 600

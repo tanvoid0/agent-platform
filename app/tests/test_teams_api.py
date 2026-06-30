@@ -43,6 +43,9 @@ def test_teams_list_includes_seed(client, test_engine):
         t for t in data["teams"] if t["name"] == "Autonomous Product Engineering Team"
     )
     assert seed.get("role_count") == 5
+    cv = next(t for t in data["teams"] if t["name"] == "CV Reviewer Agency")
+    assert cv.get("role_count") == 5
+    assert cv.get("category") == "Career"
 
 
 def test_teams_crud(client, test_engine):

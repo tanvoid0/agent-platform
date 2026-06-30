@@ -21,7 +21,7 @@
 <body>
   <h1>Agent Platform HTTP API</h1>
   <p class="muted">Use this service from any UI or backend. Prefer versioned paths under <code>/api/v1</code>. Legacy unprefixed routes (<code>/processes</code>, <code>/teams</code>) behave the same.</p>
-  <p><a href="/docs">OpenAPI (Swagger)</a> · <a href="/ui">Minimal UI</a> · <a href="/flow/">Flow UI</a></p>
+  <p><a href="/docs">OpenAPI (Swagger)</a> · <a href="/config">LLM config</a> · <a href="/ui">Process demo</a></p>
 
   <details open>
     <summary>Overview</summary>
@@ -69,7 +69,7 @@
 
   <details>
     <summary>CORS</summary>
-    <p>Set <code>CORS_ALLOW_ORIGINS</code> to a comma-separated list of browser origins (for example <code>http://localhost:5173</code>). Default when unset is <code>*</code>.</p>
+    <p>Set <code>CORS_ALLOW_ORIGINS</code> to a comma-separated list of browser origins (for example <code>http://localhost:3333</code>). Default when unset is <code>*</code> (credentials disabled with wildcard). The Vite dev UI should use same-origin requests via the dev proxy unless you set <code>VITE_API_ORIGIN</code>.</p>
   </details>
 
   <details>

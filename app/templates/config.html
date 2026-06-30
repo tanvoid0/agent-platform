@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Platform · LLM config</title>
+  <style>
+    :root {
+      font-family: system-ui, sans-serif;
+      line-height: 1.5;
+      color: #0f172a;
+      background: #f8fafc;
+    }
+    body { max-width: 52rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+    h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
+    h2 { font-size: 1.1rem; margin: 1.75rem 0 0.75rem; }
+    .muted { color: #64748b; font-size: 0.9rem; }
+    .card {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1rem 0;
+    }
+    label { display: block; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: #64748b; margin: 0.75rem 0 0.35rem; }
+    input, select, textarea, button { font: inherit; }
+    input[type="text"], input[type="password"], select, textarea {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 0.5rem 0.65rem;
+      background: #fff;
+    }
+    textarea { min-height: 12rem; font-family: ui-monospace, monospace; font-size: 0.85rem; }
+    pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow: auto; font-size: 0.8rem; }
+    .row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; margin-top: 0.75rem; }
+    button { padding: 0.45rem 0.9rem; border-radius: 8px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .error { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; padding: 0.65rem 0.85rem; border-radius: 8px; margin: 0.75rem 0; }
+    .ok { color: #166534; background: #f0fdf4; border: 1px solid #bbf7d0; padding: 0.65rem 0.85rem; border-radius: 8px; margin: 0.75rem 0; }
+    .hint { font-size: 0.85rem; color: #64748b; margin: 0.25rem 0; }
+    .masked { font-size: 0.85rem; color: #64748b; font-family: ui-monospace, monospace; }
+    nav a { margin-right: 1rem; }
+    #auth-bar { display: none; margin-bottom: 1rem; }
+    #auth-bar.visible { display: block; }
+  </style>
+</head>
+<body>
+  <nav class="muted">
+    <a href="/config">Config</a>
+    <a href="/docs">OpenAPI</a>
+    <a href="/api-guide">API guide</a>
+    <a href="/ui">Process demo</a>
+  </nav>
+
+  <h1>Agent Platform</h1>
+  <p class="muted">Configure the embedded LLM proxy: default provider, model, API keys, and <code>config.yaml</code>.</p>
+
+  <div id="auth-bar" class="card">
+    <label for="api-key">API key (Bearer)</label>
+    <p class="hint">Required when <code>AGENT_PLATFORM_MASTER_KEY</code> is set on the server.</p>
+    <div class="row">
+      <input type="password" id="api-key" autocomplete="off" placeholder="Paste master key" style="flex:1;min-width:12rem" />
+      <button type="button" id="btn-save-key">Use key</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+
+  <section class="card" id="defaults-card" hidden>
+    <h2 style="margin-top:0">Default LLM</h2>
+    <p class="hint">Local providers (Ollama, LM Studio) are listed first when configured in <code>config.yaml</code>.</p>
+    <label for="route-select">Configured route</label>
+    <select id="route-select"><option value="">Loading…</option></select>
+    <label for="model-select">Default model</label>
+    <select id="model-select" disabled><option value="">Select a route first</option></select>
+    <p class="hint" id="models-meta"></p>
+  </section>
+
+  <form id="env-form" class="card" hidden>
+    <h2 style="margin-top:0">Environment</h2>
+    <p class="hint">Leave secret fields blank to keep the current value. Restart the server after saving env vars.</p>
+    <div id="env-fields"></div>
+    <div class="row">
+      <button type="submit" class="primary">Save environment</button>
+    </div>
+  </form>
+
+  <form id="yaml-form" class="card" hidden>
+    <h2 style="margin-top:0">config.yaml</h2>
+    <p class="hint">Model aliases and provider blocks. Validated against the server schema on save.</p>
+    <textarea id="yaml-text" spellcheck="false"></textarea>
+    <div class="row">
+      <button type="submit" class="primary">Save config.yaml</button>
+    </div>
+  </form>
+
+  <section class="card" id="snippet-card" hidden>
+    <h2 style="margin-top:0">CLI clients</h2>
+    <pre id="snippet-text"></pre>
+  </section>
+
+  <script>
+    const KEY_STORAGE = "agent-platform-config-api-key";
+    const ENV_FIELDS = [
+      ["AGENT_PLATFORM_MASTER_KEY", "Bearer token for /v1", true],
+      ["GEMINI_API_KEY", "Google Gemini API key", true],
+      ["AIMLAPI_API_KEY", "AIMLAPI API key", true],
+      ["AIMLAPI_OPENAI_BASE", "AIMLAPI OpenAI base URL", false],
+      ["OLLAMA_API_BASE", "Ollama base URL", false],
+      ["LM_STUDIO_API_BASE", "LM Studio server base (no /v1)", false],
+      ["LM_STUDIO_API_KEY", "Optional LM Studio Bearer key", true],
+    ];
+
+    let apiKey = sessionStorage.getItem(KEY_STORAGE) || "";
+    let envMeta = {};
+    let effectiveDefaults = {};
+    let draft = {};
+
+    const statusEl = document.getElementById("status");
+    const authBar = document.getElementById("auth-bar");
+
+    function setStatus(msg, kind) {
+      statusEl.innerHTML = msg ? `<div class="${kind || "error"}">${msg}</div>` : "";
+    }
+
+    function headers(json) {
+      const h = {};
+      if (json) h["Content-Type"] = "application/json";
+      if (apiKey) h["Authorization"] = "Bearer " + apiKey;
+      return h;
+    }
+
+    async function api(path, opts) {
+      const r = await fetch(path, { ...opts, headers: { ...headers(opts && opts.body), ...(opts && opts.headers) } });
+      const text = await r.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      if (r.status === 401) {
+        authBar.classList.add("visible");
+        throw new Error("Unauthorized — enter the API key above.");
+      }
+      if (!r.ok) {
+        const detail = data && data.detail ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : text;
+        throw new Error(detail || ("HTTP " + r.status));
+      }
+      return data;
+    }
+
+    function envPlain(meta) {
+      return meta && "value" in meta ? (meta.value || "") : "";
+    }
+
+    function renderEnvFields() {
+      const root = document.getElementById("env-fields");
+      root.innerHTML = "";
+      for (const [key, label, secret] of ENV_FIELDS) {
+        const meta = envMeta[key] || {};
+        const wrap = document.createElement("div");
+        const lab = document.createElement("label");
+        lab.textContent = key + " — " + label;
+        wrap.appendChild(lab);
+        if (secret && meta.set && meta.masked) {
+          const m = document.createElement("p");
+          m.className = "masked";
+          m.textContent = "Current: " + meta.masked;
+          wrap.appendChild(m);
+        } else if (!secret && meta.set) {
+          const m = document.createElement("p");
+          m.className = "masked";
+          m.textContent = "Stored: " + envPlain(meta);
+          wrap.appendChild(m);
+        }
+        const input = document.createElement("input");
+        input.type = secret ? "password" : "text";
+        input.name = key;
+        input.id = "env-" + key;
+        input.autocomplete = "off";
+        input.placeholder = secret ? "Leave blank to keep" : (effectiveDefaults[key] || "");
+        if (key === "DEFAULT_PROVIDER" || key === "DEFAULT_MODEL") continue;
+        wrap.appendChild(input);
+        root.appendChild(wrap);
+      }
+
+      const dpWrap = document.createElement("div");
+      dpWrap.innerHTML = `
+        <label for="env-DEFAULT_PROVIDER">DEFAULT_PROVIDER</label>
+        <select id="env-DEFAULT_PROVIDER" name="DEFAULT_PROVIDER">
+          <option value="">Unset (use config.yaml)</option>
+          <option value="ollama">Ollama</option>
+          <option value="lm_studio">LM Studio</option>
+          <option value="aimlapi">AIMLAPI</option>
+          <option value="gemini">Gemini</option>
+        </select>
+        <label for="env-DEFAULT_MODEL">DEFAULT_MODEL</label>
+        <input type="text" id="env-DEFAULT_MODEL" name="DEFAULT_MODEL" autocomplete="off" placeholder="Model id for active provider" />
+      `;
+      root.appendChild(dpWrap);
+      document.getElementById("env-DEFAULT_PROVIDER").value = draft.DEFAULT_PROVIDER || "";
+      document.getElementById("env-DEFAULT_MODEL").value = draft.DEFAULT_MODEL || "";
+    }
+
+    async function loadModelsForRoute(alias) {
+      const sel = document.getElementById("model-select");
+      const meta = document.getElementById("models-meta");
+      if (!alias) {
+        sel.innerHTML = '<option value="">Select a route first</option>';
+        sel.disabled = true;
+        meta.textContent = "";
+        return;
+      }
+      sel.disabled = true;
+      sel.innerHTML = '<option value="">Loading models…</option>';
+      try {
+        const data = await api("/api/v1/llm-proxy/ui/providers/" + encodeURIComponent(alias) + "/models");
+        const models = data.models || [];
+        sel.innerHTML = '<option value="">(use server default)</option>' +
+          models.map((m) => `<option value="${m}">${m}</option>`).join("");
+        sel.disabled = false;
+        meta.textContent = "Source: " + (data.source || "unknown") + (models.length ? " · " + models.length + " models" : "");
+        const stored = draft.DEFAULT_MODEL || "";
+        if (stored && [...sel.options].some((o) => o.value === stored)) sel.value = stored;
+      } catch (e) {
+        sel.innerHTML = '<option value="">Failed to load</option>';
+        meta.textContent = String(e.message || e);
+      }
+    }
+
+    async function loadAll() {
+      setStatus("Loading…", "hint");
+      try {
+        const [envRes, snip, providersRes] = await Promise.all([
+          api("/api/v1/llm-proxy/env"),
+          api("/api/v1/llm-proxy/snippet").catch(() => ({ snippet: "", public_base: "" })),
+          api("/api/v1/llm-proxy/ui/providers"),
+        ]);
+        envMeta = envRes.keys || {};
+        effectiveDefaults = envRes.effective_defaults || {};
+        const rs = envRes.resolved_defaults || {};
+        draft.DEFAULT_PROVIDER = envPlain(envMeta.DEFAULT_PROVIDER) || rs.provider || "";
+        draft.DEFAULT_MODEL = envPlain(envMeta.DEFAULT_MODEL) || rs.model || "";
+
+        renderEnvFields();
+        document.getElementById("env-form").hidden = false;
+        document.getElementById("defaults-card").hidden = false;
+
+        const routeSel = document.getElementById("route-select");
+        const providers = providersRes.providers || [];
+        routeSel.innerHTML = providers.length
+          ? providers.map((p) => `<option value="${p.id}">${p.label || p.id}</option>`).join("")
+          : '<option value="">No routes in config.yaml</option>';
+        const match = providers.find((p) => p.id === draft.DEFAULT_PROVIDER || p.kind === draft.DEFAULT_PROVIDER);
+        if (match) routeSel.value = match.id;
+        await loadModelsForRoute(routeSel.value);
+
+        let yamlText = "";
+        try {
+          const y = await api("/api/v1/llm-proxy/config-yaml");
+          yamlText = y.content || "";
+        } catch (e) {
+          yamlText = "# config.yaml\n# Save to create the file on the server.\n";
+        }
+        document.getElementById("yaml-text").value = yamlText;
+        document.getElementById("yaml-form").hidden = false;
+
+        if (snip.snippet) {
+          document.getElementById("snippet-text").textContent = snip.snippet;
+          document.getElementById("snippet-card").hidden = false;
+        }
+
+        authBar.classList.remove("visible");
+        setStatus("");
+      } catch (e) {
+        setStatus(String(e.message || e), "error");
+      }
+    }
+
+    document.getElementById("btn-save-key").addEventListener("click", () => {
+      apiKey = document.getElementById("api-key").value.trim();
+      if (apiKey) sessionStorage.setItem(KEY_STORAGE, apiKey);
+      else sessionStorage.removeItem(KEY_STORAGE);
+      void loadAll();
+    });
+
+    document.getElementById("route-select").addEventListener("change", (e) => {
+      draft.DEFAULT_PROVIDER = e.target.value;
+      document.getElementById("env-DEFAULT_PROVIDER").value = e.target.value;
+      void loadModelsForRoute(e.target.value);
+    });
+
+    document.getElementById("model-select").addEventListener("change", (e) => {
+      draft.DEFAULT_MODEL = e.target.value;
+      document.getElementById("env-DEFAULT_MODEL").value = e.target.value;
+    });
+
+    document.getElementById("env-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const body = {};
+      for (const [key] of ENV_FIELDS) {
+        const el = document.getElementById("env-" + key);
+        if (!el || !el.value.trim()) continue;
+        body[key] = el.value.trim();
+      }
+      body.DEFAULT_PROVIDER = document.getElementById("env-DEFAULT_PROVIDER").value.trim() || null;
+      body.DEFAULT_MODEL = document.getElementById("env-DEFAULT_MODEL").value.trim() || null;
+      if (document.getElementById("model-select").value) {
+        body.DEFAULT_MODEL = document.getElementById("model-select").value;
+      }
+      if (document.getElementById("route-select").value) {
+        body.DEFAULT_PROVIDER = document.getElementById("route-select").value;
+      }
+      try {
+        const res = await api("/api/v1/llm-proxy/env", { method: "POST", body: JSON.stringify(body) });
+        setStatus(res.message || "Saved environment.", "ok");
+        await loadAll();
+      } catch (err) {
+        setStatus(String(err.message || err), "error");
+      }
+    });
+
+    document.getElementById("yaml-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      try {
+        const res = await api("/api/v1/llm-proxy/config-yaml", {
+          method: "POST",
+          body: JSON.stringify({ content: document.getElementById("yaml-text").value }),
+        });
+        setStatus(res.message || "Saved config.yaml.", "ok");
+        await loadAll();
+      } catch (err) {
+        setStatus(String(err.message || err), "error");
+      }
+    });
+
+    if (apiKey) document.getElementById("api-key").value = apiKey;
+    void loadAll();
+  </script>
+</body>
+</html>

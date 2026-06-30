@@ -26,6 +26,13 @@ class Project(SQLModel, table=True):
     name: str = Field(max_length=256)
     description: Optional[str] = Field(default=None, max_length=4096)
     color: Optional[str] = Field(default=None, max_length=32)
+    # Browser workspace snapshot (`PersistedProjectPayload` JSON from the Flow UI).
+    workspace_payload_json: Optional[str] = Field(default=None)
+    # Last opened todo board for this project (server authority for "Continue planning").
+    last_todo_board_id: Optional[int] = Field(default=None, foreign_key="todo_boards.id")
+    # Default Personal Assistant planning board for this project.
+    assistant_board_id: Optional[int] = Field(default=None, foreign_key="todo_boards.id")
+    planning_prefs_json: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 

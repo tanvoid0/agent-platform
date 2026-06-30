@@ -6,7 +6,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from sqlmodel import Session, select
+from sqlmodel import Session, select, update
 
 from database import get_session
 from models import Process, TeamTemplate
@@ -161,9 +161,7 @@ def delete_team(team_id: int, session: Session = Depends(get_session)):
     row = session.get(TeamTemplate, team_id)
     if not row:
         raise HTTPException(status_code=404, detail="Team template not found")
-    for proc in session.exec(select(Process).where(Process.team_template_id == team_id)).all():
-        proc.team_template_id = None
-        session.add(proc)
+    session.exec(update(Process).where(Process.team_template_id == team_id).values(team_template_id=None))
     session.delete(row)
     session.commit()
     return {"ok": True}

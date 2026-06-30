@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlmodel import Session
 
 from database import get_session
+from document_service import ingest_workspace_upload, read_workspace_file_for_llm
 from models import Process, Project
 from workspace_service import (
     WorkspaceError,
@@ -121,10 +122,45 @@ def workspace_list(project_id: int, path: str = "", session: Session = Depends(g
 def workspace_read_file(project_id: int, path: str, session: Session = Depends(get_session)):
     _require_project(session, project_id)
     try:
-        content = read_text_file(project_id, path)
-        return {"path": path, "content": content}
+        payload = read_workspace_file_for_llm(project_id, path)
+        return payload
     except WorkspaceError as e:
         raise _map_error(e) from e
+
+
+@router.post("/upload")
+async def workspace_upload_file(
+    project_id: int,
+    file: UploadFile = File(...),
+    dest: str = "documents",
+    session: Session = Depends(get_session),
+):
+    """Multipart upload; PDFs are extracted to ``<path>.derived/structured.md``."""
+    _require_project(session, project_id)
+    name = (file.filename or "upload").strip()
+    try:
+        data = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"read_failed: {e}") from e
+    try:
+        result = ingest_workspace_upload(
+            project_id,
+            filename=name,
+            data=data,
+            dest_dir=dest,
+        )
+    except WorkspaceError as e:
+        raise _map_error(e) from e
+    return {
+        "path": result.path,
+        "mime_type": result.mime_type,
+        "bytes": result.bytes_written,
+        "derived_path": result.derived_path,
+        "manifest_path": result.manifest_path,
+        "page_count": result.page_count,
+        "excerpt": result.excerpt,
+        "extraction": result.extraction,
+    }
 
 
 @router.put("/file")

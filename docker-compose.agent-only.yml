@@ -1,43 +1,11 @@
-# Agent Platform only (embedded LLM proxy on port 18410 — no separate orchestrator container).
-#   docker-compose -f docker-compose.agent-only.yml up --build
-#
-# SQLite + workspaces: same named volume as docker-compose.yml (`agent_platform_data`) so data is shared
-# when you use the same project directory. Survives image rebuilds; removed only with `docker compose down -v`.
-#
-# Do not set PATH=${PATH} from the host; it breaks Linux containers on Windows.
+# Same as docker-compose.yml — explicit API-only alias for scripts and docs.
+#   docker compose -f docker-compose.agent-only.yml up --build
 
 services:
   agent-platform:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    command: >
-      sh -c "uvicorn main:app --host 0.0.0.0 --port 18410
-      --workers ${AGENT_PLATFORM_UVICORN_WORKERS:-8}
-      --timeout-keep-alive ${AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS:-30}"
-    ports:
-      - "127.0.0.1:18410:18410"
-    env_file:
-      - .env
-    environment:
-      AGENT_PLATFORM_DB_PATH: /app/data/agent_platform.db
-      AGENT_PLATFORM_WORKSPACE_ROOT: /app/data/workspaces
-      CONFIG_DIR: /app/data/llm
-      CONFIG_PATH: /app/data/llm/config.yaml
-      ORCHESTRATOR_INTERNAL_URL: http://127.0.0.1:18410
-      PROXY_PUBLIC_URL: http://127.0.0.1:18410
-      LLM_ORCHESTRATOR_BASE_URL: http://127.0.0.1:18410/v1
-      AGENT_PLATFORM_DAG_MAX_CONCURRENT_TASKS: ${AGENT_PLATFORM_DAG_MAX_CONCURRENT_TASKS:-12}
-      UV_THREADPOOL_SIZE: ${UV_THREADPOOL_SIZE:-16}
-      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-16}
-      OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-16}
-      MKL_NUM_THREADS: ${MKL_NUM_THREADS:-16}
-      NUMEXPR_NUM_THREADS: ${NUMEXPR_NUM_THREADS:-16}
-      AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX: "0"
-    volumes:
-      - agent_platform_data:/app/data
-      - ./app:/app
-    restart: unless-stopped
+    extends:
+      file: docker-compose.yml
+      service: agent-platform
 
 volumes:
   agent_platform_data:

@@ -20,5 +20,5 @@ env/
 # Runtime / build
 data/
 app/static/dist/
+flow-ui/dist/
 node_modules/
-web/node_modules/

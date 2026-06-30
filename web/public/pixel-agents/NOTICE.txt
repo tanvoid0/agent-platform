@@ -1,9 +1,0 @@
-Assets from the Pixel Agents project: https://github.com/pablodelucca/pixel-agents
-
-MIT License — Copyright (c) 2026 Pablo De Lucca
-
-Included here:
-- characters/char_0.png … char_5.png — character art (JIK-A-4 / Metro City per upstream README)
-- assets/floors/floor_0.png … floor_8.png — floor tile patterns (layout tile ids 1–9)
-- assets/walls/wall_0.png — wall autotile sheet (16×32px pieces, bitmask tiling)
-- assets/furniture/ — furniture catalog (sprites + manifest.json per item)

@@ -1,5 +1,8 @@
 import json
 import os
+import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,7 +33,7 @@ apply_platform_yaml_defaults()
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlmodel import Session, create_engine
 
 _db_raw = (os.getenv("AGENT_PLATFORM_DB_PATH") or "data/agent_platform.db").strip()
@@ -40,11 +43,84 @@ if _db_path.parent != Path("."):
 
 sqlite_url = f"sqlite:///{_db_path.as_posix()}"
 
-connect_args = {"check_same_thread": False}
+# busy_timeout (seconds) reduces "database is locked" under concurrent writers (e.g. multiple uvicorn workers).
+_sqlite_busy_timeout_s = float(os.getenv("AGENT_PLATFORM_SQLITE_BUSY_TIMEOUT_SECONDS", "30"))
+connect_args = {"check_same_thread": False, "timeout": _sqlite_busy_timeout_s}
 engine = create_engine(sqlite_url, connect_args=connect_args)
+
+
+@event.listens_for(engine, "connect")
+def _sqlite_on_connect(dbapi_connection, _connection_record) -> None:
+    if engine.url.get_backend_name() != "sqlite":
+        return
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+    cursor.close()
 
 _APP_DIR = Path(__file__).resolve().parent
 _ALEMBIC_CFG = Config(str(_APP_DIR / "alembic.ini"))
+
+
+@contextmanager
+def _sqlite_startup_migration_lock():
+    """Serialize schema work across uvicorn workers (each runs lifespan on SQLite)."""
+    lock_path = _db_path.with_name(f"{_db_path.name}.startup.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+b")  # noqa: SIM115 — short-lived lock file handle
+    timeout_s = float(os.getenv("AGENT_PLATFORM_SQLITE_STARTUP_LOCK_TIMEOUT_SECONDS", "120"))
+    deadline = time.time() + timeout_s
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            while True:
+                fh.seek(0)
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.time() >= deadline:
+                        fh.close()
+                        raise TimeoutError(
+                            "Timed out waiting for SQLite startup migration lock "
+                            f"({lock_path}). Another process may be holding it."
+                        ) from None
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fd = fh.fileno()
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.time() >= deadline:
+                        fh.close()
+                        raise TimeoutError(
+                            "Timed out waiting for SQLite startup migration lock "
+                            f"({lock_path}). Another process may be holding it."
+                        ) from None
+                    time.sleep(0.05)
+        yield
+    finally:
+        if sys.platform == "win32":
+            import msvcrt
+
+            fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fh.close()
 
 
 def _ensure_sqlite_columns() -> None:
@@ -76,27 +152,38 @@ def create_db_and_tables() -> None:
     """Apply Alembic migrations; legacy DBs without alembic_version get column patches then upgrade."""
     from process_table_sqlite import apply_process_table_sqlite
 
-    with engine.connect() as conn:
-        inspector = inspect(conn)
-        table_names = inspector.get_table_names()
+    with _sqlite_startup_migration_lock():
+        with engine.connect() as conn:
+            inspector = inspect(conn)
+            table_names = inspector.get_table_names()
 
-    has_process = "process" in table_names
-    has_run = "run" in table_names
-    has_alembic = "alembic_version" in table_names
+        has_process = "process" in table_names
+        has_run = "run" in table_names
+        has_alembic = "alembic_version" in table_names
 
-    if (has_process or has_run) and not has_alembic:
-        _ensure_sqlite_columns()
+        if (has_process or has_run) and not has_alembic:
+            _ensure_sqlite_columns()
 
-    command.upgrade(_ALEMBIC_CFG, "head")
+        command.upgrade(_ALEMBIC_CFG, "head")
 
-    with engine.begin() as conn:
-        apply_process_table_sqlite(conn)
+        with engine.begin() as conn:
+            apply_process_table_sqlite(conn)
 
-    with engine.connect() as conn:
-        conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
-        conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
+        with engine.connect() as conn:
+            conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
+            conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
 
-    _seed_team_templates_if_empty()
+        _seed_team_templates_if_empty()
+        _seed_todo_domain_if_empty()
+
+
+def _seed_todo_domain_if_empty() -> None:
+    from sqlmodel import Session
+
+    from todos.seeds import seed_todo_domain_if_empty
+
+    with Session(engine) as session:
+        seed_todo_domain_if_empty(session)
 
 
 def _seed_team_templates_if_empty() -> None:

@@ -193,3 +193,43 @@ def test_workspace_info_validates_process_folder(client, test_engine, tmp_path, 
 
     r_bad = c.get(f"/projects/{project_id}/workspace/info", params={"path": "processes/999999999"})
     assert r_bad.status_code == 404
+
+
+def test_project_workspace_state_roundtrip(client, test_engine):
+    c, _mock_cls, _mock_inst = client
+    pr = c.post("/projects/", json={"name": "Snap"})
+    assert pr.status_code == 201
+    pid = pr.json()["id"]
+
+    r0 = c.get(f"/projects/{pid}/workspace-state")
+    assert r0.status_code == 200
+    assert r0.json()["payload"] is None
+
+    payload = {
+        "userBrief": "Ship the feature",
+        "phase": "working",
+        "tasks": [{"id": "t1", "title": "Plan", "status": "todo"}],
+        "selectedAgentSetId": "consultant-workshop",
+    }
+    r1 = c.put(f"/projects/{pid}/workspace-state", json={"payload": payload})
+    assert r1.status_code == 200
+    body = r1.json()
+    assert body["payload"]["userBrief"] == "Ship the feature"
+    assert body["updated_at"] is not None
+
+    r2 = c.get(f"/projects/{pid}/workspace-state")
+    assert r2.status_code == 200
+    assert r2.json()["payload"]["tasks"][0]["title"] == "Plan"
+
+    with Session(test_engine) as session:
+        row = session.get(Project, pid)
+        assert row is not None
+        assert row.workspace_payload_json is not None
+
+
+def test_project_workspace_state_not_found(client, test_engine):
+    c, _mock_cls, _mock_inst = client
+    r = c.get("/projects/999999/workspace-state")
+    assert r.status_code == 404
+    r2 = c.put("/projects/999999/workspace-state", json={"payload": {"phase": "idle"}})
+    assert r2.status_code == 404

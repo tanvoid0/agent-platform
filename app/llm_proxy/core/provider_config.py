@@ -18,7 +18,7 @@ _runtime_lm_studio_base: str | None = None
 ProviderId = str
 SUPPORTED_PROVIDER_IDS: tuple[ProviderId, ...] = ("ollama", "lm_studio", "aimlapi", "gemini")
 PROVIDER_LABELS: dict[ProviderId, str] = {
-    "ollama": "Server",
+    "ollama": "Ollama",
     "lm_studio": "LM Studio",
     "aimlapi": "AIMLAPI",
     "gemini": "Cloud",
@@ -162,10 +162,10 @@ def provider_configured(provider: str) -> bool:
 
 def first_configured_provider() -> str:
     """Prefer local backends first, then cloud when requested is unavailable."""
-    if lm_studio_configured():
-        return "lm_studio"
     if ollama_configured():
         return "ollama"
+    if lm_studio_configured():
+        return "lm_studio"
     if aimlapi_configured():
         return "aimlapi"
     if gemini_configured():

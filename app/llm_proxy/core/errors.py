@@ -15,10 +15,21 @@ logger = logging.getLogger("llm_proxy")
 ERROR_TYPE = "llm_proxy_error"
 
 
+_PLATFORM_JSON_API_PREFIXES = (
+    "/v1",
+    "/api/v1",
+    "/projects",
+    "/processes",
+    "/teams",
+    "/action-sets",
+    "/sessions",
+)
+
+
 def wants_wrapped_json_errors(request: Request) -> bool:
     path = request.url.path
-    # Only the embedded OpenAI-compatible surface (/v1/*); do not wrap all Agent Platform /api errors.
-    if path.startswith("/v1"):
+    # OpenAI-compatible /v1 and Agent Platform REST — return JSON 500s so CORS middleware can attach headers.
+    if any(path.startswith(prefix) for prefix in _PLATFORM_JSON_API_PREFIXES):
         return True
     accept = (request.headers.get("accept") or "").lower()
     return "application/json" in accept

@@ -5,10 +5,10 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from action_orchestrator import router as action_orchestrator_router
 from api_auth import verify_agent_platform_api_key
 from chat_routes import router as chat_router
 from database import create_db_and_tables
@@ -20,6 +20,8 @@ from llm_proxy_env import llm_proxy_master_key
 from process_routes import router as process_router
 from projects_routes import router as projects_router
 from teams_routes import router as teams_router
+from todos.routes import router as todos_router
+from assistant.routes import router as assistant_router
 from workspace_routes import router as workspace_router
 
 logger = logging.getLogger(__name__)
@@ -44,103 +46,48 @@ app.add_middleware(RequestIdMiddleware)
 app.include_router(llm_proxy_router)
 
 _api_deps = [Depends(verify_agent_platform_api_key)]
+# Routers at root paths for backward compatibility
 app.include_router(process_router, dependencies=_api_deps)
 app.include_router(teams_router, dependencies=_api_deps)
 app.include_router(projects_router, dependencies=_api_deps)
 app.include_router(workspace_router, dependencies=_api_deps)
-app.include_router(process_router, prefix="/api/v1", dependencies=_api_deps)
-app.include_router(teams_router, prefix="/api/v1", dependencies=_api_deps)
-app.include_router(projects_router, prefix="/api/v1", dependencies=_api_deps)
-app.include_router(workspace_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(action_orchestrator_router, dependencies=_api_deps)
+# Additional routers at /api/v1 prefix
+app.include_router(todos_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(assistant_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(chat_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(llm_proxy_admin_router, prefix="/api/v1/llm-proxy", dependencies=_api_deps)
 
+_cors_origins = [
+    o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
+] or ["*"]
+# Browsers reject Access-Control-Allow-Origin: * together with Allow-Credentials: true.
+_cors_allow_credentials = "*" not in _cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-_static_dir = BASE_DIR / "static" / "dist"
-
-_FLOW_STATIC_FILE_EXT = frozenset(
-    {
-        "css",
-        "eot",
-        "html",
-        "ico",
-        "jpeg",
-        "jpg",
-        "js",
-        "json",
-        "map",
-        "png",
-        "svg",
-        "ttf",
-        "txt",
-        "webp",
-        "woff",
-        "woff2",
-    }
-)
-
-
-@app.middleware("http")
-async def flow_spa_fallback(request: Request, call_next):
-    """Serve `index.html` for client-side routes under `/flow` when the Vite build is present."""
-    response = await call_next(request)
-    if response.status_code != 404:
-        return response
-    path = request.url.path
-    if not path.startswith("/flow/"):
-        return response
-    if path.startswith("/flow/assets/"):
-        return response
-    tail = path.rsplit("/", 1)[-1]
-    if "." in tail:
-        ext = tail.rsplit(".", 1)[-1].lower()
-        if ext in _FLOW_STATIC_FILE_EXT:
-            return response
-    index_file = _static_dir / "index.html"
-    if not index_file.is_file():
-        return response
-    return FileResponse(index_file)
-
-
-@app.get("/flow", include_in_schema=False)
-def redirect_flow_slash():
-    # StaticFiles + Vite `base: "/flow/"` expect `/flow/`; bare `/flow` is often a 404.
-    return RedirectResponse(url="/flow/", status_code=307)
-
-
-if _static_dir.is_dir():
-    app.mount(
-        "/flow",
-        StaticFiles(directory=str(_static_dir), html=True),
-        name="flow",
-    )
-else:
-
-    @app.get("/flow/", include_in_schema=False)
-    def flow_not_built():
-        return HTMLResponse(
-            "<p>Build the web UI: <code>cd web && pnpm install && pnpm run build</code></p>",
-            status_code=503,
-        )
 
 
 @app.get("/", include_in_schema=False)
 def root():
-    return RedirectResponse(url="/ui")
+    return RedirectResponse(url="/config")
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "agent-platform"}
+
+
+@app.get("/config", response_class=HTMLResponse, include_in_schema=False)
+def config_page(request: Request):
+    return templates.TemplateResponse("config.html", {"request": request})
 
 
 @app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
