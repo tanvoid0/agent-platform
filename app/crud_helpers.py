@@ -34,3 +34,16 @@ def require_belongs_to(
         resource_name = name or model_class.__name__
         raise HTTPException(status_code=404, detail=f"{resource_name} not found")
     return row
+
+
+def require_process_with_access(
+    session: Session, process_id: int, client_hdr: str | None = None
+) -> T:
+    """Get process by ID, verify client access, raise 404/403 if not found or inaccessible."""
+    from models import Process
+    from client_scope import assert_process_client_access
+
+    proc = require_one(session, Process, process_id, "Process")
+    if client_hdr is not None:
+        assert_process_client_access(proc, client_hdr)
+    return proc

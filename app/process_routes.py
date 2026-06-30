@@ -16,6 +16,7 @@ from client_scope import (
     merged_client_id,
     require_client_id_enabled,
 )
+from crud_helpers import require_one, require_process_with_access
 from dag_schema import validate_planner_dag
 from database import engine, get_session
 from models import EventLog, Process, Project, TaskNode, TeamTemplate
@@ -104,13 +105,9 @@ async def start_process(
             detail="client_id is required (JSON body or X-Agent-Platform-Client header)",
         )
 
-    tmpl = session.get(TeamTemplate, req.team_template_id)
-    if not tmpl:
-        raise HTTPException(status_code=404, detail="Team template not found")
+    tmpl = require_one(session, TeamTemplate, req.team_template_id, "Team template")
     if req.project_id is not None:
-        proj = session.get(Project, req.project_id)
-        if not proj:
-            raise HTTPException(status_code=404, detail="Project not found")
+        proj = require_one(session, Project, req.project_id, "Project")
     roster = parse_team_roster_json(tmpl.roster_json)
     team_context = render_team_context_for_planner(
         tmpl.name, tmpl.description, tmpl.color, roster
@@ -146,13 +143,8 @@ def get_process_status(
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
 ):
-    proc = session.get(Process, process_id)
-    if not proc:
-        raise HTTPException(status_code=404, detail="Process not found")
-    assert_process_client_access(proc, client_hdr)
-
+    proc = require_process_with_access(session, process_id, client_hdr)
     tasks = session.exec(select(TaskNode).where(TaskNode.process_id == process_id)).all()
-
     return {"process": proc, "tasks": tasks}
 
 
@@ -166,10 +158,7 @@ def list_process_events(
     after_id: int = 0,
 ):
     """Append-ordered event log for a process (trace, status_change, error, …)."""
-    proc = session.get(Process, process_id)
-    if not proc:
-        raise HTTPException(status_code=404, detail="Process not found")
-    assert_process_client_access(proc, client_hdr)
+    proc = require_process_with_access(session, process_id, client_hdr)
     lim = min(max(limit, 1), 2000)
     q = (
         select(EventLog)
@@ -190,10 +179,7 @@ async def approve_dag(
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
 ):
-    proc = session.get(Process, process_id)
-    if not proc:
-        raise HTTPException(status_code=404, detail="Process not found")
-    assert_process_client_access(proc, client_hdr)
+    proc = require_process_with_access(session, process_id, client_hdr)
 
     if is_idempotent_approval_status(proc.status):
         # "approved" covers duplicate POST after commit but before status moves to "running"
@@ -233,12 +219,9 @@ async def review_task(
     client_hdr: str | None = Depends(agent_platform_client_header),
 ):
     """Approve, reject, or request changes for a task in awaiting_review."""
-    proc = session.get(Process, process_id)
-    if not proc:
-        raise HTTPException(status_code=404, detail="Process not found")
-    assert_process_client_access(proc, client_hdr)
-    task = session.get(TaskNode, task_id)
-    if not task or task.process_id != process_id:
+    proc = require_process_with_access(session, process_id, client_hdr)
+    task = require_one(session, TaskNode, task_id, "Task")
+    if task.process_id != process_id:
         raise HTTPException(status_code=404, detail="Task not found")
 
     if task.status == "completed" and req.decision == ReviewDecision.APPROVE:
@@ -298,10 +281,7 @@ def cancel_process(
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
 ):
-    proc = session.get(Process, process_id)
-    if not proc:
-        raise HTTPException(status_code=404, detail="Process not found")
-    assert_process_client_access(proc, client_hdr)
+    proc = require_process_with_access(session, process_id, client_hdr)
     if proc.status in ("completed", "failed", "cancelled"):
         return {"status": proc.status, "idempotent": True}
     if proc.status not in (
