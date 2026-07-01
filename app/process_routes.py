@@ -11,6 +11,7 @@ from sqlmodel import Session, select
 from sse_starlette.sse import EventSourceResponse
 
 from api_auth import agent_platform_client_header
+from api_tokens.auth import TokenPrincipal, assert_token_project_access, require_scope, require_valid_token
 from client_scope import (
     assert_process_client_access,
     merged_client_id,
@@ -75,11 +76,18 @@ class ReviewTaskRequest(BaseModel):
 @router.get("/processes")
 def list_processes(
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
     limit: int = 50,
     client_id: str | None = None,
     project_id: int | None = None,
     unassigned_only: bool = False,
 ):
+    require_scope(principal, "process:read")
+    if principal.project_id is not None:
+        # Project-scoped token: force the filter to its own project regardless of query params.
+        project_id = principal.project_id
+        unassigned_only = False
+
     # Require explicit scope: must filter by project_id, client_id, or unassigned_only
     if not (client_id or project_id is not None or unassigned_only):
         raise HTTPException(
@@ -98,13 +106,28 @@ def list_processes(
     return {"processes": rows}
 
 
-@router.post("/processes")
+@router.post(
+    "/processes",
+    summary="Start a multi-agent process",
+    description=(
+        "Kicks off planning (async) for a goal against a team template. Poll GET /processes/{id} "
+        "for status. Requires scope process:write; project-scoped tokens are pinned to their own project."
+    ),
+)
 async def start_process(
     req: StartProcessRequest,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
+    require_scope(principal, "process:write")
+    if principal.project_id is not None:
+        # Project-scoped token: force this process into its own project.
+        if req.project_id is not None and req.project_id != principal.project_id:
+            raise HTTPException(status_code=404, detail="Project not found")
+        req.project_id = principal.project_id
+
     effective = merged_client_id(client_hdr, req.client_id)
     if require_client_id_enabled() and not effective:
         raise HTTPException(
@@ -133,6 +156,7 @@ async def start_process(
         team_snapshot_json=team_snapshot_json,
         project_id=req.project_id,
         client_id=effective,
+        token_id=principal.token_id,
     )
     session.add(proc)
     session.commit()
@@ -144,13 +168,16 @@ async def start_process(
     return {"process_id": proc.id, "status": proc.status}
 
 
-@router.get("/processes/{process_id}")
+@router.get("/processes/{process_id}", summary="Get a process's status and tasks")
 def get_process_status(
     process_id: int,
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
+    require_scope(principal, "process:read")
     proc = require_process_with_access(session, process_id, client_hdr)
+    assert_token_project_access(principal, proc.project_id)
     tasks = session.exec(select(TaskNode).where(TaskNode.process_id == process_id)).all()
     return {"process": proc, "tasks": tasks}
 
@@ -160,12 +187,15 @@ def list_process_events(
     process_id: int,
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
     event_type: str | None = None,
     limit: int = 500,
     after_id: int = 0,
 ):
     """Append-ordered event log for a process (trace, status_change, error, …)."""
+    require_scope(principal, "process:read")
     proc = require_process_with_access(session, process_id, client_hdr)
+    assert_token_project_access(principal, proc.project_id)
     lim = min(max(limit, 1), 2000)
     q = (
         select(EventLog)
@@ -185,8 +215,11 @@ async def approve_dag(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
+    require_scope(principal, "process:write")
     proc = require_process_with_access(session, process_id, client_hdr)
+    assert_token_project_access(principal, proc.project_id)
 
     if is_idempotent_approval_status(proc.status):
         # "approved" covers duplicate POST after commit but before status moves to "running"
@@ -224,9 +257,12 @@ async def review_task(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
     """Approve, reject, or request changes for a task in awaiting_review."""
+    require_scope(principal, "process:write")
     proc = require_process_with_access(session, process_id, client_hdr)
+    assert_token_project_access(principal, proc.project_id)
     task = require_one(session, TaskNode, task_id, "Task")
     if task.process_id != process_id:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -287,8 +323,11 @@ def cancel_process(
     process_id: int,
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
+    require_scope(principal, "process:write")
     proc = require_process_with_access(session, process_id, client_hdr)
+    assert_token_project_access(principal, proc.project_id)
     if proc.status in ("completed", "failed", "cancelled"):
         return {"status": proc.status, "idempotent": True}
     if proc.status not in (
@@ -313,6 +352,7 @@ async def sync_process(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
     """
     Recover a stuck process: re-schedule planning or DAG execution, or explain what blocks progress.
@@ -321,10 +361,12 @@ async def sync_process(
     server restart). For `running`, this resets any tasks still marked `running` to `pending` and
     re-queues execution—aborting any in-flight work the server no longer tracks.
     """
+    require_scope(principal, "process:write")
     proc = session.get(Process, process_id)
     if not proc:
         raise HTTPException(status_code=404, detail="Process not found")
     assert_process_client_access(proc, client_hdr)
+    assert_token_project_access(principal, proc.project_id)
 
     tasks = session.exec(select(TaskNode).where(TaskNode.process_id == process_id)).all()
 
@@ -461,12 +503,15 @@ async def retry_process(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
     """Re-run planning (no tasks persisted) or re-execute from stored DAG after a failed process."""
+    require_scope(principal, "process:write")
     proc = session.get(Process, process_id)
     if not proc:
         raise HTTPException(status_code=404, detail="Process not found")
     assert_process_client_access(proc, client_hdr)
+    assert_token_project_access(principal, proc.project_id)
     if proc.status != "failed":
         raise HTTPException(
             status_code=400,
@@ -531,12 +576,15 @@ async def retry_failed_task(
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
     """Re-queue one failed task and resume DAG execution (process must be failed)."""
+    require_scope(principal, "process:write")
     proc = session.get(Process, process_id)
     if not proc:
         raise HTTPException(status_code=404, detail="Process not found")
     assert_process_client_access(proc, client_hdr)
+    assert_token_project_access(principal, proc.project_id)
     task = session.get(TaskNode, task_id)
     if not task or task.process_id != process_id:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -578,14 +626,17 @@ async def retry_failed_task(
 async def stream_process_events(
     process_id: int,
     client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
     """SSE: append-only event log tail (correctness remains on GET /processes/{id})."""
+    require_scope(principal, "process:read")
 
     with Session(engine) as db:
         proc0 = db.get(Process, process_id)
         if not proc0:
             raise HTTPException(status_code=404, detail="Process not found")
         assert_process_client_access(proc0, client_hdr)
+        assert_token_project_access(principal, proc0.project_id)
 
     async def event_generator():
         last_log_id = 0

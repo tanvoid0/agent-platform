@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from api_tokens.usage_tracking import record_api_token_usage
 from dag_schema import sanitize_llm_model_alias
 from models import Process, TaskNode
 from sqlmodel import Session
@@ -32,6 +33,7 @@ def apply_planner_success(
     run.total_cost += plan_cost
     run.failure_reason = None
     run.status = "approval_required"
+    record_api_token_usage(session, run.token_id, tokens=tokens, cost=plan_cost)
 
     for agent in dag.get("subagents", []):
         task = TaskNode(
@@ -56,5 +58,6 @@ def apply_planner_failure(session: Session, *, process_id: int, reason: str) -> 
         raise ValueError("process not found")
     run.status = "failed"
     run.failure_reason = reason
+    record_api_token_usage(session, run.token_id, is_error=True)
     session.commit()
     return run

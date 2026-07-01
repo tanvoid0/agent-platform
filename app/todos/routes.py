@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query, Response
 from sqlmodel import Session
 
+from api_tokens.auth import TokenPrincipal, assert_token_project_access, require_scope, require_valid_token
 from database import get_session
 from todos.board_templates import list_board_templates
 from todos.schemas import (
@@ -48,7 +49,11 @@ def list_board_templates_route() -> dict:
 def list_boards(
     project_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> dict:
+    require_scope(principal, "todos:read")
+    if principal.project_id is not None:
+        project_id = principal.project_id
     return {"boards": board_service.list_boards(session, project_id=project_id)}
 
 
@@ -57,37 +62,65 @@ def create_board(
     req: BoardCreate,
     project_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> BoardOut:
+    require_scope(principal, "todos:write")
+    if principal.project_id is not None:
+        assert_token_project_access(principal, project_id)
+        project_id = principal.project_id
     return board_service.create_board(session, req, project_id=project_id)
 
 
 @router.get("/boards/{board_id}", response_model=BoardDetailOut)
-def get_board(board_id: int, session: Session = Depends(get_session)) -> BoardDetailOut:
+def get_board(
+    board_id: int,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> BoardDetailOut:
+    require_scope(principal, "todos:read")
     return board_service.get_board(session, board_id)
 
 
 @router.patch("/boards/{board_id}", response_model=BoardOut)
 def update_board(
-    board_id: int, req: BoardUpdate, session: Session = Depends(get_session)
+    board_id: int,
+    req: BoardUpdate,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> BoardOut:
+    require_scope(principal, "todos:write")
     return board_service.update_board(session, board_id, req)
 
 
 @router.delete("/boards/{board_id}", status_code=204)
-def delete_board(board_id: int, session: Session = Depends(get_session)):
+def delete_board(
+    board_id: int,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    require_scope(principal, "todos:write")
     board_service.delete_board(session, board_id)
     return Response(status_code=204)
 
 
 @router.get("/boards/{board_id}/categories")
-def list_categories(board_id: int, session: Session = Depends(get_session)) -> dict:
+def list_categories(
+    board_id: int,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> dict:
+    require_scope(principal, "todos:read")
     return {"categories": board_service.list_categories(session, board_id)}
 
 
 @router.post("/boards/{board_id}/categories", status_code=201, response_model=CategoryOut)
 def create_category(
-    board_id: int, req: CategoryCreate, session: Session = Depends(get_session)
+    board_id: int,
+    req: CategoryCreate,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> CategoryOut:
+    require_scope(principal, "todos:write")
     return board_service.create_category(session, board_id, req)
 
 
@@ -97,42 +130,71 @@ def update_category(
     category_id: int,
     req: CategoryUpdate,
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> CategoryOut:
+    require_scope(principal, "todos:write")
     return board_service.update_category(session, board_id, category_id, req)
 
 
 @router.get("/boards/{board_id}/items")
-def list_items(board_id: int, session: Session = Depends(get_session)) -> dict:
+def list_items(
+    board_id: int,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> dict:
+    require_scope(principal, "todos:read")
     return {"items": board_service.list_items(session, board_id)}
 
 
 @router.post("/boards/{board_id}/items", status_code=201, response_model=ItemOut)
 def create_item(
-    board_id: int, req: ItemCreate, session: Session = Depends(get_session)
+    board_id: int,
+    req: ItemCreate,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> ItemOut:
+    require_scope(principal, "todos:write")
     return board_service.create_item(session, board_id, req)
 
 
 @router.get("/items/{item_id}", response_model=ItemOut)
-def get_item(item_id: int, session: Session = Depends(get_session)) -> ItemOut:
+def get_item(
+    item_id: int,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> ItemOut:
+    require_scope(principal, "todos:read")
     return board_service.get_item(session, item_id)
 
 
 @router.patch("/items/{item_id}", response_model=ItemOut)
 def update_item(
-    item_id: int, req: ItemUpdate, session: Session = Depends(get_session)
+    item_id: int,
+    req: ItemUpdate,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> ItemOut:
+    require_scope(principal, "todos:write")
     return board_service.update_item(session, item_id, req)
 
 
 @router.delete("/items/{item_id}", status_code=204)
-def delete_item(item_id: int, session: Session = Depends(get_session)):
+def delete_item(
+    item_id: int,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    require_scope(principal, "todos:write")
     board_service.delete_item(session, item_id)
     return Response(status_code=204)
 
 
 @router.get("/planner-profiles")
-def list_planner_profiles(session: Session = Depends(get_session)) -> dict:
+def list_planner_profiles(
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> dict:
+    require_scope(principal, "todos:read")
     return {"profiles": board_service.list_planner_profiles(session)}
 
 
@@ -141,7 +203,9 @@ async def item_agent_step(
     item_id: int,
     req: AgentStepRequest,
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> AgentStepResponse:
+    require_scope(principal, "todos:write")
     ctx = dict(req.context)
     if req.document_paths:
         ctx["document_paths"] = list(req.document_paths)
@@ -153,7 +217,9 @@ async def item_agent_chat(
     item_id: int,
     req: AgentChatRequest,
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> AgentChatResponse:
+    require_scope(principal, "todos:write")
     return await agent_bridge.agent_chat(
         session, item_id, req.message, req.model, req.history
     )
@@ -164,7 +230,9 @@ def item_agent_apply(
     item_id: int,
     req: ApplyActionsRequest,
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> ApplyActionsResponse:
+    require_scope(principal, "todos:write")
     item, result = apply_planned_actions(session, item_id, req.actions)
     return ApplyActionsResponse(
         item=item,
@@ -180,7 +248,9 @@ def item_planning_form_submit(
     item_id: int,
     req: PlanningFormSubmitRequest,
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> ItemOut:
+    require_scope(principal, "todos:write")
     return submit_planning_form(session, item_id, req.form_index, req.answers)
 
 
@@ -190,7 +260,9 @@ def item_events(
     after_id: int = 0,
     limit: int = 200,
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> dict:
+    require_scope(principal, "todos:read")
     board_service.get_item(session, item_id)
     rows = list_item_events(session, item_id, after_id=after_id, limit=limit)
     return {
@@ -212,7 +284,9 @@ def item_spawn_process(
     item_id: int,
     req: SpawnProcessRequest,
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ) -> SpawnProcessResponse:
+    require_scope(principal, "todos:write")
     return spawn_process_for_item(
         session,
         item_id,

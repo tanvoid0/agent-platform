@@ -7,10 +7,11 @@ import os
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from api_tokens.auth import TokenPrincipal, require_scope, require_valid_token
 from context_budget import fit_chat_messages_for_request, max_output_tokens_default
 from dag_schema import sanitize_llm_model_alias
 from llm_proxy_env import (
@@ -126,8 +127,11 @@ async def llm_ui_catalog():
     return await build_llm_ui_catalog_response()
 
 
-@router.post("/chat")
-async def chat_completions(req: ChatCompletionRequest):
+@router.post("/chat", summary="One-shot OpenAI-compatible chat completion")
+async def chat_completions(
+    req: ChatCompletionRequest,
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
     """
     One-shot chat completion via the embedded LLM proxy (POST {base}/chat/completions).
     Does not create a Process; for multi-agent runs use POST /api/v1/processes.
@@ -135,6 +139,7 @@ async def chat_completions(req: ChatCompletionRequest):
     requests from simulated agents queue here instead of hitting the upstream at once.
     The upstream call itself also retries on rate-limit responses (see upstream_http.py).
     """
+    require_scope(principal, "chat:write")
     key = llm_proxy_master_key()
     if not key:
         raise HTTPException(

@@ -55,6 +55,8 @@ class Process(SQLModel, table=True):
     project_id: Optional[int] = Field(default=None, foreign_key="project.id")
     # Optional namespace for external apps (logical isolation; not a security boundary alone).
     client_id: Optional[str] = Field(default=None, max_length=256, index=True)
+    # Set when started by a project-scoped API token, for per-token usage attribution.
+    token_id: Optional[int] = Field(default=None, foreign_key="api_tokens.id", index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -102,3 +104,52 @@ class EventLog(SQLModel, table=True):
     event_type: str  # trace, tool_call, status_change, error
     content: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class ApiToken(SQLModel, table=True):
+    """Project-scoped external API credential (issued from the dashboard, not the master key)."""
+
+    __tablename__ = "api_tokens"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    name: str = Field(max_length=256)
+    # Public-safe display prefix (e.g. "agp_live_a1b2c3d4"); the secret suffix is never stored.
+    prefix: str = Field(max_length=32, index=True)
+    token_hash: str = Field(max_length=64, unique=True, index=True)  # sha256 hex of the raw token
+    scopes_json: str = Field(default="[]")
+    status: str = Field(default="active", index=True)  # active, held, revoked
+    rate_limit_per_minute: Optional[int] = Field(default=None)  # None = unlimited
+    expires_at: Optional[datetime] = Field(default=None)
+    last_used_at: Optional[datetime] = Field(default=None)
+    revoked_at: Optional[datetime] = Field(default=None)
+    revoked_reason: Optional[str] = Field(default=None, max_length=512)
+    held_reason: Optional[str] = Field(default=None, max_length=512)
+    total_requests: int = Field(default=0)
+    total_errors: int = Field(default=0)
+    total_tokens: int = Field(default=0)
+    total_cost: float = Field(default=0.0)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    @property
+    def scopes(self) -> List[str]:
+        return json.loads(self.scopes_json)
+
+    @scopes.setter
+    def scopes(self, value: List[str]):
+        self.scopes_json = json.dumps(value)
+
+
+class ApiTokenUsageDaily(SQLModel, table=True):
+    """Per-token, per-UTC-day usage rollup (one row per token per day)."""
+
+    __tablename__ = "api_token_usage_daily"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    token_id: int = Field(foreign_key="api_tokens.id", index=True)
+    usage_date: str = Field(max_length=10, index=True)  # "YYYY-MM-DD" UTC
+    request_count: int = Field(default=0)
+    error_count: int = Field(default=0)
+    total_tokens: int = Field(default=0)
+    total_cost: float = Field(default=0.0)

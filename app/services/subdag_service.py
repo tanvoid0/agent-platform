@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from api_tokens.usage_tracking import record_api_token_usage
 from dag_schema import merge_planner_with_new_subagents, planner_dag_to_json_dict, sanitize_llm_model_alias
 from models import Process, TaskNode
 from sqlmodel import Session, select
@@ -26,6 +27,7 @@ def merge_and_persist_subdag_expansion(
     run.dag_json = merged_json
     run.total_tokens += add_tokens
     run.total_cost += add_cost
+    record_api_token_usage(session, run.token_id, tokens=add_tokens, cost=add_cost)
 
     created = 0
     for agent in new_raw:

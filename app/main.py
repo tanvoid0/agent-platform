@@ -9,7 +9,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from action_orchestrator import router as action_orchestrator_router
-from api_auth import verify_agent_platform_api_key
+from api_tokens.auth import require_valid_token
+from api_tokens.routes import router as api_tokens_router
 from chat_routes import router as chat_router
 from database import create_db_and_tables
 from llm_proxy.admin_routes import router as llm_proxy_admin_router
@@ -43,18 +44,34 @@ async def lifespan(app: FastAPI):
         await cache.stop_background_refresh()
 
 
-app = FastAPI(title="Agent Platform", version="0.1.0", lifespan=lifespan)
+_env = (os.getenv("AGENT_PLATFORM_ENV") or "development").strip().lower()
+app = FastAPI(
+    title="Agent Platform",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url=None if _env == "production" else "/docs",
+    redoc_url=None if _env == "production" else "/redoc",
+    openapi_url="/openapi.json",  # stays on in all envs; the frontend's own docs UI depends on it
+)
 register_exception_handlers(app)
 app.add_middleware(RequestIdMiddleware)
 app.include_router(llm_proxy_router)
 
-_api_deps = [Depends(verify_agent_platform_api_key)]
+_api_deps = [Depends(require_valid_token)]
 # Routers at root paths for backward compatibility
 app.include_router(process_router, dependencies=_api_deps)
 app.include_router(teams_router, dependencies=_api_deps)
 app.include_router(projects_router, dependencies=_api_deps)
 app.include_router(workspace_router, dependencies=_api_deps)
 app.include_router(action_orchestrator_router, dependencies=_api_deps)
+app.include_router(api_tokens_router, dependencies=_api_deps)
+# Same routers mirrored under /api/v1 (versioned REST surface)
+app.include_router(process_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(teams_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(projects_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(workspace_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(action_orchestrator_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(api_tokens_router, prefix="/api/v1", dependencies=_api_deps)
 # Additional routers at /api/v1 prefix
 app.include_router(todos_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(assistant_router, prefix="/api/v1", dependencies=_api_deps)

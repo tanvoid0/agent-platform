@@ -10,6 +10,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from api_tokens.exceptions import ApiTokenError
+
 logger = logging.getLogger("llm_proxy")
 
 ERROR_TYPE = "llm_proxy_error"
@@ -103,6 +105,24 @@ def _detail_to_message(detail: Any) -> str:
 
 
 def register_exception_handlers(app: Any) -> None:
+    @app.exception_handler(ApiTokenError)
+    async def api_token_error_handler(request: Request, exc: ApiTokenError) -> JSONResponse:
+        rid = get_request_id(request)
+        logger.info(
+            "api_token_error code=%s status=%s token_prefix=%s request_id=%s",
+            exc.code,
+            exc.status_code,
+            exc.token_prefix,
+            rid,
+        )
+        return json_error_response(
+            exc.status_code,
+            exc.message,
+            exc.code,
+            request_id=rid,
+            extra={"token_prefix": exc.token_prefix} if exc.token_prefix else None,
+        )
+
     @app.exception_handler(LlmProxyError)
     async def llm_proxy_error_handler(request: Request, exc: LlmProxyError) -> JSONResponse:
         rid = get_request_id(request)

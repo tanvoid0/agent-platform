@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from api_tokens.usage_tracking import record_api_token_usage
 from models import Process, TaskNode
 from services.review_assignment_service import sync_review_assignments
 from sqlmodel import Session
@@ -26,6 +27,7 @@ def apply_task_success(
     run.total_tokens += tokens
     run.total_cost += task_cost
     run.tool_invocations_used = int(run.tool_invocations_used or 0) + int(tool_calls)
+    record_api_token_usage(session, run.token_id, tokens=tokens, cost=task_cost)
 
     needs_expand = False
     if task.requires_review:
@@ -59,5 +61,6 @@ def apply_task_failure(
     task.failure_debug_json = failure_debug_json
     run.status = "failed"
     run.failure_reason = failure_reason
+    record_api_token_usage(session, run.token_id, is_error=True)
     session.commit()
     return task, run
