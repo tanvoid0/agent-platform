@@ -28,6 +28,7 @@ from api_tokens.rate_limiter import check_and_increment
 from api_tokens.token_service import hash_token
 from database import get_session
 from models import ApiToken
+from time_utils import utc_now_naive
 
 _LAST_USED_THROTTLE_SECONDS = 60
 _TOKEN_PREFIX_MARKER = "agp_"
@@ -68,7 +69,7 @@ def verify_project_api_token(required_scope: str | None = None):
                     row.held_reason or "This token is temporarily on hold.",
                     token_prefix=row.prefix,
                 )
-            if row.expires_at and row.expires_at < datetime.utcnow():
+            if row.expires_at and row.expires_at < utc_now_naive():
                 raise TokenExpiredError("This token has expired.", token_prefix=row.prefix)
 
             scopes = row.scopes
@@ -79,7 +80,7 @@ def verify_project_api_token(required_scope: str | None = None):
 
             check_and_increment(row.id, row.rate_limit_per_minute)
 
-            now = datetime.utcnow()
+            now = utc_now_naive()
             if not row.last_used_at or (now - row.last_used_at).total_seconds() > _LAST_USED_THROTTLE_SECONDS:
                 row.last_used_at = now
                 session.add(row)

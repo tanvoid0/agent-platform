@@ -4,7 +4,7 @@
 Checks:
 1) No tracked paths contain backslashes.
 2) No duplicate logical tracked paths after slash normalization.
-3) Frontend imports in `web/src` avoid parent-relative traversals (`../`).
+3) Frontend imports in sibling `flow-ui/src` avoid parent-relative traversals (`../`).
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+FLOW_UI_SRC = REPO_ROOT.parent / "flow-ui" / "src"
 WEB_SRC = REPO_ROOT / "web" / "src"
 IMPORT_RE = re.compile(
     r"""(?:import|export)\s+(?:type\s+)?(?:[^'"]+from\s+)?["'](?P<spec>[^"']+)["']"""
@@ -50,9 +51,10 @@ def check_git_paths() -> list[str]:
 
 def check_web_imports() -> list[str]:
     errors: list[str] = []
-    if not WEB_SRC.exists():
+    src_root = FLOW_UI_SRC if FLOW_UI_SRC.exists() else WEB_SRC
+    if not src_root.exists():
         return errors
-    for file in WEB_SRC.rglob("*.ts*"):
+    for file in src_root.rglob("*.ts*"):
         text = file.read_text(encoding="utf-8")
         for match in IMPORT_RE.finditer(text):
             spec = match.group("spec")

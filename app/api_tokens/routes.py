@@ -18,6 +18,7 @@ from crud_helpers import require_one
 from database import get_session
 from models import ApiToken, ApiTokenUsageDaily, Workspace
 from schema_converter import to_schemas
+from time_utils import utc_now_naive
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/api-tokens", tags=["api-tokens"])
 
@@ -140,7 +141,7 @@ def create_api_token(
     require_one(session, Workspace, workspace_id, "Workspace")
 
     full_token, prefix, token_hash = generate_token()
-    now = datetime.utcnow()
+    now = utc_now_naive()
     row = ApiToken(
         workspace_id=workspace_id,
         name=req.name.strip(),
@@ -220,7 +221,7 @@ def update_api_token(
         row.expires_at = req.expires_at
     if "rate_limit_per_minute" in fields:
         row.rate_limit_per_minute = req.rate_limit_per_minute
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     session.add(row)
     session.commit()
     session.refresh(row)
@@ -269,9 +270,9 @@ def revoke_api_token(
     _require_dashboard_caller(principal)
     row = _require_token(session, workspace_id, token_id)
     row.status = "revoked"
-    row.revoked_at = datetime.utcnow()
+    row.revoked_at = utc_now_naive()
     row.revoked_reason = req.reason
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     session.add(row)
     session.commit()
     session.refresh(row)
@@ -297,7 +298,7 @@ def hold_api_token(
         raise HTTPException(status_code=409, detail="Cannot hold a revoked token")
     row.status = "held"
     row.held_reason = req.reason
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     session.add(row)
     session.commit()
     session.refresh(row)
@@ -321,7 +322,7 @@ def unhold_api_token(
         raise HTTPException(status_code=409, detail="Token is not on hold")
     row.status = "active"
     row.held_reason = None
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     session.add(row)
     session.commit()
     session.refresh(row)

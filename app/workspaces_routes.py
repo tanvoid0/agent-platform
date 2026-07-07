@@ -20,6 +20,7 @@ from crud_helpers import require_one
 from database import get_session
 from models import Project, Workspace
 from schema_converter import to_schemas
+from time_utils import utc_now_naive
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 me_router = APIRouter(prefix="/me", tags=["workspaces"])
@@ -82,7 +83,7 @@ def create_workspace(
     slug = _slugify(req.slug or req.name)
     if session.exec(select(Workspace).where(Workspace.slug == slug)).first():
         raise HTTPException(status_code=409, detail=f"Workspace slug '{slug}' already exists")
-    now = datetime.utcnow()
+    now = utc_now_naive()
     row = Workspace(
         name=req.name.strip(),
         slug=slug,
@@ -120,7 +121,7 @@ def update_workspace(
         row.name = req.name.strip()
     if req.description is not None:
         row.description = req.description.strip() if req.description else None
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     session.add(row)
     session.commit()
     session.refresh(row)

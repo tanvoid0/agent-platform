@@ -126,6 +126,7 @@ def test_agent_step_endpoint_mocked(client, test_engine):
     item_id = r_item.json()["id"]
 
     from action_orchestrator.schemas import PlannedAction
+    from chat_usage import LlmUsageOut
 
     mock_actions = [
         PlannedAction(
@@ -137,7 +138,7 @@ def test_agent_step_endpoint_mocked(client, test_engine):
 
     with patch(
         "todos.services.agent_bridge.decide_actions",
-        new=AsyncMock(return_value=(mock_actions, "Think step")),
+        new=AsyncMock(return_value=(mock_actions, "Think step", LlmUsageOut())),
     ):
         r = c.post(
             f"/api/v1/todos/items/{item_id}/agent/step",

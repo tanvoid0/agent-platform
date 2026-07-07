@@ -4,6 +4,8 @@ from typing import Optional, List, Dict, Any
 
 from sqlmodel import SQLModel, Field
 
+from time_utils import utc_now_naive
+
 
 class TeamTemplate(SQLModel, table=True):
     """Saved team roster used as planner hint and optional process snapshot.
@@ -21,8 +23,8 @@ class TeamTemplate(SQLModel, table=True):
     # Optional library grouping / card chip (e.g. Engineering, Content).
     category: Optional[str] = Field(default=None, max_length=128)
     roster_json: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now_naive)
+    updated_at: datetime = Field(default_factory=utc_now_naive)
 
 
 class Workspace(SQLModel, table=True):
@@ -37,8 +39,8 @@ class Workspace(SQLModel, table=True):
     name: str = Field(max_length=256)
     slug: str = Field(max_length=128, unique=True, index=True)
     description: Optional[str] = Field(default=None, max_length=4096)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now_naive)
+    updated_at: datetime = Field(default_factory=utc_now_naive)
 
 
 class Project(SQLModel, table=True):
@@ -56,8 +58,8 @@ class Project(SQLModel, table=True):
     # Default Personal Assistant planning board for this project.
     assistant_board_id: Optional[int] = Field(default=None, foreign_key="todo_boards.id")
     planning_prefs_json: Optional[str] = Field(default=None)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now_naive)
+    updated_at: datetime = Field(default_factory=utc_now_naive)
 
 
 class Process(SQLModel, table=True):
@@ -80,8 +82,8 @@ class Process(SQLModel, table=True):
     client_id: Optional[str] = Field(default=None, max_length=256, index=True)
     # Set when started by a project-scoped API token, for per-token usage attribution.
     token_id: Optional[int] = Field(default=None, foreign_key="api_tokens.id", index=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now_naive)
+    updated_at: datetime = Field(default_factory=utc_now_naive)
 
 
 class TaskNode(SQLModel, table=True):
@@ -126,7 +128,7 @@ class EventLog(SQLModel, table=True):
     task_id: Optional[int] = Field(default=None, foreign_key="tasknode.id")
     event_type: str  # trace, tool_call, status_change, error
     content: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now_naive)
 
 
 class ApiToken(SQLModel, table=True):
@@ -155,8 +157,8 @@ class ApiToken(SQLModel, table=True):
     total_errors: int = Field(default=0)
     total_tokens: int = Field(default=0)
     total_cost: float = Field(default=0.0)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now_naive)
+    updated_at: datetime = Field(default_factory=utc_now_naive)
 
     @property
     def scopes(self) -> List[str]:

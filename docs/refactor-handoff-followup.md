@@ -18,12 +18,12 @@ This document is the handoff for continuing the project-wide cleanup in a new ch
 
 ### Frontend store cleanup
 - Extracted task/history logic from `coreStore` into helpers:
-  - `web/src/integration/store/coreTaskMutations.ts`
-  - `web/src/integration/store/coreHistoryMutations.ts`
+  - `flow-ui/src/integration/store/coreTaskMutations.ts`
+  - `flow-ui/src/integration/store/coreHistoryMutations.ts`
 - Extracted shared UI state utilities:
-  - `web/src/integration/ui/projectSideTabStorage.ts`
-  - `web/src/integration/hooks/useHeartbeatNow.ts`
-  - `web/src/integration/hooks/useProjectsReachabilityPolling.ts`
+  - `flow-ui/src/integration/ui/projectSideTabStorage.ts`
+  - `flow-ui/src/integration/hooks/useHeartbeatNow.ts`
+  - `flow-ui/src/integration/hooks/useProjectsReachabilityPolling.ts`
 
 ### Contract/hygiene updates
 - Added repo hygiene check script:

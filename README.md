@@ -26,10 +26,11 @@ pip install -r app/requirements.txt
 python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
 ```
 
-Flow UI dev (separate terminal):
+Flow UI dev (separate terminal, sibling `../flow-ui/`):
 
 ```bash
 cd flow-ui
+cp env.example .env.local   # set VITE_AGENT_PLATFORM_TOKEN or master key
 pnpm install && pnpm run dev
 ```
 

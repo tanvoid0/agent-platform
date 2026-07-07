@@ -22,6 +22,7 @@ from schema_converter import to_schemas
 from schema_fields import ResourceName, ResourceDescription, ResourceColor
 from workspace_service import delete_project_workspace
 from todos.services.planning_context import get_planning_context, patch_planning_context
+from time_utils import utc_now_naive
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -123,7 +124,7 @@ def create_project(
             )
         workspace_id = default.id
     require_one(session, Workspace, workspace_id, "Workspace")
-    now = datetime.utcnow()
+    now = utc_now_naive()
     row = Project(
         workspace_id=workspace_id,
         name=req.name.strip(),
@@ -164,7 +165,7 @@ def update_project(
         row.description = req.description.strip() if req.description else None
     if req.color is not None:
         row.color = req.color.strip() if req.color else None
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     session.add(row)
     session.commit()
     session.refresh(row)
@@ -200,7 +201,7 @@ def put_project_workspace_state(
     assert_token_project_access(principal, project_id, session)
     row = require_one(session, Project, project_id, "Project")
     row.workspace_payload_json = json.dumps(req.payload, ensure_ascii=False)
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     session.add(row)
     session.commit()
     session.refresh(row)

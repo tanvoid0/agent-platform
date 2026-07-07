@@ -15,6 +15,7 @@ from models import Process, TeamTemplate, Workspace
 from schema_converter import to_schemas
 from schema_fields import ResourceName, ResourceDescription, ResourceColor, ResourceCategory
 from team_schema import TeamRoster, parse_team_roster_json, roster_to_json
+from time_utils import utc_now_naive
 
 router = APIRouter(prefix="/teams", tags=["teams"])
 
@@ -152,7 +153,7 @@ def create_team(
         workspace_id = req.workspace_id
         if workspace_id is not None:
             require_one(session, Workspace, workspace_id, "Workspace")
-    now = datetime.utcnow()
+    now = utc_now_naive()
     row = TeamTemplate(
         workspace_id=workspace_id,
         name=req.name.strip(),
@@ -201,7 +202,7 @@ def update_team(
         row.category = raw.strip() if isinstance(raw, str) and raw.strip() else None
     if req.roster is not None:
         row.roster_json = roster_to_json(req.roster)
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     session.add(row)
     session.commit()
     session.refresh(row)

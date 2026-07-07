@@ -43,6 +43,24 @@ def test_upgrade_creates_tables_and_version(monkeypatch):
     assert "project_id" in proc_cols
 
     assert "project" in names
+    assert "workspace" in names
+
+    with eng.connect() as conn:
+        default_ws = conn.exec_driver_sql(
+            "SELECT id, slug FROM workspace WHERE slug = 'default'"
+        ).fetchone()
+    assert default_ws is not None
+    default_id = int(default_ws[0])
+
+    with eng.connect() as conn:
+        pinfo = conn.exec_driver_sql("PRAGMA table_info(project)").fetchall()
+    assert "workspace_id" in {row[1] for row in pinfo}
+
+    with eng.connect() as conn:
+        orphan = conn.exec_driver_sql(
+            "SELECT COUNT(*) FROM project WHERE workspace_id IS NULL"
+        ).fetchone()[0]
+    assert int(orphan) == 0
 
 
 def test_legacy_db_without_alembic_version_gets_stamped(monkeypatch):

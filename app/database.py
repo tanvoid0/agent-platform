@@ -174,6 +174,30 @@ def _ensure_sqlite_columns() -> None:
         # client_id is added by Alembic revision h2i3j4k5l6m7 after ``run`` → ``process`` rename.
 
 
+def _run_alembic_upgrade_subprocess() -> bool:
+    """Run Alembic in a child process — avoids in-process hang on Windows file SQLite."""
+    import subprocess
+
+    app_dir = Path(__file__).resolve().parent
+    cfg = app_dir / "alembic.ini"
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "alembic", "-c", str(cfg), "upgrade", "head"],
+            cwd=str(app_dir),
+            timeout=120,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("Alembic subprocess upgrade timed out after 120s")
+        return False
+    if proc.returncode != 0:
+        logger.error("Alembic subprocess upgrade failed: %s", (proc.stderr or proc.stdout or "").strip())
+        return False
+    logger.info("Alembic migrations complete (subprocess)")
+    return True
+
+
 def create_db_and_tables() -> None:
     """Apply Alembic migrations; legacy DBs without alembic_version get column patches then upgrade."""
     with _sqlite_startup_migration_lock():
@@ -200,8 +224,12 @@ def create_db_and_tables() -> None:
                 command.upgrade(_ALEMBIC_CFG, "head")
                 logger.info("Alembic migrations complete")
             else:
-                logger.info("Alembic migrations SKIPPED (command.upgrade hangs on Windows file-based SQLite)")
-                # TODO: Investigate and fix the root cause; see commit ca51947.
+                logger.info("Running Alembic migrations for Windows SQLite (subprocess)...")
+                if not _run_alembic_upgrade_subprocess():
+                    logger.warning(
+                        "Alembic subprocess upgrade failed or timed out; "
+                        "run `alembic upgrade head` manually from app/"
+                    )
 
             from process_table_sqlite import apply_process_table_sqlite
             with engine.begin() as conn:

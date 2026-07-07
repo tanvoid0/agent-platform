@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from sqlmodel import Session, select
 
 from models import ApiToken, ApiTokenUsageDaily
+from time_utils import utc_now_naive
 
 
 def record_api_token_usage(
@@ -21,7 +20,7 @@ def record_api_token_usage(
     if token_id is None:
         return
 
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = utc_now_naive().strftime("%Y-%m-%d")
 
     row = session.exec(
         select(ApiTokenUsageDaily).where(

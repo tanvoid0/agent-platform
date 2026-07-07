@@ -28,10 +28,10 @@ OpenAPI is available from the FastAPI app on the same port (paths depend on rout
 | DB, Alembic | `app/database.py`, `app/alembic/` |
 | Models | `app/models.py` |
 | Planner, executor, LLM | `app/orchestrator.py`, `app/llm_client.py`, `app/dag_schema.py` |
-| Team templates | `app/teams_routes.py`, `app/team_schema.py`, `web/src/components/TeamsPage.tsx` |
+| Team templates | `app/teams_routes.py`, `app/team_schema.py`, `flow-ui/src/components/TeamsPage.tsx` |
 | Approve / retry / auto-approve | `app/process_approval.py` |
 | Tools, MCP client | `app/tools_policy.py`, `app/tool_handlers.py`, `app/mcp_streamable_client.py` |
-| Frontend | `web/src/` (TanStack Query, `@xyflow/react`; entry under **`/app/`**) |
+| Frontend | `../flow-ui/src/` (sibling repo; TanStack Query, `@xyflow/react`; entry under **`/app/`**) |
 | ADRs | `docs/adr/` |
 
 ## ADRs
@@ -65,11 +65,11 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
 
 ## Implemented (summary)
 
-REST: processes list/create/detail, approve, cancel, retry, task review, **`GET /processes/{id}/events`** (filterable; `limit` capped server-side, `after_id` for pagination), **`GET /processes/{id}/stream`** (SSE). Duplicate **`/api/v1/...`** paths for the same routers. Statuses: process (`planning` … `completed`/`failed`/`cancelled`); task (`pending`, `running`, `awaiting_review`, …). Planner JSON validated (Pydantic, acyclicity) on plan and approve. Task review + sub-DAG expansion after approval; failure fields, `total_cost`, tool invocations, optional timeouts and auto-approve. SQLite + Alembic (legacy stamp path). **Web UI (`/app/`):** graph/board/timeline/**events**, inspector, approve DAG, cancel, retry, review mutations, recent processes, 2D polish (edges, minimap, status visuals), **graph lineage** (`parent_client_uuid`: depth layout, tint, parent hint, visibility **All / ≤1 / Roots**). **Export JSON** in `ProcessMainPane` (`downloadProcessExport` → process + tasks + **all** events via paginated fetch). Tools: echo, http_fetch, MCP streamable, optional nested chat; planner/expansion retries and subdecompose env knobs. Tests under `app/tests/` and `web/src/**/*.test.ts`.
+REST: processes list/create/detail, approve, cancel, retry, task review, **`GET /processes/{id}/events`** (filterable; `limit` capped server-side, `after_id` for pagination), **`GET /processes/{id}/stream`** (SSE). Duplicate **`/api/v1/...`** paths for the same routers. Statuses: process (`planning` … `completed`/`failed`/`cancelled`); task (`pending`, `running`, `awaiting_review`, …). Planner JSON validated (Pydantic, acyclicity) on plan and approve. Task review + sub-DAG expansion after approval; failure fields, `total_cost`, tool invocations, optional timeouts and auto-approve. SQLite + Alembic (legacy stamp path). **Web UI (`/app/`):** graph/board/timeline/**events**, inspector, approve DAG, cancel, retry, review mutations, recent processes, 2D polish (edges, minimap, status visuals), **graph lineage** (`parent_client_uuid`: depth layout, tint, parent hint, visibility **All / ≤1 / Roots**). **Export JSON** in `ProcessMainPane` (`downloadProcessExport` → process + tasks + **all** events via paginated fetch). Tools: echo, http_fetch, MCP streamable, optional nested chat; planner/expansion retries and subdecompose env knobs. Tests under `app/tests/` and `flow-ui/src/**/*.test.ts`.
 
 ## Team templates page — Delegation as reference (not a port)
 
-**Today:** **Teams** (`TeamsPage` route) is `web/src/components/TeamsPage.tsx`: library + editor backed by **`GET/POST/PATCH/DELETE`** on **`/teams`** (and **`/api/v1/teams`**) — `app/teams_routes.py`, `team_schema.py`, DB templates. Roster is JSON (**roles** with `id`, `name`, `description`, optional `parent_id`, `default_model`, optional **`accent_color`**) for planner / LLM alias use — no simulation state.
+**Today:** **Teams** (`TeamsPage` route) is `flow-ui/src/components/TeamsPage.tsx`: library + editor backed by **`GET/POST/PATCH/DELETE`** on **`/teams`** (and **`/api/v1/teams`**) — `app/teams_routes.py`, `team_schema.py`, DB templates. Roster is JSON (**roles** with `id`, `name`, `description`, optional `parent_id`, `default_model`, optional **`accent_color`**) for planner / LLM alias use — no simulation state.
 
 **Reference UX (The Delegation):** `the-delegation/src/interface/TeamManagementPage.tsx` → **`VisualConfigurator`** (`VisualConfigurator.tsx`): React Flow roster graph, **`TeamsPanel`** (library + “Create New Team”), **`VisualFlowNode`** (border + **`Avatar`** + LEAD/SUB tags + model line), **`TeamCard`** density. Avatars live in **`the-delegation/src/interface/components/Avatar.tsx`** (`user` | `lead` | `sub`, tint `color`). Brand tints: **`the-delegation/src/theme/brand.ts`** (`USER_COLOR`, etc.). Our port stays **lean**: reuse **visual patterns** (palette, node chrome, tags), not `AgenticSystem` or client-only persistence.
 
@@ -80,7 +80,7 @@ REST: processes list/create/detail, approve, cancel, retry, task review, **`GET 
 3. **Starter templates:** ship **preset JSON** in the web app (`teamTemplatePresets.ts`) aligned with **proxy model aliases** (e.g. `gemini-flash`, `local` — not vendor-specific IDs unless documented in `.env.example`). **Apply preset** fills the editor (new template or confirm overwrite). Optional DB seed script: `scripts/seed_team_template_once.py`.
 4. **Not in scope (short term):** human-in-the-loop toggles, capabilities checklist, separate “User (You)” node — those belong to a richer agent model than `RosterRole` today.
 
-**Deep links:** `?team=<id>` / `?team=new` + **Copy link** (see `web/src/lib/teamUrl.ts`).
+**Deep links:** `?team=<id>` / `?team=new` + **Copy link** (see `flow-ui/src/lib/teamUrl.ts`).
 
 ## Backlog (product)
 
@@ -108,7 +108,7 @@ See **`docs/practical-assistant-roadmap.md`** for the phased plan toward a pract
 5. **Teams page (template UX)** — **Done:** library + editor, **`?team=` / `?team=new`**, **Copy link**, **`TeamRosterGraph`**, **`accent_color`**, **starter presets**. Library cards: **`#id`**, relative **Updated**, **role count**, optional **category** chip when set (`TeamTemplateCard`).
 6. ~~**Pixel art slice**~~ — **Done:** **`PixelProcessStrip`** (also exported as **`PixelRunStrip`**) — live task tiles + optional pixel office; **`TASK_STATUS_COLORS`** via `taskStatusColor`; subtle pulse on a subset of **running** tiles. **`PixelHomeTeaser`** when **Pixel preview** is on and no process is loaded. Optional viz **off by default**.
 7. ~~**Export (JSON)**~~ — **Done:** **Export JSON** in `ProcessMainPane`; **`downloadProcessExport`** paginates events (server `limit` max 2000 per request) so large logs export in full.
-8. ~~**3D boundary spike (ADR 0003)**~~ — **Done:** lazy **`SimulationSpike`** (`web/src/features/simulation/SimulationSpike.tsx`): R3F + Three + `OrbitControls`; rotating box tint from read-only **`GET /processes/:id`** status; heavy deps stay out of the main graph bundle. ~~SSE semantics~~ — **Done:** documented in **`plan.md`** (runbook) and **`/api-guide`**.
+8. ~~**3D boundary spike (ADR 0003)**~~ — **Done:** lazy **`SimulationSpike`** (`flow-ui/src/features/simulation/SimulationSpike.tsx`): R3F + Three + `OrbitControls`; rotating box tint from read-only **`GET /processes/:id`** status; heavy deps stay out of the main graph bundle. ~~SSE semantics~~ — **Done:** documented in **`plan.md`** (runbook) and **`/api-guide`**.
 9. ~~**Raster sprite sheets (office)**~~ — **Done:** MIT assets from [pixel-agents](https://github.com/pablodelucca/pixel-agents) ship under `web/public/pixel-agents/` (characters, floors, walls, furniture); refresh via `scripts/sync_pixel_agents_assets.py`. Task strip defaults to **`PixelChibiTile`** (CSS); **optional raster tiles** use the same character sheets as the office (`PixelRasterChibiTile`), with **Strip task tiles** under Process controls (persisted). Falls back to CSS if assets fail to load.
 
 ## Notes

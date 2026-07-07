@@ -12,7 +12,7 @@ This ADR defines how a **future** 3D viewport may attach **without** entangling 
 
 ## Decision
 
-1. **Lazy loading (mandatory):** Any 3D or heavy renderer loads via **dynamic `import()`** in a dedicated route or feature folder (e.g. `web/src/features/simulation/`). The **default** orchestration bundle must not statically import Three, Babylon, or R3F.
+1. **Lazy loading (mandatory):** Any 3D or heavy renderer loads via **dynamic `import()`** in a dedicated route or feature folder (e.g. `flow-ui/src/features/simulation/`). The **default** orchestration bundle must not statically import Three, Babylon, or R3F.
 
 2. **Default engine (when an ADR chooses to implement):** Prefer **React Three Fiber (@react-three/fiber) + Three.js** inside the lazy chunk—**one** component model (React) from forms → graph → scene. Use `@react-three/drei` only as needed. **WebGPU** depth (e.g. Three’s WebGPU renderer) remains an **incremental** choice inside that module.
 
@@ -24,14 +24,14 @@ This ADR defines how a **future** 3D viewport may attach **without** entangling 
 
 5. **Contract:** The 3D module consumes **JSON** (run summaries, optional future `WorldSnapshot`-style DTOs) over the same **poll-first** patterns as the rest of the UI. Optional **WebSocket or binary** streams are **presentation-only** (e.g. pose interpolation), not approval gates.
 
-6. **Spike (minimal):** A **placeholder** lazy chunk proves bundle split and route wiring without adding engine dependencies—see `web/src/features/simulation/` (placeholder component). Replacing the placeholder with R3F is a **later** task once product prioritizes 3D.
+6. **Spike (minimal):** A **placeholder** lazy chunk proves bundle split and route wiring without adding engine dependencies—see `flow-ui/src/features/simulation/` (placeholder component). Replacing the placeholder with R3F is a **later** task once product prioritizes 3D.
 
 7. **Pixel art / 2D activity visualization (optional, reference—not a fork):** Embodied “office” metaphors and **activity-mapped** character animation are well illustrated by the open-source **[pixel-agents](https://github.com/pablodelucca/pixel-agents)** project (MIT): Canvas 2D, game loop, pathfinding, and a small state machine (idle → walk → type/read), with sprites driven by **observed** agent activity (today: Claude Code JSONL transcripts). That stack is a **UX and animation pattern** reference only.
 
    **How agent-platform should differ (when/if we go beyond status tiles):**
 
    - **Authority:** Drive animation from **agent-platform run and task state** (HTTP poll + SSE + persisted DAG/task records)—not from log-file heuristics on a specific CLI.
-   - **Scope:** Keep the same **lazy** boundary: any Canvas 2D or sprite atlas that grows beyond trivial UI lives under `web/src/features/pixel/` (or a sibling lazy chunk), not in the default graph bundle.
+   - **Scope:** Keep the same **lazy** boundary: any Canvas 2D or sprite atlas that grows beyond trivial UI lives under `flow-ui/src/features/pixel/` (or a sibling lazy chunk), not in the default graph bundle.
    - **Assets:** If we add manifests or sprite packs later, follow the same **modular asset** idea (declarative manifests, integer zoom for crisp pixels)—without vendoring upstream art unless license and product intent align.
 
    Current UI ships a minimal **server-driven** strip (`PixelRunStrip`) as a thin, authoritative preview—not a port of pixel-agents.
