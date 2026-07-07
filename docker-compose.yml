@@ -29,6 +29,7 @@ services:
     env_file:
       - .env
     environment:
+      DATABASE_URL: ""
       AGENT_PLATFORM_DB_PATH: /app/data/agent_platform.db
       AGENT_PLATFORM_WORKSPACE_ROOT: /app/data/workspaces
       CONFIG_DIR: /app/data/llm

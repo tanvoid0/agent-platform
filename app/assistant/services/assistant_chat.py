@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
 from fastapi import HTTPException
 from sqlmodel import Session, select
 
-from action_orchestrator.engine import decide_actions
+from action_orchestrator.engine import build_action_tools, decide_actions
 from action_orchestrator.registry import list_actions
 from assistant.clarifying_form import (
     build_clarifying_form,
@@ -25,6 +26,14 @@ from assistant.services.user_profile_service import (
     get_all_profiles,
     get_profile,
     merge_profile,
+)
+from chat_usage import (
+    ContextUsageOut,
+    LlmStepUsageOut,
+    LlmUsageOut,
+    estimate_context_usage,
+    merge_llm_usages,
+    parse_llm_usage,
 )
 from context_budget import fit_chat_messages_for_request, max_output_tokens_default
 from dag_schema import sanitize_llm_model_alias
@@ -134,6 +143,28 @@ def list_chat_threads(session: Session, project_id: int) -> list[dict[str, Any]]
     return out
 
 
+def _assistant_context_usage(
+    *,
+    profile: PlannerAgentProfile,
+    messages: list[dict[str, Any]],
+    board_context: dict[str, Any],
+    profile_ctx: dict[str, Any],
+    tools: list[dict[str, Any]] | None,
+) -> ContextUsageOut:
+    system = "\n\n".join(
+        p for p in (PA_SYSTEM_PROMPT, profile.system_prompt or "") if p
+    )
+    injected = json.dumps(
+        {**board_context, **profile_ctx}, default=str, ensure_ascii=False
+    )
+    return estimate_context_usage(
+        system_prompt=system,
+        tools=tools,
+        conversation_messages=messages,
+        injected_context=injected,
+    )
+
+
 def _thread_payload(
     session: Session,
     thread: AssistantChatThread,
@@ -144,6 +175,23 @@ def _thread_payload(
     pending_form = _extract_pending_form(pending)
     profile_slug = thread.last_profile_slug or "personal-assistant"
     profile_ctx = build_profile_context(session, project_id, profile_slug)
+    profile = _resolve_profile(session, profile_slug)
+    messages = thread.get_messages()
+    board_context = build_board_context(session, board.id, project_id)
+    tools: list[dict[str, Any]] | None = None
+    if profile and profile.action_set_id:
+        tools = build_action_tools(list_actions(session, profile.action_set_id))
+    context_usage = (
+        _assistant_context_usage(
+            profile=profile,
+            messages=messages,
+            board_context=board_context,
+            profile_ctx=profile_ctx,
+            tools=tools,
+        )
+        if profile
+        else None
+    )
     return {
         "thread_id": thread.id,
         "project_id": project_id,
@@ -154,6 +202,8 @@ def _thread_payload(
         "pending_form": pending_form,
         "last_profile_slug": thread.last_profile_slug,
         "domain_profiles": profile_ctx.get("user_domain_profiles", {}),
+        "context_window": context_usage.context_window if context_usage else None,
+        "context_usage": context_usage,
     }
 
 
@@ -436,6 +486,27 @@ def _resolve_pending_proposal_in_messages(
             return
 
 
+def _assistant_message_with_usage(
+    content: str,
+    usage_steps: list[LlmStepUsageOut],
+    *,
+    proposed_actions: list[PlannedActionOut] | None = None,
+) -> dict[str, Any]:
+    msg: dict[str, Any] = {"role": "assistant", "content": content}
+    turn = merge_llm_usages(usage_steps)
+    if turn.total_tokens or turn.cost_usd:
+        msg["usage"] = {
+            "prompt_tokens": turn.prompt_tokens,
+            "completion_tokens": turn.completion_tokens,
+            "total_tokens": turn.total_tokens,
+            "cost_usd": turn.cost_usd,
+        }
+    if proposed_actions:
+        msg["proposed_actions"] = [p.model_dump() for p in proposed_actions]
+        msg["proposal_status"] = "pending"
+    return msg
+
+
 def _append_assistant_message(
     messages: list[dict[str, Any]],
     content: str,
@@ -553,11 +624,48 @@ def _maybe_inject_domain_form(
     ]
 
 
+def format_apply_summary(result: Any) -> str:
+    """Render a board_action_apply result as a synthetic user turn for auto-continue."""
+    parts: list[str] = []
+    if result.applied:
+        parts.append("Applied: " + "; ".join(result.applied) + ".")
+    if result.skipped:
+        parts.append("Skipped: " + "; ".join(result.skipped) + ".")
+    if result.guidance:
+        parts.append(" ".join(result.guidance))
+    if not parts:
+        return "Done."
+    return " ".join(parts)
+
+
 async def get_thread(
     session: Session, project_id: int, *, thread_id: int | None = None
 ) -> dict[str, Any]:
     thread = _resolve_thread(session, project_id, thread_id)
     return _thread_payload(session, thread, project_id)
+
+
+def get_context_usage(
+    session: Session, project_id: int, *, thread_id: int | None = None
+) -> ContextUsageOut:
+    thread = _resolve_thread(session, project_id, thread_id)
+    board = ensure_assistant_board(session, project_id)
+    profile_slug = thread.last_profile_slug or "personal-assistant"
+    profile = _resolve_profile(session, profile_slug)
+    if not profile:
+        raise HTTPException(status_code=400, detail="No planner profile configured")
+    profile_ctx = build_profile_context(session, project_id, profile_slug)
+    board_context = build_board_context(session, board.id, project_id)
+    tools: list[dict[str, Any]] | None = None
+    if profile.action_set_id:
+        tools = build_action_tools(list_actions(session, profile.action_set_id))
+    return _assistant_context_usage(
+        profile=profile,
+        messages=thread.get_messages(),
+        board_context=board_context,
+        profile_ctx=profile_ctx,
+        tools=tools,
+    )
 
 
 async def _generate_assistant_turn(
@@ -585,22 +693,33 @@ async def _generate_assistant_turn(
     pending_form: dict[str, Any] | None = None
 
     profile_ctx = build_profile_context(session, project_id, profile_slug)
+    board_context = build_board_context(session, board.id, project_id)
+    actions = list_actions(session, profile.action_set_id) if profile.action_set_id else []
+    tools = build_action_tools(actions) if actions else None
+    context_usage = _assistant_context_usage(
+        profile=profile,
+        messages=messages,
+        board_context=board_context,
+        profile_ctx=profile_ctx,
+        tools=tools,
+    )
+    usage_steps: list[LlmStepUsageOut] = []
 
     if propose_actions and profile.action_set_id:
-        actions = list_actions(session, profile.action_set_id)
-        context = build_board_context(session, board.id, project_id)
+        context = dict(board_context)
         context.update(profile_ctx)
         context["planner_system_prompt"] = profile.system_prompt
         context["personal_assistant_prompt"] = PA_SYSTEM_PROMPT
         context["conversation_history"] = _format_conversation_for_planner(messages[:-1])
 
-        planned, thought = await decide_actions(
+        planned, thought, decide_usage = await decide_actions(
             goal=message,
             context=context,
             actions=actions,
             history=None,
             llm_model=llm_model,
         )
+        usage_steps.extend(decide_usage.steps)
         planned_out = [
             PlannedActionOut(
                 action_id=a.action_id,
@@ -636,8 +755,10 @@ async def _generate_assistant_turn(
                     content = thought.strip()
         elif task_actions:
             content = _assistant_reply_for_actions(task_actions, thought=thought)
+        elif _thought_is_user_facing(thought):
+            content = thought.strip()
         else:
-            content = await _chat_only(
+            content, chat_usage = await _chat_only(
                 session,
                 profile,
                 message,
@@ -647,6 +768,7 @@ async def _generate_assistant_turn(
                 project_id,
                 profile_slug,
             )
+            usage_steps.extend(chat_usage.steps)
             if not (content or "").strip():
                 content = (
                     "Tell me a bit more about what you want on your board — "
@@ -658,19 +780,24 @@ async def _generate_assistant_turn(
         )
         if persist_pending:
             thread.set_pending_actions([p.model_dump() for p in planned_out])
-            _append_assistant_message(
-                messages,
-                content,
-                proposed_actions=planned_out if planned_out else None,
+            messages.append(
+                _assistant_message_with_usage(
+                    content,
+                    usage_steps,
+                    proposed_actions=planned_out if planned_out else None,
+                )
             )
         else:
             thread.set_pending_actions([])
-            messages.append({"role": "assistant", "content": content})
+            messages.append(_assistant_message_with_usage(content, usage_steps))
     else:
-        content = await _chat_only(
+        content, chat_usage = await _chat_only(
             session, profile, message, messages, llm_model, board.id, project_id, profile_slug
         )
-        messages.append({"role": "assistant", "content": content})
+        usage_steps.extend(chat_usage.steps)
+        messages.append(_assistant_message_with_usage(content, usage_steps))
+
+    turn_usage = merge_llm_usages(usage_steps)
 
     thread.set_messages(messages)
     thread.last_profile_slug = profile_slug
@@ -695,6 +822,9 @@ async def _generate_assistant_turn(
         "pending_form": pending_form,
         "board_id": board.id,
         "domain_profiles": profile_ctx.get("user_domain_profiles", {}),
+        "context_window": context_usage.context_window,
+        "context_usage": context_usage,
+        "usage": turn_usage,
     }
 
 
@@ -719,6 +849,11 @@ async def send_chat_message(
         thread.set_pending_actions([])
     messages.append({"role": "user", "content": message})
     thread.set_messages(messages)
+    # Commit the user turn before generation: an LLM failure or client disconnect
+    # must not lose it — the thread can then be retried/regenerated as-is.
+    thread.updated_at = utc_now_naive()
+    session.add(thread)
+    session.commit()
 
     return await _generate_assistant_turn(
         session,
@@ -871,7 +1006,7 @@ async def _chat_only(
     board_id: int,
     project_id: int,
     profile_slug: str,
-) -> str:
+) -> tuple[str, LlmUsageOut]:
     profile_ctx = build_profile_context(session, project_id, profile_slug)
     context = build_board_context(session, board_id, project_id)
     context.update(profile_ctx)
@@ -907,7 +1042,9 @@ async def _chat_only(
         raise HTTPException(status_code=502, detail=f"LLM proxy returned HTTP {r.status_code}")
 
     data = r.json()
+    usage = merge_llm_usages([parse_llm_usage(data, label="chat_only")])
     choices = data.get("choices") or []
     if choices:
-        return (choices[0].get("message") or {}).get("content") or ""
-    return ""
+        content = (choices[0].get("message") or {}).get("content") or ""
+        return content, usage
+    return "", usage

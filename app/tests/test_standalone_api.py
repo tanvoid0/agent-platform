@@ -109,8 +109,8 @@ def test_llm_ui_catalog_returns_providers_and_media(client):
     assert "resolved_defaults" in j
     assert "providers" in j
     providers = j["providers"]
-    assert len(providers) == 4
-    assert [p["id"] for p in providers] == ["ollama", "lm_studio", "aimlapi", "gemini"]
+    assert len(providers) == 5
+    assert [p["id"] for p in providers] == ["ollama", "lm_studio", "aimlapi", "anthropic", "gemini"]
     for p in providers:
         assert "configured" in p
         assert "reachable" in p
@@ -177,7 +177,11 @@ def test_api_key_required_when_set(client, monkeypatch):
     r2 = c.get("/processes", headers={"Authorization": "Bearer wrong"})
     assert r2.status_code == 401
 
-    r3 = c.get("/processes", headers={"Authorization": "Bearer secret-apk"})
+    r3 = c.get(
+        "/processes",
+        params={"unassigned_only": "true"},
+        headers={"Authorization": "Bearer secret-apk"},
+    )
     assert r3.status_code == 200
 
 
@@ -192,7 +196,7 @@ def test_client_id_scope_list_and_access(client, monkeypatch):
     assert r.status_code == 200
     pid = r.json()["process_id"]
 
-    r_all = c.get("/api/v1/processes")
+    r_all = c.get("/api/v1/processes", params={"unassigned_only": "true"})
     assert r_all.status_code == 200
     ids_all = {p["id"] for p in r_all.json()["processes"]}
     assert pid in ids_all

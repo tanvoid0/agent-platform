@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -190,17 +191,30 @@ def _llm_proxy_http_error_message(status_code: int, response: httpx.Response) ->
     return " ".join(parts)
 
 
-async def call_llm(
-    messages: list[Dict[str, str]],
-    model: str | None = None,
-    require_json: bool = False,
-    temperature: float = 0.7,
-    max_output_tokens: int | None = None,
-) -> tuple[str, int, float]:
-    """
-    Calls the embedded LLM proxy and returns (content, total_tokens, cost_usd).
+def _llm_transport_error_message(base: str) -> str:
+    return (
+        f"Could not reach the LLM proxy at {base}. "
+        "Ensure the embedded LLM proxy is reachable (same process; default port 18410). "
+        "In Docker with loopback rewrite, use host.docker.internal or set "
+        "LLM_ORCHESTRATOR_BASE_URL=http://127.0.0.1:18410/v1 (AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX=0 for same-container)."
+    )
 
-    cost_usd is 0.0 when the upstream response omits cost fields (e.g. plain Ollama).
+
+def _connect_max_attempts() -> int:
+    raw = (os.getenv("LLM_CLIENT_CONNECT_MAX_ATTEMPTS") or "3").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 3
+
+
+async def _post_chat_completions(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    POST to the embedded proxy's /chat/completions and return the parsed JSON body.
+
+    Connect-phase failures (ConnectError/ConnectTimeout) are retried with backoff:
+    the request was never sent, so retrying cannot duplicate a completion. Everything
+    else maps to the typed LLM*Error exceptions.
     """
     key = llm_proxy_master_key()
     if not key:
@@ -215,7 +229,55 @@ async def call_llm(
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
+    timeout = llm_proxy_http_timeout_seconds()
+    max_attempts = _connect_max_attempts()
 
+    for attempt in range(max_attempts):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                raise LLMAuthenticationError(
+                    "LLM proxy returned 401: set AGENT_PLATFORM_MASTER_KEY in agent-platform/.env to match "
+                    "the value used for Bearer auth on /v1."
+                ) from None
+            raise LLMRequestError(
+                _llm_proxy_http_error_message(e.response.status_code, e.response)
+            ) from None
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            if attempt < max_attempts - 1:
+                delay = 0.2 * (2**attempt)
+                logger.warning(
+                    "LLM proxy connect failed (%s); retry %s/%s in %.1fs",
+                    e.__class__.__name__,
+                    attempt + 1,
+                    max_attempts,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise LLMTransportError(_llm_transport_error_message(base)) from e
+        except httpx.RequestError as e:
+            raise LLMTransportError(_llm_transport_error_message(base)) from e
+
+    raise LLMTransportError(_llm_transport_error_message(base))
+
+
+async def call_llm(
+    messages: list[Dict[str, str]],
+    model: str | None = None,
+    require_json: bool = False,
+    temperature: float = 0.7,
+    max_output_tokens: int | None = None,
+) -> tuple[str, int, float]:
+    """
+    Calls the embedded LLM proxy and returns (content, total_tokens, cost_usd).
+
+    cost_usd is 0.0 when the upstream response omits cost fields (e.g. plain Ollama).
+    """
     raw_model = (model or "").strip() or _default_subagent_model()
     resolved_model = sanitize_llm_model_alias(raw_model)
     fitted, _prompt_budget = fit_chat_messages_for_request([dict(m) for m in messages])
@@ -242,27 +304,7 @@ async def call_llm(
     if require_json:
         payload["response_format"] = {"type": "json_object"}
 
-    _timeout = llm_proxy_http_timeout_seconds()
-    try:
-        async with httpx.AsyncClient(timeout=_timeout) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 401:
-            raise LLMAuthenticationError(
-                "LLM proxy returned 401: set AGENT_PLATFORM_MASTER_KEY in agent-platform/.env to match "
-                "the value used for Bearer auth on /v1."
-            ) from None
-        raise LLMRequestError(_llm_proxy_http_error_message(e.response.status_code, e.response)) from None
-    except httpx.RequestError as e:
-        raise LLMTransportError(
-            f"Could not reach the LLM proxy at {base}. "
-            "Ensure the embedded LLM proxy is reachable (same process; default port 18410). "
-            "In Docker with loopback rewrite, use host.docker.internal or set "
-            "LLM_ORCHESTRATOR_BASE_URL=http://127.0.0.1:18410/v1 (AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX=0 for same-container)."
-        ) from e
-
-    data = response.json()
+    data = await _post_chat_completions(payload)
     content = data["choices"][0]["message"]["content"]
     tokens = data.get("usage", {}).get("total_tokens", 0)
     cost = usage_cost_from_completion_response(data)
@@ -285,20 +327,6 @@ async def call_llm_tool_proposals(
         content, tokens, cost = await call_llm(messages, model=model, temperature=temperature)
         return content, [], tokens, cost
 
-    key = llm_proxy_master_key()
-    if not key:
-        raise LLMConfigurationError(
-            "AGENT_PLATFORM_MASTER_KEY is not set. Add it to agent-platform/.env (Bearer for /v1). "
-            "See .env.example."
-        )
-
-    base = llm_proxy_base_url_v1()
-    url = f"{base}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-
     raw_model = (model or "").strip() or _default_subagent_model()
     resolved_model = sanitize_llm_model_alias(raw_model)
     conversation, _ = fit_chat_messages_for_request([dict(m) for m in messages])
@@ -312,25 +340,7 @@ async def call_llm_tool_proposals(
     if resolved_model:
         payload["model"] = resolved_model
 
-    http_timeout = llm_proxy_http_timeout_seconds()
-    try:
-        async with httpx.AsyncClient(timeout=http_timeout) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 401:
-            raise LLMAuthenticationError(
-                "LLM proxy returned 401: set AGENT_PLATFORM_MASTER_KEY in agent-platform/.env to match "
-                "the value used for Bearer auth on /v1."
-            ) from None
-        raise LLMRequestError(_llm_proxy_http_error_message(e.response.status_code, e.response)) from None
-    except httpx.RequestError as e:
-        raise LLMTransportError(
-            f"Could not reach the LLM proxy at {base}. "
-            "Ensure the embedded LLM proxy is reachable (same process; default port 18410)."
-        ) from e
-
-    data = response.json()
+    data = await _post_chat_completions(payload)
     usage = data.get("usage") or {}
     tokens = int(usage.get("total_tokens", 0) or 0)
     cost = usage_cost_from_completion_response(data)
@@ -383,24 +393,9 @@ async def call_llm_with_tools(
         content, tokens, cost = await call_llm(slim, model=model, temperature=temperature)
         return content, tokens, cost, 0
 
-    key = llm_proxy_master_key()
-    if not key:
-        raise LLMConfigurationError(
-            "AGENT_PLATFORM_MASTER_KEY is not set. Add it to agent-platform/.env (Bearer for /v1). "
-            "See .env.example."
-        )
-
-    base = llm_proxy_base_url_v1()
-    url = f"{base}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-
     raw_model = (model or "").strip() or _default_subagent_model()
     resolved_model = sanitize_llm_model_alias(raw_model)
     conversation: List[Dict[str, Any]] = [dict(m) for m in messages]
-    http_timeout = llm_proxy_http_timeout_seconds()
 
     total_tokens = 0
     total_cost = 0.0
@@ -420,28 +415,7 @@ async def call_llm_with_tools(
             payload["tool_choice"] = "auto"
         # When the budget is exhausted, omit tools so the model must answer in plain text.
 
-        try:
-            async with httpx.AsyncClient(timeout=http_timeout) as client:
-                response = await client.post(url, headers=headers, json=payload)
-                response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 401:
-                raise LLMAuthenticationError(
-                    "LLM proxy returned 401: set AGENT_PLATFORM_MASTER_KEY in agent-platform/.env to match "
-                    "the value used for Bearer auth on /v1."
-                ) from None
-            raise LLMRequestError(
-                _llm_proxy_http_error_message(e.response.status_code, e.response)
-            ) from None
-        except httpx.RequestError as e:
-            raise LLMTransportError(
-                f"Could not reach the LLM proxy at {base}. "
-                "Ensure the embedded LLM proxy is reachable (same process; default port 18410). "
-                "In Docker with loopback rewrite, use host.docker.internal or set "
-                "LLM_ORCHESTRATOR_BASE_URL=http://127.0.0.1:18410/v1 (AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX=0 for same-container)."
-            ) from e
-
-        data = response.json()
+        data = await _post_chat_completions(payload)
         usage = data.get("usage") or {}
         total_tokens += int(usage.get("total_tokens", 0) or 0)
         total_cost += usage_cost_from_completion_response(data)

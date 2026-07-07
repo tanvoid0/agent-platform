@@ -24,13 +24,14 @@ from workspace_service import (
 )
 
 router = APIRouter(prefix="/projects/{project_id}/workspace", tags=["workspace"])
+files_router = APIRouter(prefix="/projects/{project_id}/files", tags=["workspace"])
 
 
 def _require_project(session: Session, project_id: int, principal: TokenPrincipal) -> Project:
     row = session.get(Project, project_id)
     if not row:
         raise HTTPException(status_code=404, detail="Project not found")
-    assert_token_project_access(principal, project_id)
+    assert_token_project_access(principal, project_id, session)
     return row
 
 
@@ -221,3 +222,85 @@ def workspace_mkdir(
         return {"ok": True, "path": body.path}
     except WorkspaceError as e:
         raise _map_error(e) from e
+
+
+# Canonical file-sandbox path (preferred). Legacy /workspace routes remain as aliases.
+@files_router.get("/info")
+def files_info(
+    project_id: int,
+    path: str = "",
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    return workspace_info(project_id, path, session, principal)
+
+
+@files_router.post("/ensure-process", status_code=201)
+def files_ensure_process(
+    project_id: int,
+    body: EnsureProcessBody,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    return workspace_ensure_process(project_id, body, session, principal)
+
+
+@files_router.get("/list")
+def files_list(
+    project_id: int,
+    path: str = "",
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    return workspace_list(project_id, path, session, principal)
+
+
+@files_router.get("/file")
+def files_read_file(
+    project_id: int,
+    path: str,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    return workspace_read_file(project_id, path, session, principal)
+
+
+@files_router.post("/upload")
+async def files_upload_file(
+    project_id: int,
+    file: UploadFile = File(...),
+    dest: str = "documents",
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    return await workspace_upload_file(project_id, file, dest, session, principal)
+
+
+@files_router.put("/file")
+def files_write_file(
+    project_id: int,
+    body: FileWriteBody,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    return workspace_write_file(project_id, body, session, principal)
+
+
+@files_router.delete("/file")
+def files_delete_file(
+    project_id: int,
+    path: str,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    return workspace_delete_file(project_id, path, session, principal)
+
+
+@files_router.post("/mkdir", status_code=201)
+def files_mkdir(
+    project_id: int,
+    body: MkdirBody,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    return workspace_mkdir(project_id, body, session, principal)

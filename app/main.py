@@ -9,7 +9,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from action_orchestrator import router as action_orchestrator_router
+from api_tokens import AVAILABLE_SCOPES
 from api_tokens.auth import require_valid_token
+from api_tokens.legacy_routes import router as api_tokens_legacy_router
 from api_tokens.routes import router as api_tokens_router
 from chat_routes import router as chat_router
 from database import create_db_and_tables
@@ -21,10 +23,13 @@ from llm_proxy.services.model_catalog_cache import get_catalog_cache
 from llm_proxy_env import llm_proxy_master_key
 from process_routes import router as process_router
 from projects_routes import router as projects_router
+from workspaces_routes import router as workspaces_router, me_router as me_workspace_router
 from teams_routes import router as teams_router
 from todos.routes import router as todos_router
 from assistant.routes import router as assistant_router
-from workspace_routes import router as workspace_router
+from playground.routes import router as playground_router
+from coder.routes import router as coder_router
+from workspace_routes import files_router as workspace_files_router, router as workspace_router
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,11 @@ async def lifespan(app: FastAPI):
         )
     cache = get_catalog_cache()
     await cache.start_background_refresh()
+    # Resume processes stranded mid-plan/mid-run by the previous shutdown; executors
+    # are in-process asyncio tasks and do not survive a restart.
+    from services.startup_recovery import schedule_startup_recovery
+
+    schedule_startup_recovery()
     try:
         yield
     finally:
@@ -62,19 +72,29 @@ _api_deps = [Depends(require_valid_token)]
 app.include_router(process_router, dependencies=_api_deps)
 app.include_router(teams_router, dependencies=_api_deps)
 app.include_router(projects_router, dependencies=_api_deps)
+app.include_router(workspaces_router, dependencies=_api_deps)
+app.include_router(me_workspace_router, dependencies=_api_deps)
 app.include_router(workspace_router, dependencies=_api_deps)
+app.include_router(workspace_files_router, dependencies=_api_deps)
 app.include_router(action_orchestrator_router, dependencies=_api_deps)
 app.include_router(api_tokens_router, dependencies=_api_deps)
+app.include_router(api_tokens_legacy_router, dependencies=_api_deps)
 # Same routers mirrored under /api/v1 (versioned REST surface)
 app.include_router(process_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(teams_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(projects_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(workspaces_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(me_workspace_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(workspace_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(workspace_files_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(action_orchestrator_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(api_tokens_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(api_tokens_legacy_router, prefix="/api/v1", dependencies=_api_deps)
 # Additional routers at /api/v1 prefix
 app.include_router(todos_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(assistant_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(playground_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(coder_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(chat_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(llm_proxy_admin_router, prefix="/api/v1/llm-proxy", dependencies=_api_deps)
 
@@ -119,6 +139,17 @@ def ui_page(request: Request):
             "api_base": os.getenv("AGENT_PLATFORM_PUBLIC_API", "").strip() or "",
         },
     )
+
+
+@app.get("/tokens", response_class=HTMLResponse, include_in_schema=False)
+def tokens_page(request: Request):
+    return templates.TemplateResponse("tokens.html", {"request": request})
+
+
+@app.get("/api/v1/api-tokens/scopes", tags=["api-tokens"], dependencies=_api_deps)
+def list_available_scopes():
+    """Catalog of scopes a token can be granted (for dashboard autocomplete)."""
+    return {"scopes": AVAILABLE_SCOPES}
 
 
 @app.get("/api-guide", response_class=HTMLResponse, include_in_schema=False)

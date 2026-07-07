@@ -1,4 +1,4 @@
-"""Project-scoped API token issuance, auth, usage, revoke/hold, rate limit, isolation."""
+"""Workspace-scoped API token issuance, auth, usage, revoke/hold, rate limit, isolation."""
 
 import pytest
 
@@ -11,16 +11,29 @@ def _master_headers():
     return {"Authorization": f"Bearer {MASTER_KEY}"}
 
 
-def _create_project(c, name="TokenProj"):
-    r = c.post("/projects/", json={"name": name}, headers=_master_headers())
+def _create_workspace(c, name="TokenWs", slug=None):
+    body = {"name": name}
+    if slug:
+        body["slug"] = slug
+    r = c.post("/workspaces/", json=body, headers=_master_headers())
     assert r.status_code == 201, r.text
     return r.json()["id"]
 
 
-def _create_token(c, project_id, **kwargs):
+def _create_project(c, workspace_id, name="TokenProj"):
+    r = c.post(
+        "/projects/",
+        json={"name": name, "workspace_id": workspace_id},
+        headers=_master_headers(),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def _create_token(c, workspace_id, **kwargs):
     body = {"name": "ext-token", "scopes": ["process:read", "process:write", "chat:write"]}
     body.update(kwargs)
-    r = c.post(f"/projects/{project_id}/api-tokens/", json=body, headers=_master_headers())
+    r = c.post(f"/workspaces/{workspace_id}/api-tokens/", json=body, headers=_master_headers())
     assert r.status_code == 201, r.text
     return r.json()
 
@@ -39,15 +52,16 @@ def _reset_rate_limit_windows():
 
 def test_token_lifecycle_use_then_revoke(client, test_engine):
     c, _mock_cls, _mock_inst = client
-    project_id = _create_project(c)
-    created = _create_token(c, project_id)
+    ws = _create_workspace(c)
+    project_id = _create_project(c, ws)
+    created = _create_token(c, ws)
     token_headers = {"Authorization": f"Bearer {created['token']}"}
 
     r = c.get(f"/projects/{project_id}", headers=token_headers)
     assert r.status_code == 200
 
     r_revoke = c.post(
-        f"/projects/{project_id}/api-tokens/{created['id']}/revoke",
+        f"/workspaces/{ws}/api-tokens/{created['id']}/revoke",
         json={"reason": "rotated"},
         headers=_master_headers(),
     )
@@ -61,12 +75,13 @@ def test_token_lifecycle_use_then_revoke(client, test_engine):
 
 def test_token_hold_blocks_with_403_then_unhold_restores(client, test_engine):
     c, _mock_cls, _mock_inst = client
-    project_id = _create_project(c)
-    created = _create_token(c, project_id)
+    ws = _create_workspace(c)
+    project_id = _create_project(c, ws)
+    created = _create_token(c, ws)
     token_headers = {"Authorization": f"Bearer {created['token']}"}
 
     r_hold = c.post(
-        f"/projects/{project_id}/api-tokens/{created['id']}/hold",
+        f"/workspaces/{ws}/api-tokens/{created['id']}/hold",
         json={"reason": "suspicious activity"},
         headers=_master_headers(),
     )
@@ -78,7 +93,7 @@ def test_token_hold_blocks_with_403_then_unhold_restores(client, test_engine):
     assert r.json()["error"]["code"] == "TOKEN_HELD"
 
     r_unhold = c.post(
-        f"/projects/{project_id}/api-tokens/{created['id']}/unhold",
+        f"/workspaces/{ws}/api-tokens/{created['id']}/unhold",
         headers=_master_headers(),
     )
     assert r_unhold.status_code == 200
@@ -90,8 +105,9 @@ def test_token_hold_blocks_with_403_then_unhold_restores(client, test_engine):
 
 def test_token_rate_limit_returns_429(client, test_engine):
     c, _mock_cls, _mock_inst = client
-    project_id = _create_project(c)
-    created = _create_token(c, project_id, rate_limit_per_minute=2)
+    ws = _create_workspace(c)
+    project_id = _create_project(c, ws)
+    created = _create_token(c, ws, rate_limit_per_minute=2)
     token_headers = {"Authorization": f"Bearer {created['token']}"}
 
     r1 = c.get(f"/projects/{project_id}", headers=token_headers)
@@ -105,25 +121,27 @@ def test_token_rate_limit_returns_429(client, test_engine):
 
 def test_token_cannot_manage_other_tokens(client, test_engine):
     c, _mock_cls, _mock_inst = client
-    project_id = _create_project(c)
-    created = _create_token(c, project_id)
+    ws = _create_workspace(c)
+    created = _create_token(c, ws)
     token_headers = {"Authorization": f"Bearer {created['token']}"}
 
-    r = c.get(f"/projects/{project_id}/api-tokens/", headers=token_headers)
+    r = c.get(f"/workspaces/{ws}/api-tokens/", headers=token_headers)
     assert r.status_code == 403
 
 
-def test_token_scoped_process_isolated_across_projects(client, test_engine):
+def test_token_scoped_process_isolated_across_workspaces(client, test_engine):
     c, _mock_cls, _mock_inst = client
-    project_a = _create_project(c, "A")
-    project_b = _create_project(c, "B")
-    token_a = _create_token(c, project_a)
+    ws_a = _create_workspace(c, "A", slug="ws-a")
+    ws_b = _create_workspace(c, "B", slug="ws-b")
+    project_a = _create_project(c, ws_a, "A")
+    project_b = _create_project(c, ws_b, "B")
+    token_a = _create_token(c, ws_a)
     token_a_headers = {"Authorization": f"Bearer {token_a['token']}"}
 
     tr = c.get("/teams/", headers=_master_headers())
     tid = tr.json()["teams"][0]["id"]
 
-    # Token for project A cannot start a process under project B.
+    # Token for workspace A cannot start a process under workspace B's project.
     r_bad = c.post(
         "/processes",
         json={"goal": "g", "team_template_id": tid, "project_id": project_b},
@@ -131,7 +149,7 @@ def test_token_scoped_process_isolated_across_projects(client, test_engine):
     )
     assert r_bad.status_code == 404
 
-    # Token for project A can start a process under its own project.
+    # Token for workspace A can start a process under its own workspace's project.
     r_ok = c.post(
         "/processes",
         json={"goal": "g", "team_template_id": tid, "project_id": project_a},
@@ -143,8 +161,8 @@ def test_token_scoped_process_isolated_across_projects(client, test_engine):
     r_get = c.get(f"/processes/{process_id}", headers=token_a_headers)
     assert r_get.status_code == 200
 
-    # A token minted for project B cannot read project A's process (404, not 401 — isolation, not auth failure).
-    token_b = _create_token(c, project_b)
+    # A token in workspace B cannot read workspace A's process (404, not 401).
+    token_b = _create_token(c, ws_b)
     token_b_headers = {"Authorization": f"Bearer {token_b['token']}"}
     r_cross = c.get(f"/processes/{process_id}", headers=token_b_headers)
     assert r_cross.status_code == 404
@@ -152,8 +170,9 @@ def test_token_scoped_process_isolated_across_projects(client, test_engine):
 
 def test_token_missing_scope_returns_403(client, test_engine):
     c, _mock_cls, _mock_inst = client
-    project_id = _create_project(c)
-    created = _create_token(c, project_id, scopes=["process:read"])
+    ws = _create_workspace(c)
+    project_id = _create_project(c, ws)
+    created = _create_token(c, ws, scopes=["process:read"])
     token_headers = {"Authorization": f"Bearer {created['token']}"}
 
     tr = c.get("/teams/", headers=_master_headers())
@@ -170,8 +189,9 @@ def test_token_missing_scope_returns_403(client, test_engine):
 
 def test_token_usage_recorded_on_process_run(client, test_engine):
     c, _mock_cls, _mock_inst = client
-    project_id = _create_project(c)
-    created = _create_token(c, project_id)
+    ws = _create_workspace(c)
+    project_id = _create_project(c, ws)
+    created = _create_token(c, ws)
     token_headers = {"Authorization": f"Bearer {created['token']}"}
 
     tr = c.get("/teams/", headers=_master_headers())

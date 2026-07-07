@@ -10,6 +10,8 @@ from sqlmodel import create_engine
 import models  # noqa: F401 — register tables on SQLModel.metadata
 import todos.models  # noqa: F401 — todo board tables
 import assistant.models  # noqa: F401 — assistant tables
+import playground.models  # noqa: F401 — playground chat tables
+import coder.models  # noqa: F401 — coder agent chat tables
 from database import create_db_and_tables
 from llm_proxy.core.provider_config import clear_runtime_provider_bases
 from main import app
@@ -22,6 +24,15 @@ def _isolate_llm_runtime_bases(monkeypatch):
     clear_runtime_provider_bases()
     yield
     clear_runtime_provider_bases()
+
+
+@pytest.fixture(autouse=True)
+def _no_startup_recovery_by_default(monkeypatch):
+    """TestClient lifespan must not requeue leftover processes mid-test.
+
+    The recovery test enables this explicitly.
+    """
+    monkeypatch.setenv("AGENT_PLATFORM_RESUME_ON_STARTUP", "0")
 
 
 @pytest.fixture(autouse=True)

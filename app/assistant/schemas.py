@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from chat_usage import ContextUsageOut, LlmUsageOut
 from pydantic import BaseModel, ConfigDict, Field
 
 from todos.schemas import CategoryOut, ItemOut, PlannedActionOut
@@ -60,6 +61,8 @@ class ChatThreadOut(BaseModel):
     pending_form: dict[str, Any] | None = None
     last_profile_slug: str | None = None
     domain_profiles: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    context_window: int | None = None
+    context_usage: ContextUsageOut | None = None
 
 
 class ChatSendRequest(BaseModel):
@@ -89,6 +92,9 @@ class ChatSendResponse(BaseModel):
     pending_form: dict[str, Any] | None = None
     board_id: int
     domain_profiles: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    context_window: int | None = None
+    context_usage: ContextUsageOut | None = None
+    usage: LlmUsageOut | None = None
 
 
 class FormSubmitRequest(BaseModel):
@@ -122,6 +128,8 @@ class DomainProfilePatch(BaseModel):
 class ApplyActionsRequest(BaseModel):
     actions: list[PlannedActionOut] = Field(default_factory=list)
     thread_id: int | None = None
+    auto_continue: bool = True
+    model: str | None = None
 
 
 class ApplyActionsResponse(BaseModel):
@@ -130,6 +138,7 @@ class ApplyActionsResponse(BaseModel):
     created_items: list[ItemOut] = Field(default_factory=list)
     updated_items: list[ItemOut] = Field(default_factory=list)
     guidance: list[str] = Field(default_factory=list)
+    continuation: ChatSendResponse | None = None
 
 
 class CompleteItemRequest(BaseModel):

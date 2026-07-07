@@ -21,7 +21,7 @@
 <body>
   <h1>Agent Platform HTTP API</h1>
   <p class="muted">Use this service from any UI or backend. Prefer versioned paths under <code>/api/v1</code>. Legacy unprefixed routes (<code>/processes</code>, <code>/teams</code>) behave the same.</p>
-  <p><a href="/docs">OpenAPI (Swagger)</a> · <a href="/config">LLM config</a> · <a href="/ui">Process demo</a></p>
+  <p><a href="/docs">OpenAPI (Swagger)</a> · <a href="/config">LLM config</a> · <a href="/tokens">API tokens</a> · <a href="/ui">Process demo</a></p>
 
   <details open>
     <summary>Overview</summary>
@@ -39,8 +39,8 @@
     <summary>Base URL and versioning</summary>
     <p>Same origin as this page, or your deployed host (for example <code>http://127.0.0.1:18410</code>).</p>
     <ul>
-      <li><strong>Versioned REST:</strong> <code>/api/v1/processes</code>, <code>/api/v1/teams</code>, <code>/api/v1/projects</code>, <code>/api/v1/projects/{id}/workspace/…</code>, <code>/api/v1/chat</code>, <code>/api/v1/llm-proxy/…</code></li>
-      <li><strong>Legacy (same behavior):</strong> <code>/processes</code>, <code>/teams</code>, <code>/projects</code>, workspace under <code>/projects/{id}/workspace/…</code></li>
+      <li><strong>Versioned REST:</strong> <code>/api/v1/processes</code>, <code>/api/v1/teams</code>, <code>/api/v1/workspaces</code>, <code>/api/v1/projects</code>, <code>/api/v1/projects/{id}/files/…</code>, <code>/api/v1/chat</code>, <code>/api/v1/llm-proxy/…</code></li>
+      <li><strong>Legacy (same behavior):</strong> <code>/processes</code>, <code>/teams</code>, <code>/projects</code>, file sandbox under <code>/projects/{id}/workspace/…</code> (deprecated alias for <code>/files/…</code>)</li>
       <li><strong>LLM proxy (OpenAI-style):</strong> <code>/v1/chat/completions</code> etc. — not under <code>/api/v1</code></li>
     </ul>
   </details>
@@ -53,8 +53,10 @@
       <li><strong>Embedded LLM</strong> — <code>/v1/chat/completions</code>, <code>/v1/models</code>, <code>/v1/embeddings</code>, <code>/v1/health</code>. Use when you only need a model call and manage prompts yourself.</li>
       <li><strong>Planner chat</strong> — <code>POST /api/v1/chat</code> — one completion via the configured proxy.</li>
       <li><strong>Processes</strong> — <code>GET/POST /api/v1/processes</code>, <code>GET /api/v1/processes/{id}</code>, <code>GET …/events</code>, <code>GET …/stream</code>, <code>POST …/approve</code>, <code>POST …/tasks/{task_id}/review</code>, <code>POST …/cancel</code>, <code>POST …/sync</code>, <code>POST …/retry</code>, <code>POST …/tasks/{task_id}/retry</code>. See <a href="/docs">/docs</a> for parameters.</li>
-      <li><strong>Projects</strong> — <code>GET/POST /api/v1/projects</code>, <code>GET/PATCH/DELETE /api/v1/projects/{id}</code> — optional grouping for processes.</li>
-      <li><strong>Workspace</strong> — <code>/api/v1/projects/{project_id}/workspace/…</code> — list/read/write files under the server’s project sandbox (see <a href="/docs">/docs</a>); pair with <code>project_id</code> on process creation if tasks should read files from disk.</li>
+      <li><strong>Projects</strong> — <code>GET/POST /api/v1/projects</code>, <code>GET/PATCH/DELETE /api/v1/projects/{id}</code> — grouping within a workspace; pass <code>workspace_id</code> on create.</li>
+      <li><strong>Workspaces</strong> — <code>GET/POST /api/v1/workspaces</code> (master key) — top-level tenant. Resolve your workspace from a token: <code>GET /api/v1/me/workspace</code>.</li>
+      <li><strong>API tokens</strong> — <code>/api/v1/workspaces/{workspace_id}/api-tokens/</code> (master key) — mint workspace-scoped bearer tokens for external apps. Dashboard: <a href="/tokens">/tokens</a>.</li>
+      <li><strong>File sandbox</strong> — <code>/api/v1/projects/{project_id}/files/…</code> — list/read/write files under the server’s project sandbox; legacy alias <code>…/workspace/…</code>.</li>
       <li><strong>Team templates</strong> — <code>GET/POST /api/v1/teams</code>, <code>GET/PATCH/DELETE /api/v1/teams/{id}</code> — define planner rosters; pass <code>team_template_id</code> when starting a process.</li>
       <li><strong>LLM proxy (admin)</strong> — <code>/api/v1/llm-proxy/*</code> — read/update <code>config.yaml</code>, env, and catalog helpers; same auth as other <code>/api/v1</code> routes when the master key is set.</li>
     </ul>
@@ -62,9 +64,10 @@
 
   <details>
     <summary>Authentication (optional)</summary>
-    <p>If <code>AGENT_PLATFORM_MASTER_KEY</code> is set in the server environment, every process, team, and chat request must send:</p>
-    <pre>Authorization: Bearer &lt;your key&gt;</pre>
-    <p class="muted">This is a single shared secret for the deployment, not per-tenant keys. Stricter auth belongs behind a gateway or future work.</p>
+    <p>If <code>AGENT_PLATFORM_MASTER_KEY</code> is set, protected routes require:</p>
+    <pre>Authorization: Bearer &lt;master key or workspace token&gt;</pre>
+    <p><strong>Master key</strong> — full admin access (config UI, workspace CRUD, token minting).</p>
+    <p><strong>Workspace token</strong> (<code>agp_…</code>) — scoped to one workspace; mint via <a href="/tokens">/tokens</a> or <code>POST /api/v1/workspaces/{id}/api-tokens/</code>. Resolve tenant: <code>GET /api/v1/me/workspace</code>.</p>
   </details>
 
   <details>

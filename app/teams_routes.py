@@ -8,14 +8,32 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select, update
 
+from api_tokens.auth import TokenPrincipal, require_valid_token
 from crud_helpers import require_one
 from database import get_session
-from models import Process, TeamTemplate
+from models import Process, TeamTemplate, Workspace
 from schema_converter import to_schemas
 from schema_fields import ResourceName, ResourceDescription, ResourceColor, ResourceCategory
 from team_schema import TeamRoster, parse_team_roster_json, roster_to_json
 
 router = APIRouter(prefix="/teams", tags=["teams"])
+
+
+def _assert_team_visible(principal: TokenPrincipal, row: TeamTemplate) -> None:
+    """Workspace tokens see global (NULL) + their own templates; master sees all."""
+    if principal.workspace_id is None:
+        return
+    if row.workspace_id is not None and row.workspace_id != principal.workspace_id:
+        raise HTTPException(status_code=404, detail="Team template not found")
+
+
+def _assert_team_owned(principal: TokenPrincipal, row: TeamTemplate) -> None:
+    """Mutations: master may touch any; a workspace token may touch only its own
+    templates (never global or another workspace's)."""
+    if principal.workspace_id is None:
+        return
+    if row.workspace_id != principal.workspace_id:
+        raise HTTPException(status_code=404, detail="Team template not found")
 
 
 class TeamTemplateCreate(BaseModel):
@@ -24,6 +42,9 @@ class TeamTemplateCreate(BaseModel):
     color: str | None = ResourceColor
     category: str | None = ResourceCategory
     roster: TeamRoster
+    # Master-key only: NULL creates a global template, a value creates one owned
+    # by that workspace. Ignored for workspace-scoped tokens (forced to their own).
+    workspace_id: int | None = None
 
 
 class TeamTemplateUpdate(BaseModel):
@@ -40,6 +61,7 @@ class TeamTemplateOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    workspace_id: int | None
     name: str
     description: str | None
     color: str | None
@@ -54,6 +76,7 @@ class TeamTemplateSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    workspace_id: int | None
     name: str
     description: str | None
     color: str | None
@@ -74,6 +97,7 @@ def _row_to_out(row: TeamTemplate) -> TeamTemplateOut:
     roster = parse_team_roster_json(row.roster_json)
     return TeamTemplateOut(
         id=row.id,
+        workspace_id=row.workspace_id,
         name=row.name,
         description=row.description,
         color=row.color,
@@ -86,12 +110,23 @@ def _row_to_out(row: TeamTemplate) -> TeamTemplateOut:
 
 
 @router.get("/")
-def list_teams(session: Session = Depends(get_session)):
-    rows = session.exec(select(TeamTemplate).order_by(TeamTemplate.id.asc())).all()
+def list_teams(
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    q = select(TeamTemplate).order_by(TeamTemplate.id.asc())
+    if principal.workspace_id is not None:
+        # Global (NULL) + this workspace's own templates.
+        q = q.where(
+            (TeamTemplate.workspace_id.is_(None))
+            | (TeamTemplate.workspace_id == principal.workspace_id)
+        )
+    rows = session.exec(q).all()
     return {
         "teams": [
             TeamTemplateSummary(
                 id=r.id,
+                workspace_id=r.workspace_id,
                 name=r.name,
                 description=r.description,
                 color=r.color,
@@ -106,9 +141,20 @@ def list_teams(session: Session = Depends(get_session)):
 
 
 @router.post("/", status_code=201)
-def create_team(req: TeamTemplateCreate, session: Session = Depends(get_session)):
+def create_team(
+    req: TeamTemplateCreate,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    if principal.workspace_id is not None:
+        workspace_id = principal.workspace_id
+    else:
+        workspace_id = req.workspace_id
+        if workspace_id is not None:
+            require_one(session, Workspace, workspace_id, "Workspace")
     now = datetime.utcnow()
     row = TeamTemplate(
+        workspace_id=workspace_id,
         name=req.name.strip(),
         description=req.description.strip() if req.description else None,
         color=req.color.strip() if req.color else None,
@@ -124,8 +170,13 @@ def create_team(req: TeamTemplateCreate, session: Session = Depends(get_session)
 
 
 @router.get("/{team_id}")
-def get_team(team_id: int, session: Session = Depends(get_session)):
+def get_team(
+    team_id: int,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
     row = require_one(session, TeamTemplate, team_id, "Team template")
+    _assert_team_visible(principal, row)
     return _row_to_out(row)
 
 
@@ -134,8 +185,10 @@ def update_team(
     team_id: int,
     req: TeamTemplateUpdate,
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
     row = require_one(session, TeamTemplate, team_id, "Team template")
+    _assert_team_owned(principal, row)
     patch = req.model_dump(exclude_unset=True)
     if req.name is not None:
         row.name = req.name.strip()
@@ -156,8 +209,13 @@ def update_team(
 
 
 @router.delete("/{team_id}")
-def delete_team(team_id: int, session: Session = Depends(get_session)):
+def delete_team(
+    team_id: int,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
     row = require_one(session, TeamTemplate, team_id, "Team template")
+    _assert_team_owned(principal, row)
     session.exec(update(Process).where(Process.team_template_id == team_id).values(team_template_id=None))
     session.delete(row)
     session.commit()

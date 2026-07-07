@@ -141,7 +141,7 @@ async def agent_step(
         context["planner_system_prompt"] = profile.system_prompt
 
     llm_model = resolve_model(session, item, model)
-    planned, thought = await decide_actions(
+    planned, thought, _ = await decide_actions(
         goal=goal,
         context=context,
         actions=actions,

@@ -19,6 +19,10 @@ from llm_proxy.core.provider_config import (
     aimlapi_api_key,
     aimlapi_configured,
     aimlapi_openai_base,
+    anthropic_api_key,
+    anthropic_configured,
+    anthropic_openai_base,
+    anthropic_version_header,
     gemini_configured,
     lm_studio_api_base,
     lm_studio_configured,
@@ -90,6 +94,21 @@ async def _provider_reachable(pid: str) -> bool | None:
             return r.status_code < 500
         except httpx.HTTPError:
             return False
+    if pid == "anthropic":
+        if not anthropic_configured():
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                r = await client.get(
+                    f"{anthropic_openai_base().rstrip('/')}/models",
+                    headers={
+                        "x-api-key": anthropic_api_key(),
+                        "anthropic-version": anthropic_version_header(),
+                    },
+                )
+            return r.status_code < 500
+        except httpx.HTTPError:
+            return False
     return None
 
 
@@ -109,11 +128,14 @@ def _chat_slice_for_provider(
     ordered: list[str] = []
     seen: set[str] = set()
     for x in [dm, *ids]:
-        if x not in seen:
+        if x and x not in seen:
             seen.add(x)
             ordered.append(x)
+    # Providers with no hardcoded default (e.g. Claude) fall back to the first live id.
+    if not dm and ordered:
+        dm = ordered[0]
     if not ordered:
-        ordered = [dm]
+        ordered = [dm] if dm else []
     return {"default_model": dm, "options": ordered}
 
 

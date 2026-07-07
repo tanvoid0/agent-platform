@@ -95,7 +95,7 @@ async def run_review(
         "Review the user's progress and propose plan adjustments. "
         "Focus on overdue items, habit consistency, and sustainable next steps."
     )
-    planned, thought = await decide_actions(
+    planned, thought, _ = await decide_actions(
         goal=goal,
         context=context,
         actions=actions,

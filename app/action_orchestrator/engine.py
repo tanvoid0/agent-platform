@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Any
 
+from chat_usage import LlmStepUsageOut, LlmUsageOut, merge_llm_usages
 from action_orchestrator.models import Action
 from action_orchestrator.schemas import PlannedAction
 from llm_client import call_llm, call_llm_tool_proposals
@@ -93,14 +94,14 @@ async def decide_actions(
     actions: list[Action],
     history: list[dict[str, Any]] | None = None,
     llm_model: str | None = None,
-) -> tuple[list[PlannedAction], str | None]:
+) -> tuple[list[PlannedAction], str | None, LlmUsageOut]:
     """Use AI to decide which actions to execute.
 
     Returns:
-        Tuple of (planned_actions, thought/reasoning)
+        Tuple of (planned_actions, thought/reasoning, llm_usage)
     """
     if not actions:
-        return [], "No actions available in the action set."
+        return [], "No actions available in the action set.", LlmUsageOut()
 
     tools = build_action_tools(actions)
     system_msg = build_system_message()
@@ -112,32 +113,47 @@ async def decide_actions(
     ]
 
     action_by_id = {a.action_id: a for a in actions}
+    usage_steps: list[LlmStepUsageOut] = []
 
     try:
-        content, raw_tool_calls, _, _ = await call_llm_tool_proposals(
+        content, raw_tool_calls, tokens, cost = await call_llm_tool_proposals(
             messages,
             model=llm_model,
             tools=tools,
             temperature=0.7,
         )
+        usage_steps.append(
+            LlmStepUsageOut(
+                total_tokens=tokens,
+                cost_usd=cost,
+                label="decide_actions",
+            )
+        )
 
         planned_actions = tool_calls_to_planned_actions(raw_tool_calls, action_by_id)
         if planned_actions:
             thought = content.strip() or None
-            return planned_actions, thought
+            return planned_actions, thought, merge_llm_usages(usage_steps)
 
         # Fallback: parse structured tags or action lines from plain text
         parsed = parse_decision_response(content or "")
         if parsed["actions"]:
-            return parsed["actions"], parsed["thought"]
+            return parsed["actions"], parsed["thought"], merge_llm_usages(usage_steps)
 
-        reasoning_response, _, _ = await call_llm(messages, model=llm_model)
+        reasoning_response, tokens2, cost2 = await call_llm(messages, model=llm_model)
+        usage_steps.append(
+            LlmStepUsageOut(
+                total_tokens=tokens2,
+                cost_usd=cost2,
+                label="decide_actions_fallback",
+            )
+        )
         parsed = parse_decision_response(reasoning_response or "")
-        return parsed["actions"], parsed["thought"]
+        return parsed["actions"], parsed["thought"], merge_llm_usages(usage_steps)
 
     except Exception as e:
         logger.exception("Error in decide_actions")
-        return [], f"Error during decision: {str(e)}"
+        return [], f"Error during decision: {str(e)}", merge_llm_usages(usage_steps)
 
 
 def tool_calls_to_planned_actions(

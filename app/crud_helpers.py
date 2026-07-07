@@ -44,6 +44,5 @@ def require_process_with_access(
     from client_scope import assert_process_client_access
 
     proc = require_one(session, Process, process_id, "Process")
-    if client_hdr is not None:
-        assert_process_client_access(proc, client_hdr)
+    assert_process_client_access(proc, client_hdr)
     return proc

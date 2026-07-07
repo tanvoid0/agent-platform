@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlmodel import Session
 
 from api_tokens.auth import TokenPrincipal, assert_token_project_access, require_scope, require_valid_token
@@ -52,8 +52,12 @@ def list_boards(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> dict:
     require_scope(principal, "todos:read")
-    if principal.project_id is not None:
-        project_id = principal.project_id
+    if principal.workspace_id is not None:
+        if project_id is None:
+            raise HTTPException(
+                status_code=400, detail="project_id is required for a workspace-scoped token."
+            )
+        assert_token_project_access(principal, project_id, session)
     return {"boards": board_service.list_boards(session, project_id=project_id)}
 
 
@@ -65,9 +69,12 @@ def create_board(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> BoardOut:
     require_scope(principal, "todos:write")
-    if principal.project_id is not None:
-        assert_token_project_access(principal, project_id)
-        project_id = principal.project_id
+    if principal.workspace_id is not None:
+        if project_id is None:
+            raise HTTPException(
+                status_code=400, detail="project_id is required for a workspace-scoped token."
+            )
+        assert_token_project_access(principal, project_id, session)
     return board_service.create_board(session, req, project_id=project_id)
 
 

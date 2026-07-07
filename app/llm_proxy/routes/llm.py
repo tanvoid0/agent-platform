@@ -23,6 +23,10 @@ from llm_proxy.core.provider_config import (
     aimlapi_api_key,
     aimlapi_configured,
     aimlapi_openai_base,
+    anthropic_api_key,
+    anthropic_configured,
+    anthropic_openai_base,
+    anthropic_version_header,
     default_model_for_provider,
     first_configured_provider,
     gemini_api_key,
@@ -44,6 +48,7 @@ from llm_proxy.services.upstream_http import (
     sse_error_chunk,
     stream_chat_completion,
 )
+from llm_proxy.usage_normalize import normalize_completion_body
 
 router = APIRouter(tags=["llm"])
 
@@ -57,17 +62,20 @@ def _master_key() -> str:
 
 
 def _default_provider_env_or_dotenv() -> str:
-    raw = os.environ.get("DEFAULT_PROVIDER", "").strip().lower()
-    if raw:
-        return raw
-    return (read_env_file_parsed().get("DEFAULT_PROVIDER") or "").strip().lower()
+    # CONFIG_DIR/.env is the live-editable source (admin UI writes here for a no-restart
+    # switch); it must win over os.environ, which YAML env defaults (platform_config.py)
+    # also seed via setdefault and would otherwise shadow forever.
+    from_file = (read_env_file_parsed().get("DEFAULT_PROVIDER") or "").strip().lower()
+    if from_file:
+        return from_file
+    return os.environ.get("DEFAULT_PROVIDER", "").strip().lower()
 
 
 def _default_model_env_or_dotenv() -> str:
-    raw = os.environ.get("DEFAULT_MODEL", "").strip()
-    if raw:
-        return raw
-    return (read_env_file_parsed().get("DEFAULT_MODEL") or "").strip()
+    from_file = (read_env_file_parsed().get("DEFAULT_MODEL") or "").strip()
+    if from_file:
+        return from_file
+    return os.environ.get("DEFAULT_MODEL", "").strip()
 
 
 def _load_yaml() -> dict[str, Any]:
@@ -239,10 +247,40 @@ async def _fetch_aimlapi_live_models() -> list[str]:
     return out
 
 
+async def _fetch_anthropic_live_models() -> list[str]:
+    # Claude changes model ids rapidly, so pull the catalog live rather than pin them.
+    # The native /v1/models endpoint uses x-api-key + anthropic-version (not Bearer).
+    a_headers = {
+        "x-api-key": anthropic_api_key(),
+        "anthropic-version": anthropic_version_header(),
+    }
+    ms_resp = await get_with_retry(
+        f"{anthropic_openai_base()}/models",
+        headers=a_headers,
+        timeout=8.0,
+        context="v1_models_anthropic",
+    )
+    if ms_resp.status_code != 200:
+        return []
+    try:
+        payload = ms_resp.json()
+    except ValueError:
+        return []
+    out: list[str] = []
+    for item in payload.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if isinstance(mid, str) and mid.strip():
+            out.append(mid.strip())
+    return out
+
+
 _LIVE_MODEL_SOURCES: tuple[_LiveModelSource, ...] = (
     _LiveModelSource("ollama", ollama_configured, _fetch_ollama_live_models),
     _LiveModelSource("lm_studio", lm_studio_configured, _fetch_lm_studio_live_models),
     _LiveModelSource("aimlapi", aimlapi_configured, _fetch_aimlapi_live_models),
+    _LiveModelSource("anthropic", anthropic_configured, _fetch_anthropic_live_models),
 )
 
 
@@ -486,6 +524,49 @@ async def health(provider: str | None = None, model: str | None = None) -> JSONR
             },
         )
 
+    if p == "anthropic":
+        if not provider_configured("anthropic"):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unhealthy",
+                    "detail": "ANTHROPIC_API_KEY is not set",
+                    **detail,
+                    "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                },
+            )
+        a_headers = {
+            "x-api-key": anthropic_api_key(),
+            "anthropic-version": anthropic_version_header(),
+        }
+        try:
+            r = await get_with_retry(
+                f"{anthropic_openai_base()}/models",
+                headers=a_headers,
+                timeout=4.0,
+                context="health_anthropic_models",
+            )
+        except LlmProxyError as e:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "unhealthy",
+                    "detail": e.message,
+                    **detail,
+                    "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                },
+            )
+        detail["upstream_status"] = r.status_code
+        ok = r.status_code == 200
+        return JSONResponse(
+            status_code=200 if ok else 503,
+            content={
+                "status": "ok" if ok else "unhealthy",
+                **detail,
+                "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            },
+        )
+
     if not provider_configured("gemini"):
         return JSONResponse(
             status_code=503,
@@ -666,6 +747,14 @@ def _upstream_urls(provider: str) -> tuple[str, str]:
             f"{base}/chat/completions",
             f"{base}/embeddings",
         )
+    if provider == "anthropic":
+        base = anthropic_openai_base().rstrip("/")
+        # Anthropic's OpenAI-compatible surface has no embeddings endpoint; the
+        # embeddings route rejects this provider before reaching the URL.
+        return (
+            f"{base}/chat/completions",
+            f"{base}/embeddings",
+        )
     raise LlmProxyError(500, "invalid_provider", "Invalid provider routing (internal).")
 
 
@@ -689,6 +778,17 @@ def _outbound_headers(provider: str) -> dict[str, str]:
                 "AIMLAPI_API_KEY is not configured for AIMLAPI routes.",
             )
         h["Authorization"] = f"Bearer {key}"
+    elif provider == "anthropic":
+        key = anthropic_api_key()
+        if not key:
+            raise LlmProxyError(
+                503,
+                "anthropic_key_missing",
+                "ANTHROPIC_API_KEY is not configured for Claude routes.",
+            )
+        # OpenAI-compat chat endpoint accepts Bearer; version header pins the schema.
+        h["Authorization"] = f"Bearer {key}"
+        h["anthropic-version"] = anthropic_version_header()
     elif provider == "lm_studio":
         key = lm_studio_api_key()
         if key:
@@ -724,8 +824,16 @@ async def chat_completions(request: Request) -> Response:
             timeout=300.0,
             context="chat_completions",
         )
+        content = r.content
+        if r.status_code == 200:
+            content = normalize_completion_body(
+                content,
+                request_messages=body.get("messages")
+                if isinstance(body.get("messages"), list)
+                else None,
+            )
         return Response(
-            content=r.content,
+            content=content,
             status_code=r.status_code,
             media_type=r.headers.get("content-type", "application/json"),
         )
@@ -771,6 +879,11 @@ async def embeddings(request: Request) -> Response:
     if not isinstance(raw_model, str) or not raw_model.strip():
         raise HTTPException(status_code=400, detail="model is required")
     prov, resolved = _resolve_model(raw_model)
+    if prov == "anthropic":
+        raise HTTPException(
+            status_code=400,
+            detail="Claude (anthropic) does not expose an embeddings endpoint; use a different provider for embeddings.",
+        )
     resolved = await coerce_local_model_if_needed(prov, resolved)
     body = dict(body)
     body["model"] = resolved

@@ -195,8 +195,8 @@ def create_db_and_tables() -> None:
             # contend over, so run migrations normally there — skipping them left test
             # runs with no schema at all ("no such table: ...").
             is_memory_db = not engine.url.database
-            if is_memory_db:
-                logger.info("Running Alembic migrations for in-memory SQLite...")
+            if is_memory_db or sys.platform != "win32":
+                logger.info("Running Alembic migrations for SQLite...")
                 command.upgrade(_ALEMBIC_CFG, "head")
                 logger.info("Alembic migrations complete")
             else:

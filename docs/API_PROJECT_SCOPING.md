@@ -1,5 +1,8 @@
 # Project Scoping in Agent Platform API
 
+> **Auth & tenant isolation:** see [API_WORKSPACE_SCOPING.md](./API_WORKSPACE_SCOPING.md).  
+> This document covers **process query filters** within a project.
+
 ## Overview
 
 All processes and sessions in the Agent Platform must be associated with a project. Projects provide logical isolation and serve as the primary namespace for organizing agent workflows.

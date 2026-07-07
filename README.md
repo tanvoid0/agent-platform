@@ -35,6 +35,10 @@ pnpm install && pnpm run dev
 
 Set **`AGENT_PLATFORM_MASTER_KEY`** in `.env` (Bearer for `/v1` and protected `/api/v1/*`). When set, paste the same key in the config UI auth bar or set `VITE_AGENT_PLATFORM_MASTER_KEY` for Flow UI.
 
+### Workspace tokens (external integrations)
+
+Each microservice or Flow UI deployment gets **one workspace-scoped token** (`agp_…`). Mint tokens at `/tokens` or `POST /api/v1/workspaces/{id}/api-tokens/` (master key). The service resolves its tenant via `GET /api/v1/me/workspace`. See [docs/CLIENT_INTEGRATION.md](docs/CLIENT_INTEGRATION.md).
+
 ## Docker (backend only)
 
 ```bash

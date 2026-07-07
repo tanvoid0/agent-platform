@@ -435,7 +435,7 @@ async def request_step(
     merged_context = {**action_session.get_context(), **req.context}
 
     # Get AI decision
-    planned_actions, thought = await decide_actions(
+    planned_actions, thought, _ = await decide_actions(
         goal=action_session.goal,
         context=merged_context,
         actions=actions,
@@ -654,7 +654,7 @@ async def decide(
         raise HTTPException(status_code=400, detail="Action set has no actions")
 
     # Get AI decision
-    planned_actions, thought = await decide_actions(
+    planned_actions, thought, _ = await decide_actions(
         goal=req.goal,
         context=req.context,
         actions=actions,

@@ -146,7 +146,7 @@ def test_retry_execution_without_dag_json_returns_400(client, test_engine):
 
     r = c.post(f"/processes/{rid}/retry")
     assert r.status_code == 400
-    assert "DAG JSON" in r.json()["detail"]
+    assert "DAG JSON" in r.json()["error"]["message"]
 
 
 def test_retry_failed_task_resets_task_and_schedules_execute(client, test_engine):

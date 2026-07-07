@@ -48,7 +48,9 @@ def build_typescript() -> str:
 
 
 def main() -> None:
-    output_path = REPO_ROOT / "web" / "src" / "api" / "enums.ts"
+    flow_ui_path = REPO_ROOT.parent / "flow-ui" / "src" / "api" / "enums.ts"
+    output_path = flow_ui_path if flow_ui_path.parent.exists() else REPO_ROOT / "web" / "src" / "api" / "enums.ts"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(build_typescript(), encoding="utf-8")
     print(f"Updated {output_path}")
 

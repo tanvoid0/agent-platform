@@ -34,9 +34,10 @@ _TOKEN_PREFIX_MARKER = "agp_"
 
 
 class TokenPrincipal(NamedTuple):
-    project_id: int | None  # None => master-key / unrestricted caller
+    project_id: int | None  # legacy per-token project binding (unused for scoping)
     token_id: int | None
     scopes: list[str]
+    workspace_id: int | None = None  # None => master-key / unrestricted caller
 
 
 def verify_project_api_token(required_scope: str | None = None):
@@ -84,11 +85,16 @@ def verify_project_api_token(required_scope: str | None = None):
                 session.add(row)
                 session.commit()
 
-            return TokenPrincipal(project_id=row.project_id, token_id=row.id, scopes=scopes)
+            return TokenPrincipal(
+                project_id=row.project_id,
+                token_id=row.id,
+                scopes=scopes,
+                workspace_id=row.workspace_id,
+            )
 
         if not _secrets.compare_digest(raw, expected_master_key):
             raise TokenNotFoundError("Invalid API key")
-        return TokenPrincipal(project_id=None, token_id=None, scopes=["*"])
+        return TokenPrincipal(project_id=None, token_id=None, scopes=["*"], workspace_id=None)
 
     return _dependency
 
@@ -109,14 +115,43 @@ def require_scope(principal: TokenPrincipal, scope: str) -> None:
     raise InsufficientScopeError(f"Token lacks required scope '{scope}'.")
 
 
-def assert_token_project_access(principal: TokenPrincipal, project_id: int | None) -> None:
-    """404s (not 401) when a project-scoped token reaches a resource outside its project.
+def assert_token_workspace_access(principal: TokenPrincipal, workspace_id: int | None) -> None:
+    """404s when a workspace-scoped token reaches a resource outside its workspace.
 
-    Master-key callers (principal.project_id is None) bypass this check.
+    Master-key callers (principal.workspace_id is None) bypass this check.
     """
-    if principal.project_id is None:
+    if principal.workspace_id is None:
         return
     from fastapi import HTTPException
 
-    if project_id is None or principal.project_id != project_id:
+    if workspace_id is None or principal.workspace_id != workspace_id:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def assert_token_project_access(
+    principal: TokenPrincipal, project_id: int | None, session: "Session | None" = None
+) -> None:
+    """404s (not 401) when a workspace-scoped token reaches a project outside its workspace.
+
+    Resolves the project's workspace and compares it to the caller's workspace.
+    Master-key callers (principal.workspace_id is None) bypass this check.
+    If ``session`` is omitted a short-lived one is opened to resolve the mapping.
+    """
+    if principal.workspace_id is None:
+        return
+    from fastapi import HTTPException
+
+    if project_id is None:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    from models import Project
+
+    if session is not None:
+        row = session.get(Project, project_id)
+    else:
+        from database import engine
+
+        with Session(engine) as s:
+            row = s.get(Project, project_id)
+    if row is None or row.workspace_id != principal.workspace_id:
         raise HTTPException(status_code=404, detail="Not found")

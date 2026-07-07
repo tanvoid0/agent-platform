@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 from sqlmodel import Session, select
 
+from chat_usage import LlmUsageOut
 from assistant.models import AssistantChatThread, AssistantDomainProfile, AssistantReview
 from models import Project
 from todos.models import TodoBoard, TodoItem
@@ -97,6 +98,7 @@ def test_assistant_chat_thread_persists(client, test_engine):
                 )
             ],
             "Here is a plan for your week.",
+            LlmUsageOut(),
         )
         r2 = c.post(
             f"/api/v1/assistant/chat/send?project_id={project_id}",
@@ -143,6 +145,7 @@ def test_assistant_chat_retry_truncates_and_regenerates(client, test_engine):
                     )
                 ],
                 "First assistant turn.",
+                LlmUsageOut(),
             ),
             (
                 [
@@ -154,6 +157,7 @@ def test_assistant_chat_retry_truncates_and_regenerates(client, test_engine):
                     )
                 ],
                 "Second assistant turn.",
+                LlmUsageOut(),
             ),
             (
                 [
@@ -165,6 +169,7 @@ def test_assistant_chat_retry_truncates_and_regenerates(client, test_engine):
                     )
                 ],
                 "Retried assistant turn.",
+                LlmUsageOut(),
             ),
         ]
         first = c.post(
@@ -217,6 +222,7 @@ def test_assistant_multiple_chat_threads(client, test_engine):
         mock_decide.return_value = (
             [PlannedAction(action_id="suggest_next_steps", name="Suggest", parameters={}, confidence=1.0)],
             "First thread reply.",
+            LlmUsageOut(),
         )
         c.post(
             f"/api/v1/assistant/chat/send?project_id={project_id}",
@@ -376,6 +382,7 @@ def test_form_submit_saves_profile_and_continues(client, test_engine):
                 )
             ],
             "Scheduled an easy run for you.",
+            LlmUsageOut(),
         )
         r = c.post(
             f"/api/v1/assistant/chat/submit-form?project_id={project_id}",
@@ -423,6 +430,7 @@ def test_form_submit_no_duplicate_user_messages(client, test_engine):
                 )
             ],
             "I'll add a meal prep task.",
+            LlmUsageOut(),
         )
         r = c.post(
             f"/api/v1/assistant/chat/submit-form?project_id={project_id}",
@@ -471,10 +479,10 @@ def test_nutrition_profile_complete_without_allergies(client, test_engine):
         patch(
             "assistant.services.assistant_chat._chat_only",
             new_callable=AsyncMock,
-            return_value="Here is a balanced plan for the week.",
+            return_value=("Here is a balanced plan for the week.", LlmUsageOut()),
         ) as mock_chat,
     ):
-        mock_decide.return_value = ([], None)
+        mock_decide.return_value = ([], None, LlmUsageOut())
         r = c.post(
             f"/api/v1/assistant/chat/send?project_id={project_id}",
             json={"message": "Plan my meals this week", "delegate_slug": "nutrition-coach"},
@@ -565,10 +573,10 @@ def test_form_submit_resolves_domain_from_pending_form(client, test_engine):
         patch(
             "assistant.services.assistant_chat._chat_only",
             new_callable=AsyncMock,
-            return_value="Thanks, planning next.",
+            return_value=("Thanks, planning next.", LlmUsageOut()),
         ),
     ):
-        mock_decide.return_value = ([], None)
+        mock_decide.return_value = ([], None, LlmUsageOut())
         r = c.post(
             f"/api/v1/assistant/chat/submit-form?project_id={project_id}",
             json={
@@ -619,8 +627,11 @@ def test_chat_fallback_when_no_planned_actions(client, test_engine):
             new_callable=AsyncMock,
         ) as mock_chat,
     ):
-        mock_decide.return_value = ([], None)
-        mock_chat.return_value = "Here is a 7-day meal prep outline with Sunday batch cooking."
+        mock_decide.return_value = ([], None, LlmUsageOut())
+        mock_chat.return_value = (
+            "Here is a 7-day meal prep outline with Sunday batch cooking.",
+            LlmUsageOut(),
+        )
         r = c.post(
             f"/api/v1/assistant/chat/send?project_id={project_id}",
             json={
@@ -644,7 +655,7 @@ def test_decide_actions_receives_conversation_history(client, test_engine):
     with patch(
         "assistant.services.assistant_chat._chat_only",
         new_callable=AsyncMock,
-        return_value="I'll help with meal prep.",
+        return_value=("I'll help with meal prep.", LlmUsageOut()),
     ):
         c.post(
             f"/api/v1/assistant/chat/send?project_id={project_id}",
@@ -666,6 +677,7 @@ def test_decide_actions_receives_conversation_history(client, test_engine):
                 )
             ],
             None,
+            LlmUsageOut(),
         )
         c.post(
             f"/api/v1/assistant/chat/send?project_id={project_id}",
@@ -753,6 +765,7 @@ def test_chat_stores_proposal_snapshot_and_resolves_on_apply(client, test_engine
                 )
             ],
             "I've prepared 1 action(s) for your review.",
+            LlmUsageOut(),
         )
         send = c.post(
             f"/api/v1/assistant/chat/send?project_id={project_id}",
@@ -834,6 +847,7 @@ def test_chat_clarifying_questions_inline_without_pending(client, test_engine):
                 )
             ],
             None,
+            LlmUsageOut(),
         )
         send = c.post(
             f"/api/v1/assistant/chat/send?project_id={project_id}",
@@ -932,6 +946,7 @@ def test_send_clears_stale_informational_pending(client, test_engine):
                 )
             ],
             None,
+            LlmUsageOut(),
         )
         send = c.post(
             f"/api/v1/assistant/chat/send?project_id={project_id}",
@@ -979,7 +994,7 @@ def test_fitness_gaps_inject_form_on_chat(client, test_engine):
         "assistant.services.assistant_chat.decide_actions",
         new_callable=AsyncMock,
     ) as mock_decide:
-        mock_decide.return_value = ([], None)
+        mock_decide.return_value = ([], None, LlmUsageOut())
         r = c.post(
             f"/api/v1/assistant/chat/send?project_id={project_id}",
             json={"message": "Plan my workouts this week"},

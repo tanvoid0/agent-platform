@@ -6,9 +6,15 @@ from sqlmodel import SQLModel, Field
 
 
 class TeamTemplate(SQLModel, table=True):
-    """Saved team roster used as planner hint and optional process snapshot."""
+    """Saved team roster used as planner hint and optional process snapshot.
+
+    ``workspace_id`` NULL => global template, shared/reusable across all
+    workspaces. Set => owned by one workspace; only that workspace (and the
+    master key) may see or modify it.
+    """
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    workspace_id: Optional[int] = Field(default=None, foreign_key="workspace.id", index=True)
     name: str = Field(max_length=256)
     description: Optional[str] = Field(default=None, max_length=4096)
     color: Optional[str] = Field(default=None, max_length=32)
@@ -19,10 +25,27 @@ class TeamTemplate(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
-class Project(SQLModel, table=True):
-    """User-facing grouping for processes (workspace / folder)."""
+class Workspace(SQLModel, table=True):
+    """Top-level tenant: one microservice / one Flow UI deployment / one token.
+
+    Owns projects; isolation boundary for workspace-scoped API tokens.
+    """
+
+    __tablename__ = "workspace"
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(max_length=256)
+    slug: str = Field(max_length=128, unique=True, index=True)
+    description: Optional[str] = Field(default=None, max_length=4096)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class Project(SQLModel, table=True):
+    """User-facing grouping for processes (grouping within a workspace)."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    workspace_id: Optional[int] = Field(default=None, foreign_key="workspace.id", index=True)
     name: str = Field(max_length=256)
     description: Optional[str] = Field(default=None, max_length=4096)
     color: Optional[str] = Field(default=None, max_length=32)
@@ -107,12 +130,15 @@ class EventLog(SQLModel, table=True):
 
 
 class ApiToken(SQLModel, table=True):
-    """Project-scoped external API credential (issued from the dashboard, not the master key)."""
+    """Workspace-scoped external API credential (issued from the dashboard, not the master key)."""
 
     __tablename__ = "api_tokens"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    project_id: int = Field(foreign_key="project.id", index=True)
+    workspace_id: int = Field(foreign_key="workspace.id", index=True)
+    # Retained nullable for back-compat / optional future single-project tokens; not
+    # used by the workspace-only scoping model.
+    project_id: Optional[int] = Field(default=None, foreign_key="project.id", index=True)
     name: str = Field(max_length=256)
     # Public-safe display prefix (e.g. "agp_live_a1b2c3d4"); the secret suffix is never stored.
     prefix: str = Field(max_length=32, index=True)

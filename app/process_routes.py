@@ -83,9 +83,15 @@ def list_processes(
     unassigned_only: bool = False,
 ):
     require_scope(principal, "process:read")
-    if principal.project_id is not None:
-        # Project-scoped token: force the filter to its own project regardless of query params.
-        project_id = principal.project_id
+    if principal.workspace_id is not None:
+        # Workspace-scoped token: must target a project inside its workspace, and
+        # cannot list unassigned (workspace-less) processes.
+        if project_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="project_id is required for a workspace-scoped token.",
+            )
+        assert_token_project_access(principal, project_id, session)
         unassigned_only = False
 
     # Require explicit scope: must filter by project_id, client_id, or unassigned_only
@@ -122,11 +128,14 @@ async def start_process(
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     require_scope(principal, "process:write")
-    if principal.project_id is not None:
-        # Project-scoped token: force this process into its own project.
-        if req.project_id is not None and req.project_id != principal.project_id:
-            raise HTTPException(status_code=404, detail="Project not found")
-        req.project_id = principal.project_id
+    if principal.workspace_id is not None:
+        # Workspace-scoped token: the target project must belong to its workspace.
+        if req.project_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="project_id is required for a workspace-scoped token.",
+            )
+        assert_token_project_access(principal, req.project_id, session)
 
     effective = merged_client_id(client_hdr, req.client_id)
     if require_client_id_enabled() and not effective:
@@ -136,6 +145,13 @@ async def start_process(
         )
 
     tmpl = require_one(session, TeamTemplate, req.team_template_id, "Team template")
+    # Workspace tokens may only use global (NULL) or their own workspace's templates.
+    if (
+        principal.workspace_id is not None
+        and tmpl.workspace_id is not None
+        and tmpl.workspace_id != principal.workspace_id
+    ):
+        raise HTTPException(status_code=404, detail="Team template not found")
     if req.project_id is not None:
         proj = require_one(session, Project, req.project_id, "Project")
     roster = parse_team_roster_json(tmpl.roster_json)

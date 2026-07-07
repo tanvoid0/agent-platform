@@ -16,18 +16,26 @@ _runtime_ollama_base: str | None = None
 _runtime_lm_studio_base: str | None = None
 
 ProviderId = str
-SUPPORTED_PROVIDER_IDS: tuple[ProviderId, ...] = ("ollama", "lm_studio", "aimlapi", "gemini")
+SUPPORTED_PROVIDER_IDS: tuple[ProviderId, ...] = (
+    "ollama",
+    "lm_studio",
+    "aimlapi",
+    "anthropic",
+    "gemini",
+)
 PROVIDER_LABELS: dict[ProviderId, str] = {
     "ollama": "Ollama",
     "lm_studio": "LM Studio",
     "aimlapi": "AIMLAPI",
+    "anthropic": "Claude",
     "gemini": "Cloud",
 }
 PROVIDER_LOCAL_SORT_ORDER: dict[ProviderId, int] = {
     "ollama": 0,
     "lm_studio": 1,
     "aimlapi": 2,
-    "gemini": 3,
+    "anthropic": 3,
+    "gemini": 4,
 }
 
 # Standard loopback URLs when env / dotenv omit these keys (matches LOCAL_LLM_AUTO_DISCOVER probes).
@@ -93,6 +101,27 @@ def aimlapi_configured() -> bool:
     return bool(aimlapi_api_key())
 
 
+def anthropic_api_key() -> str:
+    return _from_env_or_dotenv("ANTHROPIC_API_KEY")
+
+
+def anthropic_openai_base() -> str:
+    """Anthropic's OpenAI-compatible surface (ends with /v1, no trailing slash)."""
+    base = _from_env_or_dotenv("ANTHROPIC_OPENAI_BASE")
+    if base:
+        return base.rstrip("/")
+    return "https://api.anthropic.com/v1"
+
+
+def anthropic_version_header() -> str:
+    """anthropic-version pin; overridable but defaults to the stable date."""
+    return _from_env_or_dotenv("ANTHROPIC_VERSION") or "2023-06-01"
+
+
+def anthropic_configured() -> bool:
+    return bool(anthropic_api_key())
+
+
 def lm_studio_api_base() -> str:
     """LM Studio base (no ``/v1``). Env / dotenv wins; else discovery; else ``DEFAULT_LM_STUDIO_BASE``."""
     k = _from_env_or_dotenv("LM_STUDIO_API_BASE")
@@ -140,6 +169,9 @@ PROVIDER_SPECS: dict[ProviderId, ProviderSpec] = {
     "ollama": ProviderSpec(configured=ollama_configured, default_model="llama3"),
     "lm_studio": ProviderSpec(configured=lm_studio_configured, default_model="google/gemma-4-e4b"),
     "aimlapi": ProviderSpec(configured=aimlapi_configured, default_model="openai/gpt-4.1-mini"),
+    # No hardcoded default: Claude rotates model ids rapidly, so the id is resolved
+    # from the live /v1/models catalog (or an explicit YAML alias) instead.
+    "anthropic": ProviderSpec(configured=anthropic_configured, default_model=""),
     "gemini": ProviderSpec(configured=gemini_configured, default_model="gemini-2.0-flash"),
 }
 
@@ -168,6 +200,8 @@ def first_configured_provider() -> str:
         return "lm_studio"
     if aimlapi_configured():
         return "aimlapi"
+    if anthropic_configured():
+        return "anthropic"
     if gemini_configured():
         return "gemini"
     return "lm_studio"

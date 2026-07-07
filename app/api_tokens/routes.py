@@ -1,7 +1,7 @@
-"""Dashboard-only CRUD for project-scoped API tokens.
+"""Dashboard-only CRUD for workspace-scoped API tokens.
 
-Master-key callers only — a project token must never be usable to mint or
-revoke other tokens, so every endpoint here rejects project-scoped principals.
+Master-key callers only — a workspace token must never be usable to mint or
+revoke other tokens, so every endpoint here rejects workspace-scoped principals.
 """
 
 from __future__ import annotations
@@ -16,21 +16,30 @@ from api_tokens.auth import TokenPrincipal, require_valid_token
 from api_tokens.token_service import generate_token
 from crud_helpers import require_one
 from database import get_session
-from models import ApiToken, ApiTokenUsageDaily, Project
+from models import ApiToken, ApiTokenUsageDaily, Workspace
 from schema_converter import to_schemas
 
-router = APIRouter(prefix="/projects/{project_id}/api-tokens", tags=["api-tokens"])
+router = APIRouter(prefix="/workspaces/{workspace_id}/api-tokens", tags=["api-tokens"])
 
 
 def _require_dashboard_caller(principal: TokenPrincipal) -> None:
     """Only the master key (unrestricted principal) may manage tokens."""
-    if principal.project_id is not None:
+    if principal.workspace_id is not None:
         raise HTTPException(status_code=403, detail="API tokens cannot be managed using an API token.")
 
 
 class ApiTokenCreate(BaseModel):
     name: str = Field(min_length=1, max_length=256)
     scopes: list[str] = Field(default_factory=list)
+    expires_at: datetime | None = None
+    rate_limit_per_minute: int | None = Field(default=None, ge=1)
+
+
+class ApiTokenUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    scopes: list[str] | None = None
     expires_at: datetime | None = None
     rate_limit_per_minute: int | None = Field(default=None, ge=1)
 
@@ -45,7 +54,8 @@ class ApiTokenOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    project_id: int
+    workspace_id: int
+    project_id: int | None
     name: str
     prefix: str
     scopes: list[str]
@@ -81,6 +91,7 @@ class ApiTokenUsageDailyOut(BaseModel):
 def _to_out(row: ApiToken) -> ApiTokenOut:
     return ApiTokenOut(
         id=row.id,
+        workspace_id=row.workspace_id,
         project_id=row.project_id,
         name=row.name,
         prefix=row.prefix,
@@ -101,9 +112,9 @@ def _to_out(row: ApiToken) -> ApiTokenOut:
     )
 
 
-def _require_token(session: Session, project_id: int, token_id: int) -> ApiToken:
+def _require_token(session: Session, workspace_id: int, token_id: int) -> ApiToken:
     row = require_one(session, ApiToken, token_id, "API token")
-    if row.project_id != project_id:
+    if row.workspace_id != workspace_id:
         raise HTTPException(status_code=404, detail="API token not found")
     return row
 
@@ -112,26 +123,26 @@ def _require_token(session: Session, project_id: int, token_id: int) -> ApiToken
     "/",
     status_code=201,
     response_model=ApiTokenCreateOut,
-    summary="Create an API token for a project",
+    summary="Create an API token for a workspace",
     description=(
-        "Mints a new opaque bearer token scoped to this project. The raw token is returned "
+        "Mints a new opaque bearer token scoped to this workspace. The raw token is returned "
         "once in this response and is never retrievable again — only its prefix and metadata "
-        "are stored. Requires the master key (a project token cannot mint other tokens)."
+        "are stored. Requires the master key (a workspace token cannot mint other tokens)."
     ),
 )
 def create_api_token(
-    project_id: int,
+    workspace_id: int,
     req: ApiTokenCreate,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_dashboard_caller(principal)
-    require_one(session, Project, project_id, "Project")
+    require_one(session, Workspace, workspace_id, "Workspace")
 
     full_token, prefix, token_hash = generate_token()
     now = datetime.utcnow()
     row = ApiToken(
-        project_id=project_id,
+        workspace_id=workspace_id,
         name=req.name.strip(),
         prefix=prefix,
         token_hash=token_hash,
@@ -153,31 +164,66 @@ def create_api_token(
 @router.get(
     "/",
     response_model=dict,
-    summary="List API tokens for a project",
+    summary="List API tokens for a workspace",
     description="Returns token metadata (prefix, status, scopes, usage totals) — never the raw token value.",
 )
 def list_api_tokens(
-    project_id: int,
+    workspace_id: int,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_dashboard_caller(principal)
-    require_one(session, Project, project_id, "Project")
+    require_one(session, Workspace, workspace_id, "Workspace")
     rows = session.exec(
-        select(ApiToken).where(ApiToken.project_id == project_id).order_by(ApiToken.id.desc())
+        select(ApiToken).where(ApiToken.workspace_id == workspace_id).order_by(ApiToken.id.desc())
     ).all()
     return {"tokens": to_schemas(rows, ApiTokenOut)}
 
 
 @router.get("/{token_id}", response_model=ApiTokenOut, summary="Get one API token's metadata and lifetime usage totals")
 def get_api_token(
-    project_id: int,
+    workspace_id: int,
     token_id: int,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_dashboard_caller(principal)
-    row = _require_token(session, project_id, token_id)
+    row = _require_token(session, workspace_id, token_id)
+    return _to_out(row)
+
+
+@router.patch(
+    "/{token_id}",
+    response_model=ApiTokenOut,
+    summary="Update an API token's name, scopes, rate limit, or expiry",
+    description=(
+        "Only fields present in the body are changed. `expires_at` and "
+        "`rate_limit_per_minute` may be set to null to clear them. Status is not "
+        "editable here — use /revoke, /hold, /unhold. The raw token never changes."
+    ),
+)
+def update_api_token(
+    workspace_id: int,
+    token_id: int,
+    req: ApiTokenUpdate,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+):
+    _require_dashboard_caller(principal)
+    row = _require_token(session, workspace_id, token_id)
+    fields = req.model_fields_set
+    if "name" in fields and req.name is not None:
+        row.name = req.name.strip()
+    if "scopes" in fields and req.scopes is not None:
+        row.scopes = req.scopes
+    if "expires_at" in fields:
+        row.expires_at = req.expires_at
+    if "rate_limit_per_minute" in fields:
+        row.rate_limit_per_minute = req.rate_limit_per_minute
+    row.updated_at = datetime.utcnow()
+    session.add(row)
+    session.commit()
+    session.refresh(row)
     return _to_out(row)
 
 
@@ -188,7 +234,7 @@ def get_api_token(
     description="Requests, tokens, cost, and errors per UTC day, optionally bounded by from_date/to_date (YYYY-MM-DD).",
 )
 def get_api_token_usage(
-    project_id: int,
+    workspace_id: int,
     token_id: int,
     from_date: str | None = None,
     to_date: str | None = None,
@@ -196,7 +242,7 @@ def get_api_token_usage(
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_dashboard_caller(principal)
-    _require_token(session, project_id, token_id)
+    _require_token(session, workspace_id, token_id)
 
     q = select(ApiTokenUsageDaily).where(ApiTokenUsageDaily.token_id == token_id)
     if from_date:
@@ -214,14 +260,14 @@ def get_api_token_usage(
     description="Irreversible. Subsequent requests using this token get 401 TOKEN_REVOKED.",
 )
 def revoke_api_token(
-    project_id: int,
+    workspace_id: int,
     token_id: int,
     req: ApiTokenActionBody,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_dashboard_caller(principal)
-    row = _require_token(session, project_id, token_id)
+    row = _require_token(session, workspace_id, token_id)
     row.status = "revoked"
     row.revoked_at = datetime.utcnow()
     row.revoked_reason = req.reason
@@ -239,14 +285,14 @@ def revoke_api_token(
     description="Reversible via /unhold. Requests using this token get 403 TOKEN_HELD until unheld.",
 )
 def hold_api_token(
-    project_id: int,
+    workspace_id: int,
     token_id: int,
     req: ApiTokenActionBody,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_dashboard_caller(principal)
-    row = _require_token(session, project_id, token_id)
+    row = _require_token(session, workspace_id, token_id)
     if row.status == "revoked":
         raise HTTPException(status_code=409, detail="Cannot hold a revoked token")
     row.status = "held"
@@ -264,13 +310,13 @@ def hold_api_token(
     summary="Restore a held API token to active",
 )
 def unhold_api_token(
-    project_id: int,
+    workspace_id: int,
     token_id: int,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_dashboard_caller(principal)
-    row = _require_token(session, project_id, token_id)
+    row = _require_token(session, workspace_id, token_id)
     if row.status != "held":
         raise HTTPException(status_code=409, detail="Token is not on hold")
     row.status = "active"

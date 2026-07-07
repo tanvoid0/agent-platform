@@ -22,3 +22,6 @@ data/
 app/static/dist/
 flow-ui/dist/
 node_modules/
+web/
+.agents/
+skills-lock.json

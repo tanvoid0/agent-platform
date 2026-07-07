@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Platform · API tokens</title>
+  <style>
+    :root {
+      font-family: system-ui, sans-serif;
+      line-height: 1.5;
+      color: #0f172a;
+      background: #f8fafc;
+    }
+    body { max-width: 60rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+    h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
+    h2 { font-size: 1.1rem; margin: 1.75rem 0 0.75rem; }
+    .muted { color: #64748b; font-size: 0.9rem; }
+    .card {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1rem 0;
+    }
+    label { display: block; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: #64748b; margin: 0.75rem 0 0.35rem; }
+    input, select, textarea, button { font: inherit; }
+    input[type="text"], input[type="password"], input[type="number"], input[type="datetime-local"], select {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 0.5rem 0.65rem;
+      background: #fff;
+    }
+    pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow: auto; font-size: 0.8rem; white-space: pre-wrap; word-break: break-all; }
+    .row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; margin-top: 0.75rem; }
+    button { padding: 0.45rem 0.9rem; border-radius: 8px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    button.danger { border-color: #fecaca; color: #b91c1c; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .error { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; padding: 0.65rem 0.85rem; border-radius: 8px; margin: 0.75rem 0; }
+    .ok { color: #166534; background: #f0fdf4; border: 1px solid #bbf7d0; padding: 0.65rem 0.85rem; border-radius: 8px; margin: 0.75rem 0; }
+    .hint { font-size: 0.85rem; color: #64748b; margin: 0.25rem 0; }
+    .masked { font-size: 0.85rem; color: #64748b; font-family: ui-monospace, monospace; }
+    nav a { margin-right: 1rem; }
+    #auth-bar { display: none; margin-bottom: 1rem; }
+    #auth-bar.visible { display: block; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+    th { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: #64748b; }
+    code.pfx { font-family: ui-monospace, monospace; }
+    .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.72rem; font-weight: 600; }
+    .badge.active { background: #dcfce7; color: #166534; }
+    .badge.held { background: #fef9c3; color: #854d0e; }
+    .badge.revoked { background: #fee2e2; color: #991b1b; }
+    .actions button { padding: 0.3rem 0.6rem; font-size: 0.78rem; margin-right: 0.35rem; }
+    .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.6rem; }
+    .chip { display: inline-flex; align-items: center; gap: 0.4rem; background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; border-radius: 999px; padding: 0.2rem 0.6rem; font-size: 0.8rem; font-family: ui-monospace, monospace; }
+    .chip button { all: unset; cursor: pointer; color: #1e40af; font-weight: 700; line-height: 1; }
+    .team { display: flex; align-items: center; gap: 0.6rem; padding: 0.4rem 0; border-bottom: 1px solid #f1f5f9; font-size: 0.88rem; }
+    .team .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; flex: none; background: #cbd5e1; }
+    .team .meta { color: #64748b; font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <nav class="muted">
+    <a href="/config">Config</a>
+    <a href="/tokens">API tokens</a>
+    <a href="/docs">OpenAPI</a>
+    <a href="/api-guide">API guide</a>
+    <a href="/ui">Process demo</a>
+  </nav>
+
+  <h1>API tokens</h1>
+  <p class="muted">Mint workspace-scoped bearer tokens for external apps. The raw token shows once at creation — copy it then.</p>
+
+  <div id="auth-bar" class="card">
+    <label for="api-key">API key (Bearer master key)</label>
+    <p class="hint">Required when <code>AGENT_PLATFORM_MASTER_KEY</code> is set. Only the master key can manage tokens.</p>
+    <div class="row">
+      <input type="password" id="api-key" autocomplete="off" placeholder="Paste master key" style="flex:1;min-width:12rem" />
+      <button type="button" id="btn-save-key">Use key</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+
+  <section class="card">
+    <label for="workspace-select">Workspace</label>
+    <select id="workspace-select"><option value="">Loading…</option></select>
+  </section>
+
+  <form id="create-form" class="card" hidden>
+    <h2 style="margin-top:0" id="form-title">Create token</h2>
+    <label for="t-name">Name</label>
+    <input type="text" id="t-name" autocomplete="off" placeholder="e.g. mobile-app prod" />
+    <label>Scopes (optional — empty means no scoped permissions)</label>
+    <div class="row" style="margin-top:0.35rem">
+      <input type="text" id="t-scope-input" list="scope-list" autocomplete="off" placeholder="Type to search permissions…" style="flex:1;min-width:14rem" />
+      <datalist id="scope-list"></datalist>
+      <button type="button" id="btn-scope-add">Add</button>
+      <button type="button" id="btn-scope-all">Select all</button>
+      <button type="button" id="btn-scope-clear">Clear</button>
+    </div>
+    <div id="scope-chips" class="chips"></div>
+    <p class="hint" id="scope-help"></p>
+    <div class="row">
+      <div style="flex:1;min-width:12rem">
+        <label for="t-rate">Rate limit / minute (optional)</label>
+        <input type="number" id="t-rate" min="1" placeholder="unlimited" />
+      </div>
+      <div style="flex:1;min-width:12rem">
+        <label for="t-expires">Expires at (optional)</label>
+        <input type="datetime-local" id="t-expires" />
+      </div>
+    </div>
+    <div class="row">
+      <button type="submit" class="primary" id="form-submit">Create token</button>
+      <button type="button" id="btn-cancel-edit" hidden>Cancel</button>
+    </div>
+  </form>
+
+  <div id="new-token-card" class="card" hidden>
+    <h2 style="margin-top:0">New token — copy now</h2>
+    <p class="hint">Stored hashed. Not retrievable again once you leave this page.</p>
+    <pre id="new-token-value"></pre>
+    <div class="row">
+      <button type="button" id="btn-copy">Copy token</button>
+      <button type="button" id="btn-dismiss">Done</button>
+    </div>
+  </div>
+
+  <section class="card" id="list-card" hidden>
+    <h2 style="margin-top:0">Existing tokens</h2>
+    <div id="tokens-table"></div>
+  </section>
+
+  <section class="card" id="teams-card" hidden>
+    <h2 style="margin-top:0">Available teams</h2>
+    <p class="hint">Agent-roster templates defined on this server — for reference when deciding what a token's app will drive.</p>
+    <div id="teams-list"></div>
+  </section>
+
+  <script>
+    const KEY_STORAGE = "agent-platform-config-api-key";
+    let apiKey = sessionStorage.getItem(KEY_STORAGE) || "";
+    let currentWorkspace = "";
+    let scopeCatalog = [];              // [{scope, description}]
+    const selectedScopes = new Set();
+    let currentTokens = [];             // last-loaded token rows for current workspace
+    let editingTokenId = null;          // null = create mode, else editing this id
+
+    const statusEl = document.getElementById("status");
+    const authBar = document.getElementById("auth-bar");
+
+    function setStatus(msg, kind) {
+      statusEl.innerHTML = msg ? `<div class="${kind || "error"}">${msg}</div>` : "";
+    }
+    function esc(s) {
+      return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+    function headers(json) {
+      const h = {};
+      if (json) h["Content-Type"] = "application/json";
+      if (apiKey) h["Authorization"] = "Bearer " + apiKey;
+      return h;
+    }
+    async function api(path, opts) {
+      const r = await fetch(path, { ...opts, headers: { ...headers(opts && opts.body), ...(opts && opts.headers) } });
+      const text = await r.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      if (r.status === 401) {
+        authBar.classList.add("visible");
+        throw new Error("Unauthorized — enter the master key above.");
+      }
+      if (!r.ok) {
+        const detail = data && data.detail ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : text;
+        throw new Error(detail || ("HTTP " + r.status));
+      }
+      return data;
+    }
+
+    function renderScopeChips() {
+      const wrap = document.getElementById("scope-chips");
+      wrap.innerHTML = [...selectedScopes].map((s) =>
+        `<span class="chip">${esc(s)}<button type="button" title="Remove" data-scope="${esc(s)}">&times;</button></span>`
+      ).join("");
+      wrap.querySelectorAll("button[data-scope]").forEach((b) =>
+        b.addEventListener("click", () => { selectedScopes.delete(b.dataset.scope); renderScopeChips(); }));
+    }
+    function addScope(raw) {
+      const s = (raw || "").trim();
+      if (!s) return;
+      selectedScopes.add(s);
+      document.getElementById("t-scope-input").value = "";
+      renderScopeChips();
+    }
+    async function loadScopeCatalog() {
+      try {
+        const res = await api("/api/v1/api-tokens/scopes");
+        scopeCatalog = res.scopes || [];
+      } catch { scopeCatalog = []; }
+      const dl = document.getElementById("scope-list");
+      dl.innerHTML = scopeCatalog.map((s) =>
+        `<option value="${esc(s.scope)}">${esc(s.description || "")}</option>`).join("");
+      document.getElementById("scope-help").textContent = scopeCatalog.length
+        ? "Known scopes: " + scopeCatalog.map((s) => s.scope).join(", ") + ". Custom values allowed."
+        : "";
+    }
+    async function loadTeams() {
+      const card = document.getElementById("teams-card");
+      const wrap = document.getElementById("teams-list");
+      try {
+        const res = await api("/api/v1/teams/");
+        const teams = res.teams || [];
+        card.hidden = false;
+        wrap.innerHTML = teams.length
+          ? teams.map((t) => `
+            <div class="team">
+              <span class="dot" style="${t.color ? `background:${esc(t.color)}` : ""}"></span>
+              <span><strong>${esc(t.name)}</strong> <span class="meta">#${t.id}${t.category ? " · " + esc(t.category) : ""} · ${t.role_count} role(s)</span></span>
+            </div>`).join("")
+          : '<p class="hint">No teams defined.</p>';
+      } catch (e) {
+        card.hidden = true;
+      }
+    }
+
+    async function loadWorkspaces() {
+      setStatus("Loading…", "hint");
+      try {
+        const res = await api("/api/v1/workspaces/");
+        const workspaces = res.workspaces || [];
+        const sel = document.getElementById("workspace-select");
+        sel.innerHTML = workspaces.length
+          ? workspaces.map((w) => `<option value="${w.id}">${esc(w.name)} (#${w.id})</option>`).join("")
+          : '<option value="">No workspaces</option>';
+        authBar.classList.remove("visible");
+        await Promise.all([loadScopeCatalog(), loadTeams()]);
+        if (workspaces.length) {
+          currentWorkspace = sel.value;
+          document.getElementById("create-form").hidden = false;
+          await loadTokens();
+        }
+        setStatus("");
+      } catch (e) {
+        setStatus(String(e.message || e), "error");
+      }
+    }
+
+    async function loadTokens() {
+      if (!currentWorkspace) return;
+      const wrap = document.getElementById("tokens-table");
+      const card = document.getElementById("list-card");
+      try {
+        const res = await api(`/api/v1/workspaces/${currentWorkspace}/api-tokens/`);
+        const tokens = res.tokens || [];
+        currentTokens = tokens;
+        card.hidden = false;
+        if (!tokens.length) {
+          wrap.innerHTML = '<p class="hint">No tokens yet.</p>';
+          return;
+        }
+        wrap.innerHTML = `
+          <table>
+            <thead><tr>
+              <th>Name</th><th>Prefix</th><th>Status</th><th>Scopes</th>
+              <th>Rate/min</th><th>Requests</th><th>Last used</th><th>Actions</th>
+            </tr></thead>
+            <tbody>${tokens.map(rowHtml).join("")}</tbody>
+          </table>`;
+      } catch (e) {
+        setStatus(String(e.message || e), "error");
+      }
+    }
+
+    function rowHtml(t) {
+      const badge = `<span class="badge ${t.status}">${esc(t.status)}</span>`;
+      const scopes = (t.scopes || []).length ? esc((t.scopes || []).join(", ")) : "—";
+      const rate = t.rate_limit_per_minute == null ? "∞" : t.rate_limit_per_minute;
+      const last = t.last_used_at ? esc(t.last_used_at.replace("T", " ").slice(0, 16)) : "never";
+      let actions = "";
+      if (t.status !== "revoked") {
+        actions += `<button onclick="edit(${t.id})">Edit</button>`;
+      }
+      if (t.status === "active") {
+        actions += `<button onclick="act(${t.id},'hold')">Hold</button>`;
+        actions += `<button class="danger" onclick="act(${t.id},'revoke')">Revoke</button>`;
+      } else if (t.status === "held") {
+        actions += `<button onclick="act(${t.id},'unhold')">Unhold</button>`;
+        actions += `<button class="danger" onclick="act(${t.id},'revoke')">Revoke</button>`;
+      }
+      return `<tr>
+        <td>${esc(t.name)}</td>
+        <td><code class="pfx">${esc(t.prefix)}…</code></td>
+        <td>${badge}</td>
+        <td>${scopes}</td>
+        <td>${rate}</td>
+        <td>${t.total_requests}</td>
+        <td>${last}</td>
+        <td class="actions">${actions || "—"}</td>
+      </tr>`;
+    }
+
+    window.act = async function (tokenId, action) {
+      if (action === "revoke" && !confirm("Revoke is permanent. Requests with this token will get 401. Continue?")) return;
+      let reason = null;
+      if (action === "revoke" || action === "hold") {
+        reason = prompt(`Reason for ${action} (optional):`, "") || null;
+      }
+      try {
+        await api(`/api/v1/workspaces/${currentWorkspace}/api-tokens/${tokenId}/${action}`, {
+          method: "POST",
+          body: JSON.stringify({ reason }),
+        });
+        setStatus(`Token ${action} ok.`, "ok");
+        await loadTokens();
+      } catch (e) {
+        setStatus(String(e.message || e), "error");
+      }
+    };
+
+    document.getElementById("workspace-select").addEventListener("change", (e) => {
+      currentWorkspace = e.target.value;
+      document.getElementById("new-token-card").hidden = true;
+      if (editingTokenId != null) cancelEdit();
+      void loadTokens();
+    });
+
+    function setEditMode(on) {
+      document.getElementById("form-title").textContent = on ? "Edit token" : "Create token";
+      document.getElementById("form-submit").textContent = on ? "Save changes" : "Create token";
+      document.getElementById("btn-cancel-edit").hidden = !on;
+    }
+    window.edit = function (tokenId) {
+      const t = currentTokens.find((x) => x.id === tokenId);
+      if (!t) return;
+      editingTokenId = tokenId;
+      document.getElementById("t-name").value = t.name || "";
+      document.getElementById("t-rate").value = t.rate_limit_per_minute == null ? "" : t.rate_limit_per_minute;
+      document.getElementById("t-expires").value = t.expires_at ? t.expires_at.slice(0, 16) : "";
+      selectedScopes.clear();
+      (t.scopes || []).forEach((s) => selectedScopes.add(s));
+      renderScopeChips();
+      setEditMode(true);
+      document.getElementById("new-token-card").hidden = true;
+      document.getElementById("create-form").scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+    function cancelEdit() {
+      editingTokenId = null;
+      document.getElementById("create-form").reset();
+      selectedScopes.clear();
+      renderScopeChips();
+      setEditMode(false);
+    }
+    document.getElementById("btn-cancel-edit").addEventListener("click", cancelEdit);
+
+    document.getElementById("create-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (!currentWorkspace) { setStatus("Select a workspace first.", "error"); return; }
+      const name = document.getElementById("t-name").value.trim();
+      if (!name) { setStatus("Name required.", "error"); return; }
+      const scopes = [...selectedScopes];
+      const rateRaw = document.getElementById("t-rate").value.trim();
+      const expRaw = document.getElementById("t-expires").value.trim();
+      // null clears the field; on create the backend treats null as unset
+      const body = {
+        name,
+        scopes,
+        rate_limit_per_minute: rateRaw ? parseInt(rateRaw, 10) : null,
+        expires_at: expRaw ? new Date(expRaw).toISOString() : null,
+      };
+      try {
+        if (editingTokenId != null) {
+          await api(`/api/v1/workspaces/${currentWorkspace}/api-tokens/${editingTokenId}`, {
+            method: "PATCH",
+            body: JSON.stringify(body),
+          });
+          setStatus("Token updated.", "ok");
+          cancelEdit();
+          await loadTokens();
+        } else {
+          const res = await api(`/api/v1/workspaces/${currentWorkspace}/api-tokens/`, {
+            method: "POST",
+            body: JSON.stringify(body),
+          });
+          document.getElementById("new-token-value").textContent = res.token;
+          document.getElementById("new-token-card").hidden = false;
+          document.getElementById("create-form").reset();
+          selectedScopes.clear();
+          renderScopeChips();
+          setStatus("Token created. Copy it now — it will not be shown again.", "ok");
+          await loadTokens();
+        }
+      } catch (err) {
+        setStatus(String(err.message || err), "error");
+      }
+    });
+
+    document.getElementById("btn-copy").addEventListener("click", async () => {
+      const val = document.getElementById("new-token-value").textContent;
+      try { await navigator.clipboard.writeText(val); setStatus("Copied to clipboard.", "ok"); }
+      catch { setStatus("Copy failed — select the text manually.", "error"); }
+    });
+    document.getElementById("btn-dismiss").addEventListener("click", () => {
+      document.getElementById("new-token-value").textContent = "";
+      document.getElementById("new-token-card").hidden = true;
+    });
+
+    document.getElementById("btn-save-key").addEventListener("click", () => {
+      apiKey = document.getElementById("api-key").value.trim();
+      if (apiKey) sessionStorage.setItem(KEY_STORAGE, apiKey);
+      else sessionStorage.removeItem(KEY_STORAGE);
+      void loadWorkspaces();
+    });
+
+    document.getElementById("btn-scope-add").addEventListener("click", () =>
+      addScope(document.getElementById("t-scope-input").value));
+    document.getElementById("t-scope-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === ",") { e.preventDefault(); addScope(e.target.value); }
+    });
+    document.getElementById("t-scope-input").addEventListener("change", (e) => {
+      // picking a datalist suggestion fires change — add it immediately
+      if (scopeCatalog.some((s) => s.scope === e.target.value.trim())) addScope(e.target.value);
+    });
+    document.getElementById("btn-scope-all").addEventListener("click", () => {
+      scopeCatalog.forEach((s) => selectedScopes.add(s.scope));
+      renderScopeChips();
+    });
+    document.getElementById("btn-scope-clear").addEventListener("click", () => {
+      selectedScopes.clear();
+      renderScopeChips();
+    });
+
+    if (apiKey) document.getElementById("api-key").value = apiKey;
+    void loadWorkspaces();
+  </script>
+</body>
+</html>
