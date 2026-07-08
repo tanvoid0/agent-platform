@@ -13,7 +13,7 @@ import secrets as _secrets
 from datetime import datetime
 from typing import NamedTuple
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 from sqlmodel import Session, select
 
 from api_auth import agent_platform_api_key_expected
@@ -28,6 +28,7 @@ from api_tokens.rate_limiter import check_and_increment
 from api_tokens.token_service import hash_token
 from database import get_session
 from models import ApiToken
+from observability import update_request_context
 from time_utils import utc_now_naive
 
 _LAST_USED_THROTTLE_SECONDS = 60
@@ -43,6 +44,7 @@ class TokenPrincipal(NamedTuple):
 
 def verify_project_api_token(required_scope: str | None = None):
     async def _dependency(
+        request: Request,
         authorization: str | None = Header(None),
         session: Session = Depends(get_session),
     ) -> TokenPrincipal:
@@ -86,15 +88,19 @@ def verify_project_api_token(required_scope: str | None = None):
                 session.add(row)
                 session.commit()
 
-            return TokenPrincipal(
+            principal = TokenPrincipal(
                 project_id=row.project_id,
                 token_id=row.id,
                 scopes=scopes,
                 workspace_id=row.workspace_id,
             )
+            request.state.workspace_id = row.workspace_id
+            update_request_context(workspace_id=row.workspace_id)
+            return principal
 
         if not _secrets.compare_digest(raw, expected_master_key):
             raise TokenNotFoundError("Invalid API key")
+        request.state.workspace_id = None
         return TokenPrincipal(project_id=None, token_id=None, scopes=["*"], workspace_id=None)
 
     return _dependency

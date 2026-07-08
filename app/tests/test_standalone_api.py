@@ -2,6 +2,9 @@
 
 import json
 import os
+import logging
+
+from observability import JsonLogFormatter, StructuredContextFilter, bind_request_context, reset_request_context
 
 
 def _api_auth_headers() -> dict[str, str]:
@@ -16,6 +19,61 @@ def test_health_liveness(client):
     r = c.get("/health")
     assert r.status_code == 200
     assert r.json() == {"status": "ok", "service": "agent-platform"}
+
+
+def test_ready_returns_named_checks(client):
+    c, _mock_cls, _mock_inst = client
+    r = c.get("/ready")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    checks = {row["name"]: row for row in body["checks"]}
+    assert checks["database"]["ok"] is True
+    assert checks["workspace_root"]["ok"] is True
+
+
+def test_request_id_is_echoed(client):
+    c, _mock_cls, _mock_inst = client
+    r = c.get("/health", headers={"X-Request-ID": "req-123"})
+    assert r.status_code == 200
+    assert r.headers["X-Request-ID"] == "req-123"
+
+
+def test_structured_formatter_includes_request_context():
+    tokens = bind_request_context(request_id="req-log-1", workspace_id=7, client_id="tenant-a")
+    try:
+        record = logging.LogRecord(
+            name="agent_platform.request",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="request completed",
+            args=(),
+            exc_info=None,
+        )
+        record.event = "request.completed"
+        record.path = "/health"
+        record.status_code = 200
+        StructuredContextFilter().filter(record)
+        payload = json.loads(JsonLogFormatter().format(record))
+        assert payload["request_id"] == "req-log-1"
+        assert payload["workspace_id"] == "7"
+        assert payload["client_id"] == "tenant-a"
+        assert payload["path"] == "/health"
+        assert payload["status_code"] == 200
+    finally:
+        reset_request_context(tokens)
+
+
+def test_llm_proxy_readiness_reports_actionable_reason(client, monkeypatch):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setattr("health_checks.first_configured_provider", lambda: "")
+    r = c.get("/v1/health/readiness")
+    assert r.status_code == 503
+    body = r.json()
+    assert body["status"] == "unready"
+    assert body["checks"][0]["name"] == "provider_config"
+    assert "No supported LLM provider is configured" in body["checks"][0]["detail"]
 
 
 def test_api_v1_processes_mirrors_legacy_post(client):
