@@ -17,6 +17,7 @@ import yaml
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from health_checks import llm_proxy_readiness_payload
 from llm_proxy.core.config_cache import load_config_yaml_dict, read_env_file_parsed
 from llm_proxy.core.errors import LlmProxyError
 from llm_proxy.core.provider_config import (
@@ -609,9 +610,10 @@ async def health(provider: str | None = None, model: str | None = None) -> JSONR
 
 
 @router.get("/v1/health/readiness")
-async def health_readiness() -> dict[str, str]:
-    """Always returns ok. Use this for Kubernetes readiness probes to avoid timeout."""
-    return {"status": "ok"}
+async def health_readiness() -> JSONResponse:
+    """Dependency-light readiness probe for the embedded LLM proxy configuration."""
+    status_code, payload = llm_proxy_readiness_payload()
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 @router.get("/v1/models")
