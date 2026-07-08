@@ -11,6 +11,13 @@ def _api_auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {key}"}
 
 
+def test_health_liveness(client):
+    c, _mock_cls, _mock_inst = client
+    r = c.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok", "service": "agent-platform"}
+
+
 def test_api_v1_processes_mirrors_legacy_post(client):
     c, _mock_cls, _mock_inst = client
     tr = c.get("/teams/")

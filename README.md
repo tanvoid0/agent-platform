@@ -7,7 +7,48 @@ Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-co
 - **API:** `http://127.0.0.1:18410` — OpenAPI at **`/docs`**, API guide at **`/api-guide`**
 - **Config UI:** `http://127.0.0.1:18410/config` — default provider, model, API keys, `config.yaml`
 - **Process demo:** `http://127.0.0.1:18410/ui` — minimal polling UI for `/processes`
-- **Flow UI (optional):** `http://127.0.0.1:18408/app/` when `AGENT_PLATFORM_CONTAINER_MODE=all`
+- **Flow UI (dev):** `http://127.0.0.1:3333/app/` — Vite dev server with API proxy
+- **Flow UI (Docker):** `http://127.0.0.1:18408/app/` when `AGENT_PLATFORM_CONTAINER_MODE=all`
+
+## Quick start
+
+First-time setup from this folder:
+
+```bash
+cp .env.example .env
+pnpm install          # root: Python deps (postinstall) + dev tooling
+cd web && pnpm install && cd ..
+```
+
+Set **`AGENT_PLATFORM_MASTER_KEY`** in `.env` (Bearer for `/v1` and protected `/api/v1/*`). When set, paste the same key in the config UI auth bar or set `VITE_AGENT_PLATFORM_MASTER_KEY` for Flow UI.
+
+| Mode | Local (no Docker) | Docker |
+|------|-------------------|--------|
+| **Backend only** | `pnpm dev:server` | `pnpm docker:up` |
+| **Backend + Flow UI** | `pnpm dev` | `pnpm docker:up:ui` |
+| **Flow UI only** (API elsewhere) | `cd web && pnpm dev` | `pnpm docker:up:ui-only` |
+
+URLs after start:
+
+| Mode | API / config | Flow UI |
+|------|--------------|---------|
+| Local backend only | `:18410` | — |
+| Local backend + web | `:18410` | `:3333/app/` |
+| Docker backend only | `:18410` | — |
+| Docker backend + web | `:18410` | `:18408/app/` |
+
+Verify setup (offline — no server required):
+
+```bash
+pnpm smoke
+```
+
+With API already running:
+
+```bash
+pnpm smoke:live
+# or: python scripts/smoke_workflow.py --live http://127.0.0.1:18410
+```
 
 ## Deploy profiles
 
@@ -17,23 +58,7 @@ Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-co
 | **Backend + Flow UI** | `docker compose -f docker-compose.yml -f docker-compose.ui.yml up --build` | Same container: API `:18410` + Flow UI `:18408` |
 | **Flow UI only** | `docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up --build` | Static Flow UI on `:18408` (API elsewhere) |
 
-Local dev without Docker:
-
-```bash
-cd agent-platform
-cp .env.example .env
-pip install -r app/requirements.txt
-python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
-```
-
-Flow UI dev (separate terminal):
-
-```bash
-cd web
-pnpm install && pnpm run dev
-```
-
-Set **`AGENT_PLATFORM_MASTER_KEY`** in `.env` (Bearer for `/v1` and protected `/api/v1/*`). When set, paste same key in config UI auth bar or set `VITE_AGENT_PLATFORM_MASTER_KEY` for Flow UI.
+Equivalent npm scripts: `pnpm docker:up`, `pnpm docker:up:ui`, `pnpm docker:up:ui-only`.
 
 ### Workspace tokens (external integrations)
 
@@ -77,6 +102,9 @@ AGENT_PLATFORM_DAG_MAX_CONCURRENT_TASKS=12
 
 See [app/tools_policy.py](app/tools_policy.py). Default is **no tools**; enable with env vars documented in `.env.example`.
 
-## Hygiene checks
+## Hygiene and smoke checks
 
-Run `python scripts/check_repo_hygiene.py` from this folder.
+```bash
+pnpm smoke              # hygiene + fast API tests (no running server)
+python scripts/check_repo_hygiene.py   # hygiene only
+```

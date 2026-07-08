@@ -3,8 +3,9 @@
   "private": true,
   "scripts": {
     "sync:contract-enums": "python scripts/sync_contract_enums.py",
+    "smoke": "python scripts/smoke_workflow.py",
+    "smoke:live": "python scripts/smoke_workflow.py --live http://127.0.0.1:18410",
     "docker:up": "npm run sync:contract-enums && docker compose up --build",
-    "docker:up:agent-only": "npm run sync:contract-enums && docker compose up --build",
     "docker:up:ui": "npm run sync:contract-enums && docker compose -f docker-compose.yml -f docker-compose.ui.yml up --build",
     "docker:up:ui-only": "docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up --build",
     "postinstall": "python -m pip install -r app/requirements.txt",

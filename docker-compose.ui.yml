@@ -6,3 +6,6 @@ services:
     environment:
       AGENT_PLATFORM_CONTAINER_MODE: all
       CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://127.0.0.1:18408}
+    ports:
+      - "18410:18410"
+      - "127.0.0.1:18408:18408"

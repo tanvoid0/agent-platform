@@ -43,7 +43,6 @@ services:
       AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS: ${AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS:-30}
     ports:
       - "18410:18410"
-      - "127.0.0.1:18408:18408"
     env_file:
       - .env
     volumes:
