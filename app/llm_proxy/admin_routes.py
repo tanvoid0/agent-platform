@@ -39,7 +39,12 @@ from llm_proxy.core.provider_config import (
     provider_configured,
     is_supported_provider,
 )
-from llm_proxy.routes.llm import get_resolved_proxy_defaults
+from llm_proxy.services.provider_catalog import (
+    build_provider_catalog,
+    get_persisted_defaults,
+    get_provider_catalog_entry,
+    get_resolved_defaults,
+)
 from llm_proxy.services.upstream_http import (
     aclose_stream,
     classify_httpx_error,
@@ -487,7 +492,8 @@ async def api_env() -> dict:
             "LM_STUDIO_API_BASE": DEFAULT_LM_STUDIO_BASE,
             "AIMLAPI_OPENAI_BASE": "https://api.aimlapi.com/v1",
         },
-        "resolved_defaults": get_resolved_proxy_defaults(),
+        "persisted_defaults": get_persisted_defaults(),
+        "resolved_defaults": get_resolved_defaults(),
     }
 
 
@@ -561,15 +567,7 @@ async def api_health_readiness() -> dict:
 
 @router.get("/ui/providers")
 async def api_ui_providers() -> dict:
-    entries = _sort_providers_local_first(_model_list_entries())
-    cfg = _config_yaml_defaults()
-    return {
-        "providers": [
-            {"id": e["id"], "label": e["label"], "kind": e["kind"]}
-            for e in entries
-        ],
-        "config_defaults": {"provider": cfg["provider"], "model": cfg["model"]},
-    }
+    return await build_provider_catalog(include_unconfigured=True)
 
 
 @router.get("/ui/env-model-options")
@@ -577,77 +575,19 @@ async def api_ui_env_model_options() -> dict:
     return {"models": _model_names_from_config_yaml()}
 
 
-@router.get("/ui/providers/{alias}/models")
-async def api_ui_provider_models(alias: str) -> dict:
-    entries = _model_list_entries()
-    entry = next((e for e in entries if e["id"] == alias), None)
-    if not entry:
-        raise HTTPException(status_code=404, detail="Unknown model alias")
-    kind = str(entry.get("kind") or "other")
-    env = read_env_file_parsed()
-    master = master_key_from_env(env)
-    fallbacks = read_llm_proxy_ui_fallbacks()
-    fb = fallbacks.get(alias, [])
-
-    models: list[str] | None = None
-    source = "proxy"
-
-    if kind == "ollama":
-        models = await _fetch_ollama_tags(ollama_api_base())
-        if models is not None:
-            source = "ollama"
-    elif kind == "gemini":
-        models = await _fetch_gemini_remote_models(gemini_api_key())
-        if models is not None:
-            source = "gemini"
-    elif kind == "lm_studio":
-        models = await _fetch_lm_studio_openai_models(lm_studio_api_base())
-        if models is not None:
-            source = "lm_studio"
-    elif kind == "aimlapi":
-        if aimlapi_configured():
-            try:
-                r = await get_with_retry(
-                    f"{aimlapi_openai_base().rstrip('/')}/models",
-                    headers={"Authorization": f"Bearer {aimlapi_api_key()}"},
-                    timeout=20.0,
-                    context="aimlapi_models",
-                )
-                if r.status_code == 200:
-                    payload = r.json()
-                    data = payload.get("data") if isinstance(payload, dict) else None
-                    names: list[str] = []
-                    if isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict):
-                                mid = item.get("id")
-                                if isinstance(mid, str) and mid.strip():
-                                    names.append(mid.strip())
-                    models = names or None
-                    if models is not None:
-                        source = "aimlapi"
-            except (LlmProxyError, ValueError):
-                models = None
-
-    if models is None:
-        prov_q = kind if is_supported_provider(kind) else None
-        models = await _fetch_proxy_v1_models(master, provider=prov_q)
-        if models is not None:
-            source = "proxy"
-
-    if not models:
-        if fb:
-            models = list(fb)
-            source = "yaml_fallback"
-        else:
-            models = [alias]
-            source = "alias_fallback"
-
+@router.get("/ui/providers/{provider_or_alias}/models")
+async def api_ui_provider_models(provider_or_alias: str) -> dict:
+    entry = await get_provider_catalog_entry(provider_or_alias)
     return {
-        "alias": alias,
-        "kind": kind,
-        "models": models,
-        "source": source,
+        "provider": entry["id"],
+        "label": entry["label"],
+        "configured": entry["configured"],
+        "capabilities": entry["capabilities"],
+        "models": entry["models"]["options"],
+        "default": entry["models"]["default_model"],
+        "source": entry["models"]["source"],
+        "warning": entry["models"].get("warning"),
+        "fallback_note": entry["models"].get("fallback_note"),
     }
 
 
@@ -670,54 +610,34 @@ async def api_proxy_models(request: Request) -> dict:
 
 
 @router.get("/test/model-options")
-async def api_test_model_options() -> dict:
-    env = read_env_file_parsed()
-    master = master_key_from_env(env)
-    headers = {"Authorization": f"Bearer {master}"}
-    fallback = _model_names_from_config_yaml()
-
-    def config_response(warning: str | None = None) -> dict:
-        out: dict[str, object] = {
-            "source": "config",
-            "models": fallback,
-            "default": _pick_default_model_from_list(fallback, env),
-        }
-        if warning:
-            out["warning"] = warning
-        return out
-
-    try:
-        r = await get_with_retry(
-            f"{PROXY_INTERNAL_URL}/v1/models",
-            headers=headers,
-            timeout=15.0,
-            context="test_model_options",
-        )
-    except LlmProxyError as e:
-        return config_response(e.message)
-
-    if r.status_code != 200:
-        return config_response(f"proxy /v1/models HTTP {r.status_code}")
-
-    try:
-        payload = r.json()
-    except ValueError:
-        return config_response("proxy returned non-JSON for /v1/models")
-
-    models: list[str] = []
-    for item in payload.get("data") or []:
-        if isinstance(item, dict):
-            mid = item.get("id")
-            if isinstance(mid, str) and mid.strip():
-                models.append(mid.strip())
-
-    if models:
-        return {
-            "source": "proxy",
-            "models": models,
-            "default": _pick_default_model_from_list(models, env),
-        }
-    return config_response("no models in proxy response")
+async def api_test_model_options(provider: str | None = None) -> dict:
+    catalog = await build_provider_catalog(include_unconfigured=True)
+    selected_provider = (provider or catalog["resolved_defaults"]["provider"]).strip().lower()
+    if not is_supported_provider(selected_provider):
+        selected_provider = catalog["resolved_defaults"]["provider"]
+    entry = next((item for item in catalog["providers"] if item["id"] == selected_provider), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Unknown provider")
+    return {
+        "source": entry["models"]["source"],
+        "models": entry["models"]["options"],
+        "default": entry["models"]["default_model"],
+        "warning": entry["models"].get("warning"),
+        "fallback_note": entry["models"].get("fallback_note"),
+        "selected_provider": entry["id"],
+        "resolved_defaults": catalog["resolved_defaults"],
+        "persisted_defaults": catalog["persisted_defaults"],
+        "providers": [
+            {
+                "id": item["id"],
+                "label": item["label"],
+                "configured": item["configured"],
+                "local": item["local"],
+                "capabilities": item["capabilities"],
+            }
+            for item in catalog["providers"]
+        ],
+    }
 
 
 def _test_chat_messages(body: ProxyTestBody) -> list[dict[str, Any]]:

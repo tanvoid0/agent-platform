@@ -11,11 +11,9 @@ from typing import Any
 
 import httpx
 
-from llm_proxy.routes.llm import collect_full_catalog_model_rows, get_resolved_proxy_defaults
 from llm_proxy.core.provider_config import (
     PROVIDER_LABELS,
     SUPPORTED_PROVIDER_IDS,
-    default_model_for_provider,
     aimlapi_api_key,
     aimlapi_configured,
     aimlapi_openai_base,
@@ -28,8 +26,8 @@ from llm_proxy.core.provider_config import (
     lm_studio_configured,
     ollama_api_base,
     ollama_configured,
-    provider_configured,
 )
+from llm_proxy.services.provider_catalog import build_provider_catalog
 
 _PROVIDER_ORDER = SUPPORTED_PROVIDER_IDS
 
@@ -112,54 +110,33 @@ async def _provider_reachable(pid: str) -> bool | None:
     return None
 
 
-def _chat_slice_for_provider(
-    pid: str,
-    resolved: dict[str, str],
-    rows: list[dict[str, str]],
-) -> dict[str, Any]:
-    ids = sorted(
-        {r["id"] for r in rows if r.get("owned_by") == pid},
-        key=lambda s: s.lower(),
-    )
-    if resolved.get("provider") == pid and (resolved.get("model") or "").strip():
-        dm = resolved["model"].strip()
-    else:
-        dm = default_model_for_provider(pid)
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for x in [dm, *ids]:
-        if x and x not in seen:
-            seen.add(x)
-            ordered.append(x)
-    # Providers with no hardcoded default (e.g. Claude) fall back to the first live id.
-    if not dm and ordered:
-        dm = ordered[0]
-    if not ordered:
-        ordered = [dm] if dm else []
-    return {"default_model": dm, "options": ordered}
-
-
 async def build_llm_ui_catalog_response() -> dict[str, Any]:
-    resolved = get_resolved_proxy_defaults()
-    rows = await collect_full_catalog_model_rows()
+    catalog = await build_provider_catalog(include_unconfigured=True)
+    by_provider = {entry["id"]: entry for entry in catalog["providers"]}
     out_providers: list[dict[str, Any]] = []
     for pid in _PROVIDER_ORDER:
-        cfg = provider_configured(pid)
+        entry = by_provider[pid]
         reachable: bool | None = None
-        if cfg:
+        if entry["configured"]:
             reachable = await _provider_reachable(pid)
-        chat = _chat_slice_for_provider(pid, resolved, rows)
         out_providers.append(
             {
                 "id": pid,
                 "label": PROVIDER_LABELS.get(pid, pid),
-                "configured": cfg,
+                "configured": entry["configured"],
                 "reachable": reachable,
-                "chat": chat,
+                "local": entry["local"],
+                "capabilities": entry["capabilities"],
+                "models": entry["models"],
+                "chat": {
+                    "default_model": entry["models"]["default_model"],
+                    "options": entry["models"]["options"],
+                },
             }
         )
     return {
-        "resolved_defaults": resolved,
+        "persisted_defaults": catalog["persisted_defaults"],
+        "resolved_defaults": catalog["resolved_defaults"],
         "providers": out_providers,
         "gemini_media": _GEMINI_MEDIA,
     }

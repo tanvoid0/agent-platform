@@ -10,6 +10,8 @@ Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-co
 - **Flow UI (dev):** `http://127.0.0.1:3333/app/` — Vite dev server with API proxy
 - **Flow UI (Docker):** `http://127.0.0.1:18408/app/` when `AGENT_PLATFORM_CONTAINER_MODE=all`
 
+Provider catalog behavior is normalized across `/api/v1/llm/ui-catalog`, `/api/v1/llm-proxy/ui/providers`, and `/api/v1/llm-proxy/test/model-options`: each provider exposes the same capability shape (`streaming`, `tools`, `json_mode`, `model_discovery`). When a provider cannot list models live, the server falls back in order to provider aliases from `config.yaml`, then `orchestrator_ui.yaml` `fallback_models`, then the provider default model.
+
 ## Quick start
 
 First-time setup from this folder:

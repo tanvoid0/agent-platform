@@ -73,7 +73,7 @@
   <section class="card" id="defaults-card" hidden>
     <h2 style="margin-top:0">Default LLM</h2>
     <p class="hint">Local providers (Ollama, LM Studio) are listed first when configured in <code>config.yaml</code>.</p>
-    <label for="route-select">Configured route</label>
+    <label for="route-select">Default provider</label>
     <select id="route-select"><option value="">Loading…</option></select>
     <label for="model-select">Default model</label>
     <select id="model-select" disabled><option value="">Select a route first</option></select>
@@ -119,6 +119,7 @@
     let envMeta = {};
     let effectiveDefaults = {};
     let draft = {};
+    let providerCatalog = {};
 
     const statusEl = document.getElementById("status");
     const authBar = document.getElementById("auth-bar");
@@ -193,6 +194,7 @@
           <option value="ollama">Ollama</option>
           <option value="lm_studio">LM Studio</option>
           <option value="aimlapi">AIMLAPI</option>
+          <option value="anthropic">Claude</option>
           <option value="gemini">Gemini</option>
         </select>
         <label for="env-DEFAULT_MODEL">DEFAULT_MODEL</label>
@@ -203,10 +205,15 @@
       document.getElementById("env-DEFAULT_MODEL").value = draft.DEFAULT_MODEL || "";
     }
 
-    async function loadModelsForRoute(alias) {
+    function providerById(providerId) {
+      const providers = providerCatalog.providers || [];
+      return providers.find((p) => p.id === providerId) || null;
+    }
+
+    async function loadModelsForRoute(providerId) {
       const sel = document.getElementById("model-select");
       const meta = document.getElementById("models-meta");
-      if (!alias) {
+      if (!providerId) {
         sel.innerHTML = '<option value="">Select a route first</option>';
         sel.disabled = true;
         meta.textContent = "";
@@ -215,14 +222,26 @@
       sel.disabled = true;
       sel.innerHTML = '<option value="">Loading models…</option>';
       try {
-        const data = await api("/api/v1/llm-proxy/ui/providers/" + encodeURIComponent(alias) + "/models");
+        const data = await api("/api/v1/llm-proxy/ui/providers/" + encodeURIComponent(providerId) + "/models");
         const models = data.models || [];
         sel.innerHTML = '<option value="">(use server default)</option>' +
           models.map((m) => `<option value="${m}">${m}</option>`).join("");
         sel.disabled = false;
-        meta.textContent = "Source: " + (data.source || "unknown") + (models.length ? " · " + models.length + " models" : "");
+        const provider = providerById(providerId);
+        const caps = provider && provider.capabilities ? provider.capabilities : null;
+        const discovery = caps && caps.model_discovery ? caps.model_discovery : null;
+        const note = data.fallback_note || "";
+        meta.textContent =
+          "Source: " + (data.source || "unknown") +
+          (discovery ? " · discovery " + discovery.mode : "") +
+          (models.length ? " · " + models.length + " models" : "") +
+          (note ? " · " + note : "");
         const stored = draft.DEFAULT_MODEL || "";
-        if (stored && [...sel.options].some((o) => o.value === stored)) sel.value = stored;
+        if (stored && [...sel.options].some((o) => o.value === stored)) {
+          sel.value = stored;
+        } else if (data.default && [...sel.options].some((o) => o.value === data.default)) {
+          sel.value = data.default;
+        }
       } catch (e) {
         sel.innerHTML = '<option value="">Failed to load</option>';
         meta.textContent = String(e.message || e);
@@ -239,9 +258,11 @@
         ]);
         envMeta = envRes.keys || {};
         effectiveDefaults = envRes.effective_defaults || {};
+        providerCatalog = providersRes || {};
         const rs = envRes.resolved_defaults || {};
-        draft.DEFAULT_PROVIDER = envPlain(envMeta.DEFAULT_PROVIDER) || rs.provider || "";
-        draft.DEFAULT_MODEL = envPlain(envMeta.DEFAULT_MODEL) || rs.model || "";
+        const ps = envRes.persisted_defaults || {};
+        draft.DEFAULT_PROVIDER = envPlain(envMeta.DEFAULT_PROVIDER) || ps.provider || rs.provider || "";
+        draft.DEFAULT_MODEL = envPlain(envMeta.DEFAULT_MODEL) || ps.model || rs.model || "";
 
         renderEnvFields();
         document.getElementById("env-form").hidden = false;
@@ -250,10 +271,10 @@
         const routeSel = document.getElementById("route-select");
         const providers = providersRes.providers || [];
         routeSel.innerHTML = providers.length
-          ? providers.map((p) => `<option value="${p.id}">${p.label || p.id}</option>`).join("")
-          : '<option value="">No routes in config.yaml</option>';
-        const match = providers.find((p) => p.id === draft.DEFAULT_PROVIDER || p.kind === draft.DEFAULT_PROVIDER);
-        if (match) routeSel.value = match.id;
+          ? providers.map((p) => `<option value="${p.id}">${p.label || p.id}${p.configured ? "" : " (not configured)"}</option>`).join("")
+          : '<option value="">No providers available</option>';
+        const match = providers.find((p) => p.id === draft.DEFAULT_PROVIDER);
+        routeSel.value = match ? match.id : (rs.provider || "");
         await loadModelsForRoute(routeSel.value);
 
         let yamlText = "";

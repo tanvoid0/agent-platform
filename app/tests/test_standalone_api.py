@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 
 
 def _api_auth_headers() -> dict[str, str]:
@@ -121,11 +122,107 @@ def test_llm_ui_catalog_returns_providers_and_media(client):
     for p in providers:
         assert "configured" in p
         assert "reachable" in p
+        assert "capabilities" in p
+        assert "streaming" in p["capabilities"]
+        assert "tools" in p["capabilities"]
+        assert "json_mode" in p["capabilities"]
+        assert "model_discovery" in p["capabilities"]
+        assert "models" in p
         assert "chat" in p
         assert "default_model" in p["chat"]
         assert isinstance(p["chat"]["options"], list)
     gm = j["gemini_media"]
     assert "image" in gm and "music" in gm and "video" in gm
+
+
+def test_llm_proxy_provider_catalog_uses_saved_defaults_and_local_order(client, monkeypatch, tmp_path):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    (tmp_path / ".env").write_text("DEFAULT_PROVIDER=lm_studio\nDEFAULT_MODEL=studio-b\n", encoding="utf-8")
+
+    async def fake_fetch(provider: str):
+        mapping = {
+            "ollama": (["llama3"], "ollama_tags"),
+            "lm_studio": (["studio-a", "studio-b"], "lm_studio_models"),
+            "aimlapi": (["gpt-4.1-mini"], "upstream_models"),
+            "anthropic": (["claude-sonnet-4-20250514"], "upstream_models"),
+            "gemini": (["gemini-2.0-flash"], "upstream_models"),
+        }
+        return mapping.get(provider, (None, None))
+
+    monkeypatch.setattr("llm_proxy.services.provider_catalog._fetch_provider_models", fake_fetch)
+
+    providers_res = c.get("/api/v1/llm-proxy/ui/providers", headers=_api_auth_headers())
+    assert providers_res.status_code == 200
+    providers_payload = providers_res.json()
+    assert providers_payload["persisted_defaults"] == {
+        "provider": "lm_studio",
+        "model": "studio-b",
+    }
+    assert providers_payload["resolved_defaults"] == {
+        "provider": "lm_studio",
+        "model": "studio-b",
+    }
+    assert [p["id"] for p in providers_payload["providers"][:2]] == ["ollama", "lm_studio"]
+
+    options_res = c.get(
+        "/api/v1/llm-proxy/test/model-options",
+        params={"provider": "lm_studio"},
+        headers=_api_auth_headers(),
+    )
+    assert options_res.status_code == 200
+    options_payload = options_res.json()
+    assert options_payload["selected_provider"] == "lm_studio"
+    assert options_payload["persisted_defaults"] == providers_payload["persisted_defaults"]
+    assert options_payload["resolved_defaults"] == providers_payload["resolved_defaults"]
+    assert options_payload["default"] == "studio-b"
+    assert options_payload["models"][:2] == ["studio-b", "studio-a"]
+    assert options_payload["source"] == "lm_studio_models"
+
+
+def test_llm_proxy_provider_catalog_falls_back_when_listing_unavailable(client, monkeypatch, tmp_path):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "\n".join(
+            [
+                "providers:",
+                "  - name: aimlapi",
+                "    models:",
+                "      - model_name: helper-alias",
+                "        model: openai/gpt-4.1-mini",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "orchestrator_ui.yaml").write_text(
+        "fallback_models:\n  aimlapi:\n    - openai/gpt-4.1-mini\n  anthropic:\n    - claude-sonnet-4-20250514\n",
+        encoding="utf-8",
+    )
+
+    async def fake_fetch(_provider: str):
+        return None, None
+
+    monkeypatch.setattr("llm_proxy.services.provider_catalog._fetch_provider_models", fake_fetch)
+
+    alias_res = c.get("/api/v1/llm-proxy/ui/providers/aimlapi/models", headers=_api_auth_headers())
+    assert alias_res.status_code == 200
+    alias_payload = alias_res.json()
+    assert alias_payload["provider"] == "aimlapi"
+    assert alias_payload["source"] == "config_aliases"
+    assert alias_payload["models"] == ["helper-alias"]
+    assert "config.yaml aliases" in (alias_payload["fallback_note"] or "")
+
+    fallback_res = c.get(
+        "/api/v1/llm-proxy/ui/providers/anthropic/models",
+        headers=_api_auth_headers(),
+    )
+    assert fallback_res.status_code == 200
+    fallback_payload = fallback_res.json()
+    assert fallback_payload["provider"] == "anthropic"
+    assert fallback_payload["source"] == "ui_fallback_models"
+    assert fallback_payload["models"] == ["claude-sonnet-4-20250514"]
 
 
 def test_llm_ready_proxies_upstream(client, monkeypatch):
