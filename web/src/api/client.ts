@@ -38,6 +38,15 @@ export class ApiError extends Error {
  * Override with `VITE_API_ORIGIN` (e.g. another port or `http://host.docker.internal:18410`).
  * If the value is a full URL with a path (e.g. `http://host:18410/flow`), only the origin is used so paths like `/projects/` do not become `/flow/projects/` (which 404s).
  */
+function browserDevApiOrigin(): string {
+  if (typeof window === "undefined") return "";
+  const { protocol, hostname, port } = window.location;
+  if ((protocol === "http:" || protocol === "https:") && port === "3333" && hostname) {
+    return `${protocol}//${hostname}:18410`;
+  }
+  return "";
+}
+
 function apiOrigin(): string {
   const raw = import.meta.env.VITE_API_ORIGIN as string | undefined;
   if (typeof raw === "string" && raw.trim() !== "") {
@@ -47,6 +56,10 @@ function apiOrigin(): string {
     } catch {
       return t.replace(/\/$/, "");
     }
+  }
+  const browserDevOrigin = browserDevApiOrigin();
+  if (browserDevOrigin) {
+    return browserDevOrigin;
   }
   if (import.meta.env.DEV) {
     return "http://127.0.0.1:18410";

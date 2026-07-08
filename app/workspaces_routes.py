@@ -11,16 +11,16 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
 
 from api_tokens.auth import TokenPrincipal, require_valid_token
-from crud_helpers import require_one
 from database import get_session
-from models import Project, Workspace
+from models import Workspace
 from schema_converter import to_schemas
 from time_utils import utc_now_naive
+from workspace_archive import archive_workspace, require_active_workspace
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 me_router = APIRouter(prefix="/me", tags=["workspaces"])
@@ -59,17 +59,22 @@ class WorkspaceOut(BaseModel):
     name: str
     slug: str
     description: str | None
+    archived_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
 
 @router.get("/")
 def list_workspaces(
+    include_archived: bool = Query(default=False),
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_master_key(principal)
-    rows = session.exec(select(Workspace).order_by(Workspace.id.asc())).all()
+    q = select(Workspace).order_by(Workspace.id.asc())
+    if not include_archived:
+        q = q.where(Workspace.archived_at.is_(None))
+    rows = session.exec(q).all()
     return {"workspaces": to_schemas(rows, WorkspaceOut)}
 
 
@@ -104,7 +109,7 @@ def get_workspace(
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_master_key(principal)
-    row = require_one(session, Workspace, workspace_id, "Workspace")
+    row = require_active_workspace(session, workspace_id)
     return WorkspaceOut.model_validate(row)
 
 
@@ -116,7 +121,7 @@ def update_workspace(
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_master_key(principal)
-    row = require_one(session, Workspace, workspace_id, "Workspace")
+    row = require_active_workspace(session, workspace_id)
     if req.name is not None:
         row.name = req.name.strip()
     if req.description is not None:
@@ -134,15 +139,10 @@ def delete_workspace(
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
+    """Archive workspace: revoke tokens, remove workspace-owned teams, hide tenant."""
     _require_master_key(principal)
-    row = require_one(session, Workspace, workspace_id, "Workspace")
-    if session.exec(select(Project).where(Project.workspace_id == workspace_id)).first():
-        raise HTTPException(
-            status_code=409, detail="Workspace still has projects; delete or reassign them first."
-        )
-    session.delete(row)
-    session.commit()
-    return {"ok": True}
+    row = require_active_workspace(session, workspace_id)
+    return archive_workspace(session, row)
 
 
 @me_router.get("/workspace", response_model=WorkspaceOut)
@@ -160,7 +160,5 @@ def get_my_workspace(
             status_code=400,
             detail="Master key is not bound to a workspace; use GET /workspaces to list them.",
         )
-    row = session.get(Workspace, principal.workspace_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+    row = require_active_workspace(session, principal.workspace_id)
     return WorkspaceOut.model_validate(row)

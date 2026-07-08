@@ -4,7 +4,11 @@ import json
 import logging
 import os
 
+import pytest
+
 from observability import JsonLogFormatter, StructuredContextFilter, bind_request_context, reset_request_context
+
+pytestmark = pytest.mark.contract
 
 
 def _api_auth_headers() -> dict[str, str]:

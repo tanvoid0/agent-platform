@@ -1,14 +1,5 @@
-.git
-.cursor
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-.env
-.venv
+# Build context is the agentic-ai repo root (see docker-compose.yml).
+# Root .dockerignore applies; this file documents local exclusions.
 app/agent_runs.db
 app/agent_runs.db-shm
 app/agent_runs.db-wal

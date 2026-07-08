@@ -33,7 +33,6 @@
       background: #fff;
     }
     pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow: auto; font-size: 0.8rem; white-space: pre-wrap; word-break: break-all; }
-    .row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; margin-top: 0.75rem; }
     button { padding: 0.45rem 0.9rem; border-radius: 8px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; }
     button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
     button.danger { border-color: #fecaca; color: #b91c1c; }
@@ -60,6 +59,42 @@
     .team { display: flex; align-items: center; gap: 0.6rem; padding: 0.4rem 0; border-bottom: 1px solid #f1f5f9; font-size: 0.88rem; }
     .team .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; flex: none; background: #cbd5e1; }
     .team .meta { color: #64748b; font-size: 0.8rem; }
+    .token-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+    .token-modal[hidden] { display: none !important; }
+    .token-modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.6);
+    }
+    .token-modal-panel {
+      position: relative;
+      max-width: 44rem;
+      width: 100%;
+      margin: 0;
+      border: 2px solid #2563eb;
+      box-shadow: 0 24px 60px rgba(15, 23, 42, 0.35);
+    }
+    .token-modal-panel h2 { margin-top: 0; color: #1e3a8a; }
+    #new-token-value {
+      font-family: ui-monospace, monospace;
+      font-size: 0.9rem;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-color: #334155;
+      cursor: text;
+      user-select: all;
+      padding: 0.75rem 0.85rem;
+    }
+    #btn-copy { min-width: 9rem; }
+    .row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; margin-top: 0.75rem; }
   </style>
 </head>
 <body>
@@ -86,8 +121,38 @@
   <div id="status"></div>
 
   <section class="card">
-    <label for="workspace-select">Workspace</label>
-    <select id="workspace-select"><option value="">Loading…</option></select>
+    <h2 style="margin-top:0">Workspace</h2>
+    <p class="hint">Each token is scoped to one workspace — create a separate workspace per app or tenant.</p>
+    <label for="workspace-select">Select workspace</label>
+    <div class="row" style="margin-top:0">
+      <select id="workspace-select" style="flex:1;min-width:12rem"><option value="">Loading…</option></select>
+      <button type="button" id="btn-edit-workspace" hidden>Edit</button>
+      <button type="button" class="danger" id="btn-archive-workspace" hidden>Archive</button>
+      <button type="button" id="btn-show-workspace-create">New workspace</button>
+    </div>
+    <div id="workspace-edit" class="card" hidden style="margin:0.75rem 0 0;padding:0.85rem 1rem;background:#f8fafc">
+      <label for="ws-edit-name">Name</label>
+      <input type="text" id="ws-edit-name" autocomplete="off" />
+      <label for="ws-edit-desc">Description (optional)</label>
+      <input type="text" id="ws-edit-desc" autocomplete="off" placeholder="Short note for admins" />
+      <p class="hint" id="ws-edit-slug"></p>
+      <div class="row">
+        <button type="button" class="primary" id="btn-save-workspace">Save changes</button>
+        <button type="button" id="btn-cancel-workspace-edit">Cancel</button>
+      </div>
+    </div>
+    <div id="workspace-create" class="card" hidden style="margin:0.75rem 0 0;padding:0.85rem 1rem;background:#f8fafc">
+      <label for="ws-name">Name</label>
+      <input type="text" id="ws-name" autocomplete="off" placeholder="e.g. mobile-app prod" />
+      <label for="ws-slug">Slug (optional)</label>
+      <input type="text" id="ws-slug" autocomplete="off" placeholder="auto from name" />
+      <label for="ws-desc">Description (optional)</label>
+      <input type="text" id="ws-desc" autocomplete="off" placeholder="Short note for admins" />
+      <div class="row">
+        <button type="button" class="primary" id="btn-create-workspace">Create workspace</button>
+        <button type="button" id="btn-cancel-workspace">Cancel</button>
+      </div>
+    </div>
   </section>
 
   <form id="create-form" class="card" hidden>
@@ -120,18 +185,24 @@
     </div>
   </form>
 
-  <div id="new-token-card" class="card" hidden>
-    <h2 style="margin-top:0">New token — copy now</h2>
-    <p class="hint">Stored hashed. Not retrievable again once you leave this page.</p>
-    <pre id="new-token-value"></pre>
-    <div class="row">
-      <button type="button" id="btn-copy">Copy token</button>
-      <button type="button" id="btn-dismiss">Done</button>
+  <div id="new-token-modal" class="token-modal" hidden aria-modal="true" role="dialog" aria-labelledby="new-token-title">
+    <div class="token-modal-backdrop" id="new-token-backdrop"></div>
+    <div class="token-modal-panel card">
+      <h2 id="new-token-title">New token — copy now</h2>
+      <p class="hint" id="new-token-name"></p>
+      <p class="hint"><strong>Copy this full value now.</strong> The list below only shows a prefix — the raw token is never stored and cannot be retrieved later.</p>
+      <label for="new-token-value">Bearer token</label>
+      <input type="text" id="new-token-value" readonly autocomplete="off" spellcheck="false" aria-label="New API token" />
+      <div class="row">
+        <button type="button" class="primary" id="btn-copy">Copy token</button>
+        <button type="button" id="btn-dismiss">I've copied it</button>
+      </div>
     </div>
   </div>
 
   <section class="card" id="list-card" hidden>
     <h2 style="margin-top:0">Existing tokens</h2>
+    <p class="hint">Prefix only — full tokens are shown once in the dialog above when created.</p>
     <div id="tokens-table"></div>
   </section>
 
@@ -143,8 +214,10 @@
 
   <script>
     const KEY_STORAGE = "agent-platform-config-api-key";
+    const PENDING_TOKEN_STORAGE = "agent-platform-pending-token";
     let apiKey = sessionStorage.getItem(KEY_STORAGE) || "";
     let currentWorkspace = "";
+    let currentWorkspaces = [];
     let scopeCatalog = [];              // [{scope, description}]
     const selectedScopes = new Set();
     let currentTokens = [];             // last-loaded token rows for current workspace
@@ -159,6 +232,60 @@
     function esc(s) {
       return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
         ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+    async function copyText(text) {
+      if (!text) return false;
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch { /* fall through */ }
+      }
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch { ok = false; }
+      document.body.removeChild(ta);
+      return ok;
+    }
+    function showNewToken(token, name) {
+      if (!token) {
+        setStatus("Token created but the raw value was missing from the response.", "error");
+        return;
+      }
+      const payload = { token, name: name || "", workspaceId: String(currentWorkspace) };
+      sessionStorage.setItem(PENDING_TOKEN_STORAGE, JSON.stringify(payload));
+      const el = document.getElementById("new-token-value");
+      el.value = token;
+      document.getElementById("new-token-name").textContent = name ? `Token: ${name}` : "";
+      document.getElementById("new-token-modal").hidden = false;
+      el.focus();
+      el.select();
+    }
+    function dismissNewToken() {
+      sessionStorage.removeItem(PENDING_TOKEN_STORAGE);
+      document.getElementById("new-token-value").value = "";
+      document.getElementById("new-token-name").textContent = "";
+      document.getElementById("new-token-modal").hidden = true;
+    }
+    function restorePendingToken() {
+      const raw = sessionStorage.getItem(PENDING_TOKEN_STORAGE);
+      if (!raw) return;
+      try {
+        const pending = JSON.parse(raw);
+        if (!pending || !pending.token) { dismissNewToken(); return; }
+        if (String(pending.workspaceId) !== String(currentWorkspace)) return;
+        document.getElementById("new-token-value").value = pending.token;
+        document.getElementById("new-token-name").textContent = pending.name ? `Token: ${pending.name}` : "";
+        document.getElementById("new-token-modal").hidden = false;
+      } catch {
+        dismissNewToken();
+      }
     }
     function headers(json) {
       const h = {};
@@ -228,23 +355,119 @@
       }
     }
 
-    async function loadWorkspaces() {
+    function showWorkspaceCreate(on) {
+      document.getElementById("workspace-create").hidden = !on;
+      document.getElementById("btn-show-workspace-create").hidden = on;
+      if (on) {
+        showWorkspaceEdit(false);
+        document.getElementById("ws-name").focus();
+      }
+    }
+
+    function showWorkspaceEdit(on) {
+      document.getElementById("workspace-edit").hidden = !on;
+      document.getElementById("btn-edit-workspace").hidden = on || !currentWorkspace;
+      document.getElementById("btn-archive-workspace").hidden = on || !currentWorkspace;
+      if (on) document.getElementById("ws-edit-name").focus();
+    }
+
+    function populateWorkspaceEdit() {
+      const ws = currentWorkspaces.find((w) => String(w.id) === String(currentWorkspace));
+      if (!ws) return;
+      document.getElementById("ws-edit-name").value = ws.name || "";
+      document.getElementById("ws-edit-desc").value = ws.description || "";
+      document.getElementById("ws-edit-slug").textContent = `Slug: ${ws.slug} (cannot be changed)`;
+    }
+
+    async function saveWorkspace() {
+      const name = document.getElementById("ws-edit-name").value.trim();
+      if (!name) { setStatus("Workspace name required.", "error"); return; }
+      const descRaw = document.getElementById("ws-edit-desc").value.trim();
+      const body = { name, description: descRaw || null };
+      try {
+        const ws = await api(`/api/v1/workspaces/${currentWorkspace}`, {
+          method: "PATCH",
+          body: JSON.stringify(body),
+        });
+        setStatus(`Workspace "${ws.name}" updated.`, "ok");
+        showWorkspaceEdit(false);
+        await loadWorkspaces(ws.id);
+      } catch (e) {
+        setStatus(String(e.message || e), "error");
+      }
+    }
+
+    async function archiveWorkspace() {
+      const ws = currentWorkspaces.find((w) => String(w.id) === String(currentWorkspace));
+      const label = ws ? `${ws.name} (#${ws.id})` : `workspace #${currentWorkspace}`;
+      if (!confirm(
+        `Archive ${label}? This revokes all tokens, removes workspace-owned teams, and hides the workspace. Projects stay in the database but are no longer reachable. This cannot be undone.`
+      )) return;
+      try {
+        const res = await api(`/api/v1/workspaces/${currentWorkspace}`, { method: "DELETE" });
+        const bits = [];
+        if (res.tokens_revoked) bits.push(`${res.tokens_revoked} token(s) revoked`);
+        if (res.teams_removed) bits.push(`${res.teams_removed} team(s) removed`);
+        setStatus(`Workspace archived.${bits.length ? " " + bits.join(", ") + "." : ""}`, "ok");
+        showWorkspaceEdit(false);
+        currentWorkspace = "";
+        await loadWorkspaces();
+      } catch (e) {
+        setStatus(String(e.message || e), "error");
+      }
+    }
+
+    async function loadWorkspaces(selectId) {
       setStatus("Loading…", "hint");
       try {
         const res = await api("/api/v1/workspaces/");
         const workspaces = res.workspaces || [];
+        currentWorkspaces = workspaces;
         const sel = document.getElementById("workspace-select");
         sel.innerHTML = workspaces.length
           ? workspaces.map((w) => `<option value="${w.id}">${esc(w.name)} (#${w.id})</option>`).join("")
-          : '<option value="">No workspaces</option>';
+          : '<option value="">No workspaces yet</option>';
+        document.getElementById("btn-edit-workspace").hidden = !workspaces.length;
+        document.getElementById("btn-archive-workspace").hidden = !workspaces.length;
         authBar.classList.remove("visible");
         await Promise.all([loadScopeCatalog(), loadTeams()]);
         if (workspaces.length) {
+          if (selectId != null) sel.value = String(selectId);
           currentWorkspace = sel.value;
           document.getElementById("create-form").hidden = false;
+          showWorkspaceCreate(false);
+          showWorkspaceEdit(false);
           await loadTokens();
+        } else {
+          currentWorkspace = "";
+          document.getElementById("create-form").hidden = true;
+          document.getElementById("list-card").hidden = true;
+          document.getElementById("btn-edit-workspace").hidden = true;
+          document.getElementById("btn-archive-workspace").hidden = true;
+          showWorkspaceCreate(true);
         }
         setStatus("");
+        restorePendingToken();
+      } catch (e) {
+        setStatus(String(e.message || e), "error");
+      }
+    }
+
+    async function createWorkspace() {
+      const name = document.getElementById("ws-name").value.trim();
+      if (!name) { setStatus("Workspace name required.", "error"); return; }
+      const slugRaw = document.getElementById("ws-slug").value.trim();
+      const descRaw = document.getElementById("ws-desc").value.trim();
+      const body = { name };
+      if (slugRaw) body.slug = slugRaw;
+      if (descRaw) body.description = descRaw;
+      try {
+        const ws = await api("/api/v1/workspaces/", { method: "POST", body: JSON.stringify(body) });
+        document.getElementById("ws-name").value = "";
+        document.getElementById("ws-slug").value = "";
+        document.getElementById("ws-desc").value = "";
+        setStatus(`Workspace "${ws.name}" created.`, "ok");
+        await loadWorkspaces(ws.id);
       } catch (e) {
         setStatus(String(e.message || e), "error");
       }
@@ -294,7 +517,7 @@
       }
       return `<tr>
         <td>${esc(t.name)}</td>
-        <td><code class="pfx">${esc(t.prefix)}…</code></td>
+        <td><code class="pfx" title="Display prefix only — full token shown once at creation">${esc(t.prefix)}…</code></td>
         <td>${badge}</td>
         <td>${scopes}</td>
         <td>${rate}</td>
@@ -324,9 +547,10 @@
 
     document.getElementById("workspace-select").addEventListener("change", (e) => {
       currentWorkspace = e.target.value;
-      document.getElementById("new-token-card").hidden = true;
+      showWorkspaceEdit(false);
       if (editingTokenId != null) cancelEdit();
       void loadTokens();
+      restorePendingToken();
     });
 
     function setEditMode(on) {
@@ -345,7 +569,6 @@
       (t.scopes || []).forEach((s) => selectedScopes.add(s));
       renderScopeChips();
       setEditMode(true);
-      document.getElementById("new-token-card").hidden = true;
       document.getElementById("create-form").scrollIntoView({ behavior: "smooth", block: "start" });
     };
     function cancelEdit() {
@@ -386,8 +609,7 @@
             method: "POST",
             body: JSON.stringify(body),
           });
-          document.getElementById("new-token-value").textContent = res.token;
-          document.getElementById("new-token-card").hidden = false;
+          showNewToken(res.token, name);
           document.getElementById("create-form").reset();
           selectedScopes.clear();
           renderScopeChips();
@@ -399,14 +621,18 @@
       }
     });
 
+    document.getElementById("new-token-value").addEventListener("click", (e) => e.target.select());
+    document.getElementById("new-token-value").addEventListener("focus", (e) => e.target.select());
     document.getElementById("btn-copy").addEventListener("click", async () => {
-      const val = document.getElementById("new-token-value").textContent;
-      try { await navigator.clipboard.writeText(val); setStatus("Copied to clipboard.", "ok"); }
-      catch { setStatus("Copy failed — select the text manually.", "error"); }
+      const el = document.getElementById("new-token-value");
+      const val = el.value;
+      if (!val) { setStatus("No token to copy.", "error"); return; }
+      if (await copyText(val)) setStatus("Copied to clipboard.", "ok");
+      else { el.focus(); el.select(); setStatus("Copy failed — press Ctrl+C (or Cmd+C) after selecting.", "error"); }
     });
-    document.getElementById("btn-dismiss").addEventListener("click", () => {
-      document.getElementById("new-token-value").textContent = "";
-      document.getElementById("new-token-card").hidden = true;
+    document.getElementById("btn-dismiss").addEventListener("click", () => dismissNewToken());
+    document.getElementById("new-token-backdrop").addEventListener("click", () => {
+      if (confirm("Dismiss without copying? You cannot retrieve this token again.")) dismissNewToken();
     });
 
     document.getElementById("btn-save-key").addEventListener("click", () => {
@@ -414,6 +640,21 @@
       if (apiKey) sessionStorage.setItem(KEY_STORAGE, apiKey);
       else sessionStorage.removeItem(KEY_STORAGE);
       void loadWorkspaces();
+    });
+
+    document.getElementById("btn-show-workspace-create").addEventListener("click", () => showWorkspaceCreate(true));
+    document.getElementById("btn-cancel-workspace").addEventListener("click", () => showWorkspaceCreate(false));
+    document.getElementById("btn-create-workspace").addEventListener("click", () => void createWorkspace());
+    document.getElementById("btn-edit-workspace").addEventListener("click", () => {
+      populateWorkspaceEdit();
+      showWorkspaceCreate(false);
+      showWorkspaceEdit(true);
+    });
+    document.getElementById("btn-cancel-workspace-edit").addEventListener("click", () => showWorkspaceEdit(false));
+    document.getElementById("btn-save-workspace").addEventListener("click", () => void saveWorkspace());
+    document.getElementById("btn-archive-workspace").addEventListener("click", () => void archiveWorkspace());
+    document.getElementById("ws-name").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); void createWorkspace(); }
     });
 
     document.getElementById("btn-scope-add").addEventListener("click", () =>

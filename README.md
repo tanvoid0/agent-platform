@@ -8,7 +8,7 @@ Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-co
 - **Config UI:** `http://127.0.0.1:18410/config` — default provider, model, API keys, `config.yaml`
 - **Process demo:** `http://127.0.0.1:18410/ui` — minimal polling UI for `/processes`
 - **Flow UI (dev):** `http://127.0.0.1:3333/app/` — Vite dev server with API proxy
-- **Flow UI (Docker):** `http://127.0.0.1:18408/app/` when `AGENT_PLATFORM_CONTAINER_MODE=all`
+- **Flow UI (Docker):** `http://127.0.0.1:3333/app/` (default compose: API + UI containers). Single-container `all` mode serves UI on `:18408/app/`.
 
 Provider catalog behavior is normalized across `/api/v1/llm/ui-catalog`, `/api/v1/llm-proxy/ui/providers`, and `/api/v1/llm-proxy/test/model-options`: each provider exposes the same capability shape (`streaming`, `tools`, `json_mode`, `model_discovery`). When a provider cannot list models live, the server falls back in order to provider aliases from `config.yaml`, then `orchestrator_ui.yaml` `fallback_models`, then the provider default model.
 
@@ -26,8 +26,8 @@ Set **`AGENT_PLATFORM_MASTER_KEY`** in `.env` (Bearer for `/v1` and protected `/
 
 | Mode | Local (no Docker) | Docker |
 |------|-------------------|--------|
-| **Backend only** | `pnpm dev:server` | `pnpm docker:up` |
-| **Backend + Flow UI** | `pnpm dev` | `pnpm docker:up:ui` |
+| **Backend only** | `pnpm dev:server` | `pnpm docker:up:server` |
+| **Backend + Flow UI** | `pnpm dev` | `pnpm docker:up` |
 | **Flow UI only** (API elsewhere) | `cd web && pnpm dev` | `pnpm docker:up:ui-only` |
 
 URLs after start:
@@ -37,7 +37,7 @@ URLs after start:
 | Local backend only | `:18410` | — |
 | Local backend + web | `:18410` | `:3333/app/` |
 | Docker backend only | `:18410` | — |
-| Docker backend + web | `:18410` | `:18408/app/` |
+| Docker backend + web | `:18410` | `:3333/app/` |
 
 Verify setup (offline — no server required):
 
@@ -56,11 +56,11 @@ pnpm smoke:live
 
 | Profile | Command | What runs |
 |--------|---------|-----------|
-| **Backend only** | `docker compose up --build` | API + config UI on `:18410` (one container) |
-| **Backend + Flow UI** | `docker compose -f docker-compose.yml -f docker-compose.ui.yml up --build` | Same container: API `:18410` + Flow UI `:18408` |
-| **Flow UI only** | `docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up --build` | Static Flow UI on `:18408` (API elsewhere) |
+| **Backend only** | `pnpm docker:up:server` | API + config UI on `:18410` (no Flow UI container) |
+| **Backend + Flow UI** | `pnpm docker:up` | API `:18410` + Flow UI dev container on host `:3333` |
+| **Flow UI only** | `pnpm docker:up:ui-only` | Static Flow UI on `:3333` (API elsewhere) |
 
-Equivalent npm scripts: `pnpm docker:up`, `pnpm docker:up:ui`, `pnpm docker:up:ui-only`.
+Equivalent npm scripts: `pnpm docker:up:server`, `pnpm docker:up`, `pnpm docker:up:ui-only`.
 
 ### Workspace tokens (external integrations)
 
@@ -71,11 +71,11 @@ Each microservice or Flow UI deployment gets **one workspace-scoped token** (`ag
 Image name: **`agent-platform`**. Main [`Dockerfile`](Dockerfile) builds FastAPI backend and Flow UI static assets from this checkout.
 
 ```bash
-# Backend only (default)
-docker compose up --build
+# Backend only
+pnpm docker:up:server
 
-# Backend + Flow UI in the same container
-docker compose -f docker-compose.yml -f docker-compose.ui.yml up --build
+# Backend + Flow UI (default compose)
+pnpm docker:up
 ```
 
 Set **`AGENT_PLATFORM_CONTAINER_MODE`** to `backend`, `ui`, or `all` (see `.env.example`).
@@ -107,6 +107,6 @@ See [app/tools_policy.py](app/tools_policy.py). Default is **no tools**; enable 
 ## Hygiene and smoke checks
 
 ```bash
-pnpm smoke              # hygiene + fast API tests (no running server)
+pnpm smoke              # hygiene + web-facing API contract tests (no running server)
 python scripts/check_repo_hygiene.py   # hygiene only
 ```

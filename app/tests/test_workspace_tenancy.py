@@ -4,6 +4,8 @@ import pytest
 
 MASTER_KEY = "test-master-key"
 
+pytestmark = pytest.mark.contract
+
 
 def _master_headers():
     return {"Authorization": f"Bearer {MASTER_KEY}"}
@@ -177,6 +179,61 @@ def test_workspace_token_cannot_manage_workspaces(client, test_engine):
     assert c.post("/workspaces/", json={"name": "x"}, headers=h).status_code == 403
 
 
+def test_archive_workspace_revokes_tokens_and_hides_tenant(client, test_engine):
+    c, *_ = client
+    ws = _create_workspace(c, "ArchiveMe", "archive-me")
+    _create_project(c, ws, "proj")
+    token = _create_token(c, ws)
+    team = _create_team(c, _master_headers(), "OwnedTeam", workspace_id=ws)
+
+    r = c.delete(f"/workspaces/{ws}", headers=_master_headers())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["tokens_revoked"] >= 1
+    assert body["teams_removed"] >= 1
+
+    listed = c.get("/workspaces/", headers=_master_headers()).json()["workspaces"]
+    assert all(w["id"] != ws for w in listed)
+
+    assert c.get(f"/workspaces/{ws}", headers=_master_headers()).status_code == 404
+    assert c.patch(
+        f"/workspaces/{ws}", json={"name": "x"}, headers=_master_headers()
+    ).status_code == 404
+
+    h = {"Authorization": f"Bearer {token}"}
+    assert c.get("/projects/", headers=h).status_code == 401
+    assert c.get(f"/teams/{team['id']}", headers=h).status_code == 401
+
+    projects = c.get("/projects/", headers=_master_headers()).json()["projects"]
+    assert all(p["workspace_id"] != ws for p in projects)
+
+
+def test_archive_default_workspace_rejected(client, test_engine):
+    c, *_ = client
+    default = next(
+        w for w in c.get("/workspaces/", headers=_master_headers()).json()["workspaces"]
+        if w["slug"] == "default"
+    )
+    r = c.delete(f"/workspaces/{default['id']}", headers=_master_headers())
+    assert r.status_code == 400
+
+
+def test_update_workspace_name_and_description(client, test_engine):
+    c, *_ = client
+    ws = _create_workspace(c, "Before", "before-edit")
+    r = c.patch(
+        f"/workspaces/{ws}",
+        json={"name": "After", "description": "updated note"},
+        headers=_master_headers(),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name"] == "After"
+    assert body["description"] == "updated note"
+    assert body["slug"] == "before-edit"
+
+
 def test_assistant_isolated_by_workspace(client, test_engine):
     c, *_ = client
     ws_a = _create_workspace(c, "A", "a")
@@ -186,3 +243,32 @@ def test_assistant_isolated_by_workspace(client, test_engine):
     h = {"Authorization": f"Bearer {token_a}"}
 
     assert c.get(f"/api/v1/assistant/dashboard?project_id={proj_b}", headers=h).status_code == 404
+
+
+def test_todos_board_isolated_by_workspace(client, test_engine):
+    c, *_ = client
+    ws_a = _create_workspace(c, "A", "a")
+    ws_b = _create_workspace(c, "B", "b")
+    proj_b = _create_project(c, ws_b, "pb")
+    board_b = c.post(
+        f"/api/v1/todos/boards?project_id={proj_b}",
+        json={"name": "BoardB"},
+        headers=_master_headers(),
+    ).json()["id"]
+    token_a = _create_token(c, ws_a)
+    h = {"Authorization": f"Bearer {token_a}"}
+
+    assert c.get(f"/api/v1/todos/boards/{board_b}", headers=h).status_code == 404
+
+
+def test_archived_workspace_project_hidden_from_master_key(client, test_engine):
+    c, *_ = client
+    ws = _create_workspace(c, "ArchiveProj", "archive-proj")
+    proj = _create_project(c, ws, "hidden")
+    c.delete(f"/workspaces/{ws}", headers=_master_headers())
+
+    assert c.get(f"/projects/{proj}", headers=_master_headers()).status_code == 404
+    assert (
+        c.patch(f"/projects/{proj}", json={"name": "x"}, headers=_master_headers()).status_code
+        == 404
+    )

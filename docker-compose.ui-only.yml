@@ -3,10 +3,14 @@
 #   docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up --build
 
 services:
-  agent-platform:
+  server:
+    profiles: ["__off__"]
+
+  client:
     environment:
       AGENT_PLATFORM_CONTAINER_MODE: ui
-    ports:
-      - "127.0.0.1:18408:18408"
-    volumes: []
-    develop: {}
+    ports: !override
+      - "127.0.0.1:3333:18408"
+    volumes: !override []
+    develop: !override {}
+    depends_on: !override []

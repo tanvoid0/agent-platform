@@ -2,11 +2,15 @@
 
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from sqlmodel import Session, select
 
+from team_schema import ROSTER_ACCENT_PALETTE
 from todos.models import PlannerAgentProfile, TodoBoard, TodoItem, TodoItemEvent
 from todos.services.agent_bridge import build_item_context
 from todos.seeds import seed_todo_domain_if_empty
+
+pytestmark = pytest.mark.contract
 
 
 def test_seed_creates_board_profiles_and_action_set(client, test_engine):
@@ -47,6 +51,19 @@ def test_board_scoped_by_project_id(client, test_engine):
     names_b = {b["name"] for b in list_b.json()["boards"]}
     assert names_a == {"Board A"}
     assert names_b == {"Board B"}
+
+
+def test_create_category_without_color_defaults(client, test_engine):
+    c, _mock_cls, _mock_inst = client
+    board_id = c.post("/api/v1/todos/boards", json={"name": "Color board"}).json()["id"]
+    with patch("todos.services.board_service.random_palette_color", return_value="#0ea5e9"):
+        r = c.post(
+            f"/api/v1/todos/boards/{board_id}/categories",
+            json={"name": "Work"},
+        )
+    assert r.status_code == 201
+    assert r.json()["color"] == "#0ea5e9"
+    assert r.json()["color"] in ROSTER_ACCENT_PALETTE
 
 
 def test_board_crud_and_item_status(client, test_engine):

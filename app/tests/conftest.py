@@ -45,6 +45,12 @@ def _api_routes_without_bearer_by_default(monkeypatch):
     monkeypatch.delenv("AGENT_PLATFORM_MASTER_KEY", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _disable_smart_chat_titles_by_default(monkeypatch):
+    """Existing API tests expect fallback titles from the first user message."""
+    monkeypatch.setenv("CHAT_SMART_TITLES", "0")
+
+
 @pytest.fixture
 def test_engine(monkeypatch):
     """Swap app DB to a fresh in-memory SQLite for the duration of the test."""

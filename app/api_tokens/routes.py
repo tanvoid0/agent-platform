@@ -16,9 +16,10 @@ from api_tokens.auth import TokenPrincipal, require_valid_token
 from api_tokens.token_service import generate_token
 from crud_helpers import require_one
 from database import get_session
-from models import ApiToken, ApiTokenUsageDaily, Workspace
+from models import ApiToken, ApiTokenUsageDaily
 from schema_converter import to_schemas
 from time_utils import utc_now_naive
+from workspace_archive import require_active_workspace
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/api-tokens", tags=["api-tokens"])
 
@@ -138,7 +139,7 @@ def create_api_token(
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_dashboard_caller(principal)
-    require_one(session, Workspace, workspace_id, "Workspace")
+    require_active_workspace(session, workspace_id)
 
     full_token, prefix, token_hash = generate_token()
     now = utc_now_naive()
@@ -174,7 +175,7 @@ def list_api_tokens(
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     _require_dashboard_caller(principal)
-    require_one(session, Workspace, workspace_id, "Workspace")
+    require_active_workspace(session, workspace_id)
     rows = session.exec(
         select(ApiToken).where(ApiToken.workspace_id == workspace_id).order_by(ApiToken.id.desc())
     ).all()

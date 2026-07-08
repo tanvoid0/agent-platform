@@ -433,6 +433,58 @@ def test_coder_stream_errors_without_workspace(client, monkeypatch):
     assert "workspace_root" in events[0][1]["detail"]
 
 
+def test_truncate_history_for_retry():
+    from coder.service import _truncate_history_for_retry
+
+    history = [
+        {"role": "user", "content": "Plan the change"},
+        {"role": "assistant", "content": "partial"},
+        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "x"},
+    ]
+    assert _truncate_history_for_retry(history) == [
+        {"role": "user", "content": "Plan the change"},
+    ]
+
+
+def test_coder_stream_retry_truncates_tail(client, monkeypatch, test_engine, tmp_path):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "test-key")
+    auth = {"Authorization": "Bearer test-key"}
+
+    created = c.post(
+        "/api/v1/coder/chat/threads",
+        json={"workspace_root": str(tmp_path)},
+        headers=auth,
+    )
+    thread_id = created.json()["thread_id"]
+
+    with Session(test_engine) as session:
+        thread = session.get(CoderChatThread, thread_id)
+        thread.set_messages(
+            [
+                {"role": "user", "content": "Create hello.txt"},
+                {"role": "assistant", "content": "partial failure"},
+            ]
+        )
+        session.add(thread)
+        session.commit()
+
+    _fake_llm_sequence(monkeypatch, [{"content": "Retried answer."}])
+
+    r = c.post(
+        "/api/v1/coder/chat/retry",
+        json={"thread_id": thread_id, "workspace_root": str(tmp_path)},
+        headers=auth,
+    )
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    assert [e[0] for e in events] == ["assistant", "done"]
+    messages = events[-1][1]["messages"]
+    assert len(messages) == 2
+    assert messages[0] == {"role": "user", "content": "Create hello.txt"}
+    assert messages[1]["content"] == "Retried answer."
+
+
 def test_coder_send_requires_master_key(client, monkeypatch):
     c, _mock_cls, _mock_inst = client
     monkeypatch.delenv("AGENT_PLATFORM_MASTER_KEY", raising=False)
@@ -506,3 +558,68 @@ def test_coder_send_reports_usage_and_context(client, monkeypatch, test_engine, 
     ctx = c.get(f"/api/v1/coder/chat/context-usage?thread_id={thread_id}", headers=auth)
     assert ctx.status_code == 200
     assert ctx.json()["categories"]["conversation"] > 0
+
+
+def test_coder_stream_delegate_tools_skips_server_workspace_check(
+    client, monkeypatch, test_engine
+):
+    """Portal Desktop paths are validated on the client, not the platform host."""
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "test-key")
+    auth = {"Authorization": "Bearer test-key"}
+    windows_root = r"D:\devstrail\devstrail"
+
+    _fake_llm_sequence(monkeypatch, [{"content": "Hello!"}])
+
+    created = c.post(
+        "/api/v1/coder/chat/threads",
+        json={"workspace_root": windows_root},
+        headers=auth,
+    )
+    thread_id = created.json()["thread_id"]
+
+    r = c.post(
+        "/api/v1/coder/chat/stream",
+        json={
+            "message": "hi",
+            "thread_id": thread_id,
+            "workspace_root": windows_root,
+            "delegate_tools": True,
+        },
+        headers=auth,
+    )
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    assert events[0][0] != "error"
+    assert [e[0] for e in events] == ["assistant", "done"]
+
+
+def test_coder_stream_portal_desktop_header_skips_server_workspace_check(
+    client, monkeypatch, test_engine
+):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "test-key")
+    auth = {
+        "Authorization": "Bearer test-key",
+        "X-Agent-Platform-Client": "portal-desktop",
+    }
+    windows_root = r"D:\devstrail\devstrail"
+
+    _fake_llm_sequence(monkeypatch, [{"content": "Hello!"}])
+
+    created = c.post(
+        "/api/v1/coder/chat/threads",
+        json={"workspace_root": windows_root},
+        headers=auth,
+    )
+    thread_id = created.json()["thread_id"]
+
+    r = c.post(
+        "/api/v1/coder/chat/stream",
+        json={"message": "hi", "thread_id": thread_id, "workspace_root": windows_root},
+        headers=auth,
+    )
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    assert events[0][0] != "error"
+    assert [e[0] for e in events] == ["assistant", "done"]

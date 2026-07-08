@@ -14,8 +14,17 @@ from database import get_session
 from models import Process, TeamTemplate, Workspace
 from schema_converter import to_schemas
 from schema_fields import ResourceName, ResourceDescription, ResourceColor, ResourceCategory
-from team_schema import TeamRoster, parse_team_roster_json, roster_to_json
+from team_schema import (
+    TeamRoster,
+    assign_missing_accents,
+    parse_team_roster_json,
+    random_team_color,
+    resolved_team_color,
+    roster_to_json,
+    with_default_accents,
+)
 from time_utils import utc_now_naive
+from workspace_archive import require_active_workspace
 
 router = APIRouter(prefix="/teams", tags=["teams"])
 
@@ -95,13 +104,19 @@ def _role_count_from_row(row: TeamTemplate) -> int:
 
 
 def _row_to_out(row: TeamTemplate) -> TeamTemplateOut:
-    roster = parse_team_roster_json(row.roster_json)
+    stable_key = str(row.id)
+    roster = with_default_accents(
+        parse_team_roster_json(row.roster_json),
+        row.color,
+        stable_key=stable_key,
+    )
+    display_color = resolved_team_color(row.color, stable_key)
     return TeamTemplateOut(
         id=row.id,
         workspace_id=row.workspace_id,
         name=row.name,
         description=row.description,
-        color=row.color,
+        color=display_color,
         category=row.category,
         roster=roster,
         role_count=len(roster.roles),
@@ -152,15 +167,19 @@ def create_team(
     else:
         workspace_id = req.workspace_id
         if workspace_id is not None:
-            require_one(session, Workspace, workspace_id, "Workspace")
+            require_active_workspace(session, workspace_id)
     now = utc_now_naive()
+    roster, team_color = assign_missing_accents(
+        req.roster,
+        req.color.strip() if req.color else None,
+    )
     row = TeamTemplate(
         workspace_id=workspace_id,
         name=req.name.strip(),
         description=req.description.strip() if req.description else None,
-        color=req.color.strip() if req.color else None,
+        color=team_color,
         category=req.category.strip() if req.category else None,
-        roster_json=roster_to_json(req.roster),
+        roster_json=roster_to_json(roster),
         created_at=now,
         updated_at=now,
     )
@@ -196,12 +215,14 @@ def update_team(
     if req.description is not None:
         row.description = req.description.strip() if req.description else None
     if req.color is not None:
-        row.color = req.color.strip() if req.color else None
+        row.color = req.color.strip() if req.color else random_team_color()
     if "category" in patch:
         raw = patch.get("category")
         row.category = raw.strip() if isinstance(raw, str) and raw.strip() else None
     if req.roster is not None:
-        row.roster_json = roster_to_json(req.roster)
+        roster, team_color = assign_missing_accents(req.roster, row.color)
+        row.color = team_color
+        row.roster_json = roster_to_json(roster)
     row.updated_at = utc_now_naive()
     session.add(row)
     session.commit()

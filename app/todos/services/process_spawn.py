@@ -6,7 +6,12 @@ from fastapi import HTTPException
 from sqlmodel import Session
 
 from models import Process, Project, TeamTemplate
-from team_schema import build_process_team_snapshot, parse_team_roster_json, render_team_context_for_planner
+from team_schema import (
+    build_process_team_snapshot,
+    parse_team_roster_json,
+    resolved_team_color,
+    with_default_accents,
+)
 from time_utils import utc_now_naive
 from todos.models import TodoBoard, TodoItem
 from todos.schemas import ItemOut, SpawnProcessResponse
@@ -37,12 +42,18 @@ def spawn_process_for_item(
         if not proj:
             raise HTTPException(status_code=404, detail="Project not found")
 
-    roster = parse_team_roster_json(tmpl.roster_json)
+    stable_key = str(tmpl.id)
+    team_color = resolved_team_color(tmpl.color, stable_key)
+    roster = with_default_accents(
+        parse_team_roster_json(tmpl.roster_json),
+        team_color,
+        stable_key=stable_key,
+    )
     team_snapshot_json = build_process_team_snapshot(
         tmpl.id,
         tmpl.name,
         tmpl.description,
-        tmpl.color,
+        team_color,
         roster,
     )
     proc_goal = (goal or "").strip() or f"{item.title}\n\n{item.description}".strip()

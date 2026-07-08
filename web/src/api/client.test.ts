@@ -1,5 +1,24 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { retryFailedTask, retryProcess, syncProcess } from "./client";
+import { apiUrl, retryFailedTask, retryProcess, syncProcess } from "./client";
+
+describe("apiUrl", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("targets the backend port when the UI runs on the Vite dev host", () => {
+    vi.stubGlobal("window", {
+      location: {
+        protocol: "http:",
+        hostname: "127.0.0.1",
+        port: "3333",
+      },
+    });
+
+    expect(apiUrl("/teams/")).toBe("http://127.0.0.1:18410/teams/");
+    expect(apiUrl("processes?limit=30")).toBe("http://127.0.0.1:18410/processes?limit=30");
+  });
+});
 
 describe("retryProcess", () => {
   afterEach(() => {

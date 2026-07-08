@@ -21,9 +21,16 @@ import database
 from coder.executor import (
     APPROVAL_REQUIRED_TOOLS,
     TOOL_SPECS,
-    LocalExecutor,
     ToolExecutionError,
     ToolExecutor,
+    make_executor,
+)
+from chat_thread_title import (
+    await_smart_title,
+    fallback_title_from_message,
+    is_placeholder_title,
+    merge_title_sse_events,
+    start_smart_title_task,
 )
 from chat_usage import (
     ContextUsageOut,
@@ -71,15 +78,6 @@ def _max_iterations() -> int:
 def _default_workspace_root() -> str | None:
     root = (os.getenv("CODER_WORKSPACE_ROOT") or "").strip()
     return root or None
-
-
-def _auto_title_from_message(message: str) -> str:
-    text = " ".join(message.split())
-    if not text:
-        return "New session"
-    if len(text) <= 48:
-        return text
-    return text[:45] + "..."
 
 
 def _create_thread_row(
@@ -208,6 +206,20 @@ def _build_llm_messages(history: list[dict[str, Any]], message: str) -> list[dic
     return llm_messages
 
 
+def _truncate_history_for_retry(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep messages through the last non-empty user turn; drop partial assistant/tool tail."""
+    last_user: int | None = None
+    for i in range(len(history) - 1, -1, -1):
+        if history[i].get("role") != "user":
+            continue
+        if str(history[i].get("content") or "").strip():
+            last_user = i
+            break
+    if last_user is None:
+        raise HTTPException(status_code=400, detail="No user message to retry")
+    return list(history[: last_user + 1])
+
+
 def _parse_tool_calls_raw(raw_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize a list of OpenAI-format tool_call dicts.
 
@@ -243,10 +255,18 @@ def _parse_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
     return _parse_tool_calls_raw(message.get("tool_calls") or [])
 
 
+def _normalize_provider(provider: str | None) -> str | None:
+    if provider is None:
+        return None
+    p = provider.strip().lower()
+    return p or None
+
+
 async def _call_llm_step(
     messages: list[dict[str, Any]],
     model: str | None,
     *,
+    provider: str | None = None,
     max_tokens: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """One non-streaming chat/completions call with tools; returns (assistant message, usage)."""
@@ -263,6 +283,9 @@ async def _call_llm_step(
     sm = sanitize_llm_model_alias(model) if model else None
     if sm:
         payload["model"] = sm
+    prov = _normalize_provider(provider)
+    if prov:
+        payload["provider"] = prov
 
     base = llm_proxy_base_url_v1()
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
@@ -273,7 +296,11 @@ async def _call_llm_step(
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}") from e
 
     if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"LLM proxy returned HTTP {r.status_code}")
+        body_snip = (r.text or "").strip().replace("\n", " ")[:400]
+        detail = f"LLM proxy returned HTTP {r.status_code}"
+        if body_snip:
+            detail = f"{detail}: {body_snip}"
+        raise HTTPException(status_code=502, detail=detail)
 
     data = r.json()
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
@@ -288,6 +315,7 @@ async def run_agent_turn(
     executor: ToolExecutor,
     model: str | None,
     *,
+    provider: str | None = None,
     max_tokens: int | None = None,
     auto_approve_commands: bool = False,
     pending_out: list[dict[str, Any]] | None = None,
@@ -313,7 +341,9 @@ async def run_agent_turn(
     step_num = 0
     for _ in range(_max_iterations()):
         if calls is None:
-            message, usage = await _call_llm_step(llm_messages, model, max_tokens=max_tokens)
+            message, usage = await _call_llm_step(
+                llm_messages, model, provider=provider, max_tokens=max_tokens
+            )
             step_num += 1
             step_usage = parse_llm_usage_dict(usage, label=f"agent_step_{step_num}")
             usage_steps.append(step_usage)
@@ -356,8 +386,12 @@ async def run_agent_turn(
                 }
                 return
 
-            yield "tool_call", {"name": c["name"], "arguments": c["arguments"]}
-            result = await executor.execute(c["name"], c["arguments"])
+            yield "tool_call", {
+                "call_id": c["id"],
+                "name": c["name"],
+                "arguments": c["arguments"],
+            }
+            result = await executor.execute(c["name"], c["arguments"], call_id=c["id"])
             result = truncate_text_to_tokens(result, tool_result_soft_cap_tokens())
             tool_msg = {
                 "role": "tool",
@@ -416,10 +450,13 @@ async def send_message(
     *,
     thread_id: int | None = None,
     model: str | None = None,
+    provider: str | None = None,
     workspace_root: str | None = None,
     allow_commands: bool = False,
     auto_approve_commands: bool = False,
     max_tokens: int | None = None,
+    client_id: str | None = None,
+    delegate_tools: bool = False,
 ) -> dict[str, Any]:
     """Non-streaming agent run: executes the full turn, returns the persisted thread.
 
@@ -431,10 +468,22 @@ async def send_message(
     if not llm_proxy_master_key():
         raise HTTPException(status_code=503, detail="AGENT_PLATFORM_MASTER_KEY is not set.")
     thread = _resolve_thread(session, thread_id)
+    title_task = None
+    fallback_title = thread.title or "New session"
+    if is_placeholder_title(thread.title, placeholders=frozenset({"New session"})):
+        fallback_title = fallback_title_from_message(message, default="New session")
+        thread.title = fallback_title
+        title_task = start_smart_title_task(message, model=model)
     _require_no_pending(thread)
     root = _resolve_workspace(thread, workspace_root)
     try:
-        executor = LocalExecutor(root, allow_commands=allow_commands)
+        executor = make_executor(
+            root,
+            thread_id=thread.id,
+            client_id=client_id,
+            allow_commands=allow_commands,
+            delegate_tools=delegate_tools,
+        )
     except ToolExecutionError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -450,6 +499,7 @@ async def send_message(
         new_history,
         executor,
         model,
+        provider=provider,
         max_tokens=max_tokens,
         auto_approve_commands=auto_approve_commands,
         pending_out=pending_out,
@@ -463,8 +513,8 @@ async def send_message(
     history.extend(new_history)
     thread.set_messages(history)
     thread.set_pending_call(pending_out[0] if pending_out else None)
-    if not thread.title or thread.title == "New session":
-        thread.title = _auto_title_from_message(message)
+    if is_placeholder_title(thread.title, placeholders=frozenset({"New session"})):
+        thread.title = fallback_title
     thread.workspace_root = str(executor.workspace_root)
     if model:
         thread.model = model
@@ -472,9 +522,13 @@ async def send_message(
     session.add(thread)
     session.commit()
 
+    final_title = await await_smart_title(
+        session, thread, title_task, fallback=fallback_title
+    )
+
     return {
         "thread_id": thread.id,
-        "title": thread.title or "New session",
+        "title": final_title,
         "workspace_root": thread.workspace_root,
         "context_window": context_usage.context_window,
         "messages": thread.get_messages(),
@@ -489,10 +543,13 @@ async def stream_message(
     *,
     thread_id: int | None = None,
     model: str | None = None,
+    provider: str | None = None,
     workspace_root: str | None = None,
     allow_commands: bool = False,
     auto_approve_commands: bool = False,
     max_tokens: int | None = None,
+    client_id: str | None = None,
+    delegate_tools: bool = False,
 ) -> AsyncIterator[str]:
     """Stream one agent turn as SSE: tool_call / tool_result / approval_required / assistant / done / error.
 
@@ -509,81 +566,242 @@ async def stream_message(
     # Fresh session, resolved lazily so tests that monkeypatch `database.engine` win.
     with Session(database.engine) as session:
         thread = _resolve_thread(session, thread_id)
-        try:
-            _require_no_pending(thread)
-            root = _resolve_workspace(thread, workspace_root)
-            executor = LocalExecutor(root, allow_commands=allow_commands)
-        except HTTPException as e:
-            yield _sse("error", {"detail": e.detail})
-            return
-        except ToolExecutionError as e:
-            yield _sse("error", {"detail": str(e)})
-            return
+        title_task = None
+        fallback_title = thread.title or "New session"
+        if is_placeholder_title(thread.title, placeholders=frozenset({"New session"})):
+            fallback_title = fallback_title_from_message(message, default="New session")
+            thread.title = fallback_title
+            title_task = start_smart_title_task(message, model=model)
 
-        history = thread.get_messages()
-        llm_messages = _build_llm_messages(history, message)
-        context_usage = _coder_context_usage(llm_messages)
-        new_history: list[dict[str, Any]] = []
-        pending_out: list[dict[str, Any]] = []
-        usage_steps: list[LlmStepUsageOut] = []
-        persisted = False
-
-        def _persist() -> None:
-            nonlocal persisted
-            if persisted:
+        async def _stream_body() -> AsyncIterator[str]:
+            try:
+                _require_no_pending(thread)
+                root = _resolve_workspace(thread, workspace_root)
+                executor = make_executor(
+                    root,
+                    thread_id=thread.id,
+                    client_id=client_id,
+                    allow_commands=allow_commands,
+                    delegate_tools=delegate_tools,
+                )
+            except HTTPException as e:
+                yield _sse("error", {"detail": e.detail})
                 return
-            persisted = True
-            history.append({"role": "user", "content": message})
-            history.extend(new_history)
-            thread.set_messages(history)
-            thread.set_pending_call(pending_out[0] if pending_out else None)
-            if not thread.title or thread.title == "New session":
-                thread.title = _auto_title_from_message(message)
-            thread.workspace_root = str(executor.workspace_root)
-            if model:
-                thread.model = model
-            thread.updated_at = utc_now_naive()
-            session.add(thread)
-            session.commit()
+            except ToolExecutionError as e:
+                yield _sse("error", {"detail": str(e)})
+                return
 
-        def _done_payload() -> dict[str, Any]:
-            turn_usage = merge_llm_usages(usage_steps) if usage_steps else LlmUsageOut()
-            return {
-                "thread_id": thread.id,
-                "title": thread.title or "New session",
-                "workspace_root": thread.workspace_root,
-                "context_window": context_usage.context_window,
-                "messages": thread.get_messages(),
-                "pending_call": thread.get_pending_call(),
-                "context_usage": context_usage.model_dump(),
-                "usage": turn_usage.model_dump(),
-            }
+            history = thread.get_messages()
+            llm_messages = _build_llm_messages(history, message)
+            context_usage = _coder_context_usage(llm_messages)
+            new_history: list[dict[str, Any]] = []
+            pending_out: list[dict[str, Any]] = []
+            usage_steps: list[LlmStepUsageOut] = []
+            persisted = False
 
-        try:
-            async for event, data in run_agent_turn(
-                llm_messages,
-                new_history,
-                executor,
-                model,
-                max_tokens=max_tokens,
-                auto_approve_commands=auto_approve_commands,
-                pending_out=pending_out,
-                usage_steps_out=usage_steps,
-            ):
-                yield _sse(event, data)
-            _persist()
-            yield _sse("done", _done_payload())
-        except HTTPException as e:
-            _persist()
-            yield _sse("error", {"detail": e.detail})
-            yield _sse("done", _done_payload())
-        except httpx.RequestError as e:
-            _persist()
-            yield _sse("error", {"detail": f"Upstream request failed: {e}"})
-            yield _sse("done", _done_payload())
-        finally:
-            # Client disconnect throws GeneratorExit here; commit what we have.
-            _persist()
+            def _persist() -> None:
+                nonlocal persisted
+                if persisted:
+                    return
+                persisted = True
+                history.append({"role": "user", "content": message})
+                history.extend(new_history)
+                thread.set_messages(history)
+                thread.set_pending_call(pending_out[0] if pending_out else None)
+                if is_placeholder_title(
+                    thread.title, placeholders=frozenset({"New session"})
+                ):
+                    thread.title = fallback_title
+                thread.workspace_root = str(executor.workspace_root)
+                if model:
+                    thread.model = model
+                thread.updated_at = utc_now_naive()
+                session.add(thread)
+                session.commit()
+
+            def _done_payload() -> dict[str, Any]:
+                turn_usage = merge_llm_usages(usage_steps) if usage_steps else LlmUsageOut()
+                return {
+                    "thread_id": thread.id,
+                    "title": thread.title or "New session",
+                    "workspace_root": thread.workspace_root,
+                    "context_window": context_usage.context_window,
+                    "messages": thread.get_messages(),
+                    "pending_call": thread.get_pending_call(),
+                    "context_usage": context_usage.model_dump(),
+                    "usage": turn_usage.model_dump(),
+                }
+
+            try:
+                async for event, data in run_agent_turn(
+                    llm_messages,
+                    new_history,
+                    executor,
+                    model,
+                    provider=provider,
+                    max_tokens=max_tokens,
+                    auto_approve_commands=auto_approve_commands,
+                    pending_out=pending_out,
+                    usage_steps_out=usage_steps,
+                ):
+                    yield _sse(event, data)
+                _persist()
+                yield _sse("done", _done_payload())
+            except HTTPException as e:
+                _persist()
+                yield _sse("error", {"detail": e.detail})
+                yield _sse("done", _done_payload())
+            except httpx.RequestError as e:
+                _persist()
+                yield _sse("error", {"detail": f"Upstream request failed: {e}"})
+                yield _sse("done", _done_payload())
+            finally:
+                # Client disconnect throws GeneratorExit here; commit what we have.
+                _persist()
+
+        async for chunk in merge_title_sse_events(
+            _stream_body(),
+            title_task,
+            thread_id=thread.id,
+            fallback_title=fallback_title,
+            session=session,
+            thread=thread,
+        ):
+            yield chunk
+
+
+async def stream_retry(
+    *,
+    thread_id: int,
+    model: str | None = None,
+    provider: str | None = None,
+    workspace_root: str | None = None,
+    allow_commands: bool = False,
+    auto_approve_commands: bool = False,
+    max_tokens: int | None = None,
+    client_id: str | None = None,
+    delegate_tools: bool = False,
+) -> AsyncIterator[str]:
+    """Re-run the agent turn after the last user message without appending a new one."""
+    key = llm_proxy_master_key()
+    if not key:
+        yield _sse("error", {"detail": "AGENT_PLATFORM_MASTER_KEY is not set."})
+        return
+
+    with Session(database.engine) as session:
+        thread = _get_thread_by_id(session, thread_id)
+        fallback_title = thread.title or "New session"
+
+        async def _stream_body() -> AsyncIterator[str]:
+            try:
+                truncated = _truncate_history_for_retry(thread.get_messages())
+                thread.set_messages(truncated)
+                thread.set_pending_call(None)
+                thread.updated_at = utc_now_naive()
+                session.add(thread)
+                session.commit()
+                session.refresh(thread)
+
+                root = _resolve_workspace(thread, workspace_root)
+                executor = make_executor(
+                    root,
+                    thread_id=thread.id,
+                    client_id=client_id,
+                    allow_commands=allow_commands,
+                    delegate_tools=delegate_tools,
+                )
+            except HTTPException as e:
+                yield _sse("error", {"detail": e.detail})
+                return
+            except ToolExecutionError as e:
+                yield _sse("error", {"detail": str(e)})
+                return
+
+            llm_messages = _llm_messages_from_history(truncated)
+            context_usage = _coder_context_usage(llm_messages)
+            new_history: list[dict[str, Any]] = []
+            pending_out: list[dict[str, Any]] = []
+            usage_steps: list[LlmStepUsageOut] = []
+            persisted = False
+
+            def _persist() -> None:
+                nonlocal persisted
+                if persisted:
+                    return
+                persisted = True
+                thread.set_messages(truncated + new_history)
+                thread.set_pending_call(pending_out[0] if pending_out else None)
+                thread.workspace_root = str(executor.workspace_root)
+                if model:
+                    thread.model = model
+                thread.updated_at = utc_now_naive()
+                session.add(thread)
+                session.commit()
+
+            def _done_payload() -> dict[str, Any]:
+                turn_usage = merge_llm_usages(usage_steps) if usage_steps else LlmUsageOut()
+                return {
+                    "thread_id": thread.id,
+                    "title": thread.title or "New session",
+                    "workspace_root": thread.workspace_root,
+                    "context_window": context_usage.context_window,
+                    "messages": thread.get_messages(),
+                    "pending_call": thread.get_pending_call(),
+                    "context_usage": context_usage.model_dump(),
+                    "usage": turn_usage.model_dump(),
+                }
+
+            try:
+                async for event, data in run_agent_turn(
+                    llm_messages,
+                    new_history,
+                    executor,
+                    model,
+                    provider=provider,
+                    max_tokens=max_tokens,
+                    auto_approve_commands=auto_approve_commands,
+                    pending_out=pending_out,
+                    usage_steps_out=usage_steps,
+                ):
+                    yield _sse(event, data)
+                _persist()
+                yield _sse("done", _done_payload())
+            except HTTPException as e:
+                _persist()
+                yield _sse("error", {"detail": e.detail})
+                yield _sse("done", _done_payload())
+            except httpx.RequestError as e:
+                _persist()
+                yield _sse("error", {"detail": f"Upstream request failed: {e}"})
+                yield _sse("done", _done_payload())
+            finally:
+                _persist()
+
+        async for chunk in merge_title_sse_events(
+            _stream_body(),
+            None,
+            thread_id=thread.id,
+            fallback_title=fallback_title,
+            session=session,
+            thread=thread,
+        ):
+            yield chunk
+
+
+def _is_command_override(original: str, edited: str) -> bool:
+    """True when ``edited`` is an intentional full command replacement.
+
+    Shorthand tokens (e.g. remember-rule ``powershell`` for a longer command)
+    must not replace the model's full command string.
+    """
+    if not edited or edited == original:
+        return False
+    if original.startswith(edited + " "):
+        return False
+    first = original.split(None, 1)[0] if original else ""
+    if edited == first:
+        return False
+    return True
 
 
 async def resolve_pending_call(
@@ -593,9 +811,12 @@ async def resolve_pending_call(
     approve: bool,
     edited_command: str | None = None,
     model: str | None = None,
+    provider: str | None = None,
     allow_commands: bool = True,
     auto_approve_commands: bool = False,
     max_tokens: int | None = None,
+    client_id: str | None = None,
+    delegate_tools: bool = False,
 ) -> AsyncIterator[str]:
     """Resolve a paused run_command approval and resume the agent turn as SSE.
 
@@ -624,7 +845,13 @@ async def resolve_pending_call(
 
         try:
             root = _resolve_workspace(thread, None)
-            executor = LocalExecutor(root, allow_commands=allow_commands)
+            executor = make_executor(
+                root,
+                thread_id=thread.id,
+                client_id=client_id,
+                allow_commands=allow_commands,
+                delegate_tools=delegate_tools,
+            )
         except HTTPException as e:
             yield _sse("error", {"detail": e.detail})
             return
@@ -640,11 +867,26 @@ async def resolve_pending_call(
 
         args = dict(pending.get("arguments") or {})
         if pending.get("name") == "run_command" and edited_command is not None:
-            args["command"] = edited_command
+            original = str(args.get("command") or "").strip()
+            edited = edited_command.strip()
+            # Desktop "Accept & remember" used to send the rule pattern (e.g.
+            # "powershell", "dir") as edited_command. That must not replace the
+            # full command the model requested.
+            if edited and edited != original and _is_command_override(original, edited):
+                args["command"] = edited
 
         if approve:
-            yield _sse("tool_call", {"name": pending["name"], "arguments": args})
-            result = await executor.execute(pending["name"], args)
+            yield _sse(
+                "tool_call",
+                {
+                    "call_id": pending["call_id"],
+                    "name": pending["name"],
+                    "arguments": args,
+                },
+            )
+            result = await executor.execute(
+                pending["name"], args, call_id=pending["call_id"]
+            )
         else:
             result = "Error: command rejected by the user."
         result = truncate_text_to_tokens(result, tool_result_soft_cap_tokens())
@@ -693,6 +935,7 @@ async def resolve_pending_call(
                 new_history,
                 executor,
                 model or thread.model,
+                provider=provider,
                 max_tokens=max_tokens,
                 auto_approve_commands=auto_approve_commands,
                 pending_out=pending_out,

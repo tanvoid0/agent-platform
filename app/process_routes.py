@@ -45,10 +45,13 @@ from services.process_retry_service import (
     mark_process_for_replanning,
 )
 from team_schema import (
+    assign_missing_accents,
     build_process_team_snapshot,
     parse_team_roster_json,
     render_team_context_for_planner,
+    resolved_team_color,
     team_context_from_snapshot_json,
+    with_default_accents,
 )
 
 router = APIRouter(tags=["processes"])
@@ -154,15 +157,21 @@ async def start_process(
         raise HTTPException(status_code=404, detail="Team template not found")
     if req.project_id is not None:
         proj = require_one(session, Project, req.project_id, "Project")
-    roster = parse_team_roster_json(tmpl.roster_json)
+    stable_key = str(tmpl.id)
+    team_color = resolved_team_color(tmpl.color, stable_key)
+    roster = with_default_accents(
+        parse_team_roster_json(tmpl.roster_json),
+        team_color,
+        stable_key=stable_key,
+    )
     team_context = render_team_context_for_planner(
-        tmpl.name, tmpl.description, tmpl.color, roster
+        tmpl.name, tmpl.description, team_color, roster
     )
     team_snapshot_json = build_process_team_snapshot(
         tmpl.id,
         tmpl.name,
         tmpl.description,
-        tmpl.color,
+        team_color,
         roster,
     )
 

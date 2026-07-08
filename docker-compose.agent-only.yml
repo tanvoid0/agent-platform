@@ -1,11 +1,13 @@
-# Same as docker-compose.yml — explicit API-only alias for scripts and docs.
+# Backend-only override for scripts and docs.
 #   docker compose -f docker-compose.agent-only.yml up --build
 
 services:
-  agent-platform:
+  server:
     extends:
       file: docker-compose.yml
-      service: agent-platform
+      service: server
+  client:
+    profiles: ["__off__"]
 
 volumes:
   agent_platform_data:

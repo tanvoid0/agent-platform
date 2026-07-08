@@ -27,6 +27,12 @@ from assistant.services.user_profile_service import (
     get_profile,
     merge_profile,
 )
+from chat_thread_title import (
+    await_smart_title,
+    fallback_title_from_message,
+    is_placeholder_title,
+    start_smart_title_task,
+)
 from chat_usage import (
     ContextUsageOut,
     LlmStepUsageOut,
@@ -54,15 +60,6 @@ Your role:
 - Use create_item, schedule_item, set_due_date for actionable plans after you have enough context
 
 Never invent body stats, travel dates, or budget numbers — ask via form or chat first."""
-
-
-def _auto_title_from_message(message: str) -> str:
-    text = " ".join(message.split())
-    if not text:
-        return "New chat"
-    if len(text) <= 48:
-        return text
-    return text[:45] + "..."
 
 
 def _create_thread_row(
@@ -839,8 +836,12 @@ async def send_chat_message(
     propose_actions: bool = True,
 ) -> dict[str, Any]:
     thread = _resolve_thread(session, project_id, thread_id)
-    if not thread.title or thread.title == "New chat":
-        thread.title = _auto_title_from_message(message)
+    title_task = None
+    fallback_title = thread.title or "New chat"
+    if is_placeholder_title(thread.title):
+        fallback_title = fallback_title_from_message(message, default="New chat")
+        thread.title = fallback_title
+        title_task = start_smart_title_task(message, model=model)
 
     messages = thread.get_messages()
     _resolve_pending_proposal_in_messages(messages, "superseded")
@@ -855,7 +856,7 @@ async def send_chat_message(
     session.add(thread)
     session.commit()
 
-    return await _generate_assistant_turn(
+    result = await _generate_assistant_turn(
         session,
         project_id,
         thread,
@@ -864,6 +865,10 @@ async def send_chat_message(
         delegate_slug=delegate_slug,
         propose_actions=propose_actions,
     )
+    result["title"] = await await_smart_title(
+        session, thread, title_task, fallback=fallback_title
+    )
+    return result
 
 
 async def retry_chat_message(

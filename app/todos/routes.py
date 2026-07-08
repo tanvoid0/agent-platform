@@ -5,7 +5,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlmodel import Session
 
-from api_tokens.auth import TokenPrincipal, assert_token_project_access, require_scope, require_valid_token
+from api_tokens.auth import (
+    TokenPrincipal,
+    assert_token_board_access,
+    assert_token_item_access,
+    assert_token_project_access,
+    require_scope,
+    require_valid_token,
+)
 from database import get_session
 from todos.board_templates import list_board_templates
 from todos.schemas import (
@@ -85,6 +92,7 @@ def get_board(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> BoardDetailOut:
     require_scope(principal, "todos:read")
+    assert_token_board_access(principal, board_id, session)
     return board_service.get_board(session, board_id)
 
 
@@ -96,6 +104,7 @@ def update_board(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> BoardOut:
     require_scope(principal, "todos:write")
+    assert_token_board_access(principal, board_id, session)
     return board_service.update_board(session, board_id, req)
 
 
@@ -106,6 +115,7 @@ def delete_board(
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     require_scope(principal, "todos:write")
+    assert_token_board_access(principal, board_id, session)
     board_service.delete_board(session, board_id)
     return Response(status_code=204)
 
@@ -117,6 +127,7 @@ def list_categories(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> dict:
     require_scope(principal, "todos:read")
+    assert_token_board_access(principal, board_id, session)
     return {"categories": board_service.list_categories(session, board_id)}
 
 
@@ -128,6 +139,7 @@ def create_category(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> CategoryOut:
     require_scope(principal, "todos:write")
+    assert_token_board_access(principal, board_id, session)
     return board_service.create_category(session, board_id, req)
 
 
@@ -140,6 +152,7 @@ def update_category(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> CategoryOut:
     require_scope(principal, "todos:write")
+    assert_token_board_access(principal, board_id, session)
     return board_service.update_category(session, board_id, category_id, req)
 
 
@@ -150,6 +163,7 @@ def list_items(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> dict:
     require_scope(principal, "todos:read")
+    assert_token_board_access(principal, board_id, session)
     return {"items": board_service.list_items(session, board_id)}
 
 
@@ -161,6 +175,7 @@ def create_item(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> ItemOut:
     require_scope(principal, "todos:write")
+    assert_token_board_access(principal, board_id, session)
     return board_service.create_item(session, board_id, req)
 
 
@@ -171,6 +186,7 @@ def get_item(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> ItemOut:
     require_scope(principal, "todos:read")
+    assert_token_item_access(principal, item_id, session)
     return board_service.get_item(session, item_id)
 
 
@@ -182,6 +198,7 @@ def update_item(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> ItemOut:
     require_scope(principal, "todos:write")
+    assert_token_item_access(principal, item_id, session)
     return board_service.update_item(session, item_id, req)
 
 
@@ -192,6 +209,7 @@ def delete_item(
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     require_scope(principal, "todos:write")
+    assert_token_item_access(principal, item_id, session)
     board_service.delete_item(session, item_id)
     return Response(status_code=204)
 
@@ -213,6 +231,7 @@ async def item_agent_step(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> AgentStepResponse:
     require_scope(principal, "todos:write")
+    assert_token_item_access(principal, item_id, session)
     ctx = dict(req.context)
     if req.document_paths:
         ctx["document_paths"] = list(req.document_paths)
@@ -227,6 +246,7 @@ async def item_agent_chat(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> AgentChatResponse:
     require_scope(principal, "todos:write")
+    assert_token_item_access(principal, item_id, session)
     return await agent_bridge.agent_chat(
         session, item_id, req.message, req.model, req.history
     )
@@ -240,6 +260,7 @@ def item_agent_apply(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> ApplyActionsResponse:
     require_scope(principal, "todos:write")
+    assert_token_item_access(principal, item_id, session)
     item, result = apply_planned_actions(session, item_id, req.actions)
     return ApplyActionsResponse(
         item=item,
@@ -258,6 +279,7 @@ def item_planning_form_submit(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> ItemOut:
     require_scope(principal, "todos:write")
+    assert_token_item_access(principal, item_id, session)
     return submit_planning_form(session, item_id, req.form_index, req.answers)
 
 
@@ -270,6 +292,7 @@ def item_events(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> dict:
     require_scope(principal, "todos:read")
+    assert_token_item_access(principal, item_id, session)
     board_service.get_item(session, item_id)
     rows = list_item_events(session, item_id, after_id=after_id, limit=limit)
     return {
@@ -294,6 +317,7 @@ def item_spawn_process(
     principal: TokenPrincipal = Depends(require_valid_token),
 ) -> SpawnProcessResponse:
     require_scope(principal, "todos:write")
+    assert_token_item_access(principal, item_id, session)
     return spawn_process_for_item(
         session,
         item_id,

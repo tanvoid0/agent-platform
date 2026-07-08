@@ -13,6 +13,13 @@ from sqlmodel import Session, select
 
 import database
 
+from chat_thread_title import (
+    await_smart_title,
+    fallback_title_from_message,
+    is_placeholder_title,
+    merge_title_sse_events,
+    start_smart_title_task,
+)
 from chat_usage import (
     ContextUsageOut,
     estimate_context_usage,
@@ -33,15 +40,6 @@ from playground.models import PlaygroundChatThread
 from time_utils import utc_now_naive
 
 PLAYGROUND_SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and concisely."
-
-
-def _auto_title_from_message(message: str) -> str:
-    text = " ".join(message.split())
-    if not text:
-        return "New chat"
-    if len(text) <= 48:
-        return text
-    return text[:45] + "..."
 
 
 def _create_thread_row(
@@ -249,6 +247,13 @@ async def send_message(
     thread = _resolve_thread(session, thread_id)
     history = thread.get_messages()
 
+    title_task = None
+    fallback_title = thread.title or "New chat"
+    if is_placeholder_title(thread.title):
+        fallback_title = fallback_title_from_message(message, default="New chat")
+        thread.title = fallback_title
+        title_task = start_smart_title_task(message, model=model)
+
     llm_messages = _build_llm_messages(history, message)
     context_usage = _playground_context_usage(llm_messages)
 
@@ -256,8 +261,6 @@ async def send_message(
     # upstream failure must not lose the message the user already sent.
     history.append({"role": "user", "content": message})
     thread.set_messages(history)
-    if not thread.title or thread.title == "New chat":
-        thread.title = _auto_title_from_message(message)
     if model:
         thread.model = model
     thread.updated_at = utc_now_naive()
@@ -278,9 +281,13 @@ async def send_message(
     session.add(thread)
     session.commit()
 
+    final_title = await await_smart_title(
+        session, thread, title_task, fallback=fallback_title
+    )
+
     return {
         "thread_id": thread.id,
-        "title": thread.title or "New chat",
+        "title": final_title,
         "context_window": context_usage.context_window,
         "messages": thread.get_messages(),
         "context_usage": context_usage,
@@ -316,96 +323,114 @@ async def stream_message(
     # Fresh session, resolved lazily so tests that monkeypatch `database.engine` win.
     with Session(database.engine) as session:
         thread = _resolve_thread(session, thread_id)
-        history = thread.get_messages()
-        llm_messages = _build_llm_messages(history, message)
-        context_usage = _playground_context_usage(llm_messages)
+        title_task = None
+        fallback_title = thread.title or "New chat"
+        if is_placeholder_title(thread.title):
+            fallback_title = fallback_title_from_message(message, default="New chat")
+            thread.title = fallback_title
+            title_task = start_smart_title_task(message, model=model)
 
-        reply_parts: list[str] = []
-        usage: dict[str, Any] | None = None
-        persisted = False
+        async def _stream_body() -> AsyncIterator[str]:
+            history = thread.get_messages()
+            llm_messages = _build_llm_messages(history, message)
+            context_usage = _playground_context_usage(llm_messages)
 
-        def _persist() -> None:
-            nonlocal persisted
-            if persisted:
-                return
-            persisted = True
-            history.append({"role": "user", "content": message})
-            text = "".join(reply_parts)
-            if text:
-                assistant_message: dict[str, Any] = {"role": "assistant", "content": text}
-                if usage is not None:
-                    assistant_message["usage"] = usage
-                history.append(assistant_message)
-            thread.set_messages(history)
-            if not thread.title or thread.title == "New chat":
-                thread.title = _auto_title_from_message(message)
-            if model:
-                thread.model = model
-            thread.updated_at = utc_now_naive()
-            session.add(thread)
-            session.commit()
+            reply_parts: list[str] = []
+            usage: dict[str, Any] | None = None
+            persisted = False
 
-        def _done_payload() -> dict[str, Any]:
-            turn_usage = merge_llm_usages([parse_llm_usage_dict(usage, label="chat")])
-            return {
-                "thread_id": thread.id,
-                "title": thread.title or "New chat",
-                "context_window": context_usage.context_window,
-                "messages": thread.get_messages(),
-                "context_usage": context_usage.model_dump(),
-                "usage": turn_usage.model_dump(),
-            }
+            def _persist() -> None:
+                nonlocal persisted
+                if persisted:
+                    return
+                persisted = True
+                history.append({"role": "user", "content": message})
+                text = "".join(reply_parts)
+                if text:
+                    assistant_message: dict[str, Any] = {"role": "assistant", "content": text}
+                    if usage is not None:
+                        assistant_message["usage"] = usage
+                    history.append(assistant_message)
+                thread.set_messages(history)
+                if is_placeholder_title(thread.title):
+                    thread.title = fallback_title
+                if model:
+                    thread.model = model
+                thread.updated_at = utc_now_naive()
+                session.add(thread)
+                session.commit()
 
-        try:
-            payload = _build_payload(
-                llm_messages,
-                model,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-            )
-            payload["stream"] = True
-            payload["stream_options"] = {"include_usage": True}
+            def _done_payload() -> dict[str, Any]:
+                turn_usage = merge_llm_usages([parse_llm_usage_dict(usage, label="chat")])
+                return {
+                    "thread_id": thread.id,
+                    "title": thread.title or "New chat",
+                    "context_window": context_usage.context_window,
+                    "messages": thread.get_messages(),
+                    "context_usage": context_usage.model_dump(),
+                    "usage": turn_usage.model_dump(),
+                }
 
-            base = llm_proxy_base_url_v1()
-            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
-            # Disable the per-read timeout so idle gaps between tokens don't abort a live stream.
-            timeout = httpx.Timeout(llm_proxy_http_timeout_seconds(), read=None)
-            async with httpx.AsyncClient(timeout=timeout) as http:
-                async with http.stream(
-                    "POST", f"{base}/chat/completions", headers=headers, json=payload
-                ) as r:
-                    if r.status_code != 200:
-                        await r.aread()
-                        _persist()
-                        yield _sse("error", {"detail": f"LLM proxy returned HTTP {r.status_code}"})
-                        yield _sse("done", _done_payload())
-                        return
-                    async for line in r.aiter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data = line[len("data:") :].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        choices = obj.get("choices") or []
-                        if choices:
-                            delta = (choices[0].get("delta") or {}).get("content")
-                            if delta:
-                                reply_parts.append(delta)
-                                yield _sse("delta", {"content": delta})
-                        u = obj.get("usage")
-                        if isinstance(u, dict):
-                            usage = u
-            _persist()
-            yield _sse("done", _done_payload())
-        except httpx.RequestError as e:
-            _persist()
-            yield _sse("error", {"detail": f"Upstream request failed: {e}"})
-            yield _sse("done", _done_payload())
-        finally:
-            # Client disconnect throws GeneratorExit here; commit what we have.
-            _persist()
+            try:
+                payload = _build_payload(
+                    llm_messages,
+                    model,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                )
+                payload["stream"] = True
+                payload["stream_options"] = {"include_usage": True}
+
+                base = llm_proxy_base_url_v1()
+                headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+                # Disable the per-read timeout so idle gaps between tokens don't abort a live stream.
+                timeout = httpx.Timeout(llm_proxy_http_timeout_seconds(), read=None)
+                async with httpx.AsyncClient(timeout=timeout) as http:
+                    async with http.stream(
+                        "POST", f"{base}/chat/completions", headers=headers, json=payload
+                    ) as r:
+                        if r.status_code != 200:
+                            await r.aread()
+                            _persist()
+                            yield _sse("error", {"detail": f"LLM proxy returned HTTP {r.status_code}"})
+                            yield _sse("done", _done_payload())
+                            return
+                        async for line in r.aiter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data = line[len("data:") :].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(data)
+                            except json.JSONDecodeError:
+                                continue
+                            choices = obj.get("choices") or []
+                            if choices:
+                                delta = (choices[0].get("delta") or {}).get("content")
+                                if delta:
+                                    reply_parts.append(delta)
+                                    yield _sse("delta", {"content": delta})
+                            u = obj.get("usage")
+                            if isinstance(u, dict):
+                                usage = u
+                _persist()
+                yield _sse("done", _done_payload())
+            except httpx.RequestError as e:
+                _persist()
+                yield _sse("error", {"detail": f"Upstream request failed: {e}"})
+                yield _sse("done", _done_payload())
+            finally:
+                # Client disconnect throws GeneratorExit here; commit what we have.
+                _persist()
+
+        async for chunk in merge_title_sse_events(
+            _stream_body(),
+            title_task,
+            thread_id=thread.id,
+            fallback_title=fallback_title,
+            session=session,
+            thread=thread,
+        ):
+            yield chunk

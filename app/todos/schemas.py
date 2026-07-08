@@ -7,7 +7,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from team_schema import DEFAULT_TEAM_COLOR, stable_palette_color
 from todos.models import TODO_ITEM_KINDS, TODO_STATUSES, TODO_TIME_HORIZONS
+
+DEFAULT_CATEGORY_COLOR = DEFAULT_TEAM_COLOR
 
 
 class PlannerProfileOut(BaseModel):
@@ -61,9 +64,16 @@ class BoardOut(BaseModel):
 
 class CategoryCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    color: str | None = Field(default="#6366f1", max_length=32)
+    color: str | None = Field(default=None, max_length=32)
     sort_order: int = 0
     planner_profile_id: int | None = None
+
+    @field_validator("color", mode="before")
+    @classmethod
+    def _normalize_color(cls, v: str | None) -> str | None:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        return v.strip()
 
 
 class CategoryUpdate(BaseModel):
@@ -81,11 +91,21 @@ class CategoryOut(BaseModel):
     id: int
     board_id: int
     name: str
-    color: str | None
+    color: str
     sort_order: int
     planner_profile_id: int | None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("color", mode="before")
+    @classmethod
+    def _default_color_on_out(cls, v: str | None, info) -> str:
+        if v is not None and isinstance(v, str) and v.strip():
+            return v.strip()
+        cat_id = info.data.get("id") if isinstance(info.data, dict) else None
+        if cat_id is not None:
+            return stable_palette_color(f"category:{cat_id}")
+        return DEFAULT_CATEGORY_COLOR
 
 
 class ItemCreate(BaseModel):

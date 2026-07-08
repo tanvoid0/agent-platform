@@ -21,6 +21,7 @@ from models import Process, Project, Workspace
 from schema_converter import to_schemas
 from schema_fields import ResourceName, ResourceDescription, ResourceColor
 from workspace_service import delete_project_workspace
+from workspace_archive import require_active_workspace
 from todos.services.planning_context import get_planning_context, patch_planning_context
 from time_utils import utc_now_naive
 
@@ -100,6 +101,9 @@ def list_projects(
     q = select(Project).order_by(Project.id.asc())
     if principal.workspace_id is not None:
         q = q.where(Project.workspace_id == principal.workspace_id)
+    else:
+        active_ws = select(Workspace.id).where(Workspace.archived_at.is_(None))
+        q = q.where(Project.workspace_id.in_(active_ws))
     rows = session.exec(q).all()
     return {"projects": to_schemas(rows, ProjectSummary)}
 
@@ -123,7 +127,7 @@ def create_project(
                 detail="workspace_id is required (no Default workspace exists).",
             )
         workspace_id = default.id
-    require_one(session, Workspace, workspace_id, "Workspace")
+    require_active_workspace(session, workspace_id)
     now = utc_now_naive()
     row = Project(
         workspace_id=workspace_id,

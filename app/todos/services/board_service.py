@@ -7,6 +7,7 @@ from sqlmodel import Session, select, func
 
 from time_utils import utc_now_naive
 from todos.board_templates import get_board_template
+from team_schema import random_palette_color
 from todos.models import TODO_STATUSES, PlannerAgentProfile, TodoBoard, TodoCategory, TodoItem
 from todos.schemas import (
     BoardCreate,
@@ -192,7 +193,7 @@ def create_category(session: Session, board_id: int, req: CategoryCreate) -> Cat
     cat = TodoCategory(
         board_id=board_id,
         name=req.name.strip(),
-        color=req.color,
+        color=req.color or random_palette_color(),
         sort_order=req.sort_order,
         planner_profile_id=req.planner_profile_id,
         created_at=now,

@@ -87,7 +87,9 @@ class ToolExecutionError(Exception):
 
 
 class ToolExecutor(Protocol):
-    async def execute(self, tool: str, args: dict[str, Any]) -> str:
+    async def execute(
+        self, tool: str, args: dict[str, Any], *, call_id: str = ""
+    ) -> str:
         """Run one tool call and return its textual result."""
         ...
 
@@ -130,7 +132,9 @@ class LocalExecutor:
             ) from None
         return p
 
-    async def execute(self, tool: str, args: dict[str, Any]) -> str:
+    async def execute(
+        self, tool: str, args: dict[str, Any], *, call_id: str = ""
+    ) -> str:
         try:
             if tool == "read_file":
                 return self._read_file(str(args.get("path", "")))
@@ -205,3 +209,26 @@ class LocalExecutor:
             return f"[exit code {r.returncode}]\n{out}".strip()
 
         return await asyncio.to_thread(_run)
+
+
+def make_executor(
+    workspace_root: str,
+    *,
+    thread_id: int,
+    client_id: str | None,
+    allow_commands: bool,
+    delegate_tools: bool = False,
+) -> ToolExecutor:
+    """Pick a tool executor for this client and workspace."""
+    from coder.desktop_executor import (
+        DesktopDelegatedExecutor,
+        is_portal_desktop_client,
+    )
+
+    if is_portal_desktop_client(client_id) or delegate_tools:
+        return DesktopDelegatedExecutor(
+            thread_id=thread_id,
+            workspace_root=workspace_root,
+            allow_commands=allow_commands,
+        )
+    return LocalExecutor(workspace_root, allow_commands=allow_commands)

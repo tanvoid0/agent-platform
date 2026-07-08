@@ -1,10 +1,14 @@
 """Team template CRUD and processes with team_template_id."""
 
 import json
+from unittest.mock import patch
 
+import pytest
 from sqlmodel import Session, select
 
 from models import Process, TeamTemplate
+
+pytestmark = pytest.mark.contract
 
 
 def _sample_roster():
@@ -46,6 +50,46 @@ def test_teams_list_includes_seed(client, test_engine):
     cv = next(t for t in data["teams"] if t["name"] == "CV Reviewer Agency")
     assert cv.get("role_count") == 5
     assert cv.get("category") == "Career"
+
+
+def test_teams_create_without_color_or_accent_defaults(client, test_engine):
+    c, _mock_cls, _mock_inst = client
+    with patch(
+        "team_schema.secrets.choice",
+        side_effect=["#9333ea", "#16a34a"],
+    ):
+        r = c.post(
+            "/teams/",
+            json={
+                "name": "Defaults Team",
+                "roster": {
+                    "roles": [
+                        {"id": "lead", "name": "Lead", "parent_id": None},
+                        {"id": "sub", "name": "Sub", "parent_id": "lead"},
+                    ]
+                },
+            },
+        )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["color"] == "#9333ea"
+    roles = {role["id"]: role for role in body["roster"]["roles"]}
+    assert roles["lead"]["accent_color"] == "#9333ea"
+    assert roles["sub"]["accent_color"] == "#16a34a"
+
+
+def test_teams_create_randomizes_team_color(client, test_engine):
+    c, _mock_cls, _mock_inst = client
+    roster = {
+        "roles": [{"id": "lead", "name": "Lead", "parent_id": None}],
+    }
+    with patch("team_schema.secrets.choice", side_effect=["#2563eb", "#ca8a04"]):
+        first = c.post("/teams/", json={"name": "Team A", "roster": roster}).json()
+    with patch("team_schema.secrets.choice", side_effect=["#dc2626", "#dc2626"]):
+        second = c.post("/teams/", json={"name": "Team B", "roster": roster}).json()
+    assert first["color"] == "#2563eb"
+    assert second["color"] == "#dc2626"
+    assert first["color"] != second["color"]
 
 
 def test_teams_crud(client, test_engine):

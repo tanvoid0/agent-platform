@@ -27,7 +27,7 @@ from api_tokens.exceptions import (
 from api_tokens.rate_limiter import check_and_increment
 from api_tokens.token_service import hash_token
 from database import get_session
-from models import ApiToken
+from models import ApiToken, Workspace
 from observability import update_request_context
 from time_utils import utc_now_naive
 
@@ -73,6 +73,13 @@ def verify_project_api_token(required_scope: str | None = None):
                 )
             if row.expires_at and row.expires_at < utc_now_naive():
                 raise TokenExpiredError("This token has expired.", token_prefix=row.prefix)
+
+            ws = session.get(Workspace, row.workspace_id)
+            if ws is None or ws.archived_at is not None:
+                raise TokenRevokedError(
+                    "This token's workspace has been archived.",
+                    token_prefix=row.prefix,
+                )
 
             scopes = row.scopes
             if required_scope and required_scope not in scopes and "*" not in scopes:
@@ -141,24 +148,65 @@ def assert_token_project_access(
     """404s (not 401) when a workspace-scoped token reaches a project outside its workspace.
 
     Resolves the project's workspace and compares it to the caller's workspace.
-    Master-key callers (principal.workspace_id is None) bypass this check.
+    Master-key callers (principal.workspace_id is None) bypass workspace matching but not
+    archived-workspace hiding.
     If ``session`` is omitted a short-lived one is opened to resolve the mapping.
     """
-    if principal.workspace_id is None:
-        return
     from fastapi import HTTPException
 
     if project_id is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        if principal.workspace_id is not None:
+            raise HTTPException(status_code=404, detail="Not found")
+        return
 
     from models import Project
 
     if session is not None:
         row = session.get(Project, project_id)
+        ws = session.get(Workspace, row.workspace_id) if row is not None else None
     else:
         from database import engine
 
         with Session(engine) as s:
             row = s.get(Project, project_id)
-    if row is None or row.workspace_id != principal.workspace_id:
+            ws = s.get(Workspace, row.workspace_id) if row is not None else None
+    if row is None:
         raise HTTPException(status_code=404, detail="Not found")
+    if ws is None or ws.archived_at is not None:
+        raise HTTPException(status_code=404, detail="Not found")
+    if principal.workspace_id is None:
+        return
+    if row.workspace_id != principal.workspace_id:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def assert_token_board_access(
+    principal: TokenPrincipal, board_id: int, session: "Session"
+) -> None:
+    """404 when a workspace-scoped token reaches a board outside its workspace."""
+    from fastapi import HTTPException
+
+    from todos.models import TodoBoard
+
+    board = session.get(TodoBoard, board_id)
+    if board is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    if board.project_id is None:
+        if principal.workspace_id is not None:
+            raise HTTPException(status_code=404, detail="Not found")
+        return
+    assert_token_project_access(principal, board.project_id, session)
+
+
+def assert_token_item_access(
+    principal: TokenPrincipal, item_id: int, session: "Session"
+) -> None:
+    """404 when a workspace-scoped token reaches an item outside its workspace."""
+    from fastapi import HTTPException
+
+    from todos.models import TodoItem
+
+    item = session.get(TodoItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    assert_token_board_access(principal, item.board_id, session)

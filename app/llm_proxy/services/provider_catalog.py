@@ -366,6 +366,123 @@ def _provider_capabilities(provider: str) -> dict[str, Any]:
     }
 
 
+async def _fetch_ollama_tag_entries() -> tuple[list[dict[str, Any]], bool]:
+    base = ollama_api_base().rstrip("/")
+    if not base:
+        return [], False
+    reachable = False
+    try:
+        version = await get_with_retry(
+            f"{base}/api/version",
+            timeout=12.0,
+            context="v1_catalog_ollama_version",
+        )
+        reachable = version.status_code == 200
+    except LlmProxyError:
+        return [], False
+    if not reachable:
+        return [], False
+    try:
+        response = await get_with_retry(
+            f"{base}/api/tags",
+            timeout=12.0,
+            context="v1_catalog_ollama_tags",
+        )
+    except LlmProxyError:
+        return [], reachable
+    if response.status_code != 200:
+        return [], reachable
+    try:
+        payload = response.json()
+    except ValueError:
+        return [], reachable
+    rows: list[dict[str, Any]] = []
+    for item in payload.get("models") or []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        metadata: dict[str, Any] = {}
+        for key in ("family", "parameter_size", "quantization_level"):
+            value = details.get(key)
+            if value is not None:
+                metadata[key] = value
+        if item.get("size") is not None:
+            metadata["size"] = item.get("size")
+        rows.append({"id": name.strip(), "source": "live", "metadata": metadata})
+    return rows, reachable
+
+
+def _alias_model_rows(aliases: list[str]) -> list[dict[str, Any]]:
+    return [{"id": alias, "source": "alias"} for alias in aliases]
+
+
+async def build_v1_provider_catalog(
+    *,
+    allowed_providers: set[str] | None,
+    include_live: bool = True,
+) -> dict[str, Any]:
+    """OpenAI-style provider registry for ``GET /v1/catalog``."""
+    aliases_by_provider = _model_aliases_by_provider()
+    resolved_defaults = get_resolved_defaults()
+    provider_ids = list(SUPPORTED_PROVIDER_IDS)
+    if allowed_providers is not None:
+        provider_ids = [provider for provider in provider_ids if provider in allowed_providers]
+
+    providers: list[dict[str, Any]] = []
+    for provider in provider_ids:
+        configured = provider_configured(provider)
+        aliases = aliases_by_provider.get(provider, [])
+        reachable: bool | None = False if not configured else None
+        models: list[dict[str, Any]] = []
+        default_model = default_model_for_provider(provider)
+
+        if configured and include_live:
+            if provider == "ollama":
+                models, reachable = await _fetch_ollama_tag_entries()
+            else:
+                discovered, _source = await _fetch_provider_models(provider)
+                reachable = bool(discovered)
+                if discovered:
+                    models = [{"id": model_id, "source": "live"} for model_id in discovered]
+
+        if not models:
+            models = _alias_model_rows(aliases)
+            if configured and reachable is None:
+                reachable = False
+
+        if not models:
+            fallback = _fallback_models_for_provider(provider, aliases)
+            models = _alias_model_rows(fallback)
+        if not models and default_model:
+            models = [{"id": default_model, "source": "alias"}]
+
+        if resolved_defaults["provider"] == provider and resolved_defaults["model"].strip():
+            default_model = resolved_defaults["model"].strip()
+        elif models:
+            default_model = models[0]["id"]
+
+        providers.append(
+            {
+                "id": provider,
+                "label": PROVIDER_LABELS.get(provider, provider),
+                "configured": configured,
+                "reachable": reachable,
+                "default_model": default_model,
+                "capabilities": _provider_capabilities(provider),
+                "models": models,
+            }
+        )
+
+    return {
+        "object": "catalog",
+        "resolved_defaults": resolved_defaults,
+        "providers": providers,
+    }
+
+
 async def build_provider_catalog(*, include_unconfigured: bool = True) -> dict[str, Any]:
     aliases_by_provider = _model_aliases_by_provider()
     resolved_defaults = get_resolved_defaults()

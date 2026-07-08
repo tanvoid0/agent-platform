@@ -14,9 +14,10 @@ from typing import Annotated, Any, Awaitable, Callable
 
 import httpx
 import yaml
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from api_tokens.auth import TokenPrincipal, require_scope, require_valid_token
 from health_checks import llm_proxy_readiness_payload
 from llm_proxy.core.config_cache import load_config_yaml_dict, read_env_file_parsed
 from llm_proxy.core.errors import LlmProxyError
@@ -41,6 +42,7 @@ from llm_proxy.core.provider_config import (
 )
 from llm_proxy.services.local_backends import coerce_local_model_if_needed
 from llm_proxy.services.model_catalog_cache import get_catalog_cache
+from llm_proxy.services.provider_catalog import build_v1_provider_catalog
 from llm_proxy.services.upstream_http import (
     aclose_stream,
     classify_httpx_error,
@@ -57,10 +59,6 @@ router = APIRouter(tags=["llm"])
 GEMINI_OPENAI_BASE = os.environ.get(
     "GEMINI_OPENAI_BASE", "https://generativelanguage.googleapis.com/v1beta/openai"
 ).rstrip("/")
-
-def _master_key() -> str:
-    return os.environ.get("AGENT_PLATFORM_MASTER_KEY", "").strip()
-
 
 def _default_provider_env_or_dotenv() -> str:
     # CONFIG_DIR/.env is the live-editable source (admin UI writes here for a no-restart
@@ -165,8 +163,9 @@ def _effective_defaults() -> tuple[str, str]:
 
 def get_resolved_proxy_defaults() -> dict[str, str]:
     """Provider + model the embedded proxy would use for an unqualified request (for Settings UI)."""
-    p, m = _effective_defaults()
-    return {"provider": p, "model": m}
+    from llm_proxy.services.provider_catalog import get_resolved_defaults
+
+    return get_resolved_defaults()
 
 
 @dataclass(frozen=True)
@@ -331,18 +330,6 @@ def _resolve_model(requested: str | None) -> tuple[str, str]:
     if r in aliases:
         return aliases[r]
     return dp, r
-
-
-def _require_auth(request: Request) -> None:
-    key = _master_key()
-    if not key:
-        return
-    auth = request.headers.get("authorization") or ""
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    token = auth.removeprefix("Bearer ").strip()
-    if token != key:
-        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 @router.get("/v1/health")
@@ -618,7 +605,7 @@ async def health_readiness() -> JSONResponse:
 
 @router.get("/v1/models")
 async def list_models(
-    request: Request,
+    _principal: TokenPrincipal = Depends(require_valid_token),
     providers: Annotated[
         list[str],
         Query(
@@ -634,7 +621,6 @@ async def list_models(
         description="Single-provider filter (ollama|lm_studio|gemini|aimlapi). Ignored when `providers` is non-empty.",
     ),
 ) -> JSONResponse:
-    _require_auth(request)
     data = _load_yaml()
     aliases = _alias_map(data)
     eff_p, _ = _effective_defaults()
@@ -711,6 +697,92 @@ async def list_models(
             continue
 
     return JSONResponse(content={"object": "list", "data": rows})
+
+
+def _parse_provider_filter(
+    providers: list[str],
+    provider: str | None,
+) -> tuple[set[str] | None, bool]:
+    """Return (allowed provider ids, full_catalog). Raises HTTPException on bad input."""
+    raw_p = (provider or "").strip().lower()
+    if raw_p and not is_supported_provider(raw_p):
+        raise HTTPException(
+            status_code=400,
+            detail="query provider must be ollama, lm_studio, gemini, aimlapi, anthropic, or omitted",
+        )
+    if raw_p and is_supported_provider(raw_p) and not provider_configured(raw_p):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Provider {raw_p} is not configured (check environment for this provider).",
+        )
+
+    prov_tokens = [p.strip().lower() for p in providers if isinstance(p, str) and p.strip()]
+    if prov_tokens:
+        if "all" in prov_tokens:
+            if len(prov_tokens) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="providers=all must not be combined with other provider values",
+                )
+            return None, True
+        allowed: set[str] = set()
+        for p in prov_tokens:
+            if not is_supported_provider(p):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unknown provider in providers: {p}",
+                )
+            if not provider_configured(p):
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Provider {p} is not configured (check environment for this provider).",
+                )
+            allowed.add(p)
+        return allowed, False
+
+    if raw_p and is_supported_provider(raw_p):
+        return {raw_p}, False
+
+    eff_p, _ = _effective_defaults()
+    ep = eff_p if is_supported_provider(eff_p) else "lm_studio"
+    return {ep}, False
+
+
+@router.get("/v1/catalog")
+async def provider_catalog(
+    _principal: TokenPrincipal = Depends(require_valid_token),
+    providers: Annotated[
+        list[str],
+        Query(
+            description=(
+                "Repeat for multiple backends, e.g. `providers=ollama&providers=lm_studio`. "
+                "Use `providers=all` for every configured provider. "
+                "Omit to list only the effective default provider."
+            ),
+        ),
+    ] = [],
+    provider: str | None = Query(
+        None,
+        description="Single-provider filter. Ignored when `providers` is non-empty.",
+    ),
+    live: bool = Query(
+        True,
+        description="When false, return only YAML aliases (no upstream catalog fetches).",
+    ),
+) -> JSONResponse:
+    """
+    Provider registry with models and upstream metadata.
+
+    Returns configured providers, reachability, default model, and per-model metadata
+    (Ollama tag details, Gemini token limits, OpenAI-style fields for cloud APIs).
+    Model ``id`` values are what clients pass to ``POST /v1/chat/completions``.
+    """
+    allowed, _full = _parse_provider_filter(providers, provider)
+    body = await build_v1_provider_catalog(
+        allowed_providers=allowed,
+        include_live=live,
+    )
+    return JSONResponse(content=body)
 
 
 def _upstream_urls(provider: str) -> tuple[str, str]:
@@ -799,8 +871,11 @@ def _outbound_headers(provider: str) -> dict[str, str]:
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(request: Request) -> Response:
-    _require_auth(request)
+async def chat_completions(
+    request: Request,
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> Response:
+    require_scope(principal, "chat:write")
     try:
         body: dict[str, Any] = await request.json()
     except json.JSONDecodeError as e:
@@ -809,9 +884,33 @@ async def chat_completions(request: Request) -> Response:
     raw_model = body.get("model")
     if raw_model is not None and not isinstance(raw_model, str):
         raise HTTPException(status_code=400, detail="model must be a string")
-    prov, resolved = _resolve_model(raw_model if isinstance(raw_model, str) else None)
-    resolved = await coerce_local_model_if_needed(prov, resolved)
+    raw_provider_hint = body.get("provider")
     body = dict(body)
+    if raw_provider_hint is not None:
+        if not isinstance(raw_provider_hint, str):
+            raise HTTPException(status_code=400, detail="provider must be a string")
+        hint = raw_provider_hint.strip().lower()
+        if hint:
+            if not is_supported_provider(hint):
+                raise HTTPException(
+                    status_code=400,
+                    detail="provider must be ollama, lm_studio, gemini, aimlapi, or anthropic",
+                )
+            if not provider_configured(hint):
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Provider {hint} is not configured (check environment for this provider).",
+                )
+            model_str = (raw_model if isinstance(raw_model, str) else "").strip()
+            _, dm = _effective_defaults()
+            prov = hint
+            resolved = model_str or default_model_for_provider(hint) or dm
+        else:
+            prov, resolved = _resolve_model(raw_model if isinstance(raw_model, str) else None)
+    else:
+        prov, resolved = _resolve_model(raw_model if isinstance(raw_model, str) else None)
+    resolved = await coerce_local_model_if_needed(prov, resolved)
+    body.pop("provider", None)
     body["model"] = resolved
 
     chat_url, _ = _upstream_urls(prov)
@@ -870,8 +969,11 @@ async def chat_completions(request: Request) -> Response:
 
 
 @router.post("/v1/embeddings")
-async def embeddings(request: Request) -> Response:
-    _require_auth(request)
+async def embeddings(
+    request: Request,
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> Response:
+    require_scope(principal, "chat:write")
     try:
         body: dict[str, Any] = await request.json()
     except json.JSONDecodeError as e:

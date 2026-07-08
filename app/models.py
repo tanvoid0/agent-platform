@@ -39,6 +39,7 @@ class Workspace(SQLModel, table=True):
     name: str = Field(max_length=256)
     slug: str = Field(max_length=128, unique=True, index=True)
     description: Optional[str] = Field(default=None, max_length=4096)
+    archived_at: Optional[datetime] = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=utc_now_naive)
     updated_at: datetime = Field(default_factory=utc_now_naive)
 
