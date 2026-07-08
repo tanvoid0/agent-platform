@@ -1,34 +1,28 @@
-# Agent Platform API + embedded LLM proxy (backend only).
+# Agent Platform — unified container (backend + optional Flow UI).
+#
+# Backend only (default):
 #   docker compose up --build
 #
-# Config UI: http://127.0.0.1:18410/config  |  API: http://127.0.0.1:18410/docs
-# Optional Flow UI (React): from repo root — `docker compose --profile ui up --build`
+# Backend + Flow UI (same container, nginx gateway on :18408):
+#   docker compose -f docker-compose.yml -f docker-compose.ui.yml up --build
 #
-# SQLite + workspaces live on the named volume `agent_platform_data`.
-# LLM proxy config + .env live under /app/data/llm (config.yaml, .env).
+# Flow UI static only (API elsewhere; set VITE_API_ORIGIN at build):
+#   docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up --build
+#
+# Config UI: http://127.0.0.1:18410/config  |  API: http://127.0.0.1:18410/docs
+# Flow UI:   http://127.0.0.1:18408/app/
 
 services:
   agent-platform:
+    image: agent-platform:${AGENT_PLATFORM_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile
-    command: >
-      sh -c "workers=$${AGENT_PLATFORM_UVICORN_WORKERS:-1};
-      db=$${AGENT_PLATFORM_DB_PATH:-/app/data/agent_platform.db};
-      case \"$$db\" in *.db|*.sqlite|*.sqlite3)
-        if [ \"$$workers\" != \"1\" ]; then
-          echo \"WARNING: SQLite ($$db) — clamping uvicorn workers to 1 ($$workers requested). Set AGENT_PLATFORM_UVICORN_WORKERS=1 or use Postgres for multi-worker.\";
-          workers=1;
-        fi;;
-      esac;
-      exec uvicorn main:app --host 0.0.0.0 --port 18410
-      --workers $$workers
-      --timeout-keep-alive $${AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS:-30}"
-    ports:
-      - "18410:18410"
-    env_file:
-      - .env
+      args:
+        VITE_API_ORIGIN: ${VITE_API_ORIGIN:-}
+        VITE_AGENT_PLATFORM_MASTER_KEY: ${AGENT_PLATFORM_MASTER_KEY:-}
     environment:
+      AGENT_PLATFORM_CONTAINER_MODE: ${AGENT_PLATFORM_CONTAINER_MODE:-backend}
       DATABASE_URL: ""
       AGENT_PLATFORM_DB_PATH: /app/data/agent_platform.db
       AGENT_PLATFORM_WORKSPACE_ROOT: /app/data/workspaces
@@ -45,6 +39,13 @@ services:
       NUMEXPR_NUM_THREADS: ${NUMEXPR_NUM_THREADS:-16}
       AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX: "0"
       AGENT_PLATFORM_LOCAL_LLM_DOCKER_FIX: "1"
+      AGENT_PLATFORM_UVICORN_WORKERS: ${AGENT_PLATFORM_UVICORN_WORKERS:-1}
+      AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS: ${AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS:-30}
+    ports:
+      - "18410:18410"
+      - "127.0.0.1:18408:18408"
+    env_file:
+      - .env
     volumes:
       - agent_platform_data:/app/data
       - ./app:/app

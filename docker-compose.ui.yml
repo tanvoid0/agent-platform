@@ -1,0 +1,8 @@
+# Merge with docker-compose.yml for backend + Flow UI in one container.
+#   docker compose -f docker-compose.yml -f docker-compose.ui.yml up --build
+
+services:
+  agent-platform:
+    environment:
+      AGENT_PLATFORM_CONTAINER_MODE: all
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://127.0.0.1:18408}

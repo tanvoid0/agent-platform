@@ -10,5 +10,3 @@
 | `/app/settings/*` | Settings | LLM proxy / env |
 
 Legacy bookmarks under `/flow/*` redirect to `/app/*` (308).
-
-The archived Flow UI under `archive/flow-ui-legacy/` is not authoritative.

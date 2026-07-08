@@ -4,7 +4,7 @@ import { TeamsPage } from "./components/TeamsPage";
 import { VIEW_MODE_PATH_SEGMENTS } from "./lib/processWorkspaceRoutes";
 import { ProcessesPage } from "./pages/ProcessesPage";
 
-/** Old bookmarks `/flow/runs/:id` → canonical `/flow/graph/:id`. */
+/** Old bookmarks `/flow/runs/:id` redirect to canonical `/app/graph/:id`. */
 function RedirectRunsToGraph() {
   const { legacyRunId } = useParams();
   return <Navigate to={legacyRunId != null ? `/graph/${legacyRunId}` : "/graph"} replace />;

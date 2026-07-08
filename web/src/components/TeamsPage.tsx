@@ -234,7 +234,7 @@ export function TeamsPage() {
   async function copyTeamDeepLink() {
     if (selectedId === null) return;
     const path =
-      selectedId === "new" ? "/flow/teams/new" : `/flow/teams/${selectedId}`;
+      selectedId === "new" ? "/app/teams/new" : `/app/teams/${selectedId}`;
     const url = `${window.location.origin}${path}`;
     try {
       await navigator.clipboard.writeText(url);
@@ -385,7 +385,7 @@ export function TeamsPage() {
             <p className="text-muted-foreground/80 max-w-sm text-xs leading-relaxed">
               Or use <span className="font-mono text-foreground/90">Create new team</span> to
               draft a template. Deep links use paths like{" "}
-              <span className="font-mono text-foreground/90">/flow/teams/&lt;id&gt;</span>.
+              <span className="font-mono text-foreground/90">/app/teams/&lt;id&gt;</span>.
             </p>
           </div>
         )}

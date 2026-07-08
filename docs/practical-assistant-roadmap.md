@@ -2,7 +2,7 @@
 
 Handoff for evolving **agent-platform** from a simulation-first orchestration demo into a **practical daily planning assistant**: personal planning, nutrition, fitness, travel, shopping, mentorship, coding help, and calendar organisation — without breaking existing process/team/simulation flows.
 
-**Related:** [ADR 0001](./adr/0001-agent-platform-orchestration.md) (server authority), [action-orchestrator-api.md](./action-orchestrator-api.md), `app/todos/`, `flow-ui/src/features/todos/`.
+**Related:** [ADR 0001](./adr/0001-agent-platform-orchestration.md) (server authority), [action-orchestrator-api.md](./action-orchestrator-api.md), `app/todos/`, `web/src/features/todos/`.
 
 ---
 

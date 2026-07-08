@@ -37,7 +37,7 @@ The product roadmap calls for a **long-lived, reactive shell**: inspectors, time
 ## Consequences
 
 - **Dependencies:** `@tanstack/react-query` in `web/package.json`; query client provided at app root.
-- **API contract:** TypeScript types in `flow-ui/src/api/types.ts` must track FastAPI/SQLModel fields; drift is caught at build time.
+- **API contract:** TypeScript types in `web/src/api/types.ts` must track FastAPI/SQLModel fields; drift is caught at build time.
 - **Babylon.js** (or a second engine) is **not** adopted unless a future ADR overrides 0003’s default (R3F + Three as the React-aligned path for optional sim).
 
 ## Related

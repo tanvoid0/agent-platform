@@ -2,20 +2,20 @@
 
 Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-compatible LLM proxy (`/v1/*` on the same process).
 
-**Portfolio context:** Backend lives here; the optional **Flow UI** (React workspace) is at [`../flow-ui/`](../flow-ui/). Root [`docker-compose.yml`](../docker-compose.yml) runs backend only by default, or backend + Flow UI with `--profile ui`.
+**Portfolio context:** Backend and canonical **Flow UI** live in this repo. UI workspace is under [`web/`](web/). One **`agent-platform`** image builds both; run mode is set with **`AGENT_PLATFORM_CONTAINER_MODE`** (`backend` | `ui` | `all`).
 
 - **API:** `http://127.0.0.1:18410` — OpenAPI at **`/docs`**, API guide at **`/api-guide`**
 - **Config UI:** `http://127.0.0.1:18410/config` — default provider, model, API keys, `config.yaml`
 - **Process demo:** `http://127.0.0.1:18410/ui` — minimal polling UI for `/processes`
-- **Flow UI (optional):** `http://127.0.0.1:3333/app/` when started via root compose `--profile ui`
+- **Flow UI (optional):** `http://127.0.0.1:18408/app/` when `AGENT_PLATFORM_CONTAINER_MODE=all`
 
 ## Deploy profiles
 
 | Profile | Command | What runs |
 |--------|---------|-----------|
-| **Backend only** | `docker compose up --build` (this folder) | API + config UI on `:18410` |
-| **Backend + Flow UI dev** | `docker compose --profile ui up --build` (repo root) | API `:18410` + Vite `:3333` |
-| **Backend + Flow UI prod** | `docker compose --profile ui-prod up --build` (repo root) | API `:18410` + nginx `:18408` |
+| **Backend only** | `docker compose up --build` | API + config UI on `:18410` (one container) |
+| **Backend + Flow UI** | `docker compose -f docker-compose.yml -f docker-compose.ui.yml up --build` | Same container: API `:18410` + Flow UI `:18408` |
+| **Flow UI only** | `docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up --build` | Static Flow UI on `:18408` (API elsewhere) |
 
 Local dev without Docker:
 
@@ -26,29 +26,41 @@ pip install -r app/requirements.txt
 python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
 ```
 
-Flow UI dev (separate terminal, sibling `../flow-ui/`):
+Flow UI dev (separate terminal):
 
 ```bash
-cd flow-ui
-cp env.example .env.local   # set VITE_AGENT_PLATFORM_TOKEN or master key
+cd web
 pnpm install && pnpm run dev
 ```
 
-Set **`AGENT_PLATFORM_MASTER_KEY`** in `.env` (Bearer for `/v1` and protected `/api/v1/*`). When set, paste the same key in the config UI auth bar or set `VITE_AGENT_PLATFORM_MASTER_KEY` for Flow UI.
+Set **`AGENT_PLATFORM_MASTER_KEY`** in `.env` (Bearer for `/v1` and protected `/api/v1/*`). When set, paste same key in config UI auth bar or set `VITE_AGENT_PLATFORM_MASTER_KEY` for Flow UI.
 
 ### Workspace tokens (external integrations)
 
 Each microservice or Flow UI deployment gets **one workspace-scoped token** (`agp_…`). Mint tokens at `/tokens` or `POST /api/v1/workspaces/{id}/api-tokens/` (master key). The service resolves its tenant via `GET /api/v1/me/workspace`. See [docs/CLIENT_INTEGRATION.md](docs/CLIENT_INTEGRATION.md).
 
-## Docker (backend only)
+## Docker (unified image)
+
+Image name: **`agent-platform`**. Main [`Dockerfile`](Dockerfile) builds FastAPI backend and Flow UI static assets from this checkout.
 
 ```bash
+# Backend only (default)
 docker compose up --build
+
+# Backend + Flow UI in the same container
+docker compose -f docker-compose.yml -f docker-compose.ui.yml up --build
 ```
 
-Open **`http://127.0.0.1:18410/config`** (LLM settings) and **`http://127.0.0.1:18410/docs`** (API).
+Set **`AGENT_PLATFORM_CONTAINER_MODE`** to `backend`, `ui`, or `all` (see `.env.example`).
 
 Uses a named volume for SQLite, workspaces, and **`/app/data/llm`** (`config.yaml` + `.env`).
+
+## Repo structure
+
+- `app/` FastAPI backend, API routes, orchestration, tests
+- `web/` canonical React + Vite Flow UI workspace
+- `docker/` nginx + entrypoint files for unified container modes
+- `docs/` ADRs, plans, integration notes
 
 ### Performance tuning (high-core desktop)
 

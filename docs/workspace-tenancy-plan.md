@@ -188,7 +188,7 @@ token (`principal.workspace_id`), so the Flow UI needs only the token in `.env`
 
 ---
 
-## Step 6 — Flow UI (sibling repo `../flow-ui`)
+## Step 6 — Flow UI (`web/` in this repo)
 
 - `.env`: single `AGENT_PLATFORM_TOKEN=agp_...` (a workspace token).
 - On boot, call `GET /me/workspace` to learn the workspace id + name; scope all

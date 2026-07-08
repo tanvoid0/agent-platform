@@ -6,16 +6,16 @@ import react from "@vitejs/plugin-react";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-/** With `base: "/flow/"`, only `/flow/` is a valid dev entry; `/flow` returns 404 without this. */
-function flowSlashRedirect(): Plugin {
+/** With `base: "/app/"`, only `/app/` is a valid dev entry; `/app` returns 404 without this. */
+function appSlashRedirect(): Plugin {
   return {
-    name: "flow-slash-redirect",
+    name: "app-slash-redirect",
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const path = ((req as { url?: string }).url ?? "").split("?")[0];
-        if (path === "/flow") {
+        if (path === "/app") {
           res.statusCode = 302;
-          res.setHeader("Location", "/flow/");
+          res.setHeader("Location", "/app/");
           res.end();
           return;
         }
@@ -26,19 +26,19 @@ function flowSlashRedirect(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), flowSlashRedirect()],
+  plugins: [react(), tailwindcss(), appSlashRedirect()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
     },
   },
-  base: "/flow/",
+  base: "/app/",
   build: {
-    outDir: "../app/static/dist",
+    outDir: "dist",
     emptyOutDir: true,
   },
   server: {
-    port: 5174,
+    port: 3333,
     proxy: {
       // Minimal HTML UI + API docs live on FastAPI (18410), not on Vite.
       "/ui": "http://127.0.0.1:18410",

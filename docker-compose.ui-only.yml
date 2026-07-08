@@ -1,0 +1,12 @@
+# Merge with docker-compose.yml for Flow UI static only (no API in container).
+# Set VITE_API_ORIGIN at build when the API runs elsewhere.
+#   docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up --build
+
+services:
+  agent-platform:
+    environment:
+      AGENT_PLATFORM_CONTAINER_MODE: ui
+    ports:
+      - "127.0.0.1:18408:18408"
+    volumes: []
+    develop: {}
