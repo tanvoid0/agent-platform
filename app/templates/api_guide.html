@@ -92,6 +92,23 @@
   </details>
 
   <details>
+    <summary>BYOK — bring your own provider key</summary>
+    <p>Forward <code>/v1/chat/completions</code>, <code>/v1/embeddings</code>, and <code>/v1/images/generations</code> through <strong>your own</strong> provider key. The server proxies to the vendor with your credential and spends none of its own quota. Your platform token still authenticates the request; BYOK only swaps the upstream credential.</p>
+    <p>Send these headers (request body stays fully OpenAI-compatible):</p>
+    <pre>X-BYOK-Provider: openai            # openai|anthropic|gemini|aimlapi|openrouter|groq|mistral
+X-BYOK-Api-Key:  sk-...            # your upstream key (never logged)
+X-BYOK-Base-Url: https://...       # optional; host must be allowlisted
+X-BYOK-Anthropic-Version: ...      # optional; overrides the anthropic-version pin</pre>
+    <pre>curl http://127.0.0.1:18410/v1/chat/completions \
+  -H "Authorization: Bearer &lt;platform token&gt;" \
+  -H "X-BYOK-Provider: openai" -H "X-BYOK-Api-Key: sk-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'</pre>
+    <p><code>model</code> passes through untouched — use your vendor’s model ids. A custom <code>X-BYOK-Base-Url</code> is accepted only for the provider’s canonical host or a host listed in <code>BYOK_ALLOWED_HOSTS</code>, must be <code>https</code>, and cannot be a raw IP (SSRF guard). Unsupported capabilities return a structured <code>501</code> (e.g. Claude has no embeddings endpoint).</p>
+    <p class="muted">Discover supported providers, modalities, and header names from the <code>byok</code> block of <code>GET /v1/capabilities</code>.</p>
+  </details>
+
+  <details>
     <summary>Multi-agent process</summary>
     <p>Pick a team template id from <code>GET /api/v1/teams</code> (each item has <code>id</code> and <code>name</code>), or create one with <code>POST /api/v1/teams</code>. Then start a run:</p>
     <p><code>POST /api/v1/processes</code></p>

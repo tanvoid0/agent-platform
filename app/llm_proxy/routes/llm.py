@@ -19,6 +19,20 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from api_tokens.auth import TokenPrincipal, require_scope, require_valid_token
 from health_checks import llm_proxy_readiness_payload
+from llm_proxy.core.byok import byok_discovery, parse_byok
+from llm_proxy.core.capabilities import (
+    MODALITIES,
+    modality_map,
+    provider_supports,
+    require_provider_for_capability,
+    resolve_provider_for_capability,
+)
+from llm_proxy.services.image_backends import (
+    IMAGE_PROVIDER_IDS,
+    image_default_model,
+    image_provider_configured,
+    image_upstream_url,
+)
 from llm_proxy.core.config_cache import load_config_yaml_dict, read_env_file_parsed
 from llm_proxy.core.errors import LlmProxyError
 from llm_proxy.core.provider_config import (
@@ -39,6 +53,7 @@ from llm_proxy.core.provider_config import (
     ollama_configured,
     provider_configured,
     is_supported_provider,
+    SUPPORTED_PROVIDER_IDS,
 )
 from llm_proxy.services.local_backends import coerce_local_model_if_needed
 from llm_proxy.services.model_catalog_cache import get_catalog_cache
@@ -785,6 +800,108 @@ async def provider_catalog(
     return JSONResponse(content=body)
 
 
+@router.get("/v1/capabilities")
+async def capabilities(
+    _principal: TokenPrincipal = Depends(require_valid_token),
+) -> JSONResponse:
+    """Capability (modality) map plus the resolved provider per capability.
+
+    Lets a client ask "who can do X" up front instead of discovering an
+    unsupported route via a failed request. ``resolved`` is the provider the
+    proxy would pick for an unqualified request of that capability (``null`` if
+    none is configured).
+    """
+    matrix: dict[str, dict[str, bool]] = {}
+    for provider in SUPPORTED_PROVIDER_IDS:
+        matrix[provider] = {
+            **modality_map(provider),
+            "configured": provider_configured(provider),
+        }
+    for provider in IMAGE_PROVIDER_IDS:
+        matrix[provider] = {
+            **modality_map(provider),
+            "configured": image_provider_configured(provider),
+        }
+    resolved = {
+        capability: resolve_provider_for_capability(capability) for capability in MODALITIES
+    }
+    return JSONResponse(
+        content={
+            "object": "capabilities",
+            "modalities": list(MODALITIES),
+            "providers": matrix,
+            "resolved": resolved,
+            "byok": byok_discovery(),
+        }
+    )
+
+
+@router.post("/v1/images/generations")
+async def images_generations(
+    request: Request,
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> Response:
+    """OpenAI-style image generation, routed to a configured image backend.
+
+    Resolves an ``image_generation`` provider via the capability router: an
+    optional ``provider`` hint pins one, else the first configured image
+    backend is chosen. No image backend configured => structured 501.
+    """
+    require_scope(principal, "chat:write")
+    try:
+        body: dict[str, Any] = await request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+
+    byok = parse_byok(request)
+    body = dict(body)
+    if byok is not None:
+        byok.require("image_generation")
+        body.pop("provider", None)
+        raw_model = body.get("model")
+        if raw_model is not None and not isinstance(raw_model, str):
+            raise HTTPException(status_code=400, detail="model must be a string")
+        model_str = (raw_model or "").strip() if isinstance(raw_model, str) else ""
+        if not model_str:
+            raise HTTPException(
+                status_code=400, detail="model is required for BYOK requests"
+            )
+        body["model"] = model_str
+        url = byok.url("image_generation")
+        headers = byok.outbound_headers()
+    else:
+        raw_provider_hint = body.get("provider")
+        hint = ""
+        if raw_provider_hint is not None:
+            if not isinstance(raw_provider_hint, str):
+                raise HTTPException(status_code=400, detail="provider must be a string")
+            hint = raw_provider_hint.strip().lower()
+
+        prov = require_provider_for_capability("image_generation", preferred=hint or None)
+
+        body.pop("provider", None)
+        raw_model = body.get("model")
+        if raw_model is not None and not isinstance(raw_model, str):
+            raise HTTPException(status_code=400, detail="model must be a string")
+        model_str = (raw_model or "").strip() if isinstance(raw_model, str) else ""
+        body["model"] = model_str or image_default_model()
+
+        url = image_upstream_url(prov)
+        headers = {"Content-Type": "application/json"}
+    r = await post_with_retry(
+        url,
+        headers=headers,
+        json_body=body,
+        timeout=600.0,
+        context="images_generations",
+    )
+    return Response(
+        content=r.content,
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "application/json"),
+    )
+
+
 def _upstream_urls(provider: str) -> tuple[str, str]:
     if provider == "ollama":
         base = ollama_api_base().rstrip("/")
@@ -884,37 +1001,53 @@ async def chat_completions(
     raw_model = body.get("model")
     if raw_model is not None and not isinstance(raw_model, str):
         raise HTTPException(status_code=400, detail="model must be a string")
-    raw_provider_hint = body.get("provider")
+    byok = parse_byok(request)
     body = dict(body)
-    if raw_provider_hint is not None:
-        if not isinstance(raw_provider_hint, str):
-            raise HTTPException(status_code=400, detail="provider must be a string")
-        hint = raw_provider_hint.strip().lower()
-        if hint:
-            if not is_supported_provider(hint):
-                raise HTTPException(
-                    status_code=400,
-                    detail="provider must be ollama, lm_studio, gemini, aimlapi, or anthropic",
-                )
-            if not provider_configured(hint):
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Provider {hint} is not configured (check environment for this provider).",
-                )
-            model_str = (raw_model if isinstance(raw_model, str) else "").strip()
-            _, dm = _effective_defaults()
-            prov = hint
-            resolved = model_str or default_model_for_provider(hint) or dm
+    if byok is not None:
+        # Client brings its own key: forward with the caller's credential and
+        # spend none of the platform's quota. Model id is passed through as-is
+        # (no server-side alias resolution / local coercion).
+        byok.require("chat")
+        model_str = (raw_model if isinstance(raw_model, str) else "").strip()
+        if not model_str:
+            raise HTTPException(
+                status_code=400, detail="model is required for BYOK requests"
+            )
+        body.pop("provider", None)
+        body["model"] = model_str
+        chat_url = byok.url("chat")
+        headers = byok.outbound_headers()
+    else:
+        raw_provider_hint = body.get("provider")
+        if raw_provider_hint is not None:
+            if not isinstance(raw_provider_hint, str):
+                raise HTTPException(status_code=400, detail="provider must be a string")
+            hint = raw_provider_hint.strip().lower()
+            if hint:
+                if not is_supported_provider(hint):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="provider must be ollama, lm_studio, gemini, aimlapi, or anthropic",
+                    )
+                if not provider_configured(hint):
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Provider {hint} is not configured (check environment for this provider).",
+                    )
+                model_str = (raw_model if isinstance(raw_model, str) else "").strip()
+                _, dm = _effective_defaults()
+                prov = hint
+                resolved = model_str or default_model_for_provider(hint) or dm
+            else:
+                prov, resolved = _resolve_model(raw_model if isinstance(raw_model, str) else None)
         else:
             prov, resolved = _resolve_model(raw_model if isinstance(raw_model, str) else None)
-    else:
-        prov, resolved = _resolve_model(raw_model if isinstance(raw_model, str) else None)
-    resolved = await coerce_local_model_if_needed(prov, resolved)
-    body.pop("provider", None)
-    body["model"] = resolved
+        resolved = await coerce_local_model_if_needed(prov, resolved)
+        body.pop("provider", None)
+        body["model"] = resolved
 
-    chat_url, _ = _upstream_urls(prov)
-    headers = _outbound_headers(prov)
+        chat_url, _ = _upstream_urls(prov)
+        headers = _outbound_headers(prov)
     stream = bool(body.get("stream"))
 
     if not stream:
@@ -982,18 +1115,29 @@ async def embeddings(
     raw_model = body.get("model")
     if not isinstance(raw_model, str) or not raw_model.strip():
         raise HTTPException(status_code=400, detail="model is required")
-    prov, resolved = _resolve_model(raw_model)
-    if prov == "anthropic":
-        raise HTTPException(
-            status_code=400,
-            detail="Claude (anthropic) does not expose an embeddings endpoint; use a different provider for embeddings.",
-        )
-    resolved = await coerce_local_model_if_needed(prov, resolved)
+    byok = parse_byok(request)
     body = dict(body)
-    body["model"] = resolved
+    if byok is not None:
+        byok.require("embeddings")
+        body["model"] = raw_model.strip()
+        emb_url = byok.url("embeddings")
+        headers = byok.outbound_headers()
+    else:
+        prov, resolved = _resolve_model(raw_model)
+        if not provider_supports(prov, "embeddings"):
+            # Structured 501 instead of forwarding into a backend with no embeddings
+            # endpoint (e.g. Claude), so the client learns which providers can serve it.
+            raise LlmProxyError(
+                501,
+                "capability_unavailable",
+                f"Provider {prov} does not expose an embeddings endpoint; use a provider that supports embeddings.",
+                extra={"capability": "embeddings", "provider": prov},
+            )
+        resolved = await coerce_local_model_if_needed(prov, resolved)
+        body["model"] = resolved
 
-    _, emb_url = _upstream_urls(prov)
-    headers = _outbound_headers(prov)
+        _, emb_url = _upstream_urls(prov)
+        headers = _outbound_headers(prov)
     r = await post_with_retry(
         emb_url,
         headers=headers,

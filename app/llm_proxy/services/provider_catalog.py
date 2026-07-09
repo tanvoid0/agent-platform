@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from llm_proxy.core.capabilities import modality_map
 from llm_proxy.core.config_cache import load_config_yaml_dict, read_env_file_parsed, read_llm_proxy_ui_fallbacks
 from llm_proxy.core.errors import LlmProxyError
 from llm_proxy.core.provider_config import (
@@ -358,6 +359,7 @@ def _provider_capabilities(provider: str) -> dict[str, Any]:
         "streaming": True,
         "tools": provider != "gemini",
         "json_mode": True,
+        "modalities": modality_map(provider),
         "model_discovery": {
             "mode": discovery["mode"],
             "primary_source": discovery["primary_source"],
