@@ -1,0 +1,10 @@
+# Image service deps. Install torch SEPARATELY first (GPU-specific) — see README.
+# For RTX 5080 (Blackwell / sm_120) you need a CUDA cu128+ build of torch.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+diffusers>=0.31
+transformers>=4.44
+accelerate>=0.33
+sentencepiece>=0.2
+protobuf>=4.25
+pillow>=10.0

@@ -12,6 +12,29 @@ Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-co
 
 Provider catalog behavior is normalized across `/api/v1/llm/ui-catalog`, `/api/v1/llm-proxy/ui/providers`, and `/api/v1/llm-proxy/test/model-options`: each provider exposes the same capability shape (`streaming`, `tools`, `json_mode`, `model_discovery`). When a provider cannot list models live, the server falls back in order to provider aliases from `config.yaml`, then `orchestrator_ui.yaml` `fallback_models`, then the provider default model.
 
+### BYOK (bring-your-own-key)
+
+Clients can forward `/v1/chat/completions`, `/v1/embeddings`, and `/v1/images/generations` through **their own** provider key — the server proxies to the vendor with the caller's credential and spends none of its own quota. The platform token still gates access; BYOK only swaps the upstream credential. Activate per-request with headers (body stays OpenAI-compatible):
+
+```
+X-BYOK-Provider: openai            # openai|anthropic|gemini|aimlapi|openrouter|groq|mistral
+X-BYOK-Api-Key:  sk-...            # the caller's upstream key (never logged)
+X-BYOK-Base-Url: https://...       # optional; host must be allowlisted
+X-BYOK-Anthropic-Version: ...      # optional; overrides the anthropic-version pin
+```
+
+```bash
+curl http://127.0.0.1:18410/v1/chat/completions \
+  -H "Authorization: Bearer $AGENT_PLATFORM_TOKEN" \
+  -H "X-BYOK-Provider: openai" -H "X-BYOK-Api-Key: sk-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+`model` is passed through untouched (use your vendor's model ids). A custom `X-BYOK-Base-Url` is accepted only for the provider's canonical host or a host in **`BYOK_ALLOWED_HOSTS`** (comma-separated), must be `https`, and cannot be a raw IP — this blocks pointing the proxy at internal services (SSRF). Unsupported capabilities return a structured `501` (e.g. Claude has no embeddings surface).
+
+Discover supported BYOK providers, their modalities, and the header names programmatically from the `byok` block of `GET /v1/capabilities`.
+
 ## Quick start
 
 First-time setup from this folder:

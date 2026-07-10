@@ -41,6 +41,9 @@ services:
       AGENT_PLATFORM_LOCAL_LLM_DOCKER_FIX: "1"
       AGENT_PLATFORM_UVICORN_WORKERS: ${AGENT_PLATFORM_UVICORN_WORKERS:-1}
       AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS: ${AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS:-30}
+      # BYOK: extra allowlisted upstream hosts for client X-BYOK-Base-Url (canonical
+      # provider hosts are always allowed). Provider keys still come from .env.
+      BYOK_ALLOWED_HOSTS: ${BYOK_ALLOWED_HOSTS:-}
     ports:
       - "18410:18410"
     env_file:
