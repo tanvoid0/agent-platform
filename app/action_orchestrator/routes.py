@@ -45,12 +45,31 @@ from action_orchestrator.schemas import (
     StepResponse,
 )
 from api_auth import agent_platform_client_header
+from api_tokens.auth import TokenPrincipal, require_valid_token
 from client_scope import merged_client_id, require_client_id_enabled
 from database import get_session
 from time_utils import utc_now_naive
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["action-orchestrator"])
+
+
+def action_client_scope(
+    client_hdr: str | None = Depends(agent_platform_client_header),
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> str | None:
+    """Namespace for this domain's rows.
+
+    `client_id` is the only tenant column these tables have, and the
+    `X-Agent-Platform-Client` header that fills it is caller-supplied — one
+    workspace token could name another tenant's namespace, or omit the header
+    and see everything. A workspace token therefore gets a namespace derived
+    from its own workspace; the master key keeps the header behaviour so a
+    single-tenant deployment can still partition by hand.
+    """
+    if principal.workspace_id is not None:
+        return f"ws:{principal.workspace_id}"
+    return client_hdr
 
 
 def _check_client_access(obj, client_hdr: str | None) -> bool:
@@ -68,7 +87,7 @@ def _check_client_access(obj, client_hdr: str | None) -> bool:
 def create_set(
     req: ActionSetCreate,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Create a new action set with optional actions."""
     effective_client = merged_client_id(client_hdr, None)
@@ -83,7 +102,7 @@ def create_set(
 @router.get("/action-sets")
 def list_sets(
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
     limit: int = 50,
 ):
     """List action sets accessible to the client."""
@@ -101,7 +120,7 @@ def list_sets(
 def get_set(
     set_id: int,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Get an action set by ID."""
     action_set, actions = get_action_set_with_actions(session, set_id)
@@ -117,7 +136,7 @@ def update_set(
     set_id: int,
     req: ActionSetUpdate,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Update an action set."""
     action_set = get_action_set(session, set_id)
@@ -135,7 +154,7 @@ def update_set(
 def delete_set(
     set_id: int,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Delete an action set and all its actions."""
     action_set = get_action_set(session, set_id)
@@ -155,7 +174,7 @@ def add_action(
     set_id: int,
     req: ActionCreate,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Add an action to an action set."""
     action_set = get_action_set(session, set_id)
@@ -185,7 +204,7 @@ def add_action(
 def list_set_actions(
     set_id: int,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """List all actions in an action set."""
     action_set = get_action_set(session, set_id)
@@ -216,7 +235,7 @@ def get_action_detail(
     set_id: int,
     action_id: str,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Get details of a specific action."""
     action_set = get_action_set(session, set_id)
@@ -246,7 +265,7 @@ def update_action_detail(
     action_id: str,
     req: ActionUpdate,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Update an action."""
     action_set = get_action_set(session, set_id)
@@ -276,7 +295,7 @@ def delete_action_endpoint(
     set_id: int,
     action_id: str,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Delete an action from an action set."""
     action_set = get_action_set(session, set_id)
@@ -299,7 +318,7 @@ def delete_action_endpoint(
 def create_session(
     req: SessionCreate,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Create a new orchestration session."""
     effective_client = merged_client_id(client_hdr, None)
@@ -349,7 +368,7 @@ def create_session(
 def get_session(
     session_id: int,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Get session details."""
     action_session = session.get(ActionSession, session_id)
@@ -375,7 +394,7 @@ async def request_step(
     session_id: int,
     req: StepRequest,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Request the next action(s) for a session."""
     action_session = session.get(ActionSession, session_id)
@@ -490,7 +509,7 @@ def submit_result(
     session_id: int,
     req: ActionResultSubmit,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Submit the result of an action execution."""
     action_session = session.get(ActionSession, session_id)
@@ -545,7 +564,7 @@ def complete_session(
     session_id: int,
     req: CompleteSessionRequest | None = None,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Mark a session as manually completed."""
     action_session = session.get(ActionSession, session_id)
@@ -570,7 +589,7 @@ def complete_session(
 def get_session_history(
     session_id: int,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """Get full session history with all steps and results."""
     action_session = session.get(ActionSession, session_id)
@@ -638,7 +657,7 @@ def get_session_history(
 async def decide(
     req: DecideRequest,
     session: Session = Depends(get_session),
-    client_hdr: str | None = Depends(agent_platform_client_header),
+    client_hdr: str | None = Depends(action_client_scope),
 ):
     """One-shot decision without creating a session."""
     # Verify action set exists and is accessible

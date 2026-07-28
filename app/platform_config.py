@@ -34,6 +34,23 @@ def resolved_agent_platform_yaml_path() -> Path:
     return here.parent / "config" / "agent_platform.yaml"
 
 
+def resolved_config_dir() -> Path:
+    """Directory holding the LLM proxy's `config.yaml`, `.env`, and caches.
+
+    Compose sets `CONFIG_DIR` explicitly. Without it, resolve to the repo's
+    `data/llm` — the old `/data` default only exists inside a container, so a
+    plain `pnpm dev:server` run silently pointed the config UI, model-ops, and
+    capability cache at a directory that was never there.
+    """
+    explicit = (os.environ.get("CONFIG_DIR") or "").strip()
+    if explicit:
+        return Path(explicit)
+    here = Path(__file__).resolve().parent
+    if here.parent == Path(here.anchor):  # flat Docker image: app files sit at /app
+        return Path("/data")
+    return here.parent / "data" / "llm"
+
+
 def _stringify_env_value(v: Any) -> str:
     if isinstance(v, bool):
         return "1" if v else "0"

@@ -2,6 +2,7 @@ import { Navigate, Route, Routes, useParams } from "react-router-dom";
 import { ProjectsPage } from "./components/ProjectsPage";
 import { TeamsPage } from "./components/TeamsPage";
 import { VIEW_MODE_PATH_SEGMENTS } from "./lib/processWorkspaceRoutes";
+import { ModelOpsPage } from "./pages/ModelOpsPage";
 import { ProcessesPage } from "./pages/ProcessesPage";
 
 /** Old bookmarks `/flow/runs/:id` redirect to canonical `/app/graph/:id`. */
@@ -25,6 +26,7 @@ export default function App() {
       {/* Single route so :teamId is always the same param; avoids split route edge cases. */}
       <Route path="teams/:teamId?" element={<TeamsPage />} />
       <Route path="projects/:projectId?" element={<ProjectsPage />} />
+      <Route path="models" element={<ModelOpsPage />} />
       <Route path="*" element={<Navigate to="/graph" replace />} />
     </Routes>
   );

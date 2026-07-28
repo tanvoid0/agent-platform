@@ -59,6 +59,10 @@ class CoderChatSendRequest(BaseModel):
     max_tokens: int | None = None
     # When True, workspace tools run on the client host (Portal Desktop).
     delegate_tools: bool = False
+    # Per-turn mode guidance from Portal Desktop — merged into the system prompt,
+    # not stored as user message content.
+    mode_instruction: str | None = Field(default=None, max_length=4096)
+    agent_mode: str | None = Field(default=None, max_length=32)
 
 
 class CoderChatSendResponse(BaseModel):
@@ -81,6 +85,8 @@ class CoderRetryRequest(BaseModel):
     auto_approve_commands: bool = False
     max_tokens: int | None = None
     delegate_tools: bool = False
+    mode_instruction: str | None = Field(default=None, max_length=4096)
+    agent_mode: str | None = Field(default=None, max_length=32)
 
 
 class CoderApprovalRequest(BaseModel):
@@ -93,6 +99,8 @@ class CoderApprovalRequest(BaseModel):
     auto_approve_commands: bool = False
     max_tokens: int | None = None
     delegate_tools: bool = False
+    mode_instruction: str | None = Field(default=None, max_length=4096)
+    agent_mode: str | None = Field(default=None, max_length=32)
 
 
 class CoderThreadDeleteOut(BaseModel):

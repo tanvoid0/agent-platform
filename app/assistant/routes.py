@@ -53,7 +53,13 @@ from assistant.services.review_service import (
 )
 from assistant.domain_forms import list_domain_form_specs
 from assistant.services.user_profile_service import get_all_profiles, get_profile, merge_profile
-from api_tokens.auth import TokenPrincipal, assert_token_project_access, require_valid_token
+from api_tokens.auth import (
+    TokenPrincipal,
+    assert_token_item_access,
+    assert_token_project_access,
+    require_valid_token,
+)
+from assistant.models import AssistantReview
 from database import get_session
 from todos.schemas import ItemOut, PlannedActionOut
 
@@ -69,6 +75,19 @@ def require_assistant_project(
 ) -> int:
     assert_token_project_access(principal, project_id, session)
     return project_id
+
+
+def require_assistant_review(
+    review_id: int,
+    session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> int:
+    """Reviews are addressed by bare id; resolve the owning project before mutating."""
+    review = session.get(AssistantReview, review_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+    assert_token_project_access(principal, review.project_id, session)
+    return review_id
 
 
 @router.get("/dashboard", response_model=DashboardOut)
@@ -308,7 +327,9 @@ def complete_item(
     item_id: int,
     body: CompleteItemRequest = ...,
     session: Session = Depends(get_session),
+    principal: TokenPrincipal = Depends(require_valid_token),
 ):
+    assert_token_item_access(principal, item_id, session)
     return log_item_completion(
         session,
         item_id,
@@ -339,7 +360,7 @@ def reviews_pending(
 
 @router.post("/reviews/{review_id}/apply")
 def reviews_apply(
-    review_id: int,
+    review_id: int = Depends(require_assistant_review),
     body: ReviewApplyRequest = ...,
     session: Session = Depends(get_session),
 ):
@@ -349,7 +370,7 @@ def reviews_apply(
 
 @router.post("/reviews/{review_id}/dismiss")
 def reviews_dismiss(
-    review_id: int,
+    review_id: int = Depends(require_assistant_review),
     session: Session = Depends(get_session),
 ):
     return dismiss_review(session, review_id)

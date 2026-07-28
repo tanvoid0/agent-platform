@@ -13,25 +13,26 @@ from typing import Any
 
 import yaml
 
+from platform_config import resolved_config_dir
+
 _file_lock = threading.Lock()
 
 
 def resolved_config_yaml_path() -> Path:
     """Same resolution as the OpenAI proxy routes (supports CONFIG_PATH)."""
-    root = Path(os.environ.get("CONFIG_DIR", "/data"))
     explicit = os.environ.get("CONFIG_PATH", "").strip()
     if explicit:
         return Path(explicit)
-    return root / "config.yaml"
+    return resolved_config_dir() / "config.yaml"
 
 
 def env_file_path() -> Path:
-    return Path(os.environ.get("CONFIG_DIR", "/data")) / ".env"
+    return resolved_config_dir() / ".env"
 
 
 def llm_proxy_ui_yaml_path() -> Path:
     """Legacy filename on disk: ``orchestrator_ui.yaml`` (fallback_models for the proxy UI)."""
-    return Path(os.environ.get("CONFIG_DIR", "/data")) / "orchestrator_ui.yaml"
+    return resolved_config_dir() / "orchestrator_ui.yaml"
 
 
 def _stat_fp(path: Path) -> tuple[int, int] | None:

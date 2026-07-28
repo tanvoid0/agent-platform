@@ -122,6 +122,25 @@ def verify_project_api_token(required_scope: str | None = None):
 require_valid_token = verify_project_api_token()
 
 
+def require_master_key(
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> TokenPrincipal:
+    """Gate platform-admin surfaces that are not tenant-scoped.
+
+    Reading or writing the server's `.env` / `config.yaml`, or printing the master
+    key, is an operator action. A workspace token authenticates a tenant, so it
+    must not reach these even though it is a valid Bearer credential.
+    """
+    if principal.workspace_id is not None:
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=403,
+            detail="This endpoint requires the platform master key, not a workspace token.",
+        )
+    return principal
+
+
 def require_scope(principal: TokenPrincipal, scope: str) -> None:
     """Raise InsufficientScopeError unless the principal's token grants `scope`."""
     if "*" in principal.scopes or scope in principal.scopes:

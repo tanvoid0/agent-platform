@@ -12,8 +12,10 @@ import todos.models  # noqa: F401 — todo board tables
 import assistant.models  # noqa: F401 — assistant tables
 import playground.models  # noqa: F401 — playground chat tables
 import coder.models  # noqa: F401 — coder agent chat tables
+import model_ops.models  # noqa: F401 — model build/train tables
 from database import create_db_and_tables
 from llm_proxy.core.provider_config import clear_runtime_provider_bases
+from llm_proxy.services.model_capabilities import clear_capability_cache
 from main import app
 
 
@@ -43,6 +45,20 @@ def _api_routes_without_bearer_by_default(monkeypatch):
     get 401 on every TestClient call. Tests that need a key set it explicitly.
     """
     monkeypatch.delenv("AGENT_PLATFORM_MASTER_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config_dir(tmp_path_factory, monkeypatch):
+    """Keep CONFIG_DIR (config.yaml, .env, capability cache) inside the test's tmp dir.
+
+    Without this the suite reads and writes the developer's real config dir, so a
+    cached model_capabilities.json makes probe-dependent tests pass locally and
+    fail on a clean checkout.
+    """
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path_factory.mktemp("config_dir")))
+    clear_capability_cache(disk=False)
+    yield
+    clear_capability_cache(disk=False)
 
 
 @pytest.fixture(autouse=True)

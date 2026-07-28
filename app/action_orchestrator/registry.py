@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from action_orchestrator.models import Action, ActionSet
@@ -65,7 +66,12 @@ def list_action_sets(
     """List action sets, optionally filtered by client."""
     query = select(ActionSet).order_by(ActionSet.id.desc())
     if client_id:
-        query = query.where(ActionSet.client_id == client_id)
+        # Unowned sets (the seeded defaults) are shared, matching the per-object
+        # access check; filtering on equality alone hid them from every caller
+        # that passed a client_id.
+        query = query.where(
+            or_(ActionSet.client_id == client_id, ActionSet.client_id.is_(None))
+        )
     return list(session.exec(query.limit(limit)).all())
 
 

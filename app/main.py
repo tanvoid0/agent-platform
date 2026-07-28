@@ -32,6 +32,7 @@ from todos.routes import router as todos_router
 from assistant.routes import router as assistant_router
 from playground.routes import router as playground_router
 from coder.routes import router as coder_router
+from model_ops.routes import router as model_ops_router
 from workspace_routes import files_router as workspace_files_router, router as workspace_router
 
 setup_logging()
@@ -101,6 +102,7 @@ app.include_router(todos_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(assistant_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(playground_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(coder_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(model_ops_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(chat_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(llm_proxy_admin_router, prefix="/api/v1/llm-proxy", dependencies=_api_deps)
 

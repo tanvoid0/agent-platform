@@ -143,6 +143,8 @@ async def coder_chat_send(
         max_tokens=body.max_tokens,
         client_id=client_id,
         delegate_tools=body.delegate_tools,
+        mode_instruction=body.mode_instruction,
+        agent_mode=body.agent_mode,
     )
     usage = data.get("usage")
     if usage is not None:
@@ -176,6 +178,8 @@ async def coder_chat_stream(
         max_tokens=body.max_tokens,
         client_id=client_id,
         delegate_tools=body.delegate_tools,
+        mode_instruction=body.mode_instruction,
+        agent_mode=body.agent_mode,
     )
     tracked = _usage_tracking_stream(generator, session, principal.token_id)
     return StreamingResponse(
@@ -206,6 +210,8 @@ async def coder_chat_retry(
         max_tokens=body.max_tokens,
         client_id=client_id,
         delegate_tools=body.delegate_tools,
+        mode_instruction=body.mode_instruction,
+        agent_mode=body.agent_mode,
     )
     tracked = _usage_tracking_stream(generator, session, principal.token_id)
     return StreamingResponse(
@@ -237,6 +243,8 @@ async def coder_chat_approve(
         max_tokens=body.max_tokens,
         client_id=client_id,
         delegate_tools=body.delegate_tools,
+        mode_instruction=body.mode_instruction,
+        agent_mode=body.agent_mode,
     )
     tracked = _usage_tracking_stream(generator, session, principal.token_id)
     return StreamingResponse(

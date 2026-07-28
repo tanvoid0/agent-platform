@@ -56,6 +56,7 @@ from llm_proxy.core.provider_config import (
     SUPPORTED_PROVIDER_IDS,
 )
 from llm_proxy.services.local_backends import coerce_local_model_if_needed
+from llm_proxy.services.model_capabilities import ensure_chat_request_supported
 from llm_proxy.services.model_catalog_cache import get_catalog_cache
 from llm_proxy.services.provider_catalog import build_v1_provider_catalog
 from llm_proxy.services.upstream_http import (
@@ -784,6 +785,13 @@ async def provider_catalog(
         True,
         description="When false, return only YAML aliases (no upstream catalog fetches).",
     ),
+    probe_capabilities: bool = Query(
+        True,
+        description=(
+            "When true with live=true, probe each Ollama model via /api/show for "
+            "tools/vision flags and attach per-model capabilities metadata."
+        ),
+    ),
 ) -> JSONResponse:
     """
     Provider registry with models and upstream metadata.
@@ -796,6 +804,7 @@ async def provider_catalog(
     body = await build_v1_provider_catalog(
         allowed_providers=allowed,
         include_live=live,
+        probe_capabilities=probe_capabilities and live,
     )
     return JSONResponse(content=body)
 
@@ -1045,6 +1054,8 @@ async def chat_completions(
         resolved = await coerce_local_model_if_needed(prov, resolved)
         body.pop("provider", None)
         body["model"] = resolved
+
+        await ensure_chat_request_supported(prov, resolved, body)
 
         chat_url, _ = _upstream_urls(prov)
         headers = _outbound_headers(prov)

@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 import yaml
 
 from llm_proxy.core.config_cache import env_file_path, resolved_config_yaml_path
-from platform_config import resolved_agent_platform_yaml_path
+from platform_config import resolved_agent_platform_yaml_path, resolved_config_dir
 from workspace_service import workspace_root
 
 _VALID_ENVS = {"development", "test", "testing", "production"}
@@ -63,10 +63,9 @@ def collect_startup_validation_errors() -> list[str]:
         if raw and not _is_positive_float(raw):
             issues.append(f"{name} must be a positive number (got {raw!r}).")
 
-    config_dir_raw = (os.getenv("CONFIG_DIR") or "/data").strip()
-    config_dir = Path(config_dir_raw)
+    config_dir = resolved_config_dir()
     if config_dir.exists() and not config_dir.is_dir():
-        issues.append(f"CONFIG_DIR must point to a directory (got {config_dir_raw!r}).")
+        issues.append(f"CONFIG_DIR must point to a directory (got {str(config_dir)!r}).")
 
     workspace_root_raw = (os.getenv("AGENT_PLATFORM_WORKSPACE_ROOT") or "").strip()
     if workspace_root_raw:

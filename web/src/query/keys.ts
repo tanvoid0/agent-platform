@@ -21,4 +21,12 @@ export const queryKeys = {
     list: () => ["projects", "list"] as const,
     detail: (id: number | null) => ["projects", "detail", id] as const,
   },
+  modelOps: {
+    all: ["modelOps"] as const,
+    projects: () => ["modelOps", "projects"] as const,
+    project: (name: string | null) => ["modelOps", "project", name] as const,
+    job: (id: number | null) => ["modelOps", "job", id] as const,
+    ollamaModels: () => ["modelOps", "ollamaModels"] as const,
+    registry: () => ["modelOps", "registry"] as const,
+  },
 };

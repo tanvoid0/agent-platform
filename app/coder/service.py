@@ -8,6 +8,7 @@ which routes to Ollama / Gemini / LM Studio / AIMLAPI.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any, AsyncIterator
@@ -25,6 +26,9 @@ from coder.executor import (
     ToolExecutor,
     make_executor,
 )
+from coder.tool_call_parse import parse_leaked_tool_calls, strip_leaked_tool_syntax
+from llm_proxy.services.model_capabilities import ensure_chat_request_supported
+from llm_proxy.services.provider_catalog import get_resolved_defaults
 from chat_thread_title import (
     await_smart_title,
     fallback_title_from_message,
@@ -66,6 +70,8 @@ CODER_SYSTEM_PROMPT = (
     "- When done, summarize what you changed and why in a short final answer."
 )
 
+_LEGACY_MODE_LABELS = ("plan", "debug", "multitask", "ask", "auto")
+
 
 def _max_iterations() -> int:
     raw = (os.getenv("CODER_MAX_ITERATIONS") or "15").strip()
@@ -73,6 +79,96 @@ def _max_iterations() -> int:
         return max(1, int(raw))
     except ValueError:
         return 15
+
+
+def _heartbeat_interval_seconds() -> float:
+    """How often to emit a ``heartbeat`` SSE event while waiting on the LLM.
+
+    A single agent step is one blocking (non-streaming) call to the LLM proxy —
+    it can take minutes if the upstream model is queued/slow, and produces zero
+    output until it resolves. Without a heartbeat, clients (e.g. Portal Desktop)
+    have no way to distinguish "still working" from "hung".
+    """
+    raw = (os.getenv("CODER_HEARTBEAT_INTERVAL_SECONDS") or "8").strip()
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 8.0
+
+
+async def _call_llm_step_with_heartbeat(
+    llm_messages: list[dict[str, Any]],
+    model: str | None,
+    *,
+    provider: str | None = None,
+    max_tokens: int | None = None,
+) -> AsyncIterator[tuple[str, dict[str, Any] | tuple[dict[str, Any], dict[str, Any] | None]]]:
+    """Wrap ``_call_llm_step``, yielding ``("heartbeat", {...})`` while it runs.
+
+    The final item is always ``("result", (message, usage))``.
+    """
+    task = asyncio.ensure_future(
+        _call_llm_step(llm_messages, model, provider=provider, max_tokens=max_tokens)
+    )
+    interval = _heartbeat_interval_seconds()
+    waited = 0.0
+    while True:
+        done, _pending = await asyncio.wait({task}, timeout=interval)
+        if task in done:
+            yield "result", task.result()
+            return
+        waited += interval
+        yield "heartbeat", {"waited_seconds": round(waited, 1)}
+
+
+def _compose_system_prompt(mode_instruction: str | None = None) -> str:
+    extra = (mode_instruction or "").strip()
+    if not extra:
+        return CODER_SYSTEM_PROMPT
+    return f"{CODER_SYSTEM_PROMPT}\n\n{extra}"
+
+
+def _unwrap_legacy_wrapped_user_message(message: str) -> str:
+    for label in _LEGACY_MODE_LABELS:
+        prefix = f"[{label} mode]\n"
+        if not message.startswith(prefix):
+            continue
+        rest = message[len(prefix) :]
+        if "\n\n" in rest:
+            return rest.split("\n\n", 1)[1]
+    return message
+
+
+def _extract_legacy_mode_instruction(message: str) -> str | None:
+    for label in _LEGACY_MODE_LABELS:
+        prefix = f"[{label} mode]\n"
+        if not message.startswith(prefix):
+            continue
+        rest = message[len(prefix) :]
+        if "\n\n" in rest:
+            instruction = rest.split("\n\n", 1)[0].strip()
+            return instruction or None
+    return None
+
+
+def _resolve_user_turn(
+    message: str, mode_instruction: str | None
+) -> tuple[str, str | None]:
+    """Return persisted user text and the system prompt mode addendum."""
+    explicit = (mode_instruction or "").strip() or None
+    if explicit:
+        return message, explicit
+    unwrapped = _unwrap_legacy_wrapped_user_message(message)
+    if unwrapped != message:
+        return unwrapped, _extract_legacy_mode_instruction(message)
+    return message, None
+
+
+def _system_prompt_from_messages(llm_messages: list[dict[str, Any]]) -> str:
+    for m in llm_messages:
+        if m.get("role") == "system":
+            return str(m.get("content") or CODER_SYSTEM_PROMPT)
+    return CODER_SYSTEM_PROMPT
 
 
 def _default_workspace_root() -> str | None:
@@ -152,7 +248,7 @@ def list_threads(session: Session) -> list[dict[str, Any]]:
 def _coder_context_usage(llm_messages: list[dict[str, Any]]) -> ContextUsageOut:
     conversation = [m for m in llm_messages if m.get("role") != "system"]
     return estimate_context_usage(
-        system_prompt=CODER_SYSTEM_PROMPT,
+        system_prompt=_system_prompt_from_messages(llm_messages),
         tools=TOOL_SPECS,
         conversation_messages=conversation,
     )
@@ -185,9 +281,13 @@ def delete_thread(session: Session, thread_id: int) -> None:
     session.commit()
 
 
-def _llm_messages_from_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _llm_messages_from_history(
+    history: list[dict[str, Any]],
+    *,
+    mode_instruction: str | None = None,
+) -> list[dict[str, Any]]:
     llm_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": CODER_SYSTEM_PROMPT}
+        {"role": "system", "content": _compose_system_prompt(mode_instruction)}
     ]
     for h in history:
         role = h.get("role", "user")
@@ -200,8 +300,13 @@ def _llm_messages_from_history(history: list[dict[str, Any]]) -> list[dict[str, 
     return llm_messages
 
 
-def _build_llm_messages(history: list[dict[str, Any]], message: str) -> list[dict[str, Any]]:
-    llm_messages = _llm_messages_from_history(history)
+def _build_llm_messages(
+    history: list[dict[str, Any]],
+    message: str,
+    *,
+    mode_instruction: str | None = None,
+) -> list[dict[str, Any]]:
+    llm_messages = _llm_messages_from_history(history, mode_instruction=mode_instruction)
     llm_messages.append({"role": "user", "content": message})
     return llm_messages
 
@@ -278,6 +383,7 @@ async def _call_llm_step(
     payload: dict[str, Any] = {
         "messages": fitted,
         "tools": TOOL_SPECS,
+        "tool_choice": "auto",
         "max_tokens": max_tokens if max_tokens is not None else max_output_tokens_default(),
     }
     sm = sanitize_llm_model_alias(model) if model else None
@@ -286,6 +392,11 @@ async def _call_llm_step(
     prov = _normalize_provider(provider)
     if prov:
         payload["provider"] = prov
+
+    effective_model = sm or (model.strip() if isinstance(model, str) and model.strip() else "")
+    if effective_model:
+        effective_provider = prov or get_resolved_defaults()["provider"]
+        await ensure_chat_request_supported(effective_provider, effective_model, payload)
 
     base = llm_proxy_base_url_v1()
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
@@ -341,14 +452,26 @@ async def run_agent_turn(
     step_num = 0
     for _ in range(_max_iterations()):
         if calls is None:
-            message, usage = await _call_llm_step(
+            message: dict[str, Any] = {}
+            usage: dict[str, Any] | None = None
+            async for kind, payload in _call_llm_step_with_heartbeat(
                 llm_messages, model, provider=provider, max_tokens=max_tokens
-            )
+            ):
+                if kind == "heartbeat":
+                    yield "heartbeat", payload
+                else:
+                    message, usage = payload
             step_num += 1
             step_usage = parse_llm_usage_dict(usage, label=f"agent_step_{step_num}")
             usage_steps.append(step_usage)
             content = message.get("content") or ""
+            if not isinstance(content, str):
+                content = str(content)
             calls = _parse_tool_calls(message)
+            if not calls and content:
+                calls = parse_leaked_tool_calls(content)
+                if calls:
+                    content = strip_leaked_tool_syntax(content)
 
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": content}
             if calls:
@@ -357,6 +480,12 @@ async def run_agent_turn(
                 assistant_msg["usage"] = usage
             llm_messages.append(assistant_msg)
             new_history.append(assistant_msg)
+
+            # Reasoning the model wrote before deciding to call a tool. Surface it
+            # now so clients show "why" before the (possibly slow) tool runs,
+            # instead of dropping it into history unseen until the turn ends.
+            if calls and content.strip():
+                yield "assistant", {"content": content}
 
             if not calls:
                 turn_usage = merge_llm_usages(usage_steps)
@@ -457,6 +586,8 @@ async def send_message(
     max_tokens: int | None = None,
     client_id: str | None = None,
     delegate_tools: bool = False,
+    mode_instruction: str | None = None,
+    agent_mode: str | None = None,
 ) -> dict[str, Any]:
     """Non-streaming agent run: executes the full turn, returns the persisted thread.
 
@@ -488,7 +619,9 @@ async def send_message(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     history = thread.get_messages()
-    llm_messages = _build_llm_messages(history, message)
+    user_text, mode_addon = _resolve_user_turn(message, mode_instruction)
+    _ = agent_mode  # reserved for telemetry / future routing
+    llm_messages = _build_llm_messages(history, user_text, mode_instruction=mode_addon)
     context_usage = _coder_context_usage(llm_messages)
     new_history: list[dict[str, Any]] = []
     pending_out: list[dict[str, Any]] = []
@@ -509,7 +642,7 @@ async def send_message(
 
     turn_usage = merge_llm_usages(usage_steps) if usage_steps else LlmUsageOut()
 
-    history.append({"role": "user", "content": message})
+    history.append({"role": "user", "content": user_text})
     history.extend(new_history)
     thread.set_messages(history)
     thread.set_pending_call(pending_out[0] if pending_out else None)
@@ -550,6 +683,8 @@ async def stream_message(
     max_tokens: int | None = None,
     client_id: str | None = None,
     delegate_tools: bool = False,
+    mode_instruction: str | None = None,
+    agent_mode: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream one agent turn as SSE: tool_call / tool_result / approval_required / assistant / done / error.
 
@@ -592,7 +727,11 @@ async def stream_message(
                 return
 
             history = thread.get_messages()
-            llm_messages = _build_llm_messages(history, message)
+            user_text, mode_addon = _resolve_user_turn(message, mode_instruction)
+            _ = agent_mode
+            llm_messages = _build_llm_messages(
+                history, user_text, mode_instruction=mode_addon
+            )
             context_usage = _coder_context_usage(llm_messages)
             new_history: list[dict[str, Any]] = []
             pending_out: list[dict[str, Any]] = []
@@ -604,7 +743,7 @@ async def stream_message(
                 if persisted:
                     return
                 persisted = True
-                history.append({"role": "user", "content": message})
+                history.append({"role": "user", "content": user_text})
                 history.extend(new_history)
                 thread.set_messages(history)
                 thread.set_pending_call(pending_out[0] if pending_out else None)
@@ -681,6 +820,8 @@ async def stream_retry(
     max_tokens: int | None = None,
     client_id: str | None = None,
     delegate_tools: bool = False,
+    mode_instruction: str | None = None,
+    agent_mode: str | None = None,
 ) -> AsyncIterator[str]:
     """Re-run the agent turn after the last user message without appending a new one."""
     key = llm_proxy_master_key()
@@ -717,7 +858,10 @@ async def stream_retry(
                 yield _sse("error", {"detail": str(e)})
                 return
 
-            llm_messages = _llm_messages_from_history(truncated)
+            _ = agent_mode
+            llm_messages = _llm_messages_from_history(
+                truncated, mode_instruction=mode_instruction
+            )
             context_usage = _coder_context_usage(llm_messages)
             new_history: list[dict[str, Any]] = []
             pending_out: list[dict[str, Any]] = []
@@ -817,6 +961,8 @@ async def resolve_pending_call(
     max_tokens: int | None = None,
     client_id: str | None = None,
     delegate_tools: bool = False,
+    mode_instruction: str | None = None,
+    agent_mode: str | None = None,
 ) -> AsyncIterator[str]:
     """Resolve a paused run_command approval and resume the agent turn as SSE.
 
@@ -860,7 +1006,10 @@ async def resolve_pending_call(
             return
 
         history = thread.get_messages()
-        llm_messages = _llm_messages_from_history(history)
+        _ = agent_mode
+        llm_messages = _llm_messages_from_history(
+            history, mode_instruction=mode_instruction
+        )
         context_usage = _coder_context_usage(llm_messages)
         new_history: list[dict[str, Any]] = []
         usage_steps: list[LlmStepUsageOut] = []

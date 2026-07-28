@@ -4,7 +4,7 @@ Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-co
 
 **Portfolio context:** Backend and canonical **Flow UI** live in this repo. UI workspace is under [`web/`](web/). One **`agent-platform`** image builds both; run mode is set with **`AGENT_PLATFORM_CONTAINER_MODE`** (`backend` | `ui` | `all`).
 
-- **API:** `http://127.0.0.1:18410` — OpenAPI at **`/docs`**, API guide at **`/api-guide`**
+- **API:** `http://127.0.0.1:18410` — OpenAPI at **`/docs`**, API guide at **`/api-guide`**, model build/train at **`/api/v1/model-ops/*`** ([`docs/model-ops-api.md`](docs/model-ops-api.md))
 - **Config UI:** `http://127.0.0.1:18410/config` — default provider, model, API keys, `config.yaml`
 - **Process demo:** `http://127.0.0.1:18410/ui` — minimal polling UI for `/processes`
 - **Flow UI (dev):** `http://127.0.0.1:3333/app/` — Vite dev server with API proxy

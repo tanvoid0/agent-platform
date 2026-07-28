@@ -83,6 +83,7 @@ class Process(SQLModel, table=True):
     client_id: Optional[str] = Field(default=None, max_length=256, index=True)
     # Set when started by a project-scoped API token, for per-token usage attribution.
     token_id: Optional[int] = Field(default=None, foreign_key="api_tokens.id", index=True)
+    model_build_job_id: Optional[int] = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=utc_now_naive)
     updated_at: datetime = Field(default_factory=utc_now_naive)
 

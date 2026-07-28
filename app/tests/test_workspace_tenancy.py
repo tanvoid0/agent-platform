@@ -245,6 +245,80 @@ def test_assistant_isolated_by_workspace(client, test_engine):
     assert c.get(f"/api/v1/assistant/dashboard?project_id={proj_b}", headers=h).status_code == 404
 
 
+def test_action_sets_isolated_by_workspace(client, test_engine):
+    """Action sets carry only a client_id; a workspace token must not read across it."""
+    c, *_ = client
+    ws_a = _create_workspace(c, "A", "a")
+    ws_b = _create_workspace(c, "B", "b")
+    ha = {"Authorization": f"Bearer {_create_token(c, ws_a)}"}
+    hb = {"Authorization": f"Bearer {_create_token(c, ws_b)}"}
+
+    set_b = c.post("/api/v1/action-sets", json={"name": "b-secret", "actions": []}, headers=hb)
+    assert set_b.status_code == 200, set_b.text
+    set_b_id = set_b.json()["id"]
+
+    assert c.get(f"/api/v1/action-sets/{set_b_id}", headers=hb).status_code == 200
+    assert c.get(f"/api/v1/action-sets/{set_b_id}", headers=ha).status_code == 403
+    assert c.delete(f"/api/v1/action-sets/{set_b_id}", headers=ha).status_code == 403
+
+    names_a = {s["name"] for s in c.get("/api/v1/action-sets", headers=ha).json()["action_sets"]}
+    assert "b-secret" not in names_a
+    # Seeded sets have no owner and stay shared with every tenant.
+    assert "todo-board-ops" in names_a
+
+
+def test_workspace_token_cannot_reach_server_config(client, test_engine):
+    """A tenant credential must not read or rewrite the server's own .env/config.yaml."""
+    c, *_ = client
+    ws_a = _create_workspace(c, "A", "a")
+    h = {"Authorization": f"Bearer {_create_token(c, ws_a)}"}
+
+    assert c.get("/api/v1/llm-proxy/env", headers=h).status_code == 403
+    assert c.get("/api/v1/llm-proxy/snippet", headers=h).status_code == 403
+    assert c.get("/api/v1/llm-proxy/config-yaml", headers=h).status_code == 403
+    assert (
+        c.post("/api/v1/llm-proxy/env", json={"DEFAULT_MODEL": "x"}, headers=h).status_code == 403
+    )
+    assert (
+        c.post(
+            "/api/v1/llm-proxy/config-yaml", json={"content": "version: 1\n"}, headers=h
+        ).status_code
+        == 403
+    )
+    # The model catalog stays reachable so a tenant UI can still render its picker.
+    assert c.get("/api/v1/llm-proxy/ui/providers", headers=h).status_code == 200
+
+
+def test_assistant_id_addressed_writes_isolated_by_workspace(client, test_engine):
+    """Routes taking a bare item/review id must resolve the owner, not trust the id."""
+    c, *_ = client
+    ws_a = _create_workspace(c, "A", "a")
+    ws_b = _create_workspace(c, "B", "b")
+    proj_b = _create_project(c, ws_b, "pb")
+    board_b = c.post(
+        f"/api/v1/todos/boards?project_id={proj_b}",
+        json={"name": "BoardB"},
+        headers=_master_headers(),
+    ).json()["id"]
+    item_b = c.post(
+        f"/api/v1/todos/boards/{board_b}/items",
+        json={"title": "secret"},
+        headers=_master_headers(),
+    ).json()["id"]
+    token_a = _create_token(c, ws_a)
+    h = {"Authorization": f"Bearer {token_a}"}
+
+    assert (
+        c.post(f"/api/v1/assistant/items/{item_b}/complete", json={}, headers=h).status_code == 404
+    )
+    # Review ids resolve through their project; a missing one must not leak either.
+    assert (
+        c.post(f"/api/v1/assistant/reviews/1/apply", json={"actions": []}, headers=h).status_code
+        == 404
+    )
+    assert c.post(f"/api/v1/assistant/reviews/1/dismiss", headers=h).status_code == 404
+
+
 def test_todos_board_isolated_by_workspace(client, test_engine):
     c, *_ = client
     ws_a = _create_workspace(c, "A", "a")

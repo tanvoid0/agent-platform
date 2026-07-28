@@ -61,13 +61,22 @@ export function AppTopNav({ committedProcessId, className }: AppTopNavProps) {
   const isProcessWorkspace = isProcessWorkspacePath(location.pathname);
   const isTeams = location.pathname === "/teams" || location.pathname.startsWith("/teams/");
   const isProjects = location.pathname === "/projects" || location.pathname.startsWith("/projects/");
+  const isModels = location.pathname === "/models" || location.pathname.startsWith("/models/");
 
-  const title = isTeams ? "Teams" : isProjects ? "Projects" : "Team / DAG";
-  const description = isTeams
-    ? "Templates for planner roster hints"
-    : isProjects
-      ? "Group processes into workspaces"
-      : "React Flow · TanStack Query + SSE";
+  const title = isModels
+    ? "Models"
+    : isTeams
+      ? "Teams"
+      : isProjects
+        ? "Projects"
+        : "Team / DAG";
+  const description = isModels
+    ? "Build, train, and manage Ollama models"
+    : isTeams
+      ? "Templates for planner roster hints"
+      : isProjects
+        ? "Group processes into workspaces"
+        : "React Flow · TanStack Query + SSE";
 
   return (
     <header
@@ -100,6 +109,9 @@ export function AppTopNav({ committedProcessId, className }: AppTopNavProps) {
             </NavLink>
             <NavLink to="/projects" className={navLinkClass}>
               Projects
+            </NavLink>
+            <NavLink to="/models" className={navLinkClass}>
+              Models
             </NavLink>
           </div>
 

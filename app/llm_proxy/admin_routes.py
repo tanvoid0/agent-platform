@@ -10,9 +10,11 @@ from typing import Any
 import httpx
 import yaml
 from jsonschema import Draft202012Validator, ValidationError
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
+
+from api_tokens.auth import require_master_key
 
 from llm_proxy.core.config_cache import (
     env_file_path,
@@ -45,6 +47,8 @@ from llm_proxy.services.provider_catalog import (
     get_provider_catalog_entry,
     get_resolved_defaults,
 )
+from llm_proxy_env import llm_proxy_master_key
+from platform_config import resolved_config_dir
 from llm_proxy.services.upstream_http import (
     aclose_stream,
     classify_httpx_error,
@@ -54,7 +58,6 @@ from llm_proxy.services.upstream_http import (
     stream_chat_completion,
 )
 
-CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/data"))
 PROXY_INTERNAL_URL = os.environ.get("ORCHESTRATOR_INTERNAL_URL", "http://127.0.0.1:18410").rstrip("/")
 
 MASTER_KEY_ENV = "AGENT_PLATFORM_MASTER_KEY"
@@ -72,6 +75,11 @@ ENV_KEYS = [
 ]
 
 router = APIRouter(tags=["llm-proxy-admin"])
+
+# Server-wide configuration: readable and writable only with the master key. The
+# model-catalog routes below stay open to workspace tokens so a tenant UI can still
+# render its model picker.
+_operator_only = [Depends(require_master_key)]
 
 
 def _mask_secret(value: str) -> str:
@@ -107,7 +115,14 @@ def _write_env_file(values: dict[str, str]) -> None:
 
 
 def master_key_from_env(env: dict[str, str]) -> str:
-    return (env.get(MASTER_KEY_ENV) or "").strip()
+    """CONFIG_DIR/.env wins (live-editable, no restart); process env is the fallback.
+
+    Without the fallback every self-call below sends `Authorization: Bearer `,
+    which h11 rejects as an illegal header value, whenever the master key comes
+    from the process environment (compose `env_file`, repo `.env`) instead of
+    having been saved through the config UI.
+    """
+    return (env.get(MASTER_KEY_ENV) or "").strip() or llm_proxy_master_key()
 
 
 def _config_yaml_defaults() -> dict[str, str]:
@@ -138,7 +153,7 @@ def _pick_default_model_from_list(models: list[str], env: dict[str, str]) -> str
 
 def _config_schema_path() -> Path | None:
     candidates = [
-        CONFIG_DIR / "config.schema.json",
+        resolved_config_dir() / "config.schema.json",
         Path(__file__).resolve().parent / "config.schema.json",
         Path(__file__).resolve().parent.parent / "config.schema.json",
     ]
@@ -461,7 +476,7 @@ def _public_base() -> str:
     return os.environ.get("PROXY_PUBLIC_URL", "http://127.0.0.1:18410").rstrip("/")
 
 
-@router.get("/snippet")
+@router.get("/snippet", dependencies=_operator_only)
 async def integration_snippet() -> dict[str, str]:
     """OpenAI-compatible client wiring (no secrets)."""
     env = read_env_file_parsed()
@@ -475,7 +490,7 @@ async def integration_snippet() -> dict[str, str]:
     return {"public_base": public_base, "snippet": snippet}
 
 
-@router.get("/env")
+@router.get("/env", dependencies=_operator_only)
 async def api_env() -> dict:
     env = read_env_file_parsed()
     out: dict[str, object] = {}
@@ -497,7 +512,7 @@ async def api_env() -> dict:
     }
 
 
-@router.post("/env")
+@router.post("/env", dependencies=_operator_only)
 async def api_env_update(body: EnvUpdate) -> dict:
     existing = read_env_file_parsed()
     merged = dict(existing)
@@ -517,7 +532,7 @@ async def api_env_update(body: EnvUpdate) -> dict:
     }
 
 
-@router.get("/config-yaml")
+@router.get("/config-yaml", dependencies=_operator_only)
 async def api_get_yaml() -> dict:
     yp = resolved_config_yaml_path()
     if not yp.is_file():
@@ -525,7 +540,7 @@ async def api_get_yaml() -> dict:
     return {"content": yp.read_text(encoding="utf-8")}
 
 
-@router.post("/config-yaml")
+@router.post("/config-yaml", dependencies=_operator_only)
 async def api_post_yaml(body: ConfigYamlBody) -> dict:
     try:
         parsed = yaml.safe_load(body.content)

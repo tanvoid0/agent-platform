@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from llm_proxy.core.capabilities import modality_map
 from llm_proxy.core.config_cache import load_config_yaml_dict, read_env_file_parsed, read_llm_proxy_ui_fallbacks
 from llm_proxy.core.errors import LlmProxyError
+from llm_proxy.services.model_capabilities import enrich_model_rows, provider_default_capabilities
 from llm_proxy.core.provider_config import (
     PROVIDER_LABELS,
     SUPPORTED_PROVIDER_IDS,
@@ -425,6 +426,7 @@ async def build_v1_provider_catalog(
     *,
     allowed_providers: set[str] | None,
     include_live: bool = True,
+    probe_capabilities: bool = True,
 ) -> dict[str, Any]:
     """OpenAI-style provider registry for ``GET /v1/catalog``."""
     aliases_by_provider = _model_aliases_by_provider()
@@ -444,11 +446,23 @@ async def build_v1_provider_catalog(
         if configured and include_live:
             if provider == "ollama":
                 models, reachable = await _fetch_ollama_tag_entries()
+                if models:
+                    await enrich_model_rows(
+                        provider,
+                        models,
+                        probe=probe_capabilities,
+                        ollama_base=ollama_api_base(),
+                    )
             else:
                 discovered, _source = await _fetch_provider_models(provider)
                 reachable = bool(discovered)
                 if discovered:
                     models = [{"id": model_id, "source": "live"} for model_id in discovered]
+                    await enrich_model_rows(provider, models, probe=probe_capabilities)
+
+        if models and "capabilities" not in models[0]:
+            for row in models:
+                row["capabilities"] = provider_default_capabilities(provider)
 
         if not models:
             models = _alias_model_rows(aliases)

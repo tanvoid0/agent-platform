@@ -18,6 +18,11 @@ These routes were chosen because a shape change here would break the current UI 
 8. `GET /api/v1/todos/boards`
 9. `GET /api/v1/todos/boards/{id}`
 10. `GET /workspaces/`, `GET /me/workspace`, and workspace-scoped `GET /projects/`
+11. `GET /api/v1/model-ops/projects`
+12. `POST /api/v1/model-ops/jobs`
+13. `GET /api/v1/model-ops/jobs/{id}`
+14. `GET /api/v1/model-ops/registry`
+15. `GET /api/v1/model-ops/ollama/models`
 
 ## Compatibility expectations
 
@@ -51,4 +56,4 @@ The current contract suite lives in:
 - `app/tests/test_v1_catalog.py`
 - `app/tests/test_teams_api.py`
 - `app/tests/test_todos_api.py`
-- `app/tests/test_workspace_tenancy.py`
+- `app/tests/test_model_ops_api.py`

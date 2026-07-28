@@ -105,5 +105,33 @@ with httpx.Client(base_url=BASE, headers=H, timeout=60) as c:
 ## Further reading
 
 - [API_WORKSPACE_SCOPING.md](./API_WORKSPACE_SCOPING.md) — isolation rules and endpoint reference
+- [model-ops-api.md](./model-ops-api.md) — build/train custom Ollama models (LoRA pipeline)
 - `/api-guide` — in-app HTTP guide
 - `scripts/external_microservice_example.py` — runnable orchestration sample
+- `scripts/model_ops_client_example.py` — runnable model build sample
+
+## Model build / train
+
+Agent Platform owns LoRA training and Ollama deployment. External apps upload knowledge and start jobs; they consume trained models via `/v1`.
+
+```python
+import os, time, httpx
+
+BASE = os.environ["AGENT_PLATFORM_BASE_URL"]
+TOKEN = os.environ["AGENT_PLATFORM_TOKEN"]
+H = {"Authorization": f"Bearer {TOKEN}"}
+
+with httpx.Client(base_url=BASE, headers=H, timeout=120) as c:
+    c.post("/api/v1/model-ops/projects", json={"name": "my-coach", "ollama_tag": "my-coach"})
+    job = c.post("/api/v1/model-ops/jobs", json={
+        "project": "my-coach",
+        "stages": ["prepare", "export", "eval"],
+        "offline_eval": True,
+    }).json()
+    while job["status"] in ("pending", "running"):
+        time.sleep(2)
+        job = c.get(f"/api/v1/model-ops/jobs/{job['id']}").json()
+    print("job:", job["status"], job.get("result"))
+    # Chat with the new model via embedded proxy:
+    # POST /v1/chat/completions with model=my-coach
+```

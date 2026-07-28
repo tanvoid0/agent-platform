@@ -1,0 +1,40 @@
+# GPU training worker profile — extends the default stack.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.train.yml --profile train up --build
+#
+# Requires NVIDIA Container Toolkit on the host for GPU access.
+
+services:
+  train:
+    profiles: ["train"]
+    image: agent-platform-train:${AGENT_PLATFORM_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.train
+    entrypoint: ["sleep", "infinity"]
+    environment:
+      AGENT_PLATFORM_CONTAINER_MODE: train
+      DATABASE_URL: ""
+      AGENT_PLATFORM_DB_PATH: /app/data/agent_platform.db
+      CONFIG_DIR: /app/data/llm
+      CONFIG_PATH: /app/data/llm/config.yaml
+      MODEL_OPS_DATA_DIR: /app/data/llm/model_ops
+      MODEL_OPS_GPU_SUBPROCESS: "0"
+      OLLAMA_API_BASE: ${OLLAMA_API_BASE:-http://host.docker.internal:11434}
+    env_file:
+      - .env
+    volumes:
+      - agent_platform_data:/app/data
+      - ./app:/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: "no"
+
+volumes:
+  agent_platform_data:

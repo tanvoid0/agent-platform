@@ -59,7 +59,26 @@
       <li><strong>File sandbox</strong> — <code>/api/v1/projects/{project_id}/files/…</code> — list/read/write files under the server’s project sandbox; legacy alias <code>…/workspace/…</code>.</li>
       <li><strong>Team templates</strong> — <code>GET/POST /api/v1/teams</code>, <code>GET/PATCH/DELETE /api/v1/teams/{id}</code> — define planner rosters; pass <code>team_template_id</code> when starting a process.</li>
       <li><strong>LLM proxy (admin)</strong> — <code>/api/v1/llm-proxy/*</code> — read/update <code>config.yaml</code>, env, and catalog helpers; same auth as other <code>/api/v1</code> routes when the master key is set.</li>
+      <li><strong>Model ops (build / train)</strong> — <code>/api/v1/model-ops/*</code> — LoRA training pipeline, Ollama lifecycle (pull/create/show/delete), project registry, and async build jobs. Requires scopes <code>model:read</code> / <code>model:write</code>. See <a href="/docs#/model-ops">OpenAPI → model-ops</a> and repo doc <code>docs/model-ops-api.md</code>. Set <code>MODEL_OPS_DATA_DIR</code> for project artifacts; GPU host needed for <code>train</code> stage.</li>
     </ul>
+  </details>
+
+  <details open>
+    <summary>Model ops (build / train)</summary>
+    <p>Agent Platform owns the full path: knowledge → dataset → LoRA train → Ollama export → eval. Domain apps (e.g. wingbot) upload knowledge and trigger jobs; inference uses <code>/v1/chat/completions</code> with the trained tag.</p>
+    <ul>
+      <li><code>GET/POST /api/v1/model-ops/projects</code> — list / create training projects (from template).</li>
+      <li><code>POST /api/v1/model-ops/projects/{name}/knowledge</code> — multipart upload of knowledge pack files.</li>
+      <li><code>POST /api/v1/model-ops/jobs</code> — start build job: <code>{"project":"my-app","stages":["prepare","train","export","eval"]}</code>.</li>
+      <li><code>GET /api/v1/model-ops/jobs/{id}</code> — poll status; <code>GET …/stream</code> — SSE log tail.</li>
+      <li><code>POST /api/v1/model-ops/operations/build</code> — <code>model.build</code> orchestration contract (returns <code>job_id</code>, <code>poll_url</code>).</li>
+      <li><code>GET /api/v1/model-ops/registry</code> — trained model versions; <code>POST …/registry/{id}/activate</code> — promote active tag.</li>
+      <li><code>GET/POST/DELETE /api/v1/model-ops/ollama/models</code> — Ollama lifecycle proxy (tags, pull, create, delete).</li>
+      <li><code>POST /api/v1/model-ops/ollama/models/copy</code> — copy tag (async by default).</li>
+      <li><code>POST /api/v1/model-ops/ollama/jobs</code> — enqueue pull/copy as tracked jobs.</li>
+      <li>Flow UI panel: <a href="/app/models">/app/models</a></li>
+    </ul>
+    <p class="muted">Full client guide: <code>docs/model-ops-api.md</code> in the repository. Runnable sample: <code>scripts/model_ops_client_example.py</code>.</p>
   </details>
 
   <details>

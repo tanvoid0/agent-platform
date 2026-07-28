@@ -25,6 +25,7 @@ import {
   type ViewMode,
 } from "../lib/processWorkspaceRoutes";
 import { projectTagFromGoal, uniqueSortedProjectTags } from "../lib/projectGoalTag";
+import type { ProcessListProjectFilter } from "../api/types";
 import { Button } from "@/components/ui/button";
 import {
   Card,

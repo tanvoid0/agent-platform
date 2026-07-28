@@ -17,22 +17,24 @@ logger = logging.getLogger("llm_proxy")
 ERROR_TYPE = "llm_proxy_error"
 
 
-_PLATFORM_JSON_API_PREFIXES = (
-    "/v1",
-    "/api/v1",
-    "/projects",
-    "/processes",
-    "/teams",
-    "/action-sets",
-    "/sessions",
+# Browser-facing pages served by this process. Everything else is a JSON API and
+# gets the wrapped error envelope — listing the HTML routes instead of the API
+# prefixes means a newly mounted router cannot silently fall back to FastAPI's
+# bare `{"detail": ...}`, which is how the legacy root mounts (/workspaces,
+# /me/workspace, /api-tokens) drifted away from their /api/v1 twins.
+_HTML_PAGE_PATHS = frozenset(
+    {"/", "/config", "/ui", "/tokens", "/api-guide", "/docs", "/redoc", "/openapi.json"}
 )
+_HTML_PAGE_PREFIXES = ("/app", "/static", "/assets")
 
 
 def wants_wrapped_json_errors(request: Request) -> bool:
     path = request.url.path
-    # OpenAI-compatible /v1 and Agent Platform REST — return JSON 500s so CORS middleware can attach headers.
-    if any(path.startswith(prefix) for prefix in _PLATFORM_JSON_API_PREFIXES):
-        return True
+    if path in _HTML_PAGE_PATHS or path.startswith(_HTML_PAGE_PREFIXES):
+        accept = (request.headers.get("accept") or "").lower()
+        return "application/json" in accept
+    # JSON 500s let the CORS middleware attach headers, which bare HTML errors lose.
+    return True
     accept = (request.headers.get("accept") or "").lower()
     return "application/json" in accept
 

@@ -1,0 +1,18 @@
+# GPU training image — extends backend with torch + model_ops train deps.
+FROM agent-platform:latest AS base
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY app/model_ops/requirements-train.txt /tmp/requirements-train.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-train.txt \
+    && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128 || \
+       pip install --no-cache-dir torch
+
+ENV MODEL_OPS_GPU_SUBPROCESS=0
+
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

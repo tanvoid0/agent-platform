@@ -91,6 +91,13 @@ def _fake_llm_sequence(monkeypatch, responses: list[dict]):
         def json(self):
             return self._body
 
+    class FakeShowResp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"capabilities": ["completion", "tools"]}
+
     class FakeClient:
         async def __aenter__(self):
             return self
@@ -99,6 +106,10 @@ def _fake_llm_sequence(monkeypatch, responses: list[dict]):
             return None
 
         async def post(self, url, headers=None, json=None):
+            # The agent turn probes Ollama for per-model capabilities before it
+            # sends tools; answer it here so the scripted chat sequence stays aligned.
+            if "/api/show" in url:
+                return FakeShowResp()
             assert "/chat/completions" in url
             captured_payloads.append(json)
             item = remaining.pop(0)
@@ -171,10 +182,12 @@ def test_coder_stream_executes_tools_and_persists(client, monkeypatch, test_engi
     events = _parse_sse(r.text)
     kinds = [e[0] for e in events]
     assert kinds == ["tool_call", "tool_result", "assistant", "done"]
-    assert events[0][1] == {
-        "name": "write_file",
-        "arguments": {"path": "hello.txt", "content": "hello world"},
+    assert events[0][1]["name"] == "write_file"
+    assert events[0][1]["arguments"] == {
+        "path": "hello.txt",
+        "content": "hello world",
     }
+    assert events[0][1]["call_id"] == "call_1"
     assert "hello.txt" in events[1][1]["content"]
     assert events[2][1]["content"] == "Created hello.txt with a greeting."
 
@@ -197,6 +210,49 @@ def test_coder_stream_executes_tools_and_persists(client, monkeypatch, test_engi
         rows = session.exec(select(CoderChatThread)).all()
         assert len(rows) == 1
         assert rows[0].workspace_root == str(tmp_path.resolve())
+
+
+def test_coder_stream_recovers_leaked_tool_syntax(client, monkeypatch, test_engine, tmp_path):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "test-key")
+    auth = {"Authorization": "Bearer test-key"}
+    (tmp_path / "hello.txt").write_text("hello world", encoding="utf-8")
+
+    _fake_llm_sequence(
+        monkeypatch,
+        [
+            {"content": 'Checking <function=read_file>{"path": "hello.txt"}'},
+            {"content": "The file contains a greeting."},
+        ],
+    )
+
+    created = c.post(
+        "/api/v1/coder/chat/threads",
+        json={"workspace_root": str(tmp_path)},
+        headers=auth,
+    )
+    assert created.status_code == 200
+    thread_id = created.json()["thread_id"]
+
+    r = c.post(
+        "/api/v1/coder/chat/stream",
+        json={"message": "Read hello.txt", "thread_id": thread_id, "model": "test-model"},
+        headers=auth,
+    )
+    assert r.status_code == 200
+
+    events = _parse_sse(r.text)
+    kinds = [e[0] for e in events]
+    # Reasoning left after stripping the leaked <function=...> syntax is surfaced
+    # as an assistant event before the recovered tool call runs.
+    assert kinds == ["assistant", "tool_call", "tool_result", "assistant", "done"]
+    assert events[0][1]["content"] == "Checking"
+    assert "<function=" not in events[0][1]["content"]
+    assert events[1][1]["name"] == "read_file"
+    assert events[1][1]["arguments"] == {"path": "hello.txt"}
+    assert "hello world" in events[2][1]["content"]
+    assert events[3][1]["content"] == "The file contains a greeting."
+    assert "<function=" not in events[3][1]["content"]
 
 
 def test_coder_send_multi_step(client, monkeypatch, test_engine, tmp_path):
@@ -623,3 +679,43 @@ def test_coder_stream_portal_desktop_header_skips_server_workspace_check(
     events = _parse_sse(r.text)
     assert events[0][0] != "error"
     assert [e[0] for e in events] == ["assistant", "done"]
+
+
+def test_coder_stream_mode_instruction_in_system_prompt(client, monkeypatch, test_engine, tmp_path):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "test-key")
+    auth = {"Authorization": "Bearer test-key"}
+
+    payloads = _fake_llm_sequence(monkeypatch, [{"content": "Hi there."}])
+
+    created = c.post(
+        "/api/v1/coder/chat/threads",
+        json={"workspace_root": str(tmp_path)},
+        headers=auth,
+    )
+    thread_id = created.json()["thread_id"]
+
+    mode_instruction = (
+        "You are in Auto mode. Choose the best strategy for the user's request."
+    )
+    r = c.post(
+        "/api/v1/coder/chat/stream",
+        json={
+            "message": "Hello",
+            "thread_id": thread_id,
+            "mode_instruction": mode_instruction,
+            "agent_mode": "auto",
+        },
+        headers=auth,
+    )
+    assert r.status_code == 200
+
+    events = _parse_sse(r.text)
+    done = events[-1][1]
+    assert done["messages"][0] == {"role": "user", "content": "Hello"}
+
+    system = payloads[0]["messages"][0]
+    assert system["role"] == "system"
+    assert mode_instruction in system["content"]
+    user_turns = [m for m in payloads[0]["messages"] if m["role"] == "user"]
+    assert user_turns == [{"role": "user", "content": "Hello"}]

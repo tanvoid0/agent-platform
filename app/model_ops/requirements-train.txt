@@ -1,0 +1,12 @@
+# Optional GPU training dependencies — install on train worker only.
+# pip install torch --index-url https://download.pytorch.org/whl/cu128
+# pip install -r app/model_ops/requirements-train.txt
+
+pyyaml>=6.0
+jsonschema>=4.21
+transformers>=4.45.0
+datasets>=2.18.0
+peft>=0.13.0
+trl>=0.11.0
+accelerate>=0.34.0
+bitsandbytes>=0.44.0; platform_system != "Darwin"

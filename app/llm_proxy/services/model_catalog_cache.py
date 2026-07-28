@@ -133,6 +133,10 @@ class ModelCatalogCache:
             return 0
         return time.time() - self._ollama_tags_updated_at
 
+    async def refresh_ollama_now(self) -> None:
+        """Immediately refresh Ollama tags (e.g. after model create/delete)."""
+        await self._refresh_ollama_tags()
+
     def lm_studio_models_age_sec(self) -> float:
         """Seconds since last successful LM Studio models fetch. 0 if never fetched."""
         if not self._lm_studio_models_updated_at:
