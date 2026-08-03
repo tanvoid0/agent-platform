@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -313,12 +314,18 @@ async def _fetch_provider_models(provider: str) -> tuple[list[str] | None, str |
     if provider == "ollama":
         return await _fetch_ollama_models(), "ollama_tags"
     if provider == "lm_studio":
-        models = await _fetch_lm_studio_openai_models()
-        if models:
-            return models, "lm_studio_models"
-        models = await _fetch_lm_studio_native_models()
-        if models:
-            return models, "lm_studio_native_models"
+        # Both URLs live on the same host:port, so when LM Studio is not running
+        # the second probe only repeats the first one's connect wait. Probing
+        # together costs one spare local request when it *is* running, and halves
+        # the stall when it is not. The OpenAI shape still wins.
+        openai_models, native_models = await asyncio.gather(
+            _fetch_lm_studio_openai_models(),
+            _fetch_lm_studio_native_models(),
+        )
+        if openai_models:
+            return openai_models, "lm_studio_models"
+        if native_models:
+            return native_models, "lm_studio_native_models"
         return None, None
     if provider == "aimlapi" and aimlapi_configured():
         return (
@@ -505,12 +512,24 @@ async def build_provider_catalog(*, include_unconfigured: bool = True) -> dict[s
     persisted_defaults = get_persisted_defaults()
     providers: list[dict[str, Any]] = []
 
+    # Providers are independent, so they are probed together: serially, one
+    # unreachable provider added its full retry budget to every other provider's
+    # wait, and the caller is a status screen that renders nothing until this
+    # returns. Unconfigured providers are never probed at all.
+    configured_by_provider = {p: provider_configured(p) for p in SUPPORTED_PROVIDER_IDS}
+    probed = [p for p in SUPPORTED_PROVIDER_IDS if configured_by_provider[p]]
+    # Every fetcher swallows its own transport errors and returns None, so no
+    # single provider can fail the gather.
+    fetched = dict(
+        zip(probed, await asyncio.gather(*(_fetch_provider_models(p) for p in probed)))
+    )
+
     for provider in SUPPORTED_PROVIDER_IDS:
-        configured = provider_configured(provider)
+        configured = configured_by_provider[provider]
         if not include_unconfigured and not configured:
             continue
         aliases = aliases_by_provider.get(provider, [])
-        discovered, source = await _fetch_provider_models(provider) if configured else (None, None)
+        discovered, source = fetched.get(provider, (None, None))
         model_source = source
         warning: str | None = None
         fallback_note: str | None = None

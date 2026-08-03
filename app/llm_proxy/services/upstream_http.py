@@ -70,8 +70,29 @@ def classify_httpx_error(exc: httpx.RequestError, context: str = "") -> tuple[st
     return ("transport_error", f"Upstream request failed ({context}): {exc.__class__.__name__}: {safe_url}")
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _is_loopback_refusal(exc: httpx.RequestError) -> bool:
+    """A refused connect to localhost means nothing is listening on that port.
+
+    Ollama and LM Studio are addressed as loopback, so when one of them is not
+    running every probe burns its whole retry budget waiting for a local app to
+    start inside a few hundred milliseconds. It will not. Remote hosts keep
+    retrying: there, a refusal really can be a transient LB or restart.
+    """
+    if not isinstance(exc, httpx.ConnectError):
+        return False
+    try:
+        return (exc.request.url.host or "") in _LOOPBACK_HOSTS
+    except (AttributeError, RuntimeError):
+        return False
+
+
 def should_retry_transport(exc: httpx.RequestError, attempt: int, max_attempts: int) -> bool:
     if attempt >= max_attempts - 1:
+        return False
+    if _is_loopback_refusal(exc):
         return False
     return isinstance(
         exc,
