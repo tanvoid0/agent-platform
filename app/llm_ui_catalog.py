@@ -1,8 +1,7 @@
 """
-Aggregate LLM provider status and model lists for the Flow UI (`GET /api/v1/llm/ui-catalog`).
+Aggregate LLM provider status and model lists (`GET /api/v1/llm/ui-catalog`).
 
 Chat model ids match the embedded proxy (YAML aliases + live Ollama / LM Studio lists).
-Gemini media defaults mirror `web/model-config.ts` so pickers stay consistent when the UI loads this API.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ from llm_proxy.services.provider_catalog import build_provider_catalog
 
 _PROVIDER_ORDER = SUPPORTED_PROVIDER_IDS
 
-# Gemini-only media defaults (keep in sync with web/model-config.ts gemini.*).
+# Gemini-only media defaults.
 _GEMINI_MEDIA: dict[str, dict[str, Any]] = {
     "image": {
         "default_model": "gemini-3.1-flash-image-preview",

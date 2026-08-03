@@ -4,22 +4,16 @@
 Checks:
 1) No tracked paths contain backslashes.
 2) No duplicate logical tracked paths after slash normalization.
-3) Frontend imports in `web/src` avoid parent-relative traversals (`../`).
 """
 
 from __future__ import annotations
 
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-WEB_SRC = REPO_ROOT / "web" / "src"
-IMPORT_RE = re.compile(
-    r"""(?:import|export)\s+(?:type\s+)?(?:[^'"]+from\s+)?["'](?P<spec>[^"']+)["']"""
-)
 
 
 def _tracked_paths() -> list[str]:
@@ -48,38 +42,14 @@ def check_git_paths() -> list[str]:
     return errors
 
 
-def check_web_imports() -> list[str]:
-    errors: list[str] = []
-    src_root = WEB_SRC
-    if not src_root.exists():
-        return errors
-    for file in src_root.rglob("*.ts*"):
-        text = file.read_text(encoding="utf-8")
-        for match in IMPORT_RE.finditer(text):
-            spec = match.group("spec")
-            if spec.startswith("../"):
-                rel = file.relative_to(REPO_ROOT).as_posix()
-                errors.append(f"Parent-relative import in {rel}: {spec}")
-    return errors
-
-
 def main() -> int:
     failures = check_git_paths()
-    warnings = check_web_imports()
     if not failures:
         print("Hygiene checks passed.")
-        if warnings:
-            print("Import-style warnings:")
-            for w in warnings:
-                print(f"- {w}")
         return 0
     print("Hygiene checks failed:")
     for f in failures:
         print(f"- {f}")
-    if warnings:
-        print("Import-style warnings:")
-        for w in warnings:
-            print(f"- {w}")
     return 1
 
 

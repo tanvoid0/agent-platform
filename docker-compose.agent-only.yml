@@ -1,4 +1,4 @@
-# Backend-only override for scripts and docs.
+# Alias for the default (backend-only) stack, kept for scripts and docs.
 #   docker compose -f docker-compose.agent-only.yml up --build
 
 services:
@@ -6,8 +6,6 @@ services:
     extends:
       file: docker-compose.yml
       service: server
-  client:
-    profiles: ["__off__"]
 
 volumes:
   agent_platform_data:

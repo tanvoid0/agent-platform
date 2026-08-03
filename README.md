@@ -2,13 +2,11 @@
 
 Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-compatible LLM proxy (`/v1/*` on the same process).
 
-**Portfolio context:** Backend and canonical **Flow UI** live in this repo. UI workspace is under [`web/`](web/). One **`agent-platform`** image builds both; run mode is set with **`AGENT_PLATFORM_CONTAINER_MODE`** (`backend` | `ui` | `all`).
+**Portfolio context:** The backend is the product. The UI is a native desktop app ([`desktop/`](desktop/), Rust + iced) that talks to this API — the server itself ships no browser UI beyond a small `/config` settings page and a `/ui` process-polling demo.
 
 - **API:** `http://127.0.0.1:18410` — OpenAPI at **`/docs`**, API guide at **`/api-guide`**, model build/train at **`/api/v1/model-ops/*`** ([`docs/model-ops-api.md`](docs/model-ops-api.md))
 - **Config UI:** `http://127.0.0.1:18410/config` — default provider, model, API keys, `config.yaml`
 - **Process demo:** `http://127.0.0.1:18410/ui` — minimal polling UI for `/processes`
-- **Flow UI (dev):** `http://127.0.0.1:3333/app/` — Vite dev server with API proxy
-- **Flow UI (Docker):** `http://127.0.0.1:3333/app/` (default compose: API + UI containers). Single-container `all` mode serves UI on `:18408/app/`.
 
 Provider catalog behavior is normalized across `/api/v1/llm/ui-catalog`, `/api/v1/llm-proxy/ui/providers`, and `/api/v1/llm-proxy/test/model-options`: each provider exposes the same capability shape (`streaming`, `tools`, `json_mode`, `model_discovery`). When a provider cannot list models live, the server falls back in order to provider aliases from `config.yaml`, then `orchestrator_ui.yaml` `fallback_models`, then the provider default model.
 
@@ -37,30 +35,33 @@ Discover supported BYOK providers, their modalities, and the header names progra
 
 ## Quick start
 
+Desktop app — one window, tray icon, server started and stopped for you ([`desktop/`](desktop/)):
+
+```bash
+cd desktop && cargo run -p agent-platform-desktop
+```
+
+API server only, no desktop shell:
+
+```bash
+python scripts/start.py
+```
+
+Opens `http://127.0.0.1:18410` — API docs at `/docs`, config at `/config`. No Bearer token unless `AGENT_PLATFORM_MASTER_KEY` is set. Use `--no-browser` to stay headless.
+
 First-time setup from this folder:
 
 ```bash
 cp .env.example .env
 pnpm install          # root: Python deps (postinstall) + dev tooling
-cd web && pnpm install && cd ..
 ```
 
-Set **`AGENT_PLATFORM_MASTER_KEY`** in `.env` (Bearer for `/v1` and protected `/api/v1/*`). When set, paste the same key in the config UI auth bar or set `VITE_AGENT_PLATFORM_MASTER_KEY` for Flow UI.
+Set **`AGENT_PLATFORM_MASTER_KEY`** in `.env` (Bearer for `/v1` and protected `/api/v1/*`). When set, paste the same key into the config UI auth bar.
 
 | Mode | Local (no Docker) | Docker |
 |------|-------------------|--------|
-| **Backend only** | `pnpm dev:server` | `pnpm docker:up:server` |
-| **Backend + Flow UI** | `pnpm dev` | `pnpm docker:up` |
-| **Flow UI only** (API elsewhere) | `cd web && pnpm dev` | `pnpm docker:up:ui-only` |
-
-URLs after start:
-
-| Mode | API / config | Flow UI |
-|------|--------------|---------|
-| Local backend only | `:18410` | — |
-| Local backend + web | `:18410` | `:3333/app/` |
-| Docker backend only | `:18410` | — |
-| Docker backend + web | `:18410` | `:3333/app/` |
+| **Desktop app** | `cd desktop && cargo run -p agent-platform-desktop` | — |
+| **API server** | `pnpm start` / `python scripts/start.py` | `pnpm docker:up` |
 
 Verify setup (offline — no server required):
 
@@ -75,41 +76,20 @@ pnpm smoke:live
 # or: python scripts/smoke_workflow.py --live http://127.0.0.1:18410
 ```
 
-## Deploy profiles
+## Docker
 
-| Profile | Command | What runs |
-|--------|---------|-----------|
-| **Backend only** | `pnpm docker:up:server` | API + config UI on `:18410` (no Flow UI container) |
-| **Backend + Flow UI** | `pnpm docker:up` | API `:18410` + Flow UI dev container on host `:3333` |
-| **Flow UI only** | `pnpm docker:up:ui-only` | Static Flow UI on `:3333` (API elsewhere) |
-
-Equivalent npm scripts: `pnpm docker:up:server`, `pnpm docker:up`, `pnpm docker:up:ui-only`.
-
-### Workspace tokens (external integrations)
-
-Each microservice or Flow UI deployment gets **one workspace-scoped token** (`agp_…`). Mint tokens at `/tokens` or `POST /api/v1/workspaces/{id}/api-tokens/` (master key). The service resolves its tenant via `GET /api/v1/me/workspace`. See [docs/CLIENT_INTEGRATION.md](docs/CLIENT_INTEGRATION.md).
-
-## Docker (unified image)
-
-Image name: **`agent-platform`**. Main [`Dockerfile`](Dockerfile) builds FastAPI backend and Flow UI static assets from this checkout.
+Image name: **`agent-platform`**. [`Dockerfile`](Dockerfile) builds the FastAPI backend only (no UI, no nginx).
 
 ```bash
-# Backend only
-pnpm docker:up:server
-
-# Backend + Flow UI (default compose)
 pnpm docker:up
 ```
-
-Set **`AGENT_PLATFORM_CONTAINER_MODE`** to `backend`, `ui`, or `all` (see `.env.example`).
 
 Uses a named volume for SQLite, workspaces, and **`/app/data/llm`** (`config.yaml` + `.env`).
 
 ## Repo structure
 
 - `app/` FastAPI backend, API routes, orchestration, tests
-- `web/` canonical React + Vite Flow UI workspace
-- `docker/` nginx + entrypoint files for unified container modes
+- `desktop/` native desktop app (Rust + iced) that drives this API
 - `docs/` ADRs, plans, integration notes
 
 ### Performance tuning (high-core desktop)
@@ -130,6 +110,6 @@ See [app/tools_policy.py](app/tools_policy.py). Default is **no tools**; enable 
 ## Hygiene and smoke checks
 
 ```bash
-pnpm smoke              # hygiene + web-facing API contract tests (no running server)
+pnpm smoke              # hygiene + API contract tests (no running server)
 python scripts/check_repo_hygiene.py   # hygiene only
 ```

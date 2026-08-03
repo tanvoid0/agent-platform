@@ -1,0 +1,27 @@
+[package]
+name = "agent-platform-desktop"
+version = "0.2.0"
+edition = "2021"
+description = "Native desktop app for agent-platform (iced), owning the Python server sidecar"
+
+[[bin]]
+name = "agent-platform"
+path = "src/main.rs"
+
+[dependencies]
+agent-platform-client = { path = "../client" }
+iced = { version = "0.14", features = ["tokio", "canvas"] }
+tray-icon = "0.24"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+dark-light = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+getrandom = "0.2"
+rfd = "0.15"
+notify-rust = "4"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

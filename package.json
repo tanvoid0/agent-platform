@@ -7,16 +7,12 @@
     "smoke:live": "python scripts/smoke_workflow.py --live http://127.0.0.1:18410",
     "docker:up": "npm run sync:contract-enums && docker compose up --build",
     "docker:up:server": "npm run sync:contract-enums && docker compose -f docker-compose.agent-only.yml up --build",
-    "docker:up:ui": "npm run sync:contract-enums && docker compose -f docker-compose.yml -f docker-compose.ui.yml up --build",
-    "docker:up:ui-only": "docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up --build",
     "postinstall": "python -m pip install -r app/requirements.txt",
-    "predev": "kill-port 18410 3333 --silent",
-    "dev:server": "pnpm predev && python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410",
-    "dev:client": "cd web && pnpm dev",
-    "dev": "concurrently \"pnpm run dev:server\" \"pnpm run dev:client\""
+    "start": "python scripts/start.py",
+    "predev": "kill-port 18410 --silent",
+    "dev:server": "pnpm predev && python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410"
   },
   "devDependencies": {
-    "concurrently": "^9.1.2",
     "kill-port": "^2.0.1"
   }
 }

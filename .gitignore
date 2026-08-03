@@ -20,7 +20,11 @@ env/
 # Runtime / build
 data/
 app/static/dist/
-web/dist/
 node_modules/
 .agents/
 skills-lock.json
+
+# Desktop shell
+desktop/target/
+desktop/payload/*
+!desktop/payload/.gitkeep

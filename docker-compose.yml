@@ -1,16 +1,8 @@
-# Agent Platform — unified image (backend + Flow UI).
+# Agent Platform — backend-only image (API + /config page).
 #
-# Backend + Flow UI (default):
 #   pnpm docker:up
 #
-# Backend only:
-#   pnpm docker:up:server
-#
-# Flow UI static only (API elsewhere; set VITE_API_ORIGIN at build):
-#   docker compose -f docker-compose.yml -f docker-compose.ui-only.yml up --build
-#
 # Config UI: http://127.0.0.1:18410/config  |  API: http://127.0.0.1:18410/docs
-# Flow UI:   http://127.0.0.1:3333/app/
 
 services:
   server:
@@ -18,11 +10,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        VITE_API_ORIGIN: ${VITE_API_ORIGIN:-}
-        VITE_AGENT_PLATFORM_MASTER_KEY: ${AGENT_PLATFORM_MASTER_KEY:-}
     environment:
-      AGENT_PLATFORM_CONTAINER_MODE: ${AGENT_PLATFORM_CONTAINER_MODE:-backend}
       DATABASE_URL: ""
       AGENT_PLATFORM_DB_PATH: /app/data/agent_platform.db
       AGENT_PLATFORM_WORKSPACE_ROOT: /app/data/workspaces
@@ -62,26 +50,6 @@ services:
             - "*.pyc"
         - action: rebuild
           path: ./app/requirements.txt
-    restart: unless-stopped
-
-  client:
-    image: agent-platform:${AGENT_PLATFORM_IMAGE_TAG:-latest}
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        VITE_API_ORIGIN: ${VITE_API_ORIGIN:-}
-        VITE_AGENT_PLATFORM_MASTER_KEY: ${AGENT_PLATFORM_MASTER_KEY:-}
-    environment:
-      AGENT_PLATFORM_CONTAINER_MODE: ui
-    env_file:
-      - .env
-    ports:
-      - "127.0.0.1:3333:18408"
-    volumes: []
-    develop: {}
-    depends_on:
-      - server
     restart: unless-stopped
 
 volumes:

@@ -1,0 +1,675 @@
+//! Processes screen state and update logic (Phase 3).
+//!
+//! Polling cadences mirror the web client: list 3s, detail 800ms while a run is
+//! live / 4s once settled. SSE frames are treated as "refetch now" triggers, and
+//! the subscription is gated on the polled status exactly as the web hook was —
+//! a terminal process replaying a backlog closes without a sentinel.
+
+use crate::domain::{self, BoardColumn, BoardRow};
+use agent_platform_client::types::*;
+use agent_platform_client::Client;
+use iced::Task;
+use std::time::Duration;
+
+/// Detail sub-views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Graph,
+    Board,
+    Timeline,
+    Events,
+}
+
+impl ViewMode {
+    pub const ALL: [ViewMode; 4] =
+        [ViewMode::Graph, ViewMode::Board, ViewMode::Timeline, ViewMode::Events];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::Graph => "Graph",
+            ViewMode::Board => "Board",
+            ViewMode::Timeline => "Timeline",
+            ViewMode::Events => "Events",
+        }
+    }
+}
+
+/// Which task the review modal is acting on.
+#[derive(Debug, Clone)]
+pub struct ReviewDraft {
+    pub task_id: i64,
+    pub role: String,
+    pub output: String,
+    pub feedback: String,
+    pub instructions: String,
+}
+
+#[derive(Default)]
+pub struct Composer {
+    pub goal: String,
+    pub team_id: Option<i64>,
+    pub project_id: Option<i64>,
+    pub auto_approve: bool,
+    pub submitting: bool,
+}
+
+pub struct State {
+    pub processes: Vec<ProcessRecord>,
+    pub selected: Option<i64>,
+    pub detail: Option<ProcessDetailResponse>,
+    pub events: Vec<EventLogRecord>,
+    pub teams: Vec<TeamTemplateSummary>,
+    pub projects: Vec<ProjectSummary>,
+    /// False until each list has come back once; an empty list is a valid answer,
+    /// so emptiness alone cannot drive the retry.
+    lists_loaded: (bool, bool),
+    pub composer: Composer,
+    pub view: ViewMode,
+    pub board_search: String,
+    pub needs_attention_only: bool,
+    pub event_filter: String,
+    pub inspecting: Option<String>,
+    pub review: Option<ReviewDraft>,
+    pub lineage: crate::graph::Lineage,
+    pub viewport: crate::graph::Viewport,
+    pub error: Option<String>,
+    pub notice: Option<String>,
+    pub busy: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            processes: Vec::new(),
+            selected: None,
+            detail: None,
+            events: Vec::new(),
+            teams: Vec::new(),
+            projects: Vec::new(),
+            lists_loaded: (false, false),
+            composer: Composer::default(),
+            view: ViewMode::Graph,
+            board_search: String::new(),
+            needs_attention_only: false,
+            event_filter: String::new(),
+            inspecting: None,
+            review: None,
+            lineage: crate::graph::Lineage::All,
+            viewport: crate::graph::Viewport::default(),
+            error: None,
+            notice: None,
+            busy: false,
+        }
+    }
+}
+
+impl State {
+    pub fn selected_process(&self) -> Option<&ProcessRecord> {
+        self.detail.as_ref().map(|d| &d.process)
+    }
+
+    pub fn status_str(&self) -> &str {
+        self.selected_process().map(|p| p.status.as_str()).unwrap_or("")
+    }
+
+    pub fn dag(&self) -> Option<PlannerDag> {
+        let p = self.selected_process()?;
+        agent_platform_client::dag::parse_planner_dag(p.dag_json.as_deref())
+    }
+
+    pub fn board_rows(&self) -> Vec<BoardRow> {
+        let Some(detail) = &self.detail else { return Vec::new() };
+        let dag = self.dag();
+        let mut rows = domain::board_rows_from_dag(dag.as_ref(), &detail.tasks);
+        if !self.board_search.trim().is_empty() {
+            rows.retain(|r| domain::matches_board_search(r, &self.board_search));
+        }
+        if self.needs_attention_only {
+            let status = self.status_str().to_string();
+            rows.retain(|r| domain::row_needs_attention(r, &status));
+        }
+        rows
+    }
+
+    pub fn rows_in_column(&self, column: BoardColumn) -> Vec<BoardRow> {
+        self.board_rows().into_iter().filter(|r| r.column == column).collect()
+    }
+
+    /// The run is live: poll fast and keep a stream open.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.selected_process().map(|p| p.status),
+            Some(ProcessStatus::Pending)
+                | Some(ProcessStatus::Planning)
+                | Some(ProcessStatus::Approved)
+                | Some(ProcessStatus::Running)
+        )
+    }
+
+    /// SSE is only opened for live runs — the server closes the stream on
+    /// terminal and approval states, and a terminal run with a log backlog
+    /// closes without a sentinel (would reconnect forever otherwise).
+    pub fn stream_eligible(&self) -> bool {
+        self.is_live()
+    }
+
+    pub fn detail_poll_interval(&self) -> Duration {
+        if self.is_live() {
+            Duration::from_millis(800)
+        } else {
+            Duration::from_secs(4)
+        }
+    }
+
+    /// Graph nodes for the selected run under the current lineage cap.
+    pub fn graph_layout(&self) -> crate::graph::GraphLayout {
+        let Some(detail) = &self.detail else { return Default::default() };
+        let Some(dag) = self.dag() else { return Default::default() };
+        crate::graph::dag_layout(&dag.subagents, &detail.tasks, self.lineage)
+    }
+
+    pub fn task_by_uuid(&self, uuid: &str) -> Option<&TaskNodeRecord> {
+        self.detail.as_ref()?.tasks.iter().find(|t| t.client_uuid == uuid)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    // data in
+    ListTick,
+    Listed(Result<Vec<ProcessRecord>, String>),
+    Select(i64),
+    DetailTick,
+    Detailed(Result<Box<ProcessDetailResponse>, String>),
+    EventsLoaded(Result<Vec<EventLogRecord>, String>),
+    TeamsLoaded(Result<Vec<TeamTemplateSummary>, String>),
+    ProjectsLoaded(Result<Vec<ProjectSummary>, String>),
+    StreamFrame,
+    // composer
+    GoalChanged(String),
+    TeamPicked(i64),
+    ProjectPicked(Option<i64>),
+    ToggleAutoApprove(bool),
+    Submit,
+    Created(Result<i64, String>),
+    // detail controls
+    SetView(ViewMode),
+    BoardSearchChanged(String),
+    ToggleNeedsAttention(bool),
+    EventFilterChanged(String),
+    Inspect(Option<String>),
+    SetLineage(crate::graph::Lineage),
+    Canvas(crate::graph::CanvasEvent),
+    // actions
+    Approve,
+    Cancel,
+    Retry,
+    Sync,
+    RetryTask(i64),
+    OpenReview(i64),
+    CloseReview,
+    ReviewOutputChanged(String),
+    ReviewFeedbackChanged(String),
+    ReviewInstructionsChanged(String),
+    SubmitReview(ReviewDecision),
+    ActionDone(Result<String, String>),
+    DismissNotice,
+}
+
+impl From<crate::graph::CanvasEvent> for Message {
+    fn from(event: crate::graph::CanvasEvent) -> Self {
+        Message::Canvas(event)
+    }
+}
+
+fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
+    r.map_err(|e| e.to_string())
+}
+
+pub fn load_lists(client: &Client) -> Task<Message> {
+    let c1 = client.clone();
+    let c2 = client.clone();
+    Task::batch([
+        Task::perform(async move { err_string(c1.teams().await).map(|r| r.teams) }, Message::TeamsLoaded),
+        Task::perform(
+            async move { err_string(c2.projects().await).map(|r| r.projects) },
+            Message::ProjectsLoaded,
+        ),
+    ])
+}
+
+fn fetch_list(client: &Client, project_id: Option<i64>) -> Task<Message> {
+    let client = client.clone();
+    // `GET /processes` requires an explicit scope; the composer's project
+    // selection doubles as the list scope, unassigned by default.
+    let filter = match project_id {
+        Some(id) => ProcessListFilter::Project(id),
+        None => ProcessListFilter::Unassigned,
+    };
+    Task::perform(
+        async move { err_string(client.processes(30, filter).await).map(|r| r.processes) },
+        Message::Listed,
+    )
+}
+
+fn fetch_detail(client: &Client, id: i64) -> Task<Message> {
+    let c1 = client.clone();
+    let c2 = client.clone();
+    Task::batch([
+        Task::perform(
+            async move { err_string(c1.process_detail(id).await).map(Box::new) },
+            Message::Detailed,
+        ),
+        Task::perform(
+            async move { err_string(c2.process_events(id, None, 2000).await).map(|r| r.events) },
+            Message::EventsLoaded,
+        ),
+    ])
+}
+
+pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
+    match message {
+        Message::ListTick => {
+            // Teams/projects are fetched at boot, before the app's own server has
+            // finished starting — that first request fails. Retry on the list
+            // poll until they arrive, or the composer has no options to pick.
+            let mut tasks = vec![fetch_list(client, state.composer.project_id)];
+            if !(state.lists_loaded.0 && state.lists_loaded.1) {
+                tasks.push(load_lists(client));
+            }
+            Task::batch(tasks)
+        }
+        Message::Listed(Ok(list)) => {
+            state.processes = list;
+            // Auto-select the newest run so the pane is never blank on first load.
+            if state.selected.is_none() {
+                if let Some(first) = state.processes.first().map(|p| p.id) {
+                    return update(state, client, Message::Select(first));
+                }
+            }
+            Task::none()
+        }
+        Message::Listed(Err(e)) => {
+            state.error = Some(e);
+            Task::none()
+        }
+        Message::Select(id) => {
+            state.selected = Some(id);
+            state.detail = None;
+            state.events.clear();
+            state.inspecting = None;
+            state.review = None;
+            state.viewport = crate::graph::Viewport::default();
+            fetch_detail(client, id)
+        }
+        Message::DetailTick | Message::StreamFrame => match state.selected {
+            Some(id) => fetch_detail(client, id),
+            None => Task::none(),
+        },
+        Message::Detailed(Ok(detail)) => {
+            let previous = state.selected_process().map(|p| p.status);
+            if became_terminal(previous, detail.process.status) {
+                crate::notify::job_finished(
+                    &format!("Run #{}", detail.process.id),
+                    &detail.process.goal,
+                    detail.process.status.as_str(),
+                );
+            }
+            state.detail = Some(*detail);
+            state.error = None;
+            Task::none()
+        }
+        Message::Detailed(Err(e)) => {
+            state.error = Some(e);
+            Task::none()
+        }
+        Message::EventsLoaded(Ok(events)) => {
+            state.events = events;
+            Task::none()
+        }
+        Message::EventsLoaded(Err(_)) => Task::none(),
+        Message::TeamsLoaded(Ok(teams)) => {
+            state.lists_loaded.0 = true;
+            if state.composer.team_id.is_none() {
+                state.composer.team_id = teams.first().map(|t| t.id);
+            }
+            state.teams = teams;
+            Task::none()
+        }
+        Message::TeamsLoaded(Err(e)) => {
+            state.error = Some(e);
+            Task::none()
+        }
+        Message::ProjectsLoaded(Ok(projects)) => {
+            state.lists_loaded.1 = true;
+            state.projects = projects;
+            Task::none()
+        }
+        Message::ProjectsLoaded(Err(_)) => Task::none(),
+
+        Message::GoalChanged(goal) => {
+            state.composer.goal = goal;
+            Task::none()
+        }
+        Message::TeamPicked(id) => {
+            state.composer.team_id = Some(id);
+            Task::none()
+        }
+        Message::ProjectPicked(id) => {
+            state.composer.project_id = id;
+            // Project doubles as the list scope, so the list must refetch.
+            state.selected = None;
+            state.detail = None;
+            fetch_list(client, id)
+        }
+        Message::ToggleAutoApprove(v) => {
+            state.composer.auto_approve = v;
+            Task::none()
+        }
+        Message::Submit => {
+            let (Some(team_id), goal) = (state.composer.team_id, state.composer.goal.trim())
+            else {
+                state.error = Some("Pick a team first.".into());
+                return Task::none();
+            };
+            if goal.is_empty() {
+                state.error = Some("Describe the goal first.".into());
+                return Task::none();
+            }
+            state.composer.submitting = true;
+            let body = CreateProcessBody {
+                goal: goal.to_string(),
+                team_template_id: team_id,
+                auto_approve: Some(state.composer.auto_approve),
+                project_id: state.composer.project_id,
+            };
+            let client = client.clone();
+            Task::perform(
+                async move { err_string(client.create_process(&body).await).map(|r| r.process_id) },
+                Message::Created,
+            )
+        }
+        Message::Created(Ok(id)) => {
+            state.composer.submitting = false;
+            state.composer.goal.clear();
+            state.notice = Some(format!("Started run #{id}."));
+            update(state, client, Message::Select(id))
+        }
+        Message::Created(Err(e)) => {
+            state.composer.submitting = false;
+            state.error = Some(e);
+            Task::none()
+        }
+
+        Message::SetView(view) => {
+            state.view = view;
+            Task::none()
+        }
+        Message::BoardSearchChanged(q) => {
+            state.board_search = q;
+            Task::none()
+        }
+        Message::ToggleNeedsAttention(v) => {
+            state.needs_attention_only = v;
+            Task::none()
+        }
+        Message::EventFilterChanged(f) => {
+            state.event_filter = f;
+            Task::none()
+        }
+        Message::Inspect(uuid) => {
+            state.inspecting = uuid;
+            Task::none()
+        }
+        Message::SetLineage(lineage) => {
+            state.lineage = lineage;
+            Task::none()
+        }
+        Message::Canvas(event) => {
+            use crate::graph::CanvasEvent;
+            match event {
+                CanvasEvent::Selected(uuid) => state.inspecting = Some(uuid),
+                CanvasEvent::Panned(delta) => state.viewport.pan(delta),
+                CanvasEvent::Zoomed(delta) => state.viewport.zoom(delta),
+            }
+            Task::none()
+        }
+
+        Message::Approve => {
+            let Some(id) = state.selected else { return Task::none() };
+            let Some(dag_json) = state.selected_process().and_then(|p| p.dag_json.clone()) else {
+                state.error = Some("This run has no plan to approve yet.".into());
+                return Task::none();
+            };
+            // Validate locally first, same as the web client, so a malformed
+            // plan reports field-level errors instead of a bare 422.
+            match serde_json::from_str::<serde_json::Value>(&dag_json)
+                .map_err(|e| vec![e.to_string()])
+                .and_then(|v| agent_platform_client::dag::validate_planner_dag(&v))
+            {
+                Err(errors) => {
+                    state.error = Some(format!("Plan is invalid: {}", errors.join("; ")));
+                    Task::none()
+                }
+                Ok(_) => {
+                    state.busy = true;
+                    let client = client.clone();
+                    Task::perform(
+                        async move {
+                            err_string(client.approve_process(id, &dag_json).await)
+                                .map(|r| r.message.unwrap_or(r.status))
+                        },
+                        Message::ActionDone,
+                    )
+                }
+            }
+        }
+        Message::Cancel => run_action(state, client, |c, id| async move {
+            err_string(c.cancel_process(id).await).map(|r| r.status)
+        }),
+        Message::Retry => run_action(state, client, |c, id| async move {
+            err_string(c.retry_process(id).await).map(|r| format!("retrying {}", r.retry.as_str()))
+        }),
+        Message::Sync => run_action(state, client, |c, id| async move {
+            err_string(c.sync_process(id).await).map(|r| r.detail)
+        }),
+        Message::RetryTask(task_id) => run_action(state, client, move |c, id| async move {
+            err_string(c.retry_task(id, task_id).await).map(|r| format!("task {} requeued", r.task_id))
+        }),
+
+        Message::OpenReview(task_id) => {
+            let task = state
+                .detail
+                .as_ref()
+                .and_then(|d| d.tasks.iter().find(|t| t.id == task_id));
+            state.review = task.map(|t| ReviewDraft {
+                task_id,
+                role: t.role.clone(),
+                // Reviewers edit the draft; fall back to final output.
+                output: t.draft_output.clone().or_else(|| t.output.clone()).unwrap_or_default(),
+                feedback: String::new(),
+                instructions: String::new(),
+            });
+            Task::none()
+        }
+        Message::CloseReview => {
+            state.review = None;
+            Task::none()
+        }
+        Message::ReviewOutputChanged(v) => {
+            if let Some(r) = &mut state.review {
+                r.output = v;
+            }
+            Task::none()
+        }
+        Message::ReviewFeedbackChanged(v) => {
+            if let Some(r) = &mut state.review {
+                r.feedback = v;
+            }
+            Task::none()
+        }
+        Message::ReviewInstructionsChanged(v) => {
+            if let Some(r) = &mut state.review {
+                r.instructions = v;
+            }
+            Task::none()
+        }
+        Message::SubmitReview(decision) => {
+            let (Some(id), Some(draft)) = (state.selected, state.review.take()) else {
+                return Task::none();
+            };
+            let body = ReviewTaskBody {
+                decision,
+                output: (decision == ReviewDecision::Approve).then(|| draft.output.clone()),
+                feedback: non_empty(&draft.feedback),
+                instructions: non_empty(&draft.instructions),
+            };
+            state.busy = true;
+            let client = client.clone();
+            Task::perform(
+                async move {
+                    err_string(client.review_task(id, draft.task_id, &body).await)
+                        .map(|r| r.message.unwrap_or(r.status))
+                },
+                Message::ActionDone,
+            )
+        }
+        Message::ActionDone(result) => {
+            state.busy = false;
+            match result {
+                Ok(msg) => state.notice = Some(msg),
+                Err(e) => state.error = Some(e),
+            }
+            match state.selected {
+                Some(id) => fetch_detail(client, id),
+                None => Task::none(),
+            }
+        }
+        Message::DismissNotice => {
+            state.notice = None;
+            state.error = None;
+            Task::none()
+        }
+    }
+}
+
+fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+fn is_terminal_status(status: ProcessStatus) -> bool {
+    matches!(status, ProcessStatus::Completed | ProcessStatus::Failed | ProcessStatus::Cancelled)
+}
+
+/// True only on the poll where the run first reaches a terminal status, so
+/// re-polling an already-terminal run does not re-fire the notification.
+fn became_terminal(previous: Option<ProcessStatus>, current: ProcessStatus) -> bool {
+    let was_terminal = previous.is_some_and(is_terminal_status);
+    !was_terminal && is_terminal_status(current)
+}
+
+/// Run a process-scoped action against the selected run.
+fn run_action<F, Fut>(state: &mut State, client: &Client, f: F) -> Task<Message>
+where
+    F: FnOnce(Client, i64) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+{
+    let Some(id) = state.selected else { return Task::none() };
+    state.busy = true;
+    Task::perform(f(client.clone(), id), Message::ActionDone)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn detail(status: &str, dag: bool) -> ProcessDetailResponse {
+        serde_json::from_value(json!({
+            "process": {
+                "id": 1, "goal": "g", "status": status,
+                "dag_json": dag.then(|| json!({
+                    "team_name": "t", "goal_restatement": "g",
+                    "subagents": [{"client_uuid":"a","role":"R","system_prompt":"s","instructions":"i"}]
+                }).to_string()),
+                "failure_reason": null, "total_tokens": 0, "total_cost": 0.0,
+                "created_at": "2026-08-02T10:00:00", "updated_at": "2026-08-02T10:00:00"
+            },
+            "tasks": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn live_states_poll_fast_and_stream() {
+        let mut s = State::default();
+        for status in ["pending", "planning", "approved", "running"] {
+            s.detail = Some(detail(status, false));
+            assert!(s.is_live(), "{status}");
+            assert!(s.stream_eligible(), "{status}");
+            assert_eq!(s.detail_poll_interval(), Duration::from_millis(800));
+        }
+    }
+
+    #[test]
+    fn gated_and_terminal_states_do_not_stream() {
+        let mut s = State::default();
+        for status in ["approval_required", "task_review_required", "completed", "failed", "cancelled"] {
+            s.detail = Some(detail(status, false));
+            assert!(!s.stream_eligible(), "{status}");
+            assert_eq!(s.detail_poll_interval(), Duration::from_secs(4));
+        }
+    }
+
+    #[test]
+    fn board_filters_apply() {
+        let mut s = State::default();
+        s.detail = Some(detail("running", true));
+        assert_eq!(s.board_rows().len(), 1);
+        s.board_search = "zzz".into();
+        assert!(s.board_rows().is_empty());
+        s.board_search = "R".into();
+        assert_eq!(s.board_rows().len(), 1);
+        // Pending row only counts as "needs attention" while approval is pending.
+        s.board_search.clear();
+        s.needs_attention_only = true;
+        assert!(s.board_rows().is_empty());
+        s.detail = Some(detail("approval_required", true));
+        assert_eq!(s.board_rows().len(), 1);
+    }
+
+    #[test]
+    fn approve_rejects_a_run_with_no_plan() {
+        let mut s = State::default();
+        s.selected = Some(1);
+        s.detail = Some(detail("approval_required", false));
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let _ = update(&mut s, &client, Message::Approve);
+        assert!(s.error.as_deref().unwrap().contains("no plan"));
+        assert!(!s.busy);
+    }
+
+    #[test]
+    fn notification_fires_once_on_the_terminal_transition() {
+        use ProcessStatus::*;
+        assert!(!became_terminal(None, Running));
+        assert!(became_terminal(None, Completed));
+        assert!(became_terminal(Some(Running), Failed));
+        assert!(!became_terminal(Some(Completed), Completed));
+        assert!(!became_terminal(Some(Cancelled), Cancelled));
+    }
+
+    #[test]
+    fn submit_requires_goal_and_team() {
+        let mut s = State::default();
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let _ = update(&mut s, &client, Message::Submit);
+        assert!(s.error.as_deref().unwrap().contains("team"));
+        s.composer.team_id = Some(7);
+        s.error = None;
+        let _ = update(&mut s, &client, Message::Submit);
+        assert!(s.error.as_deref().unwrap().contains("goal"));
+        assert!(!s.composer.submitting);
+    }
+}
