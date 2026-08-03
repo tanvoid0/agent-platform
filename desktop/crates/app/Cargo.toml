@@ -22,6 +22,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 getrandom = "0.2"
 rfd = "0.15"
 notify-rust = "4"
+tts = "0.26"
+msedge-tts = "0.2"
+rodio = "0.19"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Foundation", "Media_SpeechRecognition", "Win32_System_WinRT"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

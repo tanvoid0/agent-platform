@@ -501,3 +501,89 @@ pub struct ModelBuildJobBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_id: Option<i64>,
 }
+
+// ---------------------------------------------------------------------------
+// LLM providers (app/llm_proxy/admin_routes.py, master-key only)
+// ---------------------------------------------------------------------------
+
+/// One `.env` entry. Secrets come back as `set` + a `****abcd` tail and never
+/// as a value, so the UI can show "configured" without holding the key.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EnvKey {
+    pub set: bool,
+    #[serde(default)]
+    pub masked: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderDefaults {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmEnv {
+    pub keys: HashMap<String, EnvKey>,
+    /// What is written in `.env` / config.yaml.
+    pub persisted_defaults: ProviderDefaults,
+    /// What the proxy will actually use, after falling back to a configured provider.
+    pub resolved_defaults: ProviderDefaults,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderModels {
+    pub options: Vec<String>,
+    pub selected_model: String,
+    /// `discovery` | `config_aliases` | `ui_fallback_models` | `provider_default` | `unavailable`.
+    pub source: String,
+    #[serde(default)]
+    pub warning: Option<String>,
+    #[serde(default)]
+    pub fallback_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderEntry {
+    pub id: String,
+    pub label: String,
+    pub configured: bool,
+    pub local: bool,
+    pub models: ProviderModels,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderCatalog {
+    pub providers: Vec<ProviderEntry>,
+    pub resolved_defaults: ProviderDefaults,
+}
+
+/// Only the keys the desktop offers. `AGENT_PLATFORM_MASTER_KEY` is deliberately
+/// absent: the shell owns that key, and rewriting it would orphan this client.
+/// Omitted fields are left untouched server-side.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EnvUpdate {
+    #[serde(rename = "GEMINI_API_KEY", skip_serializing_if = "Option::is_none")]
+    pub gemini_api_key: Option<String>,
+    #[serde(rename = "AIMLAPI_API_KEY", skip_serializing_if = "Option::is_none")]
+    pub aimlapi_api_key: Option<String>,
+    #[serde(rename = "AIMLAPI_OPENAI_BASE", skip_serializing_if = "Option::is_none")]
+    pub aimlapi_openai_base: Option<String>,
+    #[serde(rename = "OLLAMA_API_BASE", skip_serializing_if = "Option::is_none")]
+    pub ollama_api_base: Option<String>,
+    #[serde(rename = "LM_STUDIO_API_BASE", skip_serializing_if = "Option::is_none")]
+    pub lm_studio_api_base: Option<String>,
+    #[serde(rename = "LM_STUDIO_API_KEY", skip_serializing_if = "Option::is_none")]
+    pub lm_studio_api_key: Option<String>,
+    #[serde(rename = "DEFAULT_PROVIDER", skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    #[serde(rename = "DEFAULT_MODEL", skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnvSaveResponse {
+    pub ok: bool,
+    pub message: String,
+}

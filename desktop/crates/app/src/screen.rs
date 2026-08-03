@@ -1,7 +1,6 @@
 //! Status and Logs screens (Phase 2), composed entirely from the shadcn-style
 //! `ui` kit — no raw widget styling here.
 
-use crate::shell::ThemeMode;
 use crate::ui::{self, space, Tone};
 use crate::{App, Message, Screen};
 use agent_platform_client::types::ReadinessReport;
@@ -30,14 +29,24 @@ pub fn view(app: &App) -> Element<'_, Message> {
                     Message::Nav(Screen::ModelOps),
                 ),
                 ui::nav_item("Chat", app.screen == Screen::Chat, Message::Nav(Screen::Chat)),
+                ui::nav_item(
+                    "E.V.",
+                    app.screen == Screen::Assistant,
+                    Message::Nav(Screen::Assistant),
+                ),
+                ui::nav_item(
+                    "Providers",
+                    app.screen == Screen::Providers,
+                    Message::Nav(Screen::Providers),
+                ),
                 ui::nav_item("Status", app.screen == Screen::Status, Message::Nav(Screen::Status)),
                 ui::nav_item("Logs", app.screen == Screen::Logs, Message::Nav(Screen::Logs)),
             ])
             .width(Length::Fill),
             iced::widget::space::vertical(),
-            ui::stack(vec![
-                ui::caption("APPEARANCE"),
-                theme_switch(app),
+            ui::cluster(vec![
+                ui::icon_button(app.settings.theme.icon(), Message::SetTheme(app.settings.theme.next())),
+                ui::icon_button("⟳", Message::RestartApp),
             ])
             .width(Length::Fill),
         ]
@@ -58,6 +67,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .map(Message::Library),
         Screen::ModelOps => crate::modelops_view::view(&app.modelops).map(Message::ModelOps),
         Screen::Chat => crate::chat_view::view(&app.chat).map(Message::Chat),
+        Screen::Assistant => crate::assistant_view::view(&app.assistant).map(Message::Assistant),
+        Screen::Providers => crate::providers_view::view(&app.providers).map(Message::Providers),
         Screen::Status => status_view(app),
         Screen::Logs => logs_view(app),
     };
@@ -68,12 +79,6 @@ pub fn view(app: &App) -> Element<'_, Message> {
         container(content).width(Length::Fill).height(Length::Fill),
     ]
     .into()
-}
-
-fn theme_switch(app: &App) -> Element<'_, Message> {
-    ui::segmented(ThemeMode::ALL.map(|mode| {
-        (mode.label(), app.settings.theme == mode, Message::SetTheme(mode))
-    }))
 }
 
 // ---------------------------------------------------------------------------

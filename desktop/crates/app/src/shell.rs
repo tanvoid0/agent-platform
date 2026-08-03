@@ -41,13 +41,21 @@ pub enum ThemeMode {
 }
 
 impl ThemeMode {
-    pub const ALL: [ThemeMode; 3] = [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark];
-
-    pub fn label(&self) -> &'static str {
+    /// Glyph for the compact sidebar toggle.
+    pub fn icon(&self) -> &'static str {
         match self {
-            ThemeMode::System => "System",
-            ThemeMode::Light => "Light",
-            ThemeMode::Dark => "Dark",
+            ThemeMode::System => "◑",
+            ThemeMode::Light => "☀",
+            ThemeMode::Dark => "☾",
+        }
+    }
+
+    /// Next mode in the System → Light → Dark cycle.
+    pub fn next(&self) -> ThemeMode {
+        match self {
+            ThemeMode::System => ThemeMode::Light,
+            ThemeMode::Light => ThemeMode::Dark,
+            ThemeMode::Dark => ThemeMode::System,
         }
     }
 
@@ -352,6 +360,14 @@ pub fn port_owner(port: u16, key: &str) -> PortOwner {
         Some(200) => PortOwner::Ours,
         _ => PortOwner::Foreign,
     }
+}
+
+/// Launch a fresh copy of this executable. The caller must have stopped the
+/// server child first — the new process probes the port on startup and would
+/// otherwise attach to a sidecar that is about to die with us.
+pub fn spawn_replacement() -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    Command::new(exe).spawn().map(|_| ())
 }
 
 /// Reveal a path in the platform file manager.

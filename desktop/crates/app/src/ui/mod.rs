@@ -122,6 +122,17 @@ pub fn button_ghost<'a, M: 'a + Clone>(label: &'a str, on_press: M) -> Element<'
     button_sized(label, ButtonVariant::Ghost, Size::Sm, Some(on_press))
 }
 
+/// Square glyph-only ghost button (`<Button variant="ghost" size="icon">`).
+pub fn icon_button<'a, M: 'a + Clone>(glyph: &'a str, on_press: M) -> Element<'a, M> {
+    button(text(glyph).size(font::SM).center())
+        .width(28)
+        .height(28)
+        .padding(0)
+        .style(theme::button_style(ButtonVariant::Ghost))
+        .on_press(on_press)
+        .into()
+}
+
 /// `<Button variant="destructive">`
 pub fn button_destructive<'a, M: 'a + Clone>(label: &'a str, on_press: M) -> Element<'a, M> {
     button_sized(label, ButtonVariant::Destructive, Size::Sm, Some(on_press))

@@ -8,6 +8,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod assistant;
+mod assistant_view;
 mod chat;
 mod chat_view;
 mod domain;
@@ -19,6 +21,8 @@ mod modelops_view;
 mod notify;
 mod processes;
 mod processes_view;
+mod providers;
+mod providers_view;
 mod screen;
 mod shell;
 mod ui;
@@ -37,6 +41,8 @@ pub enum Screen {
     Teams,
     ModelOps,
     Chat,
+    Assistant,
+    Providers,
     Status,
     Logs,
 }
@@ -69,6 +75,8 @@ pub struct App {
     pub library: library::State,
     pub modelops: modelops::State,
     pub chat: chat::State,
+    pub assistant: assistant::State,
+    pub providers: providers::State,
 }
 
 #[derive(Debug, Clone)]
@@ -88,12 +96,15 @@ pub enum Message {
     SetTheme(ThemeMode),
     Copy(&'static str, String),
     RestartServer,
+    RestartApp,
     RevealPath(String),
     Quit,
     Processes(processes::Message),
     Library(library::Message),
     ModelOps(modelops::Message),
     Chat(chat::Message),
+    Assistant(assistant::Message),
+    Providers(providers::Message),
 }
 
 fn open_window() -> Task<Message> {
@@ -217,6 +228,8 @@ fn boot() -> (App, Task<Message>) {
         library: library::State::default(),
         modelops: modelops::State::default(),
         chat: chat::State::default(),
+        assistant: assistant::State::new(),
+        providers: providers::State::default(),
     };
     let task = if minimized { Task::none() } else { open_window() };
     let bootstrap = Task::batch([
@@ -275,7 +288,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 Screen::Processes => Task::done(Message::Processes(processes::Message::ListTick)),
                 Screen::Projects | Screen::Teams => Task::done(Message::Library(library::Message::Refresh)),
                 Screen::ModelOps => Task::done(Message::ModelOps(modelops::Message::Refresh)),
-                Screen::Status | Screen::Chat => Task::none(),
+                Screen::Providers => Task::done(Message::Providers(providers::Message::Refresh)),
+                Screen::Status | Screen::Chat | Screen::Assistant => Task::none(),
             }
         }
         Message::StatusTick => {
@@ -370,6 +384,19 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.child_alive = app.shell.server_running();
             Task::none()
         }
+        Message::RestartApp => {
+            // Stop our sidecar before launching the replacement, so it does not
+            // attach to a server that dies with us; then exit like Quit does.
+            if !app.shell.attached {
+                app.shell.stop_server();
+            }
+            if let Err(e) = shell::spawn_replacement() {
+                app.shell.log_line(format!("[shell] could not relaunch the app: {e}"));
+                return Task::none();
+            }
+            drop(app.tray.take());
+            std::process::exit(0)
+        }
         Message::RevealPath(path) => {
             shell::reveal_path(&path);
             Task::none()
@@ -385,6 +412,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             modelops::update(&mut app.modelops, &app.client, msg).map(Message::ModelOps)
         }
         Message::Chat(msg) => chat::update(&mut app.chat, &app.client, msg).map(Message::Chat),
+        Message::Assistant(msg) => {
+            assistant::update(&mut app.assistant, &app.client, msg).map(Message::Assistant)
+        }
+        Message::Providers(msg) => {
+            providers::update(&mut app.providers, &app.client, msg).map(Message::Providers)
+        }
     }
 }
 
@@ -447,6 +480,12 @@ fn subscription(app: &App) -> Subscription<Message> {
                     .map(|_| Message::Processes(processes::Message::StreamFrame))
             }));
         }
+    }
+    if app.window.is_some() && app.screen == Screen::Assistant {
+        subs.push(
+            iced::time::every(std::time::Duration::from_millis(50))
+                .map(|_| Message::Assistant(assistant::Message::Tick)),
+        );
     }
     if app.window.is_some() && app.screen == Screen::ModelOps && app.modelops.job_running() {
         subs.push(

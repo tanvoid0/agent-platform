@@ -325,6 +325,20 @@ impl Client {
             .await?;
         Self::handle(resp).await
     }
+
+    // -- LLM providers ---------------------------------------------------------
+
+    pub async fn llm_env(&self) -> Result<LlmEnv> {
+        self.get_json("/api/v1/llm-proxy/env").await
+    }
+
+    pub async fn save_llm_env(&self, body: &EnvUpdate) -> Result<EnvSaveResponse> {
+        self.post_json("/api/v1/llm-proxy/env", body).await
+    }
+
+    pub async fn llm_providers(&self) -> Result<ProviderCatalog> {
+        self.get_json("/api/v1/llm-proxy/ui/providers").await
+    }
 }
 
 /// Minimal percent-encoding for path segments (model project names).
