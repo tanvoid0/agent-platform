@@ -1,85 +1,281 @@
 //! Status and Logs screens (Phase 2), composed entirely from the shadcn-style
 //! `ui` kit — no raw widget styling here.
 
-use crate::ui::{self, space, Tone};
-use crate::{App, Message, Screen};
+use crate::ui::{self, space, Icon, Tone};
+use crate::{App, Message, Screen, ServerState, SettingsTab};
 use agent_platform_client::types::ReadinessReport;
-use iced::widget::{column, container, row, scrollable};
+use iced::widget::{column, container, row, scrollable, Column};
 use iced::{Element, Length};
 
-pub fn view(app: &App) -> Element<'_, Message> {
-    let sidebar = container(
-        column![
-            ui::stack(vec![
-                ui::caption("AGENT PLATFORM"),
-                ui::nav_item(
-                    "Processes",
-                    app.screen == Screen::Processes,
-                    Message::Nav(Screen::Processes),
-                ),
-                ui::nav_item(
-                    "Projects",
-                    app.screen == Screen::Projects,
-                    Message::Nav(Screen::Projects),
-                ),
-                ui::nav_item("Teams", app.screen == Screen::Teams, Message::Nav(Screen::Teams)),
-                ui::nav_item(
-                    "Model ops",
-                    app.screen == Screen::ModelOps,
-                    Message::Nav(Screen::ModelOps),
-                ),
-                ui::nav_item("Chat", app.screen == Screen::Chat, Message::Nav(Screen::Chat)),
-                ui::nav_item(
-                    "E.V.",
-                    app.screen == Screen::Assistant,
-                    Message::Nav(Screen::Assistant),
-                ),
-                ui::nav_item(
-                    "Providers",
-                    app.screen == Screen::Providers,
-                    Message::Nav(Screen::Providers),
-                ),
-                ui::nav_item("Status", app.screen == Screen::Status, Message::Nav(Screen::Status)),
-                ui::nav_item("Logs", app.screen == Screen::Logs, Message::Nav(Screen::Logs)),
-            ])
-            .width(Length::Fill),
-            iced::widget::space::vertical(),
-            ui::cluster(vec![
-                ui::icon_button(app.settings.theme.icon(), Message::SetTheme(app.settings.theme.next())),
-                ui::icon_button("⟳", Message::RestartApp),
-            ])
-            .width(Length::Fill),
-        ]
-        .spacing(space::MD),
-    )
-    .width(200)
-    .padding(space::MD)
-    .height(Length::Fill)
-    .style(ui::theme::sidebar);
+/// The sidebar: two short groups of things you *work in*. Everything you
+/// configure or inspect is one entry below them, on its own tabbed page — so
+/// the top level is five destinations rather than nine.
+const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
+    (
+        "WORKSPACE",
+        &[
+            (Screen::Processes, Icon::Activity, "Processes"),
+            (Screen::Projects, Icon::Folder, "Projects"),
+            (Screen::Teams, Icon::Users, "Teams"),
+        ],
+    ),
+    // One entry, two tabs: see [`chat_view`].
+    ("ASSISTANTS", &[(Screen::Chat, Icon::Message, "Chat")]),
+];
 
+/// The chat tab strip: the plain thread and the voiced one, in that order.
+const CHAT_TABS: [(Screen, &str); 2] = [(Screen::Chat, "Chat"), (Screen::Assistant, "E.V.")];
+
+pub fn view(app: &App) -> Element<'_, Message> {
     let content = match app.screen {
-        Screen::Processes => {
-            crate::processes_view::view(&app.processes).map(Message::Processes)
+        Screen::Settings => settings_view(app),
+        _ if !app.view_available() => blocked_view(app, screen_title(app.screen)),
+        Screen::Processes => crate::processes_view::view(&app.processes, &app.settings.theme.resolve())
+            .map(Message::Processes),
+        Screen::Projects => {
+            crate::library_view::view(&app.library, crate::library_view::Kind::Projects)
+                .map(Message::Library)
         }
-        Screen::Projects => crate::library_view::view(&app.library, crate::library_view::Kind::Projects)
-            .map(Message::Library),
         Screen::Teams => crate::library_view::view(&app.library, crate::library_view::Kind::Teams)
             .map(Message::Library),
-        Screen::ModelOps => crate::modelops_view::view(&app.modelops).map(Message::ModelOps),
-        Screen::Chat => crate::chat_view::view(&app.chat).map(Message::Chat),
-        Screen::Assistant => crate::assistant_view::view(&app.assistant).map(Message::Assistant),
-        Screen::Providers => crate::providers_view::view(&app.providers).map(Message::Providers),
-        Screen::Status => status_view(app),
-        Screen::Logs => logs_view(app),
+        Screen::Chat | Screen::Assistant => chat_view(app),
     };
 
     row![
-        sidebar,
+        sidebar(app),
         ui::separator_vertical(),
         container(content).width(Length::Fill).height(Length::Fill),
     ]
     .into()
 }
+
+// ---------------------------------------------------------------------------
+// Sidebar
+// ---------------------------------------------------------------------------
+
+fn sidebar(app: &App) -> Element<'_, Message> {
+    let ready = app.server_ready();
+    let mut items: Vec<Element<'_, Message>> = Vec::new();
+    for (group, entries) in NAV {
+        items.push(ui::nav_group(group));
+        for (screen, glyph, label) in *entries {
+            items.push(if screen.needs_server() && !ready {
+                ui::nav_item_locked(*glyph, label)
+            } else if screen.is_chat() {
+                // One entry for both chat tabs; it returns to the last one open.
+                ui::nav_item(*glyph, label, app.screen.is_chat(), Message::Nav(app.chat_tab))
+            } else {
+                ui::nav_item(*glyph, label, app.screen == *screen, Message::Nav(*screen))
+            });
+        }
+    }
+
+    container(
+        column![
+            brand(app),
+            // The list scrolls on its own so the brand block and the footer keep
+            // their place in a short window.
+            scrollable(Column::with_children(items).spacing(2.0)).height(Length::Fill),
+            ui::separator(),
+            // Settings sits with the window controls, not in the groups above:
+            // it is where you go to change the app, not to use it. It never
+            // locks — Status and Logs live inside it.
+            ui::nav_item(
+                Icon::Settings,
+                "Settings",
+                app.screen == Screen::Settings,
+                Message::Nav(Screen::Settings),
+            ),
+            ui::cluster(vec![
+                ui::icon_button(
+                    app.settings.theme.icon(),
+                    Message::SetTheme(app.settings.theme.next()),
+                ),
+                ui::icon_button(Icon::Refresh, Message::RestartApp),
+            ])
+            .width(Length::Fill),
+        ]
+        .spacing(space::SM),
+    )
+    .width(208)
+    .padding(space::MD)
+    .height(Length::Fill)
+    .style(ui::theme::sidebar)
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// Settings — one page, four tabs
+// ---------------------------------------------------------------------------
+
+/// The four back-of-house screens on one page. Providers and Model ops are what
+/// you change; Status and Logs are what you read when a change did not take.
+/// Each tab keeps its own server gate, so the page opens even when nothing else
+/// does and lands you on the two tabs that still work.
+fn settings_view(app: &App) -> Element<'_, Message> {
+    let ready = app.server_ready();
+    let tabs = ui::segmented(SettingsTab::ALL.map(|tab| {
+        (tab.label(), app.settings_tab == tab, Message::NavSettings(tab))
+    }));
+
+    let body = if app.settings_tab.needs_server() && !ready {
+        blocked_view(app, app.settings_tab.label())
+    } else {
+        match app.settings_tab {
+            SettingsTab::Providers => {
+                crate::providers_view::view(&app.providers).map(Message::Providers)
+            }
+            SettingsTab::ModelOps => {
+                crate::modelops_view::view(&app.modelops).map(Message::ModelOps)
+            }
+            SettingsTab::Status => status_view(app),
+            SettingsTab::Logs => logs_view(app),
+        }
+    };
+
+    tabbed(tabs, body)
+}
+
+// ---------------------------------------------------------------------------
+// Chat — one page, two tabs
+// ---------------------------------------------------------------------------
+
+/// The two assistants on one page: `Chat` is the plain thread, `E.V.` the same
+/// conversation with a HUD, a persona and a voice. Tabbed rather than two
+/// sidebar entries because they are one destination — "talk to the model" —
+/// with two levels of ceremony.
+fn chat_view(app: &App) -> Element<'_, Message> {
+    let tabs = ui::segmented(
+        CHAT_TABS.map(|(screen, label)| (label, app.screen == screen, Message::Nav(screen))),
+    );
+    let body = match app.screen {
+        Screen::Assistant => {
+            crate::assistant_view::view(&app.assistant, &app.settings.theme.resolve())
+                .map(Message::Assistant)
+        }
+        _ => crate::chat_view::view(&app.chat, &app.settings.theme.resolve()).map(Message::Chat),
+    };
+    tabbed(tabs, body)
+}
+
+/// Tab strip over a body. The strip is chrome, so it sits outside the tab's own
+/// `ui::page` scaffold rather than scrolling away with the content.
+fn tabbed<'a>(tabs: Element<'a, Message>, body: Element<'a, Message>) -> Element<'a, Message> {
+    container(
+        column![
+            container(tabs).padding(iced::Padding {
+                top: space::MD,
+                right: space::LG,
+                bottom: 0.0,
+                left: space::LG,
+            }),
+            body
+        ]
+        .spacing(space::SM),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(ui::theme::app_background)
+    .into()
+}
+
+/// App name plus the one fact that governs everything else on screen: whether
+/// the server is up. Putting it here means the user never has to open Status to
+/// learn why a screen is locked.
+fn brand(app: &App) -> Element<'_, Message> {
+    let (label, tone) = server_label(app.server_state());
+    ui::stack(vec![
+        ui::cluster(vec![ui::icon(Icon::Server), ui::body("Agent Platform")]).into(),
+        ui::badge(label, tone),
+    ])
+    .into()
+}
+
+fn server_label(state: ServerState) -> (&'static str, Tone) {
+    match state {
+        ServerState::Ready => ("Connected", Tone::Success),
+        ServerState::Starting => ("Starting…", Tone::Warning),
+        ServerState::Unreachable => ("Offline", Tone::Danger),
+        ServerState::Conflict => ("Port in use", Tone::Danger),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server guard
+// ---------------------------------------------------------------------------
+
+/// Stands in for any screen or settings tab that needs the API while the API is
+/// not there. Deliberately not a bare spinner: it names the state and offers the
+/// things that can actually help — the logs, a restart, and the status page.
+fn blocked_view<'a>(app: &'a App, title: &'a str) -> Element<'a, Message> {
+    let (headline, detail, tone) = match app.server_state() {
+        ServerState::Conflict => (
+            "Another server owns the port",
+            "A server that rejects this install's key is already on this port. \
+             Nothing was started, so this screen has no data to show.",
+            Tone::Danger,
+        ),
+        ServerState::Unreachable => (
+            "The server is not running",
+            "Nothing is answering on the port this app owns.",
+            Tone::Danger,
+        ),
+        // Ready never reaches here (the caller checks first); folding it in with
+        // Starting keeps this total rather than panicking inside a view.
+        _ => (
+            "Waiting for the server",
+            "The local API is starting. This screen unlocks by itself as soon as \
+             it answers — nothing to click.",
+            Tone::Warning,
+        ),
+    };
+
+    let mut actions = vec![ui::button_secondary(
+        Icon::Scroll,
+        "Open logs",
+        Message::NavSettings(SettingsTab::Logs),
+    )];
+    if !app.shell.attached {
+        actions.push(ui::button_outline(
+            Icon::Refresh,
+            "Restart server",
+            Message::RestartServer,
+        ));
+    }
+    actions.push(ui::button_ghost(
+        Icon::Gauge,
+        "Status",
+        Message::NavSettings(SettingsTab::Status),
+    ));
+
+    ui::page(
+        title,
+        Some(ui::muted("Unavailable until the local server is running.")),
+        None,
+        ui::stack_lg(vec![ui::alert(
+            tone,
+            headline,
+            Some(ui::stack(vec![ui::muted(detail), ui::cluster(actions).into()]).into()),
+        )]),
+    )
+}
+
+/// The sidebar label for a screen, so a guarded page keeps the title the user
+/// clicked instead of a generic one.
+fn screen_title(screen: Screen) -> &'static str {
+    if screen == Screen::Settings {
+        return "Settings";
+    }
+    if screen.is_chat() {
+        return CHAT_TABS.iter().find(|(s, _)| *s == screen).map(|(_, l)| *l).unwrap_or("Chat");
+    }
+    NAV.iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .find(|(s, _, _)| *s == screen)
+        .map(|(_, _, label)| *label)
+        .unwrap_or("Agent Platform")
+}
+
 
 // ---------------------------------------------------------------------------
 // Status
@@ -99,8 +295,9 @@ fn status_view(app: &App) -> Element<'_, Message> {
                          (a second install, or a Docker port-forward). No server was started.",
                     ),
                     ui::cluster(vec![
-                        ui::button_secondary("Re-check port", Message::RestartServer),
+                        ui::button_secondary(Icon::Refresh, "Re-check port", Message::RestartServer),
                         ui::button_ghost(
+                            Icon::FolderOpen,
                             "Open data folder",
                             Message::RevealPath(app.shell.data_dir.display().to_string()),
                         ),
@@ -118,9 +315,9 @@ fn status_view(app: &App) -> Element<'_, Message> {
     if let Some(status) = &app.status {
         blocks.push(
             ui::cluster(vec![
-                ui::stat("Active processes", status.processes.active.to_string()),
-                ui::stat("Total processes", status.processes.total.to_string()),
-                ui::stat("Uptime", format!("{:.0}s", status.uptime_seconds)),
+                ui::stat(Icon::Activity, "Active processes", status.processes.active.to_string()),
+                ui::stat(Icon::Scroll, "Total processes", status.processes.total.to_string()),
+                ui::stat(Icon::Clock, "Uptime", format!("{:.0}s", status.uptime_seconds)),
             ])
             .into(),
         );
@@ -138,7 +335,7 @@ fn status_view(app: &App) -> Element<'_, Message> {
             ]),
         ));
     } else if !app.port_conflict {
-        blocks.push(ui::empty_state("Waiting for the server. See Logs for startup output."));
+        blocks.push(ui::empty_state_icon(Icon::Clock, "Waiting for the server. See Logs for startup output."));
     }
 
     ui::page(
@@ -159,10 +356,10 @@ fn server_card(app: &App) -> Element<'_, Message> {
     };
 
     let actions: Option<Element<'_, Message>> = (!app.shell.attached && !app.port_conflict)
-        .then(|| ui::button_outline("Restart", Message::RestartServer));
+        .then(|| ui::button_outline(Icon::Refresh, "Restart", Message::RestartServer));
 
     let mut rows = vec![
-        ui::field("State", ui::badge(label, tone)),
+        ui::field("State", ui::badge_icon(ui::tone_icon(tone), label, tone)),
         ui::field("Port", ui::mono(app.shell.port.to_string())),
     ];
     if let Some(status) = &app.status {
@@ -215,18 +412,21 @@ fn api_card(app: &App) -> Element<'_, Message> {
             ui::field("API key", ui::mono(key_display)),
             ui::cluster(vec![
                 ui::button_ghost(
+                    if app.key_revealed { Icon::EyeOff } else { Icon::Eye },
                     if app.key_revealed { "Hide key" } else { "Show key" },
                     Message::ToggleKeyRevealed,
                 ),
                 ui::button_secondary(
+                    Icon::Copy,
                     copied("key", "Copy key"),
                     Message::Copy("key", app.shell.key.clone()),
                 ),
                 ui::button_secondary(
+                    Icon::Copy,
                     copied("origin", "Copy URL"),
                     Message::Copy("origin", origin.clone()),
                 ),
-                ui::button_secondary(copied("curl", "Copy curl"), Message::Copy("curl", curl)),
+                ui::button_secondary(Icon::Copy, copied("curl", "Copy curl"), Message::Copy("curl", curl)),
             ])
             .into(),
             // The sample never renders the key; the Copy button carries it.
@@ -247,7 +447,8 @@ fn checks_view(report: &ReadinessReport) -> Element<'_, Message> {
             .iter()
             .map(|check| {
                 ui::cluster(vec![
-                    ui::badge(
+                    ui::badge_icon(
+                        if check.ok { Icon::CheckCircle } else { Icon::XCircle },
                         if check.ok { "ok" } else { "fail" },
                         if check.ok { Tone::Success } else { Tone::Danger },
                     ),
@@ -268,7 +469,7 @@ fn path_field<'a>(label: &'a str, value: Option<&str>) -> Element<'a, Message> {
             label,
             ui::cluster(vec![
                 container(ui::mono(p.to_string())).width(Length::Fill).into(),
-                ui::button_ghost("Reveal", Message::RevealPath(p.to_string())),
+                ui::button_ghost(Icon::FolderOpen, "Reveal", Message::RevealPath(p.to_string())),
             ]),
         ),
     }
@@ -280,14 +481,15 @@ fn path_field<'a>(label: &'a str, value: Option<&str>) -> Element<'a, Message> {
 
 fn logs_view(app: &App) -> Element<'_, Message> {
     let toolbar = ui::cluster(vec![
-        container(ui::input("Filter lines…", &app.logs.filter, Message::LogFilterChanged))
+        container(ui::input_icon(Icon::Search, "Filter lines…", &app.logs.filter, Message::LogFilterChanged))
             .width(320)
             .into(),
         ui::button_secondary(
+            if app.logs.paused { Icon::Play } else { Icon::Pause },
             if app.logs.paused { "Resume" } else { "Pause" },
             Message::ToggleLogsPaused,
         ),
-        ui::button_ghost("Clear", Message::ClearLogs),
+        ui::button_ghost(Icon::Trash, "Clear", Message::ClearLogs),
         ui::spacer(),
         ui::badge(
             if app.shell.attached { "server log" } else { "process output" },
@@ -307,7 +509,7 @@ fn logs_view(app: &App) -> Element<'_, Message> {
     let tail = &matched[matched.len().saturating_sub(500)..];
 
     let body: Element<'_, Message> = if tail.is_empty() {
-        ui::empty_state(if app.logs.lines.is_empty() {
+        ui::empty_state_icon(Icon::Scroll, if app.logs.lines.is_empty() {
             "No output yet."
         } else {
             "No lines match the filter."

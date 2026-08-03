@@ -75,6 +75,11 @@ pub struct State {
     pub error: Option<String>,
     pub notice: Option<String>,
     pub busy: bool,
+    /// One chat thread per scope (`"<run id>"`, or `"<run id>:<uuid>"` while a
+    /// subagent is inspected), so switching runs does not mix conversations.
+    /// In memory only — the server's chat endpoint is stateless either way.
+    pub chats: std::collections::HashMap<String, crate::chat::State>,
+    pub chat_open: bool,
 }
 
 impl Default for State {
@@ -99,9 +104,15 @@ impl Default for State {
             error: None,
             notice: None,
             busy: false,
+            chats: std::collections::HashMap::new(),
+            chat_open: false,
         }
     }
 }
+
+/// How much of a task's output travels with the scope context. Same bound the
+/// web panel used — enough to reason about, short of blowing the prompt.
+const OUTPUT_SNIP_LEN: usize = 3000;
 
 impl State {
     pub fn selected_process(&self) -> Option<&ProcessRecord> {
@@ -171,6 +182,78 @@ impl State {
     pub fn task_by_uuid(&self, uuid: &str) -> Option<&TaskNodeRecord> {
         self.detail.as_ref()?.tasks.iter().find(|t| t.client_uuid == uuid)
     }
+
+    /// Which thread the chat panel is talking on: the inspected subagent if one
+    /// is open, otherwise the run. `None` with nothing selected.
+    pub fn chat_key(&self) -> Option<String> {
+        let id = self.selected_process()?.id;
+        Some(match &self.inspecting {
+            Some(uuid) => format!("{id}:{uuid}"),
+            None => id.to_string(),
+        })
+    }
+
+    /// Make sure the current scope has a thread, so the panel has something to
+    /// render before the first message is typed.
+    pub fn ensure_chat(&mut self) {
+        if let Some(key) = self.chat_key() {
+            self.chats.entry(key.clone()).or_insert_with(|| crate::chat::State::scoped(&key));
+        }
+    }
+
+    /// The scope context sent ahead of the thread. Rebuilt per send so a run
+    /// that has moved on since the last question is described as it is now.
+    pub fn scope_system(&self) -> Option<String> {
+        let process = self.selected_process()?;
+        let mut parts = match &self.inspecting {
+            None => vec!["You are a concise assistant for the agent-platform orchestration UI."
+                .to_string()],
+            Some(_) => vec![
+                "You are a concise assistant for a single subagent task in agent-platform."
+                    .to_string(),
+            ],
+        };
+        parts.push(format!("Process id: {}", process.id));
+        parts.push(format!("Status: {}", process.status.as_str()));
+        parts.push(format!("Goal: {}", process.goal));
+        if let Some(reason) = process.failure_reason.as_deref().map(str::trim).filter(|r| !r.is_empty())
+        {
+            parts.push(format!("Last failure: {reason}"));
+        }
+
+        match &self.inspecting {
+            None => parts.push(
+                "Help interpret DAG tasks, statuses, and next steps. Do not invent task outputs."
+                    .to_string(),
+            ),
+            Some(uuid) => {
+                parts.push(format!("Focused client_uuid: {uuid}"));
+                if let Some(sub) = self
+                    .dag()
+                    .and_then(|d| d.subagents.into_iter().find(|s| &s.client_uuid == uuid))
+                {
+                    parts.push(format!("Role: {}", sub.role));
+                }
+                if let Some(task) = self.task_by_uuid(uuid) {
+                    parts.push(format!("Task status: {}", task.status.as_str()));
+                    if let Some(output) =
+                        task.output.as_deref().map(str::trim).filter(|o| !o.is_empty())
+                    {
+                        let snip = match output.char_indices().nth(OUTPUT_SNIP_LEN) {
+                            Some((cut, _)) => format!("{}…", &output[..cut]),
+                            None => output.to_string(),
+                        };
+                        parts.push(format!("Task output (snippet): {snip}"));
+                    }
+                }
+                parts.push(
+                    "Answer about this task only. Do not invent output it does not have."
+                        .to_string(),
+                );
+            }
+        }
+        Some(parts.join("\n"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +288,7 @@ pub enum Message {
     Cancel,
     Retry,
     Sync,
+    Export,
     RetryTask(i64),
     OpenReview(i64),
     CloseReview,
@@ -214,6 +298,9 @@ pub enum Message {
     SubmitReview(ReviewDecision),
     ActionDone(Result<String, String>),
     DismissNotice,
+    // scoped chat
+    ToggleChat,
+    Chat(crate::chat::Message),
 }
 
 impl From<crate::graph::CanvasEvent> for Message {
@@ -261,7 +348,7 @@ fn fetch_detail(client: &Client, id: i64) -> Task<Message> {
             Message::Detailed,
         ),
         Task::perform(
-            async move { err_string(c2.process_events(id, None, 2000).await).map(|r| r.events) },
+            async move { err_string(c2.process_events(id, None, 2000, 0).await).map(|r| r.events) },
             Message::EventsLoaded,
         ),
     ])
@@ -317,6 +404,11 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             }
             state.detail = Some(*detail);
             state.error = None;
+            // The scope only becomes addressable once the detail lands, so an
+            // open panel gets its thread here rather than at Select.
+            if state.chat_open {
+                state.ensure_chat();
+            }
             Task::none()
         }
         Message::Detailed(Err(e)) => {
@@ -419,6 +511,9 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         }
         Message::Inspect(uuid) => {
             state.inspecting = uuid;
+            if state.chat_open {
+                state.ensure_chat();
+            }
             Task::none()
         }
         Message::SetLineage(lineage) => {
@@ -473,6 +568,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Sync => run_action(state, client, |c, id| async move {
             err_string(c.sync_process(id).await).map(|r| r.detail)
         }),
+        Message::Export => run_action(state, client, export_process),
         Message::RetryTask(task_id) => run_action(state, client, move |c, id| async move {
             err_string(c.retry_task(id, task_id).await).map(|r| format!("task {} requeued", r.task_id))
         }),
@@ -550,6 +646,21 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.error = None;
             Task::none()
         }
+        Message::ToggleChat => {
+            state.chat_open = !state.chat_open;
+            if state.chat_open {
+                state.ensure_chat();
+            }
+            Task::none()
+        }
+        Message::Chat(msg) => {
+            let Some(key) = state.chat_key() else { return Task::none() };
+            let system = state.scope_system();
+            let thread =
+                state.chats.entry(key.clone()).or_insert_with(|| crate::chat::State::scoped(&key));
+            thread.system = system;
+            crate::chat::update(thread, client, msg).map(Message::Chat)
+        }
     }
 }
 
@@ -570,6 +681,35 @@ fn became_terminal(previous: Option<ProcessStatus>, current: ProcessStatus) -> b
 }
 
 /// Run a process-scoped action against the selected run.
+/// Writes `{exported_at, process, tasks, events}` to a file the user picks —
+/// the whole run, not the page currently on screen, so events are walked to the
+/// end. Cancelling the picker is a no-op, not an error.
+async fn export_process(client: Client, id: i64) -> Result<String, String> {
+    let Some(handle) = rfd::AsyncFileDialog::new()
+        .set_title("Export run")
+        .set_file_name(format!("run-{id}.json"))
+        .add_filter("JSON", &["json"])
+        .save_file()
+        .await
+    else {
+        return Ok("Export cancelled.".into());
+    };
+
+    let detail = client.process_detail(id).await.map_err(|e| e.to_string())?;
+    let events = client.all_process_events(id).await.map_err(|e| e.to_string())?;
+    let count = events.len();
+    let payload = serde_json::json!({
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "process": detail.process,
+        "tasks": detail.tasks,
+        "events": events,
+    });
+    let bytes = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
+    let name = handle.file_name();
+    handle.write(&bytes).await.map_err(|e| e.to_string())?;
+    Ok(format!("Exported {count} event(s) to {name}."))
+}
+
 fn run_action<F, Fut>(state: &mut State, client: &Client, f: F) -> Task<Message>
 where
     F: FnOnce(Client, i64) -> Fut,
@@ -658,6 +798,30 @@ mod tests {
         assert!(became_terminal(Some(Running), Failed));
         assert!(!became_terminal(Some(Completed), Completed));
         assert!(!became_terminal(Some(Cancelled), Cancelled));
+    }
+
+    #[test]
+    fn chat_scope_follows_the_inspector() {
+        let mut s = State::default();
+        s.detail = Some(detail("running", true));
+
+        assert_eq!(s.chat_key().as_deref(), Some("1"));
+        let run_scope = s.scope_system().unwrap();
+        assert!(run_scope.contains("Process id: 1"));
+        assert!(run_scope.contains("Goal: g"));
+        assert!(!run_scope.contains("client_uuid"));
+
+        s.inspecting = Some("a".into());
+        assert_eq!(s.chat_key().as_deref(), Some("1:a"));
+        let sub_scope = s.scope_system().unwrap();
+        assert!(sub_scope.contains("Focused client_uuid: a"));
+        assert!(sub_scope.contains("Role: R"));
+
+        // Each scope owns its own thread rather than sharing one.
+        s.ensure_chat();
+        s.inspecting = None;
+        s.ensure_chat();
+        assert_eq!(s.chats.len(), 2);
     }
 
     #[test]

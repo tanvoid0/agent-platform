@@ -25,6 +25,7 @@ mod providers;
 mod providers_view;
 mod screen;
 mod shell;
+mod stt;
 mod ui;
 
 use agent_platform_client::types::SystemStatus;
@@ -34,17 +35,76 @@ use shell::{Settings, Shell, ThemeMode};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
+/// Top-level destinations. Everything the user configures or inspects rather
+/// than works in lives behind [`Screen::Settings`], so the sidebar stays five
+/// entries long instead of nine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Processes,
     Projects,
     Teams,
-    ModelOps,
     Chat,
     Assistant,
+    Settings,
+}
+
+impl Screen {
+    /// Whether this screen is useless without the API. Settings opens either
+    /// way — it is the page holding Status and Logs, which is where the user
+    /// finds out why the server is down.
+    pub fn needs_server(self) -> bool {
+        !matches!(self, Screen::Settings)
+    }
+
+    /// The two assistants share one sidebar entry and one tab strip: same
+    /// conversation surface, plain on one tab and voiced with a HUD on the other.
+    pub fn is_chat(self) -> bool {
+        matches!(self, Screen::Chat | Screen::Assistant)
+    }
+}
+
+/// Tabs within [`Screen::Settings`]. Ordered configure-then-diagnose: the two
+/// you change, then the two you read when something is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
     Providers,
+    ModelOps,
     Status,
     Logs,
+}
+
+impl SettingsTab {
+    pub const ALL: [SettingsTab; 4] =
+        [SettingsTab::Providers, SettingsTab::ModelOps, SettingsTab::Status, SettingsTab::Logs];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Providers => "Providers",
+            SettingsTab::ModelOps => "Model ops",
+            SettingsTab::Status => "Status",
+            SettingsTab::Logs => "Logs",
+        }
+    }
+
+    /// Gating is per tab, not per page: Status and Logs are exactly the tabs a
+    /// user needs while the server is not answering.
+    pub fn needs_server(self) -> bool {
+        matches!(self, SettingsTab::Providers | SettingsTab::ModelOps)
+    }
+}
+
+/// What the UI may rely on right now. Derived on demand from the poll result and
+/// the child's liveness, so there is one answer and it cannot go stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerState {
+    /// A server is up and answering authenticated requests.
+    Ready,
+    /// Our child is alive (or we attached) but the API has not answered yet.
+    Starting,
+    /// Nothing is answering and no process of ours is running.
+    Unreachable,
+    /// Another server owns the port; we started nothing and cannot use it.
+    Conflict,
 }
 
 pub struct LogsState {
@@ -63,6 +123,10 @@ pub struct App {
     pub window: Option<window::Id>,
     tray: Option<TrayIcon>,
     pub screen: Screen,
+    /// Which tab the Settings page shows; remembered across visits.
+    pub settings_tab: SettingsTab,
+    /// Which of the two chat tabs the sidebar entry returns to.
+    pub chat_tab: Screen,
     pub status: Option<SystemStatus>,
     pub status_error: Option<String>,
     pub child_alive: bool,
@@ -79,12 +143,44 @@ pub struct App {
     pub providers: providers::State,
 }
 
+impl App {
+    /// Single source of truth for "can the UI talk to the API yet". Every gate —
+    /// nav locks, screen guards, poll intervals — reads this and nothing else.
+    pub fn server_state(&self) -> ServerState {
+        if self.port_conflict {
+            ServerState::Conflict
+        } else if self.status.is_some() {
+            ServerState::Ready
+        } else if self.child_alive || self.shell.attached {
+            ServerState::Starting
+        } else {
+            ServerState::Unreachable
+        }
+    }
+
+    pub fn server_ready(&self) -> bool {
+        self.server_state() == ServerState::Ready
+    }
+
+    /// Whether what the user is currently looking at can actually work. The
+    /// single guard: the sidebar, the settings tabs, the content area and the
+    /// pollers all ask this one question, so none of them can disagree.
+    pub fn view_available(&self) -> bool {
+        let needs_server = match self.screen {
+            Screen::Settings => self.settings_tab.needs_server(),
+            other => other.needs_server(),
+        };
+        !needs_server || self.server_ready()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Tray(String),
     WindowOpened(window::Id),
     WindowClosed(window::Id),
     Nav(Screen),
+    NavSettings(SettingsTab),
     StatusTick,
     StatusFetched(Result<SystemStatus, String>),
     LogsTick,
@@ -109,7 +205,7 @@ pub enum Message {
 
 fn open_window() -> Task<Message> {
     let (_id, task) = window::open(window::Settings {
-        size: iced::Size::new(1100.0, 760.0),
+        size: iced::Size::new(1440.0, 900.0),
         min_size: Some(iced::Size::new(820.0, 560.0)),
         ..window::Settings::default()
     });
@@ -165,8 +261,12 @@ fn boot() -> (App, Task<Message>) {
         String::new()
     });
 
-    // Ollama-style: if one of OUR servers is already on the port (a second app
-    // instance, or a dev run), attach as a pure client instead of spawning.
+    // One app at a time, dev or installed: an earlier instance is killed and
+    // waited out before we look at the port, so we never probe a dying sidecar.
+    let replaced = shell::claim_single_instance(&app_dir, port);
+
+    // Ollama-style: if one of OUR servers is already on the port (a bare
+    // `start.py` dev run), attach as a pure client instead of spawning.
     let owner = shell::port_owner(port, &key);
     let attached = owner == shell::PortOwner::Ours;
 
@@ -180,6 +280,9 @@ fn boot() -> (App, Task<Message>) {
         data_dir: app_dir.clone(),
         attached,
     };
+    if let Some(note) = replaced {
+        sh.log_line(note);
+    }
     let port_conflict = owner == shell::PortOwner::Foreign;
     match owner {
         shell::PortOwner::Ours => {
@@ -210,6 +313,8 @@ fn boot() -> (App, Task<Message>) {
         window: None,
         tray,
         screen: Screen::Processes,
+        settings_tab: SettingsTab::Providers,
+        chat_tab: Screen::Chat,
         status: None,
         status_error: None,
         child_alive: false,
@@ -248,6 +353,28 @@ fn quit(app: &mut App) -> ! {
     std::process::exit(0)
 }
 
+/// The one fetch the current view needs on entry. Skipped entirely while the
+/// server is not ready, so a blocked view never fires a request that can only
+/// fail — [`Message::StatusFetched`] replays it the moment the server answers.
+fn enter_screen(app: &App) -> Task<Message> {
+    if !app.view_available() {
+        return Task::none();
+    }
+    match app.screen {
+        Screen::Processes => Task::done(Message::Processes(processes::Message::ListTick)),
+        Screen::Projects | Screen::Teams => {
+            Task::done(Message::Library(library::Message::Refresh))
+        }
+        Screen::Chat | Screen::Assistant => Task::none(),
+        Screen::Settings => match app.settings_tab {
+            SettingsTab::Logs => Task::done(Message::LogsTick),
+            SettingsTab::ModelOps => Task::done(Message::ModelOps(modelops::Message::Refresh)),
+            SettingsTab::Providers => Task::done(Message::Providers(providers::Message::Refresh)),
+            SettingsTab::Status => Task::none(),
+        },
+    }
+}
+
 fn fetch_status(client: &Client) -> Task<Message> {
     let client = client.clone();
     Task::perform(
@@ -282,29 +409,44 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Nav(screen) => {
             app.screen = screen;
-            app.copied = None;
-            match screen {
-                Screen::Logs => Task::done(Message::LogsTick),
-                Screen::Processes => Task::done(Message::Processes(processes::Message::ListTick)),
-                Screen::Projects | Screen::Teams => Task::done(Message::Library(library::Message::Refresh)),
-                Screen::ModelOps => Task::done(Message::ModelOps(modelops::Message::Refresh)),
-                Screen::Providers => Task::done(Message::Providers(providers::Message::Refresh)),
-                Screen::Status | Screen::Chat | Screen::Assistant => Task::none(),
+            if screen.is_chat() {
+                app.chat_tab = screen;
             }
+            app.copied = None;
+            enter_screen(app)
+        }
+        Message::NavSettings(tab) => {
+            app.screen = Screen::Settings;
+            app.settings_tab = tab;
+            app.copied = None;
+            enter_screen(app)
         }
         Message::StatusTick => {
             app.child_alive = app.shell.server_running();
             fetch_status(&app.client)
         }
         Message::StatusFetched(result) => {
+            let was = app.server_state();
             match result {
                 Ok(status) => {
                     app.status = Some(status);
                     app.status_error = None;
                 }
-                Err(e) => app.status_error = Some(e),
+                Err(e) => {
+                    // A failed poll means the API is gone, not merely noisy: drop
+                    // the last report so the guard closes instead of showing a
+                    // screen backed by data that is no longer being refreshed.
+                    app.status = None;
+                    app.status_error = Some(e);
+                }
             }
-            Task::none()
+            // The screen the user is already looking at was blocked while the
+            // server came up; load it now rather than waiting for a re-click.
+            if was != ServerState::Ready && app.server_state() == ServerState::Ready {
+                enter_screen(app)
+            } else {
+                Task::none()
+            }
         }
         Message::LogsTick => {
             if app.logs.paused {
@@ -390,6 +532,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if !app.shell.attached {
                 app.shell.stop_server();
             }
+            // Drop our claim first: the replacement must not spend its startup
+            // killing a process that is exiting on the next line anyway.
+            let _ = std::fs::remove_file(shell::pid_file(&app.shell.data_dir));
             if let Err(e) = shell::spawn_replacement() {
                 app.shell.log_line(format!("[shell] could not relaunch the app: {e}"));
                 return Task::none();
@@ -448,14 +593,29 @@ fn subscription(app: &App) -> Subscription<Message> {
                 }
             })
         }),
-        iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::StatusTick),
+        // The health poll doubles as the readiness listener, so it runs fast
+        // while the server is coming up (a cold start is the one moment the user
+        // is watching the UI wait) and backs off once it is answering. Changing
+        // the duration changes the subscription's identity, so iced swaps the
+        // timer for us.
+        iced::time::every(match app.server_state() {
+            ServerState::Starting | ServerState::Unreachable => {
+                std::time::Duration::from_millis(750)
+            }
+            ServerState::Ready | ServerState::Conflict => std::time::Duration::from_secs(5),
+        })
+        .map(|_| Message::StatusTick),
     ];
-    if app.window.is_some() && app.screen == Screen::Logs && !app.logs.paused {
+    // A blocked view has nothing to refresh: every poll below would be a request
+    // that can only fail. Polling also only runs while the window is open — a
+    // hidden app is a server host, not a UI.
+    let live = app.window.is_some() && app.view_available();
+    let tab = |t: SettingsTab| app.screen == Screen::Settings && app.settings_tab == t;
+
+    if live && tab(SettingsTab::Logs) && !app.logs.paused {
         subs.push(iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::LogsTick));
     }
-    // Polling only runs while the window is open; a hidden app is a server host,
-    // not a UI, and must not keep hitting the API.
-    if app.window.is_some() && app.screen == Screen::Processes {
+    if live && app.screen == Screen::Processes {
         subs.push(
             iced::time::every(std::time::Duration::from_secs(3))
                 .map(|_| Message::Processes(processes::Message::ListTick)),
@@ -481,13 +641,13 @@ fn subscription(app: &App) -> Subscription<Message> {
             }));
         }
     }
-    if app.window.is_some() && app.screen == Screen::Assistant {
+    if live && app.screen == Screen::Assistant {
         subs.push(
-            iced::time::every(std::time::Duration::from_millis(50))
+            iced::time::every(assistant::TICK)
                 .map(|_| Message::Assistant(assistant::Message::Tick)),
         );
     }
-    if app.window.is_some() && app.screen == Screen::ModelOps && app.modelops.job_running() {
+    if live && tab(SettingsTab::ModelOps) && app.modelops.job_running() {
         subs.push(
             iced::time::every(app.modelops.poll_interval())
                 .map(|_| Message::ModelOps(modelops::Message::JobTick)),
@@ -503,5 +663,29 @@ fn main() -> iced::Result {
         // is picked up without a restart.
         .theme(|state: &App, _w| state.settings.theme.resolve())
         .subscription(subscription)
+        // lucide glyphs (`ui::Icon`) render as text, so the font has to be loaded.
+        .font(ui::icon::FONT_BYTES)
         .run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard is only useful if it leaves a way out. Settings must open with
+    /// no server, and at least one of its tabs must work there — that is where
+    /// the user finds out what went wrong.
+    #[test]
+    fn diagnostics_stay_reachable_without_a_server() {
+        assert!(!Screen::Settings.needs_server());
+        for screen in
+            [Screen::Processes, Screen::Projects, Screen::Teams, Screen::Chat, Screen::Assistant]
+        {
+            assert!(screen.needs_server(), "{screen:?} would render against a dead API");
+        }
+
+        let usable: Vec<_> =
+            SettingsTab::ALL.iter().filter(|t| !t.needs_server()).map(|t| t.label()).collect();
+        assert_eq!(usable, vec!["Status", "Logs"]);
+    }
 }

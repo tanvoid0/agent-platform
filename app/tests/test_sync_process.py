@@ -9,7 +9,7 @@ from models import Process, TaskNode
 
 def test_sync_404(client, test_engine):
     c, _, _ = client
-    r = c.post("/processes/999999/sync")
+    r = c.post("/api/v1/processes/999999/sync")
     assert r.status_code == 404
 
 
@@ -22,7 +22,7 @@ def test_sync_terminal_completed(client, test_engine):
         session.refresh(proc)
         pid = proc.id
 
-    r = c.post(f"/processes/{pid}/sync")
+    r = c.post(f"/api/v1/processes/{pid}/sync")
     assert r.status_code == 200
     body = r.json()
     assert body["action"] == "none"
@@ -39,7 +39,7 @@ def test_sync_terminal_failed_hints_retry(client, test_engine):
         session.refresh(proc)
         pid = proc.id
 
-    r = c.post(f"/processes/{pid}/sync")
+    r = c.post(f"/api/v1/processes/{pid}/sync")
     assert r.status_code == 200
     body = r.json()
     assert body["action"] == "none"
@@ -56,7 +56,7 @@ def test_sync_schedules_plan_for_planning(client, test_engine):
         session.refresh(proc)
         pid = proc.id
 
-    r = c.post(f"/processes/{pid}/sync")
+    r = c.post(f"/api/v1/processes/{pid}/sync")
     assert r.status_code == 200
     body = r.json()
     assert body["action"] == "requeued_plan"
@@ -87,7 +87,7 @@ def test_sync_schedules_execute_for_approved(client, test_engine):
         session.refresh(proc)
         pid = proc.id
 
-    r = c.post(f"/processes/{pid}/sync")
+    r = c.post(f"/api/v1/processes/{pid}/sync")
     assert r.status_code == 200
     body = r.json()
     assert body["action"] == "requeued_execution"
@@ -129,7 +129,7 @@ def test_sync_running_resets_tasks_and_schedules_execute(client, test_engine):
         session.add(task)
         session.commit()
 
-    r = c.post(f"/processes/{pid}/sync")
+    r = c.post(f"/api/v1/processes/{pid}/sync")
     assert r.status_code == 200
     body = r.json()
     assert body["action"] == "requeued_execution"
@@ -151,7 +151,7 @@ def test_sync_blocked_approval_required(client, test_engine):
         session.refresh(proc)
         pid = proc.id
 
-    r = c.post(f"/processes/{pid}/sync")
+    r = c.post(f"/api/v1/processes/{pid}/sync")
     assert r.status_code == 200
     assert r.json()["action"] == "blocked"
 
@@ -176,7 +176,7 @@ def test_sync_aligns_running_with_awaiting_review(client, test_engine):
         session.add(task)
         session.commit()
 
-    r = c.post(f"/processes/{pid}/sync")
+    r = c.post(f"/api/v1/processes/{pid}/sync")
     assert r.status_code == 200
     body = r.json()
     assert body["action"] == "aligned_status"

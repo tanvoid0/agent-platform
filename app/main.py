@@ -4,14 +4,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from action_orchestrator import router as action_orchestrator_router
 from api_tokens import AVAILABLE_SCOPES
 from api_tokens.auth import require_valid_token
-from api_tokens.legacy_routes import router as api_tokens_legacy_router
 from api_tokens.routes import router as api_tokens_router
 from chat_routes import router as chat_router
 from database import create_db_and_tables
@@ -76,18 +74,8 @@ app.add_middleware(RequestLoggingMiddleware)
 app.include_router(llm_proxy_router)
 
 _api_deps = [Depends(require_valid_token)]
-# Routers at root paths for backward compatibility
-app.include_router(process_router, dependencies=_api_deps)
-app.include_router(teams_router, dependencies=_api_deps)
-app.include_router(projects_router, dependencies=_api_deps)
-app.include_router(workspaces_router, dependencies=_api_deps)
-app.include_router(me_workspace_router, dependencies=_api_deps)
-app.include_router(workspace_router, dependencies=_api_deps)
-app.include_router(workspace_files_router, dependencies=_api_deps)
-app.include_router(action_orchestrator_router, dependencies=_api_deps)
-app.include_router(api_tokens_router, dependencies=_api_deps)
-app.include_router(api_tokens_legacy_router, dependencies=_api_deps)
-# Same routers mirrored under /api/v1 (versioned REST surface)
+# The versioned REST surface is the only one; the bare-root mirror was removed
+# with the browser UI (the native desktop client targets /api/v1 exclusively).
 app.include_router(process_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(teams_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(projects_router, prefix="/api/v1", dependencies=_api_deps)
@@ -97,7 +85,6 @@ app.include_router(workspace_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(workspace_files_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(action_orchestrator_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(api_tokens_router, prefix="/api/v1", dependencies=_api_deps)
-app.include_router(api_tokens_legacy_router, prefix="/api/v1", dependencies=_api_deps)
 # Additional routers at /api/v1 prefix
 app.include_router(todos_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(assistant_router, prefix="/api/v1", dependencies=_api_deps)
@@ -108,46 +95,13 @@ app.include_router(chat_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(llm_proxy_admin_router, prefix="/api/v1/llm-proxy", dependencies=_api_deps)
 app.include_router(system_router, prefix="/api/v1", dependencies=_api_deps)
 
-_cors_origins = [
-    o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
-] or ["*"]
-# Browsers reject Access-Control-Allow-Origin: * together with Allow-Credentials: true.
-_cors_allow_credentials = "*" not in _cors_origins
-
-
-class LoggingCORSMiddleware(CORSMiddleware):
-    """CORS with the rejected origin in the log.
-
-    A failed preflight is a bare 400 with no request-log line, so a client whose origin is not on
-    the list looks identical to a broken server. Naming the origin turns that into a one-line fix.
-    """
-
-    def preflight_response(self, request_headers):
-        response = super().preflight_response(request_headers)
-        if response.status_code == 400:
-            logging.getLogger("agent_platform").warning(
-                "CORS preflight rejected: origin=%r allowed=%s",
-                request_headers.get("origin"),
-                _cors_origins,
-            )
-        return response
-
-
-app.add_middleware(
-    LoggingCORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=_cors_allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 @app.get("/", include_in_schema=False)
 def root():
-    return RedirectResponse(url="/config")
+    return {"service": "agent-platform", "api": "/api/v1", "docs": app.docs_url}
 
 
 @app.get("/health")
@@ -161,22 +115,6 @@ def ready():
     return JSONResponse(status_code=status_code, content=payload)
 
 
-@app.get("/config", response_class=HTMLResponse, include_in_schema=False)
-def config_page(request: Request):
-    return templates.TemplateResponse("config.html", {"request": request})
-
-
-@app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
-def ui_page(request: Request):
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "api_base": os.getenv("AGENT_PLATFORM_PUBLIC_API", "").strip() or "",
-        },
-    )
-
-
 @app.get("/tokens", response_class=HTMLResponse, include_in_schema=False)
 def tokens_page(request: Request):
     return templates.TemplateResponse("tokens.html", {"request": request})
@@ -186,8 +124,3 @@ def tokens_page(request: Request):
 def list_available_scopes():
     """Catalog of scopes a token can be granted (for dashboard autocomplete)."""
     return {"scopes": AVAILABLE_SCOPES}
-
-
-@app.get("/api-guide", response_class=HTMLResponse, include_in_schema=False)
-def api_guide_page(request: Request):
-    return templates.TemplateResponse("api_guide.html", {"request": request})

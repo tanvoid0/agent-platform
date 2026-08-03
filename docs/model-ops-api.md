@@ -4,7 +4,7 @@ Agent Platform owns **model build and train**: knowledge merge → dataset → L
 
 **Base URL:** `http://127.0.0.1:18410/api/v1`
 
-**OpenAPI:** `/docs` (tag `model-ops`) · **In-app guide:** `/api-guide`
+**OpenAPI:** `/docs` (tag `model-ops`)
 
 ---
 

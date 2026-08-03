@@ -3,7 +3,7 @@
 
 use crate::domain;
 use crate::library::{Message, State};
-use crate::ui::{self, space, Tone};
+use crate::ui::{self, space, Icon, Tone};
 use agent_platform_client::types::RosterRole;
 use iced::widget::{column, container, scrollable};
 use iced::{Element, Length};
@@ -46,7 +46,7 @@ pub fn view(state: &State, kind: Kind) -> Element<'_, Message> {
     });
 
     let actions = match state.draft {
-        None => Some(ui::button_default(new_label, new_msg)),
+        None => Some(ui::button_default(Icon::Plus, new_label, new_msg)),
         Some(_) => None,
     };
     ui::page(title, Some(ui::muted(subtitle)), actions, ui::stack_lg(blocks))
@@ -55,7 +55,7 @@ pub fn view(state: &State, kind: Kind) -> Element<'_, Message> {
 fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
     ui::cluster(vec![
         container(inner).width(Length::Fill).into(),
-        ui::button_ghost("Dismiss", Message::DismissNotice),
+        ui::button_ghost(Icon::X, "Dismiss", Message::DismissNotice),
     ])
     .into()
 }
@@ -66,7 +66,7 @@ fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
 
 fn project_list(state: &State) -> Element<'_, Message> {
     if state.projects.is_empty() {
-        return ui::card(ui::empty_state("No projects yet."));
+        return ui::card(ui::empty_state_icon(Icon::Folder, "No projects yet."));
     }
     let rows: Vec<Element<'_, Message>> = state
         .projects
@@ -80,17 +80,42 @@ fn project_list(state: &State) -> Element<'_, Message> {
                 .into(),
                 ui::spacer(),
                 ui::caption(domain::relative_time(&p.updated_at).unwrap_or_default()),
-                ui::button_outline("Edit", Message::EditProject(p.id)),
-                ui::button_destructive("Delete", Message::DeleteProject(p.id)),
+                ui::button_outline(Icon::Pencil, "Edit", Message::EditProject(p.id)),
+                ui::button_destructive(Icon::Trash, "Delete", Message::DeleteProject(p.id)),
             ]))
         })
         .collect();
     scrollable(ui::stack(rows)).height(Length::Fill).into()
 }
 
+/// Curated starting rosters. An empty library is the case that most needs them,
+/// so they sit above the list either way rather than only in the empty state.
+fn team_presets<'a>() -> Element<'a, Message> {
+    let cards: Vec<Element<'a, Message>> = crate::library::TEAM_PRESETS
+        .iter()
+        .enumerate()
+        .map(|(i, preset)| {
+            ui::card(ui::stack(vec![
+                ui::body(preset.name),
+                ui::caption(preset.description),
+                ui::button_outline(Icon::Plus, "Use", Message::NewTeamFromPreset(i)),
+            ]))
+        })
+        .collect();
+    ui::section(
+        "Start from a template",
+        Some(ui::muted("Fills the editor — nothing is saved until you save it.")),
+        ui::cluster(cards),
+    )
+}
+
 fn team_list(state: &State) -> Element<'_, Message> {
     if state.teams.is_empty() {
-        return ui::card(ui::empty_state("No teams yet."));
+        return ui::stack_lg(vec![
+            ui::card(ui::empty_state_icon(Icon::Users, "No teams yet.")),
+            team_presets(),
+        ])
+        .into();
     }
     let rows: Vec<Element<'_, Message>> = state
         .teams
@@ -104,12 +129,14 @@ fn team_list(state: &State) -> Element<'_, Message> {
                 .into(),
                 ui::spacer(),
                 ui::badge(format!("{} roles", t.role_count), Tone::Neutral),
-                ui::button_outline("Edit", Message::EditTeam(t.id)),
-                ui::button_destructive("Delete", Message::DeleteTeam(t.id)),
+                ui::button_outline(Icon::Pencil, "Edit", Message::EditTeam(t.id)),
+                ui::button_destructive(Icon::Trash, "Delete", Message::DeleteTeam(t.id)),
             ]))
         })
         .collect();
-    scrollable(ui::stack(rows)).height(Length::Fill).into()
+    scrollable(ui::stack_lg(vec![ui::stack(rows).into(), team_presets()]))
+        .height(Length::Fill)
+        .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -138,8 +165,8 @@ fn save_actions(state: &State, save: Message) -> Element<'_, Message> {
     if state.busy {
         buttons.push(ui::badge("saving…", Tone::Info));
     }
-    buttons.push(ui::button_default("Save", save));
-    buttons.push(ui::button_ghost("Cancel", Message::CancelEdit));
+    buttons.push(ui::button_default(Icon::Save, "Save", save));
+    buttons.push(ui::button_ghost(Icon::X, "Cancel", Message::CancelEdit));
     ui::cluster(buttons).into()
 }
 
@@ -163,7 +190,7 @@ fn team_editor(state: &State) -> Element<'_, Message> {
 
     let layout = state.roster_layout();
     let canvas: Element<'_, Message> = if layout.nodes.is_empty() {
-        ui::empty_state("No roles yet.")
+        ui::empty_state_icon(Icon::Users, "No roles yet.")
     } else {
         iced::widget::canvas(crate::graph::DagCanvas {
             layout,
@@ -181,7 +208,7 @@ fn team_editor(state: &State) -> Element<'_, Message> {
     let roster = ui::card_with_header(
         "Roster",
         Some(ui::muted("Reporting lines come from each role's parent.")),
-        Some(ui::button_secondary("Add role", Message::AddRole)),
+        Some(ui::button_secondary(Icon::Plus, "Add role", Message::AddRole)),
         column![canvas, ui::separator(), ui::stack(roles)].spacing(space::MD),
     );
 
@@ -232,7 +259,7 @@ fn role_row<'a>(
             ))
             .width(220)
             .into(),
-            ui::button_destructive("Remove", Message::RemoveRole(id.clone())),
+            ui::button_destructive(Icon::Trash, "Remove", Message::RemoveRole(id.clone())),
         ])
         .into(),
         ui::input(

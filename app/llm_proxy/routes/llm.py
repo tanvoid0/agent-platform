@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Awaitable, Callable
 
 import httpx
-import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 

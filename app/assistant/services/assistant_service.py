@@ -10,8 +10,8 @@ from sqlmodel import Session, select
 from models import Project
 from time_utils import utc_now_naive
 from todos.models import TodoBoard, TodoCategory, TodoItem
-from todos.schemas import BoardCreate, CategoryOut, ItemOut
-from todos.services.board_service import _category_out, _item_out, create_board, get_board
+from todos.schemas import BoardCreate, ItemOut
+from todos.services.board_service import _category_out, _item_out, create_board
 
 
 ASSISTANT_BOARD_NAME = "Personal Assistant"
@@ -95,7 +95,6 @@ def get_dashboard(
     horizon: str = "day",
 ) -> dict:
     board = ensure_assistant_board(session, project_id)
-    detail = get_board(session, board.id)
     now = utc_now_naive()
     start, end = _horizon_range(horizon, now)
 

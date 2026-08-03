@@ -10,8 +10,8 @@ from sqlmodel import Session
 
 from time_utils import utc_now_naive
 from todos.models import TODO_STATUSES, TodoItem
-from todos.schemas import ItemCreate, ItemOut, ItemUpdate, PlannedActionOut
-from todos.services.board_service import _item_out, create_item, update_item
+from todos.schemas import ItemCreate, ItemOut, PlannedActionOut
+from todos.services.board_service import _item_out, create_item
 from todos.services.item_events import append_item_event
 from todos.services.server_actions import execute_trigger_webhook
 

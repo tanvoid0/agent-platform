@@ -37,7 +37,7 @@ def test_retry_planning_failure_schedules_plan(client, test_engine):
         session.refresh(proc)
         rid = proc.id
 
-    r = c.post(f"/processes/{rid}/retry")
+    r = c.post(f"/api/v1/processes/{rid}/retry")
     assert r.status_code == 200
     body = r.json()
     assert body["process_id"] == rid
@@ -86,7 +86,7 @@ def test_retry_execution_failure_resets_tasks_and_schedules_execute(client, test
         session.add(task)
         session.commit()
 
-    r = c.post(f"/processes/{rid}/retry")
+    r = c.post(f"/api/v1/processes/{rid}/retry")
     assert r.status_code == 200
     body = r.json()
     assert body["retry"] == "execution"
@@ -114,13 +114,13 @@ def test_retry_not_failed_returns_400(client, test_engine):
         session.refresh(proc)
         rid = proc.id
 
-    r = c.post(f"/processes/{rid}/retry")
+    r = c.post(f"/api/v1/processes/{rid}/retry")
     assert r.status_code == 400
 
 
 def test_retry_missing_run_returns_404(client):
     c, _, _ = client
-    r = c.post("/processes/99999/retry")
+    r = c.post("/api/v1/processes/99999/retry")
     assert r.status_code == 404
 
 
@@ -144,7 +144,7 @@ def test_retry_execution_without_dag_json_returns_400(client, test_engine):
         session.add(task)
         session.commit()
 
-    r = c.post(f"/processes/{rid}/retry")
+    r = c.post(f"/api/v1/processes/{rid}/retry")
     assert r.status_code == 400
     assert "DAG JSON" in r.json()["error"]["message"]
 
@@ -181,7 +181,7 @@ def test_retry_failed_task_resets_task_and_schedules_execute(client, test_engine
         session.refresh(task)
         tid = task.id
 
-    r = c.post(f"/processes/{rid}/tasks/{tid}/retry")
+    r = c.post(f"/api/v1/processes/{rid}/tasks/{tid}/retry")
     assert r.status_code == 200
     body = r.json()
     assert body["process_id"] == rid
@@ -228,7 +228,7 @@ def test_retry_failed_task_wrong_run_returns_404(client, test_engine):
         wrong_process_id = r2.id
         task_id = task.id
 
-    r = c.post(f"/processes/{wrong_process_id}/tasks/{task_id}/retry")
+    r = c.post(f"/api/v1/processes/{wrong_process_id}/tasks/{task_id}/retry")
     assert r.status_code == 404
 
 
@@ -256,7 +256,7 @@ def test_retry_failed_task_not_failed_returns_400(client, test_engine):
         process_id = proc.id
         task_id = task.id
 
-    r = c.post(f"/processes/{process_id}/tasks/{task_id}/retry")
+    r = c.post(f"/api/v1/processes/{process_id}/tasks/{task_id}/retry")
     assert r.status_code == 400
 
 
@@ -283,7 +283,7 @@ def test_retry_failed_task_run_not_failed_returns_400(client, test_engine):
         process_id = proc.id
         task_id = task.id
 
-    r = c.post(f"/processes/{process_id}/tasks/{task_id}/retry")
+    r = c.post(f"/api/v1/processes/{process_id}/tasks/{task_id}/retry")
     assert r.status_code == 400
 
 
@@ -309,5 +309,5 @@ def test_retry_failed_task_no_dag_json_returns_400(client, test_engine):
         process_id = proc.id
         task_id = task.id
 
-    r = c.post(f"/processes/{process_id}/tasks/{task_id}/retry")
+    r = c.post(f"/api/v1/processes/{process_id}/tasks/{task_id}/retry")
     assert r.status_code == 400

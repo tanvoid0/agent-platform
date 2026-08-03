@@ -61,7 +61,7 @@ from api_tokens.auth import (
 )
 from assistant.models import AssistantReview
 from database import get_session
-from todos.schemas import ItemOut, PlannedActionOut
+from todos.schemas import ItemOut
 
 logger = logging.getLogger(__name__)
 

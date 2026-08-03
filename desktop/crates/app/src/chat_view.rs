@@ -1,69 +1,110 @@
-//! Chat rendering: transcript above, composer below.
+//! Chat rendering: transcript scrolls, composer stays pinned below it.
+//!
+//! The plain half of the pair — same transcript shape as E.V.'s, without the
+//! HUD, the voice or the persona. Model override lives in the header, not the
+//! composer: it is a setting for the thread, not part of writing a message.
 
 use crate::chat::{Message, State};
-use crate::ui::{self, space, Tone};
-use iced::widget::{column, container, scrollable};
-use iced::{Element, Length};
+use crate::ui::{self, space, Icon, Tone};
+use iced::widget::{column, container, markdown, scrollable};
+use iced::{Element, Length, Theme};
 
-pub fn view(state: &State) -> Element<'_, Message> {
+/// Transcript + composer, with no page chrome — the screen wraps it in a page,
+/// the processes pane wraps it in a card.
+///
+/// `height` is the caller's: the screen gives the transcript the window, a card
+/// inside a scrolling pane has to cap it or it fights the outer scroll.
+pub fn panel<'a>(
+    state: &'a State,
+    iced_theme: &Theme,
+    empty_hint: &'static str,
+    height: Length,
+) -> Element<'a, Message> {
     let transcript: Element<'_, Message> = if state.messages.is_empty() {
-        ui::empty_state("Ask the platform's model anything.")
+        ui::empty_state_icon(Icon::Message, empty_hint)
     } else {
         let turns: Vec<Element<'_, Message>> = state
             .messages
             .iter()
-            .map(|m| {
+            .zip(&state.md)
+            .map(|(m, items)| {
+                let is_user = m.role == "user";
                 let (label, tone) = match m.role.as_str() {
-                    "user" => ("You", Tone::Info),
-                    "assistant" => ("Assistant", Tone::Success),
+                    "user" => ("You", Tone::Neutral),
+                    "assistant" => ("Assistant", Tone::Info),
                     other => (other, Tone::Neutral),
                 };
-                ui::card(ui::stack(vec![
-                    ui::badge(label, tone),
-                    ui::body(m.content.clone()),
-                ]))
+                let content: Element<'_, Message> = if is_user {
+                    ui::body(m.content.clone())
+                } else {
+                    markdown::view(items, markdown::Settings::from(iced_theme))
+                        .map(Message::LinkClicked)
+                };
+                ui::turn(label, tone, is_user, content)
             })
             .collect();
-        scrollable(ui::stack(turns)).height(Length::Fill).anchor_bottom().into()
+        scrollable(
+            ui::stack_lg(turns)
+                .padding(iced::Padding { right: 12.0, ..Default::default() }),
+        )
+        .id(state.scroll_id())
+        .height(height)
+        .into()
     };
 
-    let composer_row: Element<'_, Message> = ui::cluster(vec![
-            container(ui::input("Message…", &state.draft, Message::DraftChanged))
-                .width(Length::Fill)
-                .into(),
-            container(ui::input("model (optional)", &state.model, Message::ModelChanged))
-                .width(180)
-                .into(),
+    let composer = ui::card(
+        ui::cluster(vec![
+            container(ui::input_submit(
+                "Message…",
+                &state.draft,
+                Message::DraftChanged,
+                Message::Send,
+            ))
+            .width(Length::Fill)
+            .into(),
             if state.sending {
                 ui::badge("thinking…", Tone::Info)
-        } else {
-            ui::button_default("Send", Message::Send)
-        },
-    ])
-    .into();
-    let composer = ui::card(composer_row);
+            } else {
+                ui::button_default(Icon::Send, "Send", Message::Send)
+            },
+        ]),
+    );
 
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
     if let Some(err) = &state.error {
         blocks.push(
             ui::cluster(vec![
                 container(ui::alert_error(err.clone())).width(Length::Fill).into(),
-                ui::button_ghost("Dismiss", Message::DismissError),
+                ui::button_ghost(Icon::X, "Dismiss", Message::DismissError),
             ])
             .into(),
         );
     }
-    blocks.push(container(transcript).height(Length::Fill).into());
+    // An empty transcript keeps its natural height whatever the caller asked
+    // for; only a real thread is worth reserving space for. The column fills
+    // only when the caller does, so a capped panel does not stretch its card.
+    let filled = matches!(height, Length::Fill);
+    let body_height = if state.messages.is_empty() { Length::Shrink } else { height };
+    blocks.push(container(transcript).height(body_height).into());
     blocks.push(composer);
+    column(blocks)
+        .spacing(space::MD)
+        .height(if filled { Length::Fill } else { Length::Shrink })
+        .into()
+}
 
-    ui::page(
+pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
+    let actions = ui::cluster(vec![
+        container(ui::input("model (optional)", &state.model, Message::ModelChanged))
+            .width(200)
+            .into(),
+        ui::button_outline(Icon::Trash, "Clear", Message::Clear),
+    ]);
+
+    ui::page_fixed(
         "Chat",
         Some(ui::muted("Talks to the same provider the agents use.")),
-        Some(ui::button_outline("Clear", Message::Clear)),
-        {
-            let body: Element<'_, Message> =
-                column(blocks).spacing(space::MD).height(Length::Fill).into();
-            body
-        },
+        Some(actions.into()),
+        panel(state, iced_theme, "Ask the platform's model anything.", Length::Fill),
     )
 }

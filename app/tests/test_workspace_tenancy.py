@@ -17,14 +17,14 @@ def _master_key_env(monkeypatch):
 
 
 def _create_workspace(c, name, slug):
-    r = c.post("/workspaces/", json={"name": name, "slug": slug}, headers=_master_headers())
+    r = c.post("/api/v1/workspaces/", json={"name": name, "slug": slug}, headers=_master_headers())
     assert r.status_code == 201, r.text
     return r.json()["id"]
 
 
 def _create_project(c, workspace_id, name):
     r = c.post(
-        "/projects/", json={"name": name, "workspace_id": workspace_id}, headers=_master_headers()
+        "/api/v1/projects/", json={"name": name, "workspace_id": workspace_id}, headers=_master_headers()
     )
     assert r.status_code == 201, r.text
     return r.json()["id"]
@@ -32,7 +32,7 @@ def _create_project(c, workspace_id, name):
 
 def _create_token(c, workspace_id):
     r = c.post(
-        f"/workspaces/{workspace_id}/api-tokens/",
+        f"/api/v1/workspaces/{workspace_id}/api-tokens/",
         json={"name": "t", "scopes": ["*"]},
         headers=_master_headers(),
     )
@@ -49,7 +49,7 @@ def test_token_cannot_reach_other_workspace_project(client, test_engine):
     h = {"Authorization": f"Bearer {token_a}"}
 
     # Cross-workspace project read → 404 isolation.
-    assert c.get(f"/projects/{proj_b}", headers=h).status_code == 404
+    assert c.get(f"/api/v1/projects/{proj_b}", headers=h).status_code == 404
 
 
 def test_list_projects_scoped_to_token_workspace(client, test_engine):
@@ -62,7 +62,7 @@ def test_list_projects_scoped_to_token_workspace(client, test_engine):
     token_a = _create_token(c, ws_a)
     h = {"Authorization": f"Bearer {token_a}"}
 
-    rows = c.get("/projects/", headers=h).json()["projects"]
+    rows = c.get("/api/v1/projects/", headers=h).json()["projects"]
     assert {p["name"] for p in rows} == {"pa1", "pa2"}
     assert all(p["workspace_id"] == ws_a for p in rows)
 
@@ -74,11 +74,11 @@ def test_master_key_sees_all_workspaces_and_projects(client, test_engine):
     _create_project(c, ws_a, "pa1")
     _create_project(c, ws_b, "pb1")
 
-    ws = c.get("/workspaces/", headers=_master_headers()).json()["workspaces"]
+    ws = c.get("/api/v1/workspaces/", headers=_master_headers()).json()["workspaces"]
     slugs = {w["slug"] for w in ws}
     assert {"a", "b", "default"} <= slugs
 
-    projects = c.get("/projects/", headers=_master_headers()).json()["projects"]
+    projects = c.get("/api/v1/projects/", headers=_master_headers()).json()["projects"]
     assert {"pa1", "pb1"} <= {p["name"] for p in projects}
 
 
@@ -86,7 +86,7 @@ def test_create_api_token_binds_to_path_workspace(client, test_engine):
     c, *_ = client
     ws = _create_workspace(c, "A", "a")
     r = c.post(
-        f"/workspaces/{ws}/api-tokens/",
+        f"/api/v1/workspaces/{ws}/api-tokens/",
         json={"name": "t", "scopes": ["*"]},
         headers=_master_headers(),
     )
@@ -100,7 +100,7 @@ def test_me_workspace_returns_token_workspace(client, test_engine):
     token = _create_token(c, ws)
     h = {"Authorization": f"Bearer {token}"}
 
-    r = c.get("/me/workspace", headers=h)
+    r = c.get("/api/v1/me/workspace", headers=h)
     assert r.status_code == 200
     body = r.json()
     assert body["id"] == ws
@@ -109,7 +109,7 @@ def test_me_workspace_returns_token_workspace(client, test_engine):
 
 def test_me_workspace_master_key_400(client, test_engine):
     c, *_ = client
-    r = c.get("/me/workspace", headers=_master_headers())
+    r = c.get("/api/v1/me/workspace", headers=_master_headers())
     assert r.status_code == 400
 
 
@@ -120,7 +120,7 @@ def _create_team(c, headers, name, workspace_id=None):
     body = {"name": name, "roster": _ROSTER}
     if workspace_id is not None:
         body["workspace_id"] = workspace_id
-    r = c.post("/teams/", json=body, headers=headers)
+    r = c.post("/api/v1/teams/", json=body, headers=headers)
     assert r.status_code == 201, r.text
     return r.json()
 
@@ -134,9 +134,9 @@ def test_global_team_visible_to_workspace_token(client, test_engine):
     glob = _create_team(c, _master_headers(), "GlobalTeam")
     assert glob["workspace_id"] is None
 
-    names = {t["name"] for t in c.get("/teams/", headers=h).json()["teams"]}
+    names = {t["name"] for t in c.get("/api/v1/teams/", headers=h).json()["teams"]}
     assert "GlobalTeam" in names
-    assert c.get(f"/teams/{glob['id']}", headers=h).status_code == 200
+    assert c.get(f"/api/v1/teams/{glob['id']}", headers=h).status_code == 200
 
 
 def test_workspace_team_isolated_and_owned(client, test_engine):
@@ -151,13 +151,13 @@ def test_workspace_team_isolated_and_owned(client, test_engine):
     assert team["workspace_id"] == ws_a
 
     # Visible to A, invisible to B.
-    assert "TeamA" in {t["name"] for t in c.get("/teams/", headers=tok_a).json()["teams"]}
-    assert "TeamA" not in {t["name"] for t in c.get("/teams/", headers=tok_b).json()["teams"]}
-    assert c.get(f"/teams/{team['id']}", headers=tok_b).status_code == 404
+    assert "TeamA" in {t["name"] for t in c.get("/api/v1/teams/", headers=tok_a).json()["teams"]}
+    assert "TeamA" not in {t["name"] for t in c.get("/api/v1/teams/", headers=tok_b).json()["teams"]}
+    assert c.get(f"/api/v1/teams/{team['id']}", headers=tok_b).status_code == 404
 
     # B cannot modify or delete A's team.
-    assert c.patch(f"/teams/{team['id']}", json={"name": "x"}, headers=tok_b).status_code == 404
-    assert c.delete(f"/teams/{team['id']}", headers=tok_b).status_code == 404
+    assert c.patch(f"/api/v1/teams/{team['id']}", json={"name": "x"}, headers=tok_b).status_code == 404
+    assert c.delete(f"/api/v1/teams/{team['id']}", headers=tok_b).status_code == 404
 
 
 def test_workspace_token_cannot_modify_global_team(client, test_engine):
@@ -166,8 +166,8 @@ def test_workspace_token_cannot_modify_global_team(client, test_engine):
     h = {"Authorization": f"Bearer {_create_token(c, ws)}"}
     glob = _create_team(c, _master_headers(), "GlobalTeam")
     # Visible but read-only for a workspace token.
-    assert c.patch(f"/teams/{glob['id']}", json={"name": "x"}, headers=h).status_code == 404
-    assert c.delete(f"/teams/{glob['id']}", headers=h).status_code == 404
+    assert c.patch(f"/api/v1/teams/{glob['id']}", json={"name": "x"}, headers=h).status_code == 404
+    assert c.delete(f"/api/v1/teams/{glob['id']}", headers=h).status_code == 404
 
 
 def test_workspace_token_cannot_manage_workspaces(client, test_engine):
@@ -175,8 +175,8 @@ def test_workspace_token_cannot_manage_workspaces(client, test_engine):
     ws = _create_workspace(c, "A", "a")
     token = _create_token(c, ws)
     h = {"Authorization": f"Bearer {token}"}
-    assert c.get("/workspaces/", headers=h).status_code == 403
-    assert c.post("/workspaces/", json={"name": "x"}, headers=h).status_code == 403
+    assert c.get("/api/v1/workspaces/", headers=h).status_code == 403
+    assert c.post("/api/v1/workspaces/", json={"name": "x"}, headers=h).status_code == 403
 
 
 def test_archive_workspace_revokes_tokens_and_hides_tenant(client, test_engine):
@@ -186,36 +186,36 @@ def test_archive_workspace_revokes_tokens_and_hides_tenant(client, test_engine):
     token = _create_token(c, ws)
     team = _create_team(c, _master_headers(), "OwnedTeam", workspace_id=ws)
 
-    r = c.delete(f"/workspaces/{ws}", headers=_master_headers())
+    r = c.delete(f"/api/v1/workspaces/{ws}", headers=_master_headers())
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
     assert body["tokens_revoked"] >= 1
     assert body["teams_removed"] >= 1
 
-    listed = c.get("/workspaces/", headers=_master_headers()).json()["workspaces"]
+    listed = c.get("/api/v1/workspaces/", headers=_master_headers()).json()["workspaces"]
     assert all(w["id"] != ws for w in listed)
 
-    assert c.get(f"/workspaces/{ws}", headers=_master_headers()).status_code == 404
+    assert c.get(f"/api/v1/workspaces/{ws}", headers=_master_headers()).status_code == 404
     assert c.patch(
-        f"/workspaces/{ws}", json={"name": "x"}, headers=_master_headers()
+        f"/api/v1/workspaces/{ws}", json={"name": "x"}, headers=_master_headers()
     ).status_code == 404
 
     h = {"Authorization": f"Bearer {token}"}
-    assert c.get("/projects/", headers=h).status_code == 401
-    assert c.get(f"/teams/{team['id']}", headers=h).status_code == 401
+    assert c.get("/api/v1/projects/", headers=h).status_code == 401
+    assert c.get(f"/api/v1/teams/{team['id']}", headers=h).status_code == 401
 
-    projects = c.get("/projects/", headers=_master_headers()).json()["projects"]
+    projects = c.get("/api/v1/projects/", headers=_master_headers()).json()["projects"]
     assert all(p["workspace_id"] != ws for p in projects)
 
 
 def test_archive_default_workspace_rejected(client, test_engine):
     c, *_ = client
     default = next(
-        w for w in c.get("/workspaces/", headers=_master_headers()).json()["workspaces"]
+        w for w in c.get("/api/v1/workspaces/", headers=_master_headers()).json()["workspaces"]
         if w["slug"] == "default"
     )
-    r = c.delete(f"/workspaces/{default['id']}", headers=_master_headers())
+    r = c.delete(f"/api/v1/workspaces/{default['id']}", headers=_master_headers())
     assert r.status_code == 400
 
 
@@ -223,7 +223,7 @@ def test_update_workspace_name_and_description(client, test_engine):
     c, *_ = client
     ws = _create_workspace(c, "Before", "before-edit")
     r = c.patch(
-        f"/workspaces/{ws}",
+        f"/api/v1/workspaces/{ws}",
         json={"name": "After", "description": "updated note"},
         headers=_master_headers(),
     )
@@ -339,10 +339,10 @@ def test_archived_workspace_project_hidden_from_master_key(client, test_engine):
     c, *_ = client
     ws = _create_workspace(c, "ArchiveProj", "archive-proj")
     proj = _create_project(c, ws, "hidden")
-    c.delete(f"/workspaces/{ws}", headers=_master_headers())
+    c.delete(f"/api/v1/workspaces/{ws}", headers=_master_headers())
 
-    assert c.get(f"/projects/{proj}", headers=_master_headers()).status_code == 404
+    assert c.get(f"/api/v1/projects/{proj}", headers=_master_headers()).status_code == 404
     assert (
-        c.patch(f"/projects/{proj}", json={"name": "x"}, headers=_master_headers()).status_code
+        c.patch(f"/api/v1/projects/{proj}", json={"name": "x"}, headers=_master_headers()).status_code
         == 404
     )

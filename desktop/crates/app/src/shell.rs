@@ -42,11 +42,11 @@ pub enum ThemeMode {
 
 impl ThemeMode {
     /// Glyph for the compact sidebar toggle.
-    pub fn icon(&self) -> &'static str {
+    pub fn icon(&self) -> crate::ui::Icon {
         match self {
-            ThemeMode::System => "◑",
-            ThemeMode::Light => "☀",
-            ThemeMode::Dark => "☾",
+            ThemeMode::System => crate::ui::Icon::Monitor,
+            ThemeMode::Light => crate::ui::Icon::Sun,
+            ThemeMode::Dark => crate::ui::Icon::Moon,
         }
     }
 
@@ -370,6 +370,95 @@ pub fn spawn_replacement() -> std::io::Result<()> {
     Command::new(exe).spawn().map(|_| ())
 }
 
+/// Path of the pid file recording the instance that currently owns the app.
+pub fn pid_file(dir: &Path) -> PathBuf {
+    dir.join("app.pid")
+}
+
+/// One app at a time. Kills whatever earlier instance recorded itself in
+/// `app.pid` and waits for it (and the sidecar that dies with it) to let go of
+/// the port before returning. Debug and release builds share the directory, so
+/// a dev run replaces an installed one and vice versa. Returns a line to log
+/// when an instance was actually replaced.
+pub fn claim_single_instance(dir: &Path, port: u16) -> Option<String> {
+    let path = pid_file(dir);
+    let mut note = None;
+    if let Some(pid) =
+        std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        if pid != std::process::id() && is_our_process(pid) {
+            kill_process(pid);
+            // Its sidecar exits with it, but not instantly — spawning or probing
+            // before the port is free would bind-fail or attach to a corpse.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline
+                && (is_our_process(pid) || health_ok(port))
+            {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            note = Some(format!("[shell] replaced the running instance (pid {pid})"));
+        }
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(&path, std::process::id().to_string());
+    note
+}
+
+fn exe_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "agent-platform".to_string())
+}
+
+/// Whether `pid` is a live process running this same executable. The name check
+/// matters: pids are recycled, and the file may be days stale.
+#[cfg(windows)]
+fn is_our_process(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = Command::new("tasklist");
+    cmd.args([
+        "/FI",
+        &format!("PID eq {pid}"),
+        "/FI",
+        &format!("IMAGENAME eq {}", exe_name()),
+        "/NH",
+        "/FO",
+        "CSV",
+    ])
+    .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    match cmd.output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\"")),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn is_our_process(pid: u32) -> bool {
+    match Command::new("ps").args(["-p", &pid.to_string(), "-o", "comm="]).output() {
+        Ok(out) => {
+            let comm = String::from_utf8_lossy(&out.stdout);
+            let comm = comm.trim();
+            !comm.is_empty() && Path::new(comm).file_name().map(|n| n == exe_name().as_str()) == Some(true)
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+fn kill_process(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(0x0800_0000)
+        .output(); // captured, so taskkill's chatter stays out of a dev console
+}
+
+#[cfg(not(windows))]
+fn kill_process(pid: u32) {
+    let _ = Command::new("kill").arg(pid.to_string()).output();
+}
+
 /// Reveal a path in the platform file manager.
 pub fn reveal_path(path: &str) {
     let program = if cfg!(windows) {
@@ -407,6 +496,27 @@ mod tests {
         let chunk = ring.since(0);
         assert_eq!(chunk.lines.len(), LOG_CAPACITY);
         assert!(chunk.dropped > 0);
+    }
+
+    /// A stale pid must not be mistaken for a live instance (nothing to kill, no
+    /// wait), and the claim must always end with our own pid in the file.
+    #[test]
+    fn single_instance_claim_ignores_a_stale_pid() {
+        let dir = std::env::temp_dir().join(format!("ap-pid-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(pid_file(&dir), "4294967290").unwrap();
+
+        // Port 0 is never listening, so a hang here would mean we decided the
+        // dead pid was alive.
+        assert_eq!(claim_single_instance(&dir, 0), None);
+        assert_eq!(
+            std::fs::read_to_string(pid_file(&dir)).unwrap(),
+            std::process::id().to_string()
+        );
+
+        // Second claim sees its own pid and leaves this process alone.
+        assert_eq!(claim_single_instance(&dir, 0), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

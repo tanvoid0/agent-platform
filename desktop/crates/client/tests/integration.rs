@@ -129,7 +129,7 @@ async fn teams_crud_and_process_lifecycle() {
     );
 
     let events = c
-        .process_events(created.process_id, None, 100)
+        .process_events(created.process_id, None, 100, 0)
         .await
         .expect("events");
     assert!(events.events.iter().all(|e| e.process_id == created.process_id));

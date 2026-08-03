@@ -20,12 +20,9 @@ ERROR_TYPE = "llm_proxy_error"
 # Browser-facing pages served by this process. Everything else is a JSON API and
 # gets the wrapped error envelope — listing the HTML routes instead of the API
 # prefixes means a newly mounted router cannot silently fall back to FastAPI's
-# bare `{"detail": ...}`, which is how the legacy root mounts (/workspaces,
-# /me/workspace, /api-tokens) drifted away from their /api/v1 twins.
-_HTML_PAGE_PATHS = frozenset(
-    {"/", "/config", "/ui", "/tokens", "/api-guide", "/docs", "/redoc", "/openapi.json"}
-)
-_HTML_PAGE_PREFIXES = ("/app", "/static", "/assets")
+# bare `{"detail": ...}`.
+_HTML_PAGE_PATHS = frozenset({"/tokens", "/docs", "/redoc", "/openapi.json"})
+_HTML_PAGE_PREFIXES = ()
 
 
 def wants_wrapped_json_errors(request: Request) -> bool:

@@ -20,7 +20,6 @@ from llm_proxy.core.config_cache import (
     env_file_path,
     load_config_yaml_dict,
     read_env_file_parsed,
-    read_llm_proxy_ui_fallbacks,
     resolved_config_yaml_path,
 )
 from llm_proxy.core.errors import LlmProxyError
@@ -28,16 +27,7 @@ from llm_proxy.core.provider_config import (
     DEFAULT_LM_STUDIO_BASE,
     DEFAULT_OLLAMA_BASE,
     PROVIDER_LOCAL_SORT_ORDER,
-    aimlapi_api_key,
-    aimlapi_configured,
-    aimlapi_openai_base,
-    gemini_api_key,
-    gemini_configured,
-    lm_studio_api_base,
     lm_studio_api_key,
-    lm_studio_configured,
-    ollama_api_base,
-    ollama_configured,
     provider_configured,
     is_supported_provider,
 )

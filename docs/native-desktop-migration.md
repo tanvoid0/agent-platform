@@ -5,8 +5,9 @@ existing Python server as a child process.
 
 **Status:** Phases 0–5 complete on Windows (visual pass, pixel office dropped,
 old stacks and server UI-serving deleted, file dialogs + notifications wired,
-packaging done). Open: Windows installer untested against a real Inno Setup
-compile, and macOS/Linux packaging/signing not started.
+packaging done). Open: three unported web features, the Windows installer
+untested against a real Inno Setup compile, and macOS/Linux packaging/signing
+not started — see [Still open](#still-open).
 
 ## Why
 
@@ -111,11 +112,33 @@ it went away with `web/` rather than being reimplemented in `iced::canvas`.
 - `scripts/bundle_server.py` no longer stages `web/` into the payload.
 
 ### 4. Server cleanup — done
-The server no longer mounts anything at `/app`. `root()` (`GET /`) redirects
-unconditionally to `/config`. Docker collapsed to backend-only — no nginx, no
-UI static serving, no `ui`/`all` container modes; the image is just the FastAPI
-app behind uvicorn. Nothing else wanted a browser UI, so `web/` was deleted
-outright rather than kept for Docker/cloud.
+The server no longer mounts anything at `/app`. Docker collapsed to
+backend-only — no nginx, no UI static serving, no `ui`/`all` container modes;
+the image is just the FastAPI app behind uvicorn. Nothing else wanted a browser
+UI, so `web/` was deleted outright rather than kept for Docker/cloud.
+
+Second pass, once the native app reached parity (it is now the only UI, and it
+talks to `/api/v1` exclusively):
+
+- **Bare-root router mounts removed** — `/processes`, `/teams`, `/projects`,
+  `/workspaces`, `/me/workspace`, `/workspace`, `/actions`, `/api-tokens` now
+  answer only under `/api/v1`. **Breaking for any external caller still on the
+  legacy paths: prefix them with `/api/v1`.** The 161 test call sites were
+  migrated with them.
+- **Deprecated project-scoped token routes removed** —
+  `/api/v1/projects/{id}/api-tokens/*` is gone (master-key-only alias of the
+  workspace routes, shipped one release with a `Deprecation` header). Use
+  `/api/v1/workspaces/{workspace_id}/api-tokens/`.
+- **CORS middleware deleted** (`LoggingCORSMiddleware`, `CORS_ALLOW_ORIGINS`) —
+  a native client sends no `Origin`, and no browser page is served any more.
+- **Jinja pages deleted**: `/config`, `/ui`, `/api-guide` and their templates.
+  `/tokens` stays (the only token dashboard). `GET /` no longer redirects to
+  `/config`; it returns `{"service", "api", "docs"}`.
+- **`app/static/`** (6.7 MB of SPA/pixel assets) deleted — it was untracked and
+  mounted by nothing after `web/` went away.
+- `system/status` no longer reports `spa_bundled` (dropped from
+  `client/src/types.rs` with it); `scripts/start.py` opens `/docs` instead of
+  `/config`.
 
 ### 5. Packaging — Windows done, macOS/Linux not started
 - Bundle the Python runtime the same way the Tauri payload did (uv's managed
@@ -166,6 +189,65 @@ and Model ops (build job completion) fire a native toast (`notify-rust`) the
 first time a run/job transitions into a terminal status, gated by the same
 "first time we saw terminal state" pattern already used for stream/poll
 gating.
+
+## Still open
+
+Audited 2026-08-03 by diffing the deleted `web/src` tree against
+`desktop/crates/app/src`. Everything the old Flow UI routed to has a native
+screen; what follows is what did not come across, plus the leftovers the
+deletion cut did not sweep up.
+
+### Web features not ported
+
+1. ~~**Process- and subagent-scoped chat.**~~ **Done.** "Ask about this" in the
+   run's action row opens a chat card scoped to what is on screen: the
+   inspected subagent if the inspector is open, otherwise the run.
+   `State::scope_system()` rebuilds the context per send — process id, status,
+   goal, failure reason, and for a subagent its role, task status and a
+   3000-char output snippet — so a run that moved on is described as it is now.
+   Threads are keyed `"<run id>"` / `"<run id>:<uuid>"` in
+   `processes::State::chats`, in memory only, matching the web panel's
+   sessionStorage semantics. The context rides ahead of the wire history and
+   never appears in the transcript (`chat::State::system`); `chat_view::panel`
+   is the shared transcript + composer, used by both the Chat screen (fills the
+   window) and this card (capped at 280px inside the pane's own scroll).
+2. ~~**Team template presets.**~~ **Done.** `library::TEAM_PRESETS` is the
+   `teamTemplatePresets.ts` table as Rust consts — the same four rosters, same
+   colors, text modality throughout. A "Start from a template" section under the
+   Teams list fills the editor from one; nothing is created until it is saved.
+   A test asserts every preset has one root and no dangling parent, since a role
+   pointing at a missing parent silently drops out of the roster layout.
+3. ~~**Process export.**~~ **Done.** "Export" in the run's action row opens a
+   save dialog (`rfd`) and writes `{exported_at, process, tasks, events}`.
+   Events are walked to the end through the server's `after_id` cursor —
+   `Client::all_process_events`, 2000 per page with the same 500-page bound the
+   web export used — so the file holds the whole run, not the page on screen.
+   `process_events` gained the `after_id` argument this needs, and the record
+   types gained `Serialize`.
+
+Deliberately not ported: the pixel office (dropped, see above) and the
+drag-resizable inspector with its persisted width (`processWorkspaceRail.ts`) —
+decorative, and iced has no pane-splitter equivalent worth the code.
+
+All three were verified against a live run (#1, 23 tasks) on 2026-08-03, not
+just unit-tested: the scoped chat answered from the run's failure reason, the
+export wrote 79 KB holding 23 tasks and 76 events with strictly increasing ids,
+and a preset filled the team editor with its roster.
+
+### Packaging
+
+Unchanged from section 5: the Inno Setup script has never been compiled by a
+real `iscc` — still not installed on this machine, so this cannot be closed
+here — and macOS/Linux packaging, icon formats and signing are not started.
+Nothing else in the migration is open.
+
+### Repo leftovers from the web era
+
+The root `package.json` is not dead weight — `pnpm start`, `pnpm smoke` and
+`pnpm docker:up` are the documented entrypoints in the README and every script
+in it shells to Python. What is left over is smaller: both `package-lock.json`
+and `pnpm-lock.yaml` are checked in for a single devDependency (`kill-port`),
+so one of the two lockfiles is redundant.
 
 ## Running it
 

@@ -43,7 +43,6 @@ from workspace_service import (
     ensure_process_workspace,
     list_dir,
     normalize_relative_path,
-    read_text_file,
     write_text_file,
 )
 

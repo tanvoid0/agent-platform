@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from llm_proxy.core.provider_config import ollama_api_base
 
 from model_ops.pipeline.project_loader import (
     get_ollama_base_model,

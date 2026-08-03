@@ -10,7 +10,6 @@ isolation) and usage attribution.
 from __future__ import annotations
 
 import secrets as _secrets
-from datetime import datetime
 from typing import NamedTuple
 
 from fastapi import Depends, Header, Request

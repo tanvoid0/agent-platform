@@ -3,20 +3,18 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from action_orchestrator.engine import decide_actions
-from action_orchestrator.models import Action, ActionSet, Session as ActionSession, SessionResult, SessionStep
+from action_orchestrator.models import Session as ActionSession, SessionResult, SessionStep
 from action_orchestrator.registry import (
     action_set_to_dict,
     create_action,
     create_action_set,
     delete_action,
     delete_action_set,
-    get_action,
     get_action_by_set_and_id,
     get_action_set,
     get_action_set_with_actions,

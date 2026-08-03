@@ -96,7 +96,7 @@ def train(
 
     try:
         model, tokenizer = load_model_and_tokenizer(base_model)
-    except Exception as e:
+    except Exception:
         if not fallback:
             raise
         base_model = fallback

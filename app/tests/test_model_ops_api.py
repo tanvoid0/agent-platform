@@ -130,12 +130,6 @@ def test_model_ops_job_envelope(client, model_ops_data_dir):
     assert r2.json()["id"] == job["id"]
 
 
-def test_api_guide_mentions_model_ops(client):
-    c, _, _ = client
-    r = c.get("/api-guide")
-    assert r.status_code == 200
-    assert "model-ops" in r.text.lower() or "model ops" in r.text.lower()
-
 
 def test_openapi_includes_model_ops_tag(client):
     c, _, _ = client
@@ -187,11 +181,11 @@ def test_model_ops_process_link(mock_bg, client, model_ops_data_dir):
     h = _master_headers(c)
     c.post("/api/v1/model-ops/projects", headers=h, json={"name": "link-proj"})
 
-    teams = c.get("/teams/", headers=h)
+    teams = c.get("/api/v1/teams/", headers=h)
     assert teams.status_code == 200
     tid = teams.json()["teams"][0]["id"]
 
-    proc = c.post("/processes", headers=h, json={"goal": "Train a model", "team_template_id": tid})
+    proc = c.post("/api/v1/processes", headers=h, json={"goal": "Train a model", "team_template_id": tid})
     assert proc.status_code == 200
     process_id = proc.json()["process_id"]
 
@@ -203,7 +197,7 @@ def test_model_ops_process_link(mock_bg, client, model_ops_data_dir):
     assert r.status_code == 200
     job_id = r.json()["id"]
 
-    detail = c.get(f"/processes/{process_id}", headers=h)
+    detail = c.get(f"/api/v1/processes/{process_id}", headers=h)
     assert detail.status_code == 200
     assert detail.json()["process"]["model_build_job_id"] == job_id
 

@@ -2,7 +2,7 @@
 //! the default provider/model pair.
 
 use crate::providers::{Message, State, ENDPOINT_FIELDS, SECRET_FIELDS};
-use crate::ui::{self, Tone};
+use crate::ui::{self, Icon, Tone};
 use iced::widget::container;
 use iced::{Element, Length};
 
@@ -28,9 +28,9 @@ pub fn view(state: &State) -> Element<'_, Message> {
                 if state.busy {
                     ui::badge("saving…", Tone::Info)
                 } else {
-                    ui::button_default("Save", Message::Save)
+                    ui::button_default(Icon::Save, "Save", Message::Save)
                 },
-                ui::button_outline("Refresh", Message::Refresh),
+                ui::button_outline(Icon::Refresh, "Refresh", Message::Refresh),
             ])
             .into(),
         ),
@@ -41,7 +41,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
 fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
     ui::cluster(vec![
         container(inner).width(Length::Fill).into(),
-        ui::button_ghost("Dismiss", Message::Dismiss),
+        ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss),
     ])
     .into()
 }

@@ -9,11 +9,13 @@ Status as of 2026-08-03. E.V. lives in `desktop/crates/app/src/assistant.rs` /
   free websocket endpoint (`msedge-tts` crate), played via `rodio`. Unofficial
   endpoint — may break without notice. Automatic fallback: native platform
   engine (`tts` crate → SAPI/WinRT on Windows), which is the robotic voice.
-- **STT (listening)**: Windows built-in speech recognition (WinRT
-  `SpeechRecognizer`) — push-to-talk button, listens until silence,
-  auto-sends. Windows-only; requires "Online speech recognition" enabled in
-  Windows privacy settings (or an offline language pack). No streaming
-  partials.
+- **STT (listening)**: local whisper.cpp (`whisper-rs` + `cpal` mic capture,
+  `desktop/crates/app/src/stt.rs`). Push-to-talk toggle: 🎤 starts recording,
+  ⏹ stops → transcribes → auto-sends. Quantized `base.en` model (~60 MB)
+  auto-downloads to the app data dir on first use; fully offline after that.
+  Cross-platform. Build needs cmake + libclang (see `desktop/.cargo/config.toml`).
+  (WinRT `SpeechRecognizer` was tried first and abandoned: its online backend
+  no longer transcribes on current Windows 11 builds.)
 
 ## TTS — options to explore (in rough order of effort)
 
@@ -42,13 +44,14 @@ Status as of 2026-08-03. E.V. lives in `desktop/crates/app/src/assistant.rs` /
 
 ## STT — options to explore
 
-1. Current: WinRT one-shot dictation (done).
-2. **whisper-rs** (whisper.cpp bindings) — local, cross-platform, `base.en`
-   model ~142 MB, good accuracy. Needs cmake toolchain + mic capture via
-   `cpal`. Removes the Windows-only + online-speech-setting constraints.
-3. **Streaming partials** — show words as they're recognized (WinRT
-   `ContinuousRecognitionSession` or whisper.cpp streaming mode).
-4. **Wake word** ("Hey E.V.") — openWakeWord / tiny keyword-spotting model;
+1. Current: local whisper `base.en` push-to-talk (done).
+2. **Bigger/faster models** — `small.en` for accuracy, or GPU features of
+   whisper-rs (vulkan/cuda) if transcription feels slow.
+3. **Auto-stop (VAD)** — detect end-of-speech instead of a second click
+   (whisper.cpp ships a VAD; energy-threshold is the cheap version).
+4. **Streaming partials** — show words as they're recognized (whisper.cpp
+   streaming mode).
+5. **Wake word** ("Hey E.V.") — openWakeWord / tiny keyword-spotting model;
    only after push-to-talk feels solid.
 
 ## North star

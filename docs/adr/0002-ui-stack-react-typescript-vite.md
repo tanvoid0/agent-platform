@@ -1,6 +1,6 @@
 # ADR 0002: Web UI stack — React, TypeScript, Vite, server state, and @xyflow/react
 
-**Status:** Accepted  
+**Status:** Superseded by [ADR 0005](0005-native-iced-desktop-headless-server.md) — `web/` is deleted; the UI is a native iced app.  
 **Date:** 2026-04-11  
 **Tags:** frontend, TanStack Query, React Flow, orchestration UI
 

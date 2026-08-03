@@ -13,7 +13,7 @@ from sqlmodel import Session, select
 from model_ops.models import ModelBuildJob, ModelProject, ModelRegistryEntry
 from model_ops.paths import ensure_data_scaffold, projects_dir, template_project_dir
 from model_ops.pipeline.project_loader import get_project_dir, load_project
-from model_ops.registry_hook import register_model_entry, set_registry_callback
+from model_ops.registry_hook import set_registry_callback
 from model_ops.schemas import ModelBuildJobOut, ModelProjectOut, ModelRegistryEntryOut
 from time_utils import utc_now_naive
 

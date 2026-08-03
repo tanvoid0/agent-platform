@@ -41,7 +41,7 @@ def build_incremental_dataset(
 def incremental_train(project: str, adapter_version: str = "v2", from_adapter: str = "v1") -> Path:
     build_incremental_dataset(project)
     project_dir = get_project_dir(project)
-    manifest = load_project(project)
+    load_project(project)  # raises if the project manifest is missing
     inc_path = project_dir / "datasets" / "incremental_train.jsonl"
     train_path = project_dir / "datasets" / "train.jsonl"
     train_path.write_text(inc_path.read_text(encoding="utf-8"), encoding="utf-8")

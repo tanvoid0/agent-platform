@@ -15,7 +15,7 @@ def test_approve_idempotent_when_already_approved(client, test_engine):
         session.refresh(proc)
         pid = proc.id
 
-    r = c.post(f"/processes/{pid}/approve", json={"dag_json": "{}"})
+    r = c.post(f"/api/v1/processes/{pid}/approve", json={"dag_json": "{}"})
     assert r.status_code == 200
     body = r.json()
     assert body.get("idempotent") is True

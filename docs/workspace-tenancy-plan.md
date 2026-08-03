@@ -265,11 +265,10 @@ moved paths — zero stale hits in docs/templates before merge.
   retain; enables optional single-project tokens later without a second
   migration. Revisit at the "drop" step in Rollout only if it stays unused for a
   full release.
-- **Old `/projects/.../api-tokens` path** — **keep a deprecated alias for one
-  release.** These endpoints are master-key only (`_require_dashboard_caller`,
-  `app/api_tokens/routes.py:25`), so the only caller is the dashboard/admin —
-  low blast radius, but a one-release alias avoids breaking any scripted admin
-  tooling. Emit a `Deprecation` header; remove at Rollout step 7.
+- **Old `/projects/.../api-tokens` path** — **removed (2026-08-03).** It ran one
+  release as a deprecated alias emitting a `Deprecation` header, and went out
+  with the same breaking release as the bare-root router mirror. Use
+  `/api/v1/workspaces/{workspace_id}/api-tokens/`.
 - **`/projects/{id}/workspace` → `/files` rename** — **keep alias one release.**
   This path is data-plane (used by Flow UI + any client browsing the sandbox),
   higher blast radius than token mgmt. Old path proxies to the new handler,

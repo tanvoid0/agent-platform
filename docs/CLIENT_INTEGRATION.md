@@ -106,7 +106,7 @@ with httpx.Client(base_url=BASE, headers=H, timeout=60) as c:
 
 - [API_WORKSPACE_SCOPING.md](./API_WORKSPACE_SCOPING.md) — isolation rules and endpoint reference
 - [model-ops-api.md](./model-ops-api.md) — build/train custom Ollama models (LoRA pipeline)
-- `/api-guide` — in-app HTTP guide
+- `/docs` — OpenAPI reference
 - `scripts/external_microservice_example.py` — runnable orchestration sample
 - `scripts/model_ops_client_example.py` — runnable model build sample
 

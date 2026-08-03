@@ -35,7 +35,7 @@ def _sample_roster():
 
 def test_teams_list_includes_seed(client, test_engine):
     c, _mock_cls, _mock_inst = client
-    r = c.get("/teams/")
+    r = c.get("/api/v1/teams/")
     assert r.status_code == 200
     data = r.json()
     assert "teams" in data
@@ -59,7 +59,7 @@ def test_teams_create_without_color_or_accent_defaults(client, test_engine):
         side_effect=["#9333ea", "#16a34a"],
     ):
         r = c.post(
-            "/teams/",
+            "/api/v1/teams/",
             json={
                 "name": "Defaults Team",
                 "roster": {
@@ -84,9 +84,9 @@ def test_teams_create_randomizes_team_color(client, test_engine):
         "roles": [{"id": "lead", "name": "Lead", "parent_id": None}],
     }
     with patch("team_schema.secrets.choice", side_effect=["#2563eb", "#ca8a04"]):
-        first = c.post("/teams/", json={"name": "Team A", "roster": roster}).json()
+        first = c.post("/api/v1/teams/", json={"name": "Team A", "roster": roster}).json()
     with patch("team_schema.secrets.choice", side_effect=["#dc2626", "#dc2626"]):
-        second = c.post("/teams/", json={"name": "Team B", "roster": roster}).json()
+        second = c.post("/api/v1/teams/", json={"name": "Team B", "roster": roster}).json()
     assert first["color"] == "#2563eb"
     assert second["color"] == "#dc2626"
     assert first["color"] != second["color"]
@@ -95,7 +95,7 @@ def test_teams_create_randomizes_team_color(client, test_engine):
 def test_teams_crud(client, test_engine):
     c, _mock_cls, _mock_inst = client
     r = c.post(
-        "/teams/",
+        "/api/v1/teams/",
         json={
             "name": "API Team",
             "description": "From test",
@@ -112,7 +112,7 @@ def test_teams_crud(client, test_engine):
     assert len(body["roster"]["roles"]) == 2
     assert body.get("role_count") == 2
 
-    r2 = c.get(f"/teams/{tid}")
+    r2 = c.get(f"/api/v1/teams/{tid}")
     assert r2.status_code == 200
     body_get = r2.json()
     assert body_get["roster"]["roles"][1]["parent_id"] == "a"
@@ -120,21 +120,21 @@ def test_teams_crud(client, test_engine):
     assert body_get.get("role_count") == 2
     assert body_get.get("category") == "QA"
 
-    r3 = c.patch(f"/teams/{tid}", json={"name": "API Team Renamed", "category": None})
+    r3 = c.patch(f"/api/v1/teams/{tid}", json={"name": "API Team Renamed", "category": None})
     assert r3.status_code == 200
     assert r3.json()["name"] == "API Team Renamed"
     assert r3.json().get("category") is None
 
-    r4 = c.delete(f"/teams/{tid}")
+    r4 = c.delete(f"/api/v1/teams/{tid}")
     assert r4.status_code == 200
-    r5 = c.get(f"/teams/{tid}")
+    r5 = c.get(f"/api/v1/teams/{tid}")
     assert r5.status_code == 404
 
 
 def test_teams_post_invalid_roster(client, test_engine):
     c, _mock_cls, _mock_inst = client
     r = c.post(
-        "/teams/",
+        "/api/v1/teams/",
         json={
             "name": "Bad",
             "roster": {"roles": [{"id": "x", "name": "X", "parent_id": "missing"}]},
@@ -146,7 +146,7 @@ def test_teams_post_invalid_roster(client, test_engine):
 def test_teams_post_non_text_modality_rejected(client, test_engine):
     c, _mock_cls, _mock_inst = client
     r = c.post(
-        "/teams/",
+        "/api/v1/teams/",
         json={
             "name": "Bad modality",
             "roster": {
@@ -167,22 +167,22 @@ def test_teams_post_non_text_modality_rejected(client, test_engine):
 
 def test_post_runs_unknown_team_template(client, test_engine):
     c, _mock_cls, _mock_inst = client
-    r = c.post("/processes", json={"goal": "g", "team_template_id": 999_999})
+    r = c.post("/api/v1/processes", json={"goal": "g", "team_template_id": 999_999})
     assert r.status_code == 404
 
 
 def test_post_process_requires_team_template_id(client, test_engine):
     c, _mock_cls, _mock_inst = client
-    r = c.post("/processes", json={"goal": "g"})
+    r = c.post("/api/v1/processes", json={"goal": "g"})
     assert r.status_code == 422
 
 
 def test_post_runs_with_team_template_passes_context_and_snapshot(client, test_engine):
     c, _mock_cls, mock_inst = client
-    r = c.get("/teams/")
+    r = c.get("/api/v1/teams/")
     tid = r.json()["teams"][0]["id"]
 
-    r2 = c.post("/processes", json={"goal": "Ship feature X", "team_template_id": tid})
+    r2 = c.post("/api/v1/processes", json={"goal": "Ship feature X", "team_template_id": tid})
     assert r2.status_code == 200
     process_id = r2.json()["process_id"]
 
@@ -192,7 +192,7 @@ def test_post_runs_with_team_template_passes_context_and_snapshot(client, test_e
     assert args[1] is not None
     assert "Autonomous Product Engineering Team" in args[1] or "Team template:" in args[1]
 
-    r3 = c.get(f"/processes/{process_id}")
+    r3 = c.get(f"/api/v1/processes/{process_id}")
     assert r3.status_code == 200
     payload = r3.json()
     assert payload["process"]["team_template_id"] == tid
@@ -206,18 +206,18 @@ def test_post_runs_with_team_template_passes_context_and_snapshot(client, test_e
 def test_delete_team_nullifies_run_fk(client, test_engine):
     c, _mock_cls, _mock_inst = client
     r = c.post(
-        "/teams/",
+        "/api/v1/teams/",
         json={"name": "Tmp", "roster": _sample_roster()},
     )
     tid = r.json()["id"]
-    r2 = c.post("/processes", json={"goal": "g", "team_template_id": tid})
+    r2 = c.post("/api/v1/processes", json={"goal": "g", "team_template_id": tid})
     process_id = r2.json()["process_id"]
 
     with Session(test_engine) as session:
         proc = session.get(Process, process_id)
         assert proc.team_template_id == tid
 
-    r3 = c.delete(f"/teams/{tid}")
+    r3 = c.delete(f"/api/v1/teams/{tid}")
     assert r3.status_code == 200
 
     with Session(test_engine) as session:

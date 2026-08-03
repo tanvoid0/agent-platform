@@ -82,11 +82,11 @@ def test_llm_proxy_readiness_reports_actionable_reason(client, monkeypatch):
 
 def test_api_v1_processes_mirrors_legacy_post(client):
     c, _mock_cls, _mock_inst = client
-    tr = c.get("/teams/")
+    tr = c.get("/api/v1/teams/")
     assert tr.status_code == 200
     tid = tr.json()["teams"][0]["id"]
     body = {"goal": "Test goal", "auto_approve": False, "team_template_id": tid}
-    r1 = c.post("/processes", json=body)
+    r1 = c.post("/api/v1/processes", json=body)
     r2 = c.post("/api/v1/processes", json=body)
     assert r1.status_code == 200
     assert r2.status_code == 200
@@ -98,7 +98,7 @@ def test_api_v1_processes_mirrors_legacy_post(client):
 
 def test_api_v1_teams_list_matches_legacy(client):
     c, _mock_cls, _mock_inst = client
-    r1 = c.get("/teams/")
+    r1 = c.get("/api/v1/teams/")
     r2 = c.get("/api/v1/teams/")
     assert r1.status_code == 200
     assert r2.status_code == 200
@@ -336,14 +336,14 @@ def test_api_key_required_when_set(client, monkeypatch):
     c, _mock_cls, _mock_inst = client
     monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "secret-apk")
 
-    r = c.get("/processes")
+    r = c.get("/api/v1/processes")
     assert r.status_code == 401
 
-    r2 = c.get("/processes", headers={"Authorization": "Bearer wrong"})
+    r2 = c.get("/api/v1/processes", headers={"Authorization": "Bearer wrong"})
     assert r2.status_code == 401
 
     r3 = c.get(
-        "/processes",
+        "/api/v1/processes",
         params={"unassigned_only": "true"},
         headers={"Authorization": "Bearer secret-apk"},
     )
@@ -352,7 +352,7 @@ def test_api_key_required_when_set(client, monkeypatch):
 
 def test_client_id_scope_list_and_access(client, monkeypatch):
     c, _mock_cls, _mock_inst = client
-    tr = c.get("/teams/")
+    tr = c.get("/api/v1/teams/")
     tid = tr.json()["teams"][0]["id"]
     r = c.post(
         "/api/v1/processes",
@@ -385,7 +385,7 @@ def test_require_client_id_env(client, monkeypatch):
     c, _mock_cls, _mock_inst = client
     monkeypatch.setenv("AGENT_PLATFORM_REQUIRE_CLIENT_ID", "1")
 
-    tr = c.get("/teams/")
+    tr = c.get("/api/v1/teams/")
     tid = tr.json()["teams"][0]["id"]
     r = c.post("/api/v1/processes", json={"goal": "No client", "team_template_id": tid})
     assert r.status_code == 400
@@ -396,9 +396,3 @@ def test_require_client_id_env(client, monkeypatch):
     assert r2.status_code == 200
 
 
-def test_api_guide_page(client):
-    c, _mock_cls, _mock_inst = client
-    r = c.get("/api-guide")
-    assert r.status_code == 200
-    assert b"/api/v1/chat" in r.content
-    assert b"Agent Platform HTTP API" in r.content

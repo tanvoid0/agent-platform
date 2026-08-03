@@ -45,6 +45,6 @@ def test_review_approve_ok_when_run_running_but_task_still_awaiting_review(clien
         session.refresh(task)
         tid = task.id
 
-    r = c.post(f"/processes/{rid}/tasks/{tid}/review", json={"decision": "approve"})
+    r = c.post(f"/api/v1/processes/{rid}/tasks/{tid}/review", json={"decision": "approve"})
     assert r.status_code == 200, r.text
     assert r.json().get("status") == "approved"

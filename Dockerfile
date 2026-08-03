@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Agent Platform — backend-only image (FastAPI API + /config page).
+# Agent Platform — backend-only image (FastAPI API; no browser UI).
 #
 # Build from this repo root:
 #   docker build -f Dockerfile -t agent-platform:latest .

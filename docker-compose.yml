@@ -1,8 +1,8 @@
-# Agent Platform — backend-only image (API + /config page).
+# Agent Platform — backend-only image (API only; the desktop app is the UI).
 #
 #   pnpm docker:up
 #
-# Config UI: http://127.0.0.1:18410/config  |  API: http://127.0.0.1:18410/docs
+# API: http://127.0.0.1:18410/api/v1  |  Docs: http://127.0.0.1:18410/docs
 
 services:
   server:

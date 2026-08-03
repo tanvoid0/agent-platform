@@ -25,13 +25,10 @@ from llm_proxy.core.provider_config import (
     default_model_for_provider,
     first_configured_provider,
     gemini_api_key,
-    gemini_configured,
     is_supported_provider,
     lm_studio_api_base,
     lm_studio_api_key,
-    lm_studio_configured,
     ollama_api_base,
-    ollama_configured,
     provider_configured,
 )
 from llm_proxy.services.upstream_http import get_with_retry

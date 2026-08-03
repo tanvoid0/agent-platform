@@ -42,7 +42,7 @@ pub struct PlannerDag {
 // Processes
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessRecord {
     pub id: i64,
     pub goal: String,
@@ -63,7 +63,7 @@ pub struct ProcessRecord {
     pub project_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskNodeRecord {
     pub id: i64,
     pub process_id: i64,
@@ -100,13 +100,13 @@ pub struct ProcessesListResponse {
     pub processes: Vec<ProcessRecord>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessDetailResponse {
     pub process: ProcessRecord,
     pub tasks: Vec<TaskNodeRecord>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventLogRecord {
     pub id: i64,
     pub process_id: i64,
@@ -324,6 +324,9 @@ pub struct ChatCompletionBody {
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<i64>,
+    /// Set by `sse::chat_stream`; leave `None` for the buffered `Client::chat`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -379,9 +382,6 @@ pub struct SystemStatus {
     pub llm_proxy: ReadinessReport,
     pub processes: ProcessCounts,
     pub paths: SystemPaths,
-    /// Dead once the SPA mount is deleted (Phase 5); optional so the client survives it.
-    #[serde(default)]
-    pub spa_bundled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,5 +1,7 @@
 # Screens → agent-platform API
 
+> **All paths are under `/api/v1`.** The bare-root mirror (`/processes`, `/teams`, …) was removed with the browser UI; paths written without the prefix below are relative to it.
+
 | Operation | HTTP | Notes |
 |-----------|------|--------|
 | List processes | `GET /processes` | Query: `limit`, `project_id`, `unassigned_only` |

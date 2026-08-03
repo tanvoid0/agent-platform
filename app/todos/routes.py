@@ -33,7 +33,6 @@ from todos.schemas import (
     ItemCreate,
     ItemOut,
     ItemUpdate,
-    PlannerProfileOut,
     PlanningFormSubmitRequest,
     SpawnProcessRequest,
     SpawnProcessResponse,

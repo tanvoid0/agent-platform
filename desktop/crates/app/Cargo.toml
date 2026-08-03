@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 agent-platform-client = { path = "../client" }
-iced = { version = "0.14", features = ["tokio", "canvas"] }
+iced = { version = "0.14", features = ["tokio", "canvas", "markdown", "svg", "advanced"] }
 tray-icon = "0.24"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 futures = "0.3"
@@ -25,9 +25,10 @@ notify-rust = "4"
 tts = "0.26"
 msedge-tts = "0.2"
 rodio = "0.19"
-
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Foundation", "Media_SpeechRecognition", "Win32_System_WinRT"] }
+cpal = "0.15"
+whisper-rs = "0.16"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
+iced_fonts = { version = "0.3.0", features = ["lucide", "advanced_text"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

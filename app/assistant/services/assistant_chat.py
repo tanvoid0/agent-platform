@@ -23,7 +23,6 @@ from assistant.services.assistant_service import ensure_assistant_board
 from assistant.services.user_profile_service import (
     build_profile_context,
     format_answers_message,
-    get_all_profiles,
     get_profile,
     merge_profile,
 )

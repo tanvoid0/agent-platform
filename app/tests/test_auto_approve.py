@@ -11,18 +11,18 @@ from models import Process
 
 def test_post_runs_passes_auto_approve_to_executor(client, test_engine):
     c, mock_cls, _mock_inst = client
-    tr = c.get("/teams/")
+    tr = c.get("/api/v1/teams/")
     tid = tr.json()["teams"][0]["id"]
-    r = c.post("/processes", json={"goal": "g", "auto_approve": True, "team_template_id": tid})
+    r = c.post("/api/v1/processes", json={"goal": "g", "auto_approve": True, "team_template_id": tid})
     assert r.status_code == 200
     assert mock_cls.call_args.kwargs.get("auto_approve") is True
 
 
 def test_post_runs_auto_approve_defaults_false(client, test_engine):
     c, mock_cls, _mock_inst = client
-    tr = c.get("/teams/")
+    tr = c.get("/api/v1/teams/")
     tid = tr.json()["teams"][0]["id"]
-    r = c.post("/processes", json={"goal": "g", "team_template_id": tid})
+    r = c.post("/api/v1/processes", json={"goal": "g", "team_template_id": tid})
     assert r.status_code == 200
     assert mock_cls.call_args.kwargs.get("auto_approve") is False
 

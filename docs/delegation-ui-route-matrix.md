@@ -1,5 +1,7 @@
 # Agent workspace routes (canonical)
 
+> **All paths are under `/api/v1`.** The bare-root mirror (`/processes`, `/teams`, …) was removed with the browser UI; paths written without the prefix below are relative to it.
+
 | Route | Purpose | Backend |
 |-------|---------|---------|
 | `/app/` | Redirect to active project workspace or project list | — |

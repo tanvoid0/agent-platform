@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from action_orchestrator.models import Action, ActionSet
+from action_orchestrator.models import ActionSet
 from action_orchestrator.schemas import ActionCreate, ActionSetCreate
 from action_orchestrator.registry import create_action_set
 from sqlmodel import Session, select

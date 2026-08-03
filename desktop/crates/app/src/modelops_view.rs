@@ -3,7 +3,7 @@
 
 use crate::domain;
 use crate::modelops::{Message, State, STAGES};
-use crate::ui::{self, space, Tone};
+use crate::ui::{self, space, Icon, Tone};
 use iced::widget::{checkbox, column, container, scrollable};
 use iced::{Element, Length};
 
@@ -22,8 +22,8 @@ pub fn view(state: &State) -> Element<'_, Message> {
             None,
             Some(
                 ui::cluster(vec![
-                    ui::button_default("Create", Message::CreateProject),
-                    ui::button_ghost("Cancel", Message::CancelNewProject),
+                    ui::button_default(Icon::Plus, "Create", Message::CreateProject),
+                    ui::button_ghost(Icon::X, "Cancel", Message::CancelNewProject),
                 ])
                 .into(),
             ),
@@ -53,8 +53,8 @@ pub fn view(state: &State) -> Element<'_, Message> {
         Some(ui::muted("Fine-tune adapters, watch build jobs, and manage local models.")),
         Some(
             ui::cluster(vec![
-                ui::button_secondary("New project", Message::NewProject),
-                ui::button_outline("Refresh", Message::Refresh),
+                ui::button_secondary(Icon::Plus, "New project", Message::NewProject),
+                ui::button_outline(Icon::Refresh, "Refresh", Message::Refresh),
             ])
             .into(),
         ),
@@ -69,14 +69,14 @@ pub fn view(state: &State) -> Element<'_, Message> {
 fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
     ui::cluster(vec![
         container(inner).width(Length::Fill).into(),
-        ui::button_ghost("Dismiss", Message::DismissNotice),
+        ui::button_ghost(Icon::X, "Dismiss", Message::DismissNotice),
     ])
     .into()
 }
 
 fn projects_card(state: &State) -> Element<'_, Message> {
     if state.projects.is_empty() {
-        return ui::card(ui::empty_state("No model projects yet."));
+        return ui::card(ui::empty_state_icon(Icon::Cpu, "No model projects yet."));
     }
 
     let rows: Vec<Element<'_, Message>> = state
@@ -124,12 +124,12 @@ fn projects_card(state: &State) -> Element<'_, Message> {
             if state.busy {
                 ui::badge("starting…", Tone::Info)
             } else {
-                ui::button_default("Start build", Message::StartBuild)
+                ui::button_default(Icon::Play, "Start build", Message::StartBuild)
             },
             if state.uploading {
                 ui::badge("uploading…", Tone::Info)
             } else {
-                ui::button_secondary("Upload dataset file…", Message::PickDatasetFile)
+                ui::button_secondary(Icon::Upload, "Upload dataset file…", Message::PickDatasetFile)
             },
         ])
         .into(),
@@ -155,7 +155,7 @@ fn job_card<'a>(
 
     let mut body = vec![
         ui::cluster(vec![
-            ui::badge(job.status.clone(), tone),
+            ui::badge_icon(ui::tone_icon(tone), job.status.clone(), tone),
             ui::caption(format!("job #{} · {}", job.id, job.job_type)),
             ui::spacer(),
             ui::caption(job.stages.join(" → ")),
@@ -177,14 +177,14 @@ fn job_card<'a>(
     ui::card_with_header(
         "Build job",
         None,
-        Some(ui::button_ghost("Close", Message::CloseJob)),
+        Some(ui::button_ghost(Icon::X, "Close", Message::CloseJob)),
         ui::stack(body),
     )
 }
 
 fn ollama_card(state: &State) -> Element<'_, Message> {
     let list: Element<'_, Message> = if state.ollama.is_empty() {
-        ui::empty_state("No local models found (is Ollama running?).")
+        ui::empty_state_icon(Icon::Cpu, "No local models found (is Ollama running?).")
     } else {
         ui::stack(
             state
@@ -211,7 +211,7 @@ fn ollama_card(state: &State) -> Element<'_, Message> {
                 container(ui::input("qwen2.5:7b", &state.pull_name, Message::PullNameChanged))
                     .width(220)
                     .into(),
-                ui::button_secondary("Pull", Message::PullModel),
+                ui::button_secondary(Icon::Download, "Pull", Message::PullModel),
             ])
             .into(),
         ),
@@ -221,7 +221,7 @@ fn ollama_card(state: &State) -> Element<'_, Message> {
 
 fn registry_card(state: &State) -> Element<'_, Message> {
     let list: Element<'_, Message> = if state.registry.is_empty() {
-        ui::empty_state("Nothing registered yet.")
+        ui::empty_state_icon(Icon::Inbox, "Nothing registered yet.")
     } else {
         ui::stack(
             state

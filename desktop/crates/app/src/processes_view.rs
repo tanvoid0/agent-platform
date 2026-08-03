@@ -2,16 +2,16 @@
 
 use crate::domain::{self, BoardColumn, BoardRow};
 use crate::processes::{Message, State, ViewMode};
-use crate::ui::{self, space, Tone};
+use crate::ui::{self, space, Icon, Tone};
 use agent_platform_client::types::{ProcessRecord, ReviewDecision, TaskNodeRecord};
 use iced::widget::{checkbox, column, container, row, scrollable, stack};
-use iced::{Element, Length};
+use iced::{Element, Length, Theme};
 
-pub fn view(state: &State) -> Element<'_, Message> {
+pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
     let main = row![
         run_list(state),
         ui::separator_vertical(),
-        container(detail_pane(state)).width(Length::Fill).height(Length::Fill),
+        container(detail_pane(state, iced_theme)).width(Length::Fill).height(Length::Fill),
     ];
 
     // The review modal is an overlay, shadcn `Dialog`-style.
@@ -50,7 +50,7 @@ fn run_list(state: &State) -> Element<'_, Message> {
     let composer = ui::card(
         ui::stack(vec![
             ui::heading("New run"),
-            ui::input("What should the team accomplish?", &state.composer.goal, Message::GoalChanged),
+            ui::input_icon(Icon::Sparkles, "What should the team accomplish?", &state.composer.goal, Message::GoalChanged),
             ui::select("Team template", team_names, selected_team, move |name: String| {
                 let id = teams_by_name
                     .iter()
@@ -71,9 +71,9 @@ fn run_list(state: &State) -> Element<'_, Message> {
                 .text_size(ui::font::SM)
                 .into(),
             if state.composer.submitting {
-                ui::button_sized("Starting…", ui::ButtonVariant::Default, ui::Size::Sm, None)
+                ui::button_sized(Some(Icon::Clock), "Starting…", ui::ButtonVariant::Default, ui::Size::Sm, None)
             } else {
-                ui::button_default("Start run", Message::Submit)
+                ui::button_default(Icon::Play, "Start run", Message::Submit)
             },
         ]),
     );
@@ -85,7 +85,7 @@ fn run_list(state: &State) -> Element<'_, Message> {
         .collect();
 
     let list: Element<'_, Message> = if items.is_empty() {
-        ui::empty_state("No runs in this scope yet.")
+        ui::empty_state_icon(Icon::Activity, "No runs in this scope yet.")
     } else {
         scrollable(ui::stack(items)).height(Length::Fill).into()
     };
@@ -132,13 +132,13 @@ fn truncate(s: &str, max: usize) -> String {
 // Right: detail pane
 // ---------------------------------------------------------------------------
 
-fn detail_pane(state: &State) -> Element<'_, Message> {
+fn detail_pane<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
     let Some(process) = state.selected_process() else {
         return ui::page(
             "Processes",
             Some(ui::muted("Pick a run, or start a new one.")),
             None,
-            ui::empty_state("Nothing selected."),
+            ui::empty_state_icon(Icon::Activity, "Nothing selected."),
         );
     };
 
@@ -164,6 +164,9 @@ fn detail_pane(state: &State) -> Element<'_, Message> {
     if let Some(uuid) = &state.inspecting {
         blocks.push(inspector(state, uuid));
     }
+    if state.chat_open {
+        blocks.extend(chat_card(state, iced_theme));
+    }
 
     ui::page(
         format!("Run #{}", process.id),
@@ -176,7 +179,7 @@ fn detail_pane(state: &State) -> Element<'_, Message> {
 fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
     ui::cluster(vec![
         container(inner).width(Length::Fill).into(),
-        ui::button_ghost("Dismiss", Message::DismissNotice),
+        ui::button_ghost(Icon::X, "Dismiss", Message::DismissNotice),
     ])
     .into()
 }
@@ -189,29 +192,59 @@ fn actions_row<'a>(state: &'a State, process: &'a ProcessRecord) -> Element<'a, 
         buttons.push(ui::badge("working…", Tone::Info));
     }
     if status == "approval_required" {
-        buttons.push(ui::button_default("Approve plan", Message::Approve));
+        buttons.push(ui::button_default(Icon::Check, "Approve plan", Message::Approve));
     }
     if matches!(status, "pending" | "planning" | "approved" | "running" | "approval_required") {
-        buttons.push(ui::button_destructive("Cancel", Message::Cancel));
+        buttons.push(ui::button_destructive(Icon::X, "Cancel", Message::Cancel));
     }
     if matches!(status, "failed" | "cancelled" | "completed") {
-        buttons.push(ui::button_secondary("Retry", Message::Retry));
+        buttons.push(ui::button_secondary(Icon::Refresh, "Retry", Message::Retry));
     }
-    buttons.push(ui::button_outline("Sync", Message::Sync));
+    buttons.push(ui::button_outline(Icon::Refresh, "Sync", Message::Sync));
+    buttons.push(ui::button_ghost(Icon::Download, "Export", Message::Export));
+    buttons.push(ui::button_ghost(
+        Icon::Message,
+        if state.chat_open { "Hide chat" } else { "Ask about this" },
+        Message::ToggleChat,
+    ));
     ui::cluster(buttons).into()
+}
+
+/// A chat thread scoped to what is on screen: the inspected subagent if one is
+/// open, otherwise the run. Switching scope switches thread rather than
+/// carrying one conversation across unrelated records.
+fn chat_card<'a>(state: &'a State, iced_theme: &Theme) -> Option<Element<'a, Message>> {
+    let thread = state.chat_key().and_then(|k| state.chats.get(&k))?;
+    let (subtitle, hint) = match &state.inspecting {
+        Some(uuid) => (
+            format!("Scoped to subagent {}", domain::short_uuid(uuid)),
+            "Ask about this subagent's task.",
+        ),
+        None => ("Scoped to this run".to_string(), "Ask about this run's plan, tasks or failure."),
+    };
+
+    Some(ui::card_with_header(
+        "Chat",
+        Some(ui::muted(subtitle)),
+        Some(ui::button_ghost(Icon::X, "Close", Message::ToggleChat)),
+        // Capped: this card lives inside the detail pane's own scroll, so a Fill
+        // transcript would fight it.
+        crate::chat_view::panel(thread, iced_theme, hint, Length::Fixed(280.0))
+            .map(Message::Chat),
+    ))
 }
 
 fn summary_card<'a>(state: &'a State, process: &'a ProcessRecord) -> Element<'a, Message> {
     let mut stats = vec![
-        ui::stat("Status", process.status.as_str()),
-        ui::stat("Tokens", process.total_tokens.to_string()),
-        ui::stat("Cost", format!("${:.4}", process.total_cost)),
+        ui::stat(Icon::Activity, "Status", process.status.as_str().to_string()),
+        ui::stat(Icon::Cpu, "Tokens", process.total_tokens.to_string()),
+        ui::stat(Icon::Gauge, "Cost", format!("${:.4}", process.total_cost)),
     ];
     if let Some(tools) = process.tool_invocations_used {
-        stats.push(ui::stat("Tool calls", tools.to_string()));
+        stats.push(ui::stat(Icon::Settings, "Tool calls", tools.to_string()));
     }
     if let Some(detail) = &state.detail {
-        stats.push(ui::stat("Tasks", detail.tasks.len().to_string()));
+        stats.push(ui::stat(Icon::Scroll, "Tasks", detail.tasks.len().to_string()));
     }
 
     let mut rows = vec![ui::cluster(stats).into()];
@@ -231,7 +264,7 @@ fn summary_card<'a>(state: &'a State, process: &'a ProcessRecord) -> Element<'a,
 fn graph_view(state: &State) -> Element<'_, Message> {
     let layout = state.graph_layout();
     if layout.nodes.is_empty() {
-        return ui::card(ui::empty_state("No plan yet — the graph appears once planning finishes."));
+        return ui::card(ui::empty_state_icon(Icon::Clock, "No plan yet — the graph appears once planning finishes."));
     }
 
     let mut controls: Vec<Element<'_, Message>> = Vec::new();
@@ -329,7 +362,7 @@ fn board_card<'a>(inspecting: Option<&str>, row: BoardRow) -> Element<'a, Messag
     }
     if row.column == BoardColumn::AwaitingReview {
         if let Some(task) = &row.task {
-            lines.push(ui::button_secondary("Review", Message::OpenReview(task.id)));
+            lines.push(ui::button_secondary(Icon::Eye, "Review", Message::OpenReview(task.id)));
         }
     }
     ui::list_item(ui::stack(lines), selected, Message::Inspect(Some(uuid)))
@@ -346,7 +379,7 @@ fn timeline_view(state: &State) -> Element<'_, Message> {
     let rows = domain::build_timeline_rows(dag.as_ref(), tasks);
 
     if rows.is_empty() {
-        return ui::card(ui::empty_state("No plan yet — the timeline appears once planning finishes."));
+        return ui::card(ui::empty_state_icon(Icon::Clock, "No plan yet — the timeline appears once planning finishes."));
     }
 
     let mut waves: Vec<Element<'_, Message>> = Vec::new();
@@ -404,7 +437,7 @@ fn events_view(state: &State) -> Element<'_, Message> {
         .collect();
 
     let body: Element<'_, Message> = if matched.is_empty() {
-        ui::empty_state("No events yet.")
+        ui::empty_state_icon(Icon::Scroll, "No events yet.")
     } else {
         // Newest last, tail-rendered: iced lays out every child.
         let tail = &matched[matched.len().saturating_sub(400)..];
@@ -423,7 +456,7 @@ fn events_view(state: &State) -> Element<'_, Message> {
     };
 
     let toolbar: Element<'_, Message> = ui::cluster(vec![
-        container(ui::input("Filter events…", &state.event_filter, Message::EventFilterChanged))
+        container(ui::input_icon(Icon::Search, "Filter events…", &state.event_filter, Message::EventFilterChanged))
             .width(280)
             .into(),
         ui::spacer(),
@@ -450,7 +483,7 @@ fn event_tone(event_type: &str) -> Tone {
 fn inspector<'a>(state: &'a State, uuid: &'a str) -> Element<'a, Message> {
     let rows = state.board_rows();
     let Some(row) = rows.iter().find(|r| r.subagent.client_uuid == uuid) else {
-        return container(ui::empty_state("Subagent not found.")).into();
+        return container(ui::empty_state_icon(Icon::Users, "Subagent not found.")).into();
     };
     let task = state.task_by_uuid(uuid);
 
@@ -496,12 +529,12 @@ fn inspector<'a>(state: &'a State, uuid: &'a str) -> Element<'a, Message> {
     }
 
     let actions: Option<Element<'a, Message>> = task.map(|t| {
-        let mut buttons = vec![ui::button_ghost("Close", Message::Inspect(None))];
+        let mut buttons = vec![ui::button_ghost(Icon::X, "Close", Message::Inspect(None))];
         if row.column == BoardColumn::AwaitingReview {
-            buttons.insert(0, ui::button_default("Review", Message::OpenReview(t.id)));
+            buttons.insert(0, ui::button_default(Icon::Eye, "Review", Message::OpenReview(t.id)));
         }
         if row.column == BoardColumn::Failed {
-            buttons.insert(0, ui::button_secondary("Retry task", Message::RetryTask(t.id)));
+            buttons.insert(0, ui::button_secondary(Icon::Refresh, "Retry task", Message::RetryTask(t.id)));
         }
         ui::cluster(buttons).into()
     });
@@ -531,14 +564,15 @@ fn review_modal(draft: &crate::processes::ReviewDraft) -> Element<'_, Message> {
             ui::caption("REVISED INSTRUCTIONS (request changes)"),
             ui::input("New instructions", &draft.instructions, Message::ReviewInstructionsChanged),
             ui::cluster(vec![
-                ui::button_default("Approve", Message::SubmitReview(ReviewDecision::Approve)),
+                ui::button_default(Icon::Check, "Approve", Message::SubmitReview(ReviewDecision::Approve)),
                 ui::button_secondary(
+                    Icon::Pencil,
                     "Request changes",
                     Message::SubmitReview(ReviewDecision::RequestChanges),
                 ),
-                ui::button_destructive("Reject", Message::SubmitReview(ReviewDecision::Reject)),
+                ui::button_destructive(Icon::X, "Reject", Message::SubmitReview(ReviewDecision::Reject)),
                 ui::spacer(),
-                ui::button_ghost("Cancel", Message::CloseReview),
+                ui::button_ghost(Icon::X, "Cancel", Message::CloseReview),
             ])
             .into(),
         ]),

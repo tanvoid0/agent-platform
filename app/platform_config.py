@@ -39,8 +39,8 @@ def resolved_config_dir() -> Path:
 
     Compose sets `CONFIG_DIR` explicitly. Without it, resolve to the repo's
     `data/llm` — the old `/data` default only exists inside a container, so a
-    plain `pnpm dev:server` run silently pointed the config UI, model-ops, and
-    capability cache at a directory that was never there.
+    plain `pnpm dev:server` run silently pointed the proxy config, model-ops,
+    and capability cache at a directory that was never there.
     """
     explicit = (os.environ.get("CONFIG_DIR") or "").strip()
     if explicit:

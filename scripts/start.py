@@ -55,13 +55,15 @@ def main() -> None:
 
     port = int(os.getenv("AGENT_PLATFORM_PORT", "18410"))
     host = os.getenv("AGENT_PLATFORM_HOST", "127.0.0.1")
-    url = f"http://{host}:{port}/config"
+    # No browser UI ships any more (the desktop app is the UI); the only page
+    # worth opening is the API reference.
+    url = f"http://{host}:{port}/docs"
 
     if "--no-browser" not in args:
         threading.Timer(1.5, webbrowser.open, [url]).start()
 
-    print(f"[start] Config  {url}")
-    print(f"[start] API docs http://{host}:{port}/docs")
+    print(f"[start] API      http://{host}:{port}/api/v1")
+    print(f"[start] API docs {url}")
     if not (os.getenv("AGENT_PLATFORM_MASTER_KEY") or "").strip():
         print("[start] auth open (no AGENT_PLATFORM_MASTER_KEY set)")
 

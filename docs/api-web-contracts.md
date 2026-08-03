@@ -12,12 +12,12 @@ These routes were chosen because a shape change here would break the current UI 
 2. `GET /v1/catalog`
 3. `POST /api/v1/chat`
 4. `GET /api/v1/chat/resolved-defaults`
-5. `GET /teams/` and `GET /api/v1/teams/`
-6. `POST /teams/`
-7. `POST /processes` and `POST /api/v1/processes`
+5. `GET /api/v1/teams/`
+6. `POST /api/v1/teams/`
+7. `POST /api/v1/processes`
 8. `GET /api/v1/todos/boards`
 9. `GET /api/v1/todos/boards/{id}`
-10. `GET /workspaces/`, `GET /me/workspace`, and workspace-scoped `GET /projects/`
+10. `GET /api/v1/workspaces/`, `GET /api/v1/me/workspace`, and workspace-scoped `GET /api/v1/projects/`
 11. `GET /api/v1/model-ops/projects`
 12. `POST /api/v1/model-ops/jobs`
 13. `GET /api/v1/model-ops/jobs/{id}`

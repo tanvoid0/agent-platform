@@ -12,7 +12,6 @@ from sqlmodel import Session, select, update
 from api_tokens.auth import (
     TokenPrincipal,
     assert_token_project_access,
-    assert_token_workspace_access,
     require_valid_token,
 )
 from crud_helpers import require_one

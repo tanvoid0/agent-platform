@@ -32,7 +32,5 @@ env:
 
   # Uncomment or add more keys as needed (same names as former `.env` — see app/*.py).
   # AGENT_PLATFORM_WORKSPACE_ROOT: "data/workspaces"
-  # CORS_ALLOW_ORIGINS: "http://127.0.0.1:3333"
-  # AGENT_PLATFORM_PUBLIC_API: "http://127.0.0.1:18410"
   # AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX: 0
   # LOCAL_LLM_AUTO_DISCOVER: 1

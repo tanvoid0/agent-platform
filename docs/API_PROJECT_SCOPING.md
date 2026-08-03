@@ -1,5 +1,7 @@
 # Project Scoping in Agent Platform API
 
+> **All paths are under `/api/v1`.** The bare-root mirror (`/processes`, `/teams`, …) was removed with the browser UI; paths written without the prefix below are relative to it.
+
 > **Auth & tenant isolation:** see [API_WORKSPACE_SCOPING.md](./API_WORKSPACE_SCOPING.md).  
 > This document covers **process query filters** within a project.
 

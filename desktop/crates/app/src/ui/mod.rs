@@ -9,6 +9,7 @@
 //! hence the blanket allow.
 #![allow(dead_code)]
 
+pub mod icon;
 pub mod theme;
 
 use iced::widget::{
@@ -17,6 +18,7 @@ use iced::widget::{
 };
 use iced::{Element, Length, Padding};
 
+pub use icon::{icon, icon_muted, Icon};
 pub use theme::{font, space, ButtonVariant, Tone};
 
 // ---------------------------------------------------------------------------
@@ -86,16 +88,24 @@ impl Size {
     }
 }
 
-/// Full-control button; the helpers below cover the common cases.
+/// Full-control button; the helpers below cover the common cases. Buttons carry
+/// a leading icon (shadcn's `<Button><Icon /> Label</Button>`); pass `None` only
+/// where a glyph would add noise.
 pub fn button_sized<'a, M: 'a + Clone>(
+    glyph: Option<Icon>,
     label: &'a str,
     variant: ButtonVariant,
     size: Size,
     on_press: Option<M>,
 ) -> Element<'a, M> {
-    let b = button(text(label).size(font::SM))
-        .padding(size.padding())
-        .style(theme::button_style(variant));
+    let content: Element<'a, M> = match glyph {
+        Some(g) => row![icon::glyph(g), text(label).size(font::SM)]
+            .spacing(space::XS + 2.0)
+            .align_y(iced::Alignment::Center)
+            .into(),
+        None => text(label).size(font::SM).into(),
+    };
+    let b = button(content).padding(size.padding()).style(theme::button_style(variant));
     match on_press {
         Some(msg) => b.on_press(msg).into(),
         None => b.into(), // no handler = disabled styling
@@ -103,28 +113,44 @@ pub fn button_sized<'a, M: 'a + Clone>(
 }
 
 /// `<Button>` — primary action.
-pub fn button_default<'a, M: 'a + Clone>(label: &'a str, on_press: M) -> Element<'a, M> {
-    button_sized(label, ButtonVariant::Default, Size::Sm, Some(on_press))
+pub fn button_default<'a, M: 'a + Clone>(
+    glyph: Icon,
+    label: &'a str,
+    on_press: M,
+) -> Element<'a, M> {
+    button_sized(Some(glyph), label, ButtonVariant::Default, Size::Sm, Some(on_press))
 }
 
 /// `<Button variant="secondary">`
-pub fn button_secondary<'a, M: 'a + Clone>(label: &'a str, on_press: M) -> Element<'a, M> {
-    button_sized(label, ButtonVariant::Secondary, Size::Sm, Some(on_press))
+pub fn button_secondary<'a, M: 'a + Clone>(
+    glyph: Icon,
+    label: &'a str,
+    on_press: M,
+) -> Element<'a, M> {
+    button_sized(Some(glyph), label, ButtonVariant::Secondary, Size::Sm, Some(on_press))
 }
 
 /// `<Button variant="outline">`
-pub fn button_outline<'a, M: 'a + Clone>(label: &'a str, on_press: M) -> Element<'a, M> {
-    button_sized(label, ButtonVariant::Outline, Size::Sm, Some(on_press))
+pub fn button_outline<'a, M: 'a + Clone>(
+    glyph: Icon,
+    label: &'a str,
+    on_press: M,
+) -> Element<'a, M> {
+    button_sized(Some(glyph), label, ButtonVariant::Outline, Size::Sm, Some(on_press))
 }
 
 /// `<Button variant="ghost">`
-pub fn button_ghost<'a, M: 'a + Clone>(label: &'a str, on_press: M) -> Element<'a, M> {
-    button_sized(label, ButtonVariant::Ghost, Size::Sm, Some(on_press))
+pub fn button_ghost<'a, M: 'a + Clone>(
+    glyph: Icon,
+    label: &'a str,
+    on_press: M,
+) -> Element<'a, M> {
+    button_sized(Some(glyph), label, ButtonVariant::Ghost, Size::Sm, Some(on_press))
 }
 
-/// Square glyph-only ghost button (`<Button variant="ghost" size="icon">`).
-pub fn icon_button<'a, M: 'a + Clone>(glyph: &'a str, on_press: M) -> Element<'a, M> {
-    button(text(glyph).size(font::SM).center())
+/// Square icon-only ghost button (`<Button variant="ghost" size="icon">`).
+pub fn icon_button<'a, M: 'a + Clone>(glyph: Icon, on_press: M) -> Element<'a, M> {
+    button(container(icon::glyph(glyph)).center(Length::Fill))
         .width(28)
         .height(28)
         .padding(0)
@@ -134,18 +160,57 @@ pub fn icon_button<'a, M: 'a + Clone>(glyph: &'a str, on_press: M) -> Element<'a
 }
 
 /// `<Button variant="destructive">`
-pub fn button_destructive<'a, M: 'a + Clone>(label: &'a str, on_press: M) -> Element<'a, M> {
-    button_sized(label, ButtonVariant::Destructive, Size::Sm, Some(on_press))
+pub fn button_destructive<'a, M: 'a + Clone>(
+    glyph: Icon,
+    label: &'a str,
+    on_press: M,
+) -> Element<'a, M> {
+    button_sized(Some(glyph), label, ButtonVariant::Destructive, Size::Sm, Some(on_press))
 }
 
-/// Sidebar nav entry.
-pub fn nav_item<'a, M: 'a + Clone>(label: &'a str, selected: bool, on_press: M) -> Element<'a, M> {
-    button(text(label).size(font::SM))
-        .width(Length::Fill)
-        .padding(Padding::from([8.0, 12.0]))
-        .style(theme::nav_item(selected))
-        .on_press(on_press)
+/// Sidebar nav entry: icon + label, the icon tracking the label's color.
+pub fn nav_item<'a, M: 'a + Clone>(
+    glyph: Icon,
+    label: &'a str,
+    selected: bool,
+    on_press: M,
+) -> Element<'a, M> {
+    button(
+        row![icon::glyph(glyph), text(label).size(font::SM)]
+        .spacing(space::SM)
+        .align_y(iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([8.0, 12.0]))
+    .style(theme::nav_item(selected))
+    .on_press(on_press)
+    .into()
+}
+
+/// Heading above a run of [`nav_item`]s, so nine destinations read as three
+/// short groups instead of one flat list.
+pub fn nav_group<'a, M: 'a>(label: &'a str) -> Element<'a, M> {
+    container(text(label).size(font::XS).style(theme::text_muted))
+        .padding(Padding { top: space::SM, right: 0.0, bottom: 2.0, left: 12.0 })
         .into()
+}
+
+/// A nav entry the app cannot open yet (the server it needs is not up). Kept
+/// visible rather than hidden so the shape of the app does not change while it
+/// starts — it just cannot be pressed.
+pub fn nav_item_locked<'a, M: 'a>(glyph: Icon, label: &'a str) -> Element<'a, M> {
+    container(
+        row![
+            icon_muted(glyph),
+            text(label).size(font::SM).width(Length::Fill).style(theme::text_muted),
+            icon_muted(Icon::Lock),
+        ]
+        .spacing(space::SM)
+        .align_y(iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([8.0, 12.0]))
+    .into()
 }
 
 /// Segmented control (shadcn `Tabs`), used for theme mode and view switching.
@@ -218,6 +283,18 @@ pub fn page<'a, M: 'a>(
     actions: Option<Element<'a, M>>,
     content: impl Into<Element<'a, M>>,
 ) -> Element<'a, M> {
+    page_fixed(title_text, description, actions, scrollable(content.into()).height(Length::Fill))
+}
+
+/// Same scaffold for screens that scroll their own body — a chat transcript
+/// scrolls while its composer stays pinned, which an outer scrollable breaks
+/// (nested scrollables, and the composer scrolling off the page).
+pub fn page_fixed<'a, M: 'a>(
+    title_text: impl text::IntoFragment<'a>,
+    description: Option<Element<'a, M>>,
+    actions: Option<Element<'a, M>>,
+    content: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
     let title_row: Element<'a, M> = match actions {
         Some(actions) => row![title(title_text), space_widget::horizontal(), actions]
             .spacing(space::SM)
@@ -230,7 +307,7 @@ pub fn page<'a, M: 'a>(
         head = head.push(desc);
     }
     container(
-        column![head, scrollable(content.into()).height(Length::Fill)]
+        column![head, container(content.into()).height(Length::Fill)]
             .spacing(space::LG)
             .padding(space::LG),
     )
@@ -293,12 +370,50 @@ pub fn badge<'a, M: 'a>(label: impl text::IntoFragment<'a>, tone: Tone) -> Eleme
         .into()
 }
 
+/// `<Badge>` with a leading glyph — state that reads faster as a shape.
+pub fn badge_icon<'a, M: 'a>(
+    glyph: Icon,
+    label: impl text::IntoFragment<'a>,
+    tone: Tone,
+) -> Element<'a, M> {
+    container(
+        row![
+            glyph.glyph().size(font::XS).style(theme::text_tone(tone)),
+            text(label).size(font::XS).style(theme::text_tone(tone)),
+        ]
+        .spacing(space::XS)
+        .align_y(iced::Alignment::Center),
+    )
+    .padding(Padding::from([2.0, space::SM]))
+    .style(theme::badge(tone))
+    .into()
+}
+
+/// The glyph that stands for a tone: used by [`alert`] and status badges.
+pub fn tone_icon(tone: Tone) -> Icon {
+    match tone {
+        Tone::Success => Icon::CheckCircle,
+        Tone::Warning => Icon::Alert,
+        Tone::Danger => Icon::XCircle,
+        Tone::Info | Tone::Neutral => Icon::Info,
+    }
+}
+
 /// Big-number tile for counts (shadcn dashboard card). Sized to share a row:
 /// the value wraps inside the tile rather than spilling past its border.
-pub fn stat<'a, M: 'a>(label: &'a str, value: impl text::IntoFragment<'a>) -> Element<'a, M> {
+pub fn stat<'a, M: 'a>(
+    glyph: Icon,
+    label: &'a str,
+    value: impl text::IntoFragment<'a>,
+) -> Element<'a, M> {
     container(
         column![
-            text(label).size(font::XS).width(Length::Fill).style(theme::text_muted),
+            row![
+                glyph.glyph().size(font::XS).style(theme::text_muted),
+                text(label).size(font::XS).width(Length::Fill).style(theme::text_muted),
+            ]
+            .spacing(space::XS)
+            .align_y(iced::Alignment::Center),
             text(value).size(font::LG).width(Length::Fill).style(theme::text_default),
         ]
         .spacing(space::XS),
@@ -315,8 +430,13 @@ pub fn alert<'a, M: 'a>(
     title_text: impl text::IntoFragment<'a>,
     body_text: Option<Element<'a, M>>,
 ) -> Element<'a, M> {
-    let mut col = column![text(title_text).size(font::SM).style(theme::text_tone(tone))]
-        .spacing(space::XS);
+    let mut col = column![row![
+        tone_icon(tone).glyph().size(font::SM).style(theme::text_tone(tone)),
+        text(title_text).size(font::SM).style(theme::text_tone(tone)),
+    ]
+    .spacing(space::SM)
+    .align_y(iced::Alignment::Center)]
+    .spacing(space::XS);
     if let Some(b) = body_text {
         col = col.push(b);
     }
@@ -344,6 +464,57 @@ pub fn input<'a, M: 'a + Clone>(
     text_input(placeholder, value)
         .on_input(on_input)
         .size(font::SM)
+        .padding(Padding::from([8.0, 12.0]))
+        .style(theme::input)
+        .into()
+}
+
+/// `<Input>` that submits on Enter — the composer of any chat box.
+pub fn input_submit<'a, M: 'a + Clone>(
+    placeholder: &'a str,
+    value: &'a str,
+    on_input: impl Fn(String) -> M + 'a,
+    on_submit: M,
+) -> Element<'a, M> {
+    text_input(placeholder, value)
+        .on_input(on_input)
+        .on_submit(on_submit)
+        .size(font::SM)
+        .padding(Padding::from([8.0, 12.0]))
+        .style(theme::input)
+        .into()
+}
+
+/// One chat turn: role tag over the content, the user's own turns on a tinted
+/// surface so a thread reads as a conversation instead of a stack of cards.
+pub fn turn<'a, M: 'a>(
+    label: &'a str,
+    tone: Tone,
+    is_user: bool,
+    content: Element<'a, M>,
+) -> Element<'a, M> {
+    let inner = Column::with_children(vec![badge(label, tone), content]).spacing(space::XS);
+    let c = container(inner).padding(space::SM).width(Length::Fill);
+    if is_user { c.style(theme::code_block).into() } else { c.into() }
+}
+
+/// `<Input>` with a leading glyph (search fields, filters).
+pub fn input_icon<'a, M: 'a + Clone>(
+    glyph: Icon,
+    placeholder: &'a str,
+    value: &'a str,
+    on_input: impl Fn(String) -> M + 'a,
+) -> Element<'a, M> {
+    text_input(placeholder, value)
+        .on_input(on_input)
+        .size(font::SM)
+        .icon(text_input::Icon {
+            font: icon::FONT,
+            code_point: glyph.code_point(),
+            size: Some(font::SM.into()),
+            spacing: space::SM,
+            side: text_input::Side::Left,
+        })
         .padding(Padding::from([8.0, 12.0]))
         .style(theme::input)
         .into()
@@ -397,9 +568,24 @@ pub fn code<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
 
 /// Placeholder for an empty list or unfetched pane.
 pub fn empty_state<'a, M: 'a>(message: impl text::IntoFragment<'a>) -> Element<'a, M> {
-    container(muted(message))
-        .padding(space::XL)
-        .width(Length::Fill)
-        .center_x(Length::Fill)
-        .into()
+    empty_state_icon(Icon::Inbox, message)
+}
+
+/// Empty state with a chosen glyph (e.g. a clock while waiting).
+pub fn empty_state_icon<'a, M: 'a>(
+    glyph: Icon,
+    message: impl text::IntoFragment<'a>,
+) -> Element<'a, M> {
+    container(
+        column![
+            icon::icon_large(glyph, 28.0),
+            text(message).size(font::SM).style(theme::text_muted),
+        ]
+        .spacing(space::SM)
+        .align_x(iced::Alignment::Center),
+    )
+    .padding(space::XL)
+    .width(Length::Fill)
+    .center_x(Length::Fill)
+    .into()
 }

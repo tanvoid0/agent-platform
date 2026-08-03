@@ -4,7 +4,9 @@ Date: 2026-08-02
 
 ## Status
 
-Accepted
+Accepted, then partly superseded by [ADR 0005](0005-native-iced-desktop-headless-server.md):
+the webview, the `web/` payload, the free port and the CORS handshake are gone. The server-as-child-process,
+loopback/auth and training-out-of-bundle decisions stand.
 
 ## Context
 

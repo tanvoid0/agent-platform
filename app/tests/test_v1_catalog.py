@@ -14,7 +14,7 @@ def _master_headers():
 
 
 def _create_workspace(c):
-    r = c.post("/workspaces/", json={"name": "CatalogWs"}, headers=_master_headers())
+    r = c.post("/api/v1/workspaces/", json={"name": "CatalogWs"}, headers=_master_headers())
     assert r.status_code == 201, r.text
     return r.json()["id"]
 
@@ -23,7 +23,7 @@ def _create_workspace_token(c, workspace_id, **kwargs):
     body = {"name": "catalog-token", "scopes": ["chat:write"]}
     body.update(kwargs)
     r = c.post(
-        f"/workspaces/{workspace_id}/api-tokens/",
+        f"/api/v1/workspaces/{workspace_id}/api-tokens/",
         json=body,
         headers=_master_headers(),
     )

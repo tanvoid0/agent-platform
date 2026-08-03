@@ -45,7 +45,6 @@ from services.process_retry_service import (
     mark_process_for_replanning,
 )
 from team_schema import (
-    assign_missing_accents,
     build_process_team_snapshot,
     parse_team_roster_json,
     render_team_context_for_planner,
@@ -156,7 +155,7 @@ async def start_process(
     ):
         raise HTTPException(status_code=404, detail="Team template not found")
     if req.project_id is not None:
-        proj = require_one(session, Project, req.project_id, "Project")
+        require_one(session, Project, req.project_id, "Project")  # 404s on an unknown project
     stable_key = str(tmpl.id)
     team_color = resolved_team_color(tmpl.color, stable_key)
     roster = with_default_accents(

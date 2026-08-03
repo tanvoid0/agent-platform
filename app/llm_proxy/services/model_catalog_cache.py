@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
 
 from llm_proxy.core.errors import LlmProxyError
 from llm_proxy.core.provider_config import (

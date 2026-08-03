@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Generic, Type, TypeVar
+from typing import Type, TypeVar
 
 from fastapi import HTTPException
 from sqlmodel import Session

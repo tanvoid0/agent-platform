@@ -19,7 +19,6 @@ from workspace_service import (
     mkdir,
     normalize_relative_path,
     process_workspace_rel,
-    read_text_file,
     write_text_file,
 )
 

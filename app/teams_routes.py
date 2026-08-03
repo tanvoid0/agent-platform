@@ -11,8 +11,7 @@ from sqlmodel import Session, select, update
 from api_tokens.auth import TokenPrincipal, require_valid_token
 from crud_helpers import require_one
 from database import get_session
-from models import Process, TeamTemplate, Workspace
-from schema_converter import to_schemas
+from models import Process, TeamTemplate
 from schema_fields import ResourceName, ResourceDescription, ResourceColor, ResourceCategory
 from team_schema import (
     TeamRoster,

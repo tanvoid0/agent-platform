@@ -8,7 +8,6 @@ from fastapi import HTTPException
 from sqlmodel import Session, select
 
 from action_orchestrator.engine import decide_actions
-from action_orchestrator.registry import list_actions
 from assistant.models import AssistantReview
 from assistant.services.assistant_service import ensure_assistant_board
 from time_utils import utc_now_naive

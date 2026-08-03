@@ -14,7 +14,7 @@ from team_schema import (
 )
 from time_utils import utc_now_naive
 from todos.models import TodoBoard, TodoItem
-from todos.schemas import ItemOut, SpawnProcessResponse
+from todos.schemas import SpawnProcessResponse
 from todos.services.board_service import _item_out
 from todos.services.item_events import append_item_event
 

@@ -36,7 +36,7 @@ impl From<reqwest::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-fn detail_message(body: &Value) -> String {
+pub(crate) fn detail_message(body: &Value) -> String {
     match body.get("detail") {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(items)) => items
@@ -136,17 +136,39 @@ impl Client {
         self.get_json(&format!("/api/v1/processes/{id}")).await
     }
 
+    /// `after_id` is the append-ordered cursor the server pages on: 0 starts at
+    /// the beginning, otherwise pass the last id you already hold.
     pub async fn process_events(
         &self,
         id: i64,
         event_type: Option<&str>,
         limit: u32,
+        after_id: i64,
     ) -> Result<ProcessEventsResponse> {
-        let mut path = format!("/api/v1/processes/{id}/events?limit={limit}");
+        let mut path = format!("/api/v1/processes/{id}/events?limit={limit}&after_id={after_id}");
         if let Some(t) = event_type {
             path.push_str(&format!("&event_type={t}"));
         }
         self.get_json(&path).await
+    }
+
+    /// Every event for a process, walking the server's `after_id` cursor. The
+    /// page bound is a safety net, not a limit anyone should hit: a server that
+    /// stopped advancing the cursor would otherwise loop forever.
+    pub async fn all_process_events(&self, id: i64) -> Result<Vec<EventLogRecord>> {
+        const PAGE: u32 = 2000;
+        const MAX_PAGES: usize = 500;
+        let mut out: Vec<EventLogRecord> = Vec::new();
+        for _ in 0..MAX_PAGES {
+            let after = out.last().map(|e| e.id).unwrap_or(0);
+            let page = self.process_events(id, None, PAGE, after).await?.events;
+            let short = page.len() < PAGE as usize;
+            out.extend(page);
+            if short {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub async fn create_process(&self, body: &CreateProcessBody) -> Result<CreateProcessResponse> {

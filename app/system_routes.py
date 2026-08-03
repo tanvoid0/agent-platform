@@ -12,7 +12,6 @@ import os
 import platform
 import sys
 import time
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -87,7 +86,6 @@ def system_status(session: Session = Depends(get_session)) -> dict[str, Any]:
             "total": sum(counts.values()),
         },
         "paths": _paths(),
-        "spa_bundled": (Path(__file__).resolve().parent.parent / "web" / "dist").is_dir(),
     }
 
 

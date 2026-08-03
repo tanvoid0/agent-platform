@@ -62,6 +62,187 @@ fn non_empty(s: &str) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Starting rosters
+// ---------------------------------------------------------------------------
+
+/// A curated starting roster, ported from the web library's template cards.
+/// These are drafts, not server records: picking one fills the editor, and
+/// nothing exists until it is saved.
+pub struct Preset {
+    pub name: &'static str,
+    pub description: &'static str,
+    color: &'static str,
+    category: &'static str,
+    roles: &'static [PresetRole],
+}
+
+struct PresetRole {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    /// `""` roots the role; anything else names its parent's preset id.
+    parent: &'static str,
+    accent: &'static str,
+}
+
+impl Preset {
+    fn draft(&self) -> Draft {
+        Draft {
+            id: None,
+            name: self.name.to_string(),
+            description: self.description.to_string(),
+            color: self.color.to_string(),
+            category: self.category.to_string(),
+            roles: self
+                .roles
+                .iter()
+                .map(|r| RosterRole {
+                    id: r.id.to_string(),
+                    name: r.name.to_string(),
+                    description: Some(r.description.to_string()),
+                    // Text-only until the server routes other modalities.
+                    modality: Some("text".into()),
+                    parent_id: non_empty(r.parent),
+                    accent_color: Some(r.accent.to_string()),
+                })
+                .collect(),
+        }
+    }
+}
+
+const GREEN: &str = "#16a34a";
+const BLUE: &str = "#2563eb";
+const PURPLE: &str = "#9333ea";
+const ORANGE: &str = "#ea580c";
+const GOLD: &str = "#ca8a04";
+const RED: &str = "#dc2626";
+
+pub const TEAM_PRESETS: &[Preset] = &[
+    Preset {
+        name: "Consultant workshop",
+        description: "Single lead — quick experiments and written deliverables.",
+        color: GREEN,
+        category: "Workshop",
+        roles: &[PresetRole {
+            id: "lead",
+            name: "Workshop lead",
+            description: "Frames the ask, drafts the outcome, and hands off notes.",
+            parent: "",
+            accent: GREEN,
+        }],
+    },
+    Preset {
+        name: "Notepad mentorship",
+        description: "Lead plus implementer and reviewer — guided delivery.",
+        color: BLUE,
+        category: "Mentorship",
+        roles: &[
+            PresetRole {
+                id: "lead",
+                name: "Mentor",
+                description: "Keeps scope clear and reviews direction.",
+                parent: "",
+                accent: BLUE,
+            },
+            PresetRole {
+                id: "junior",
+                name: "Junior implementer",
+                description: "Implements tasks and asks for checkpoints.",
+                parent: "lead",
+                accent: GREEN,
+            },
+            PresetRole {
+                id: "reviewer",
+                name: "Reviewer",
+                description: "Sanity-checks changes and suggests fixes.",
+                parent: "lead",
+                accent: PURPLE,
+            },
+        ],
+    },
+    Preset {
+        name: "Content sprint",
+        description: "Parallel writers with a coordinating editor.",
+        color: ORANGE,
+        category: "Content",
+        roles: &[
+            PresetRole {
+                id: "editor",
+                name: "Editor",
+                description: "Owns tone, deadlines, and final assembly.",
+                parent: "",
+                accent: ORANGE,
+            },
+            PresetRole {
+                id: "a",
+                name: "Writer A",
+                description: "Drafts assigned sections.",
+                parent: "editor",
+                accent: BLUE,
+            },
+            PresetRole {
+                id: "b",
+                name: "Writer B",
+                description: "Drafts assigned sections.",
+                parent: "editor",
+                accent: GREEN,
+            },
+            PresetRole {
+                id: "fact",
+                name: "Fact checker",
+                description: "Traces claims to sources.",
+                parent: "editor",
+                accent: PURPLE,
+            },
+        ],
+    },
+    Preset {
+        name: "Autonomous product engineering",
+        description: "Software-style tree: lead → senior + QA; backend chain to frontend.",
+        color: BLUE,
+        category: "Engineering",
+        roles: &[
+            PresetRole {
+                id: "lead",
+                name: "Team lead",
+                description:
+                    "Coordinates priorities, integrates work, requests human review when needed.",
+                parent: "",
+                accent: BLUE,
+            },
+            PresetRole {
+                id: "senior",
+                name: "Senior full-stack developer",
+                description: "Owns architecture and splits work across the stack.",
+                parent: "lead",
+                accent: GREEN,
+            },
+            PresetRole {
+                id: "qa",
+                name: "QA & documentation",
+                description: "Tests flows and keeps docs aligned.",
+                parent: "lead",
+                accent: PURPLE,
+            },
+            PresetRole {
+                id: "backend",
+                name: "Backend developer",
+                description: "APIs, persistence, and integration points.",
+                parent: "senior",
+                accent: GOLD,
+            },
+            PresetRole {
+                id: "frontend",
+                name: "Frontend developer",
+                description: "UI, accessibility, and client behavior.",
+                parent: "backend",
+                accent: RED,
+            },
+        ],
+    },
+];
+
 #[derive(Default)]
 pub struct State {
     pub projects: Vec<ProjectSummary>,
@@ -94,6 +275,8 @@ pub enum Message {
     NewProject,
     EditProject(i64),
     NewTeam,
+    /// Index into [`TEAM_PRESETS`].
+    NewTeamFromPreset(usize),
     EditTeam(i64),
     CancelEdit,
 
@@ -187,6 +370,14 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::NewTeam => {
             state.team_detail = None;
             state.draft = Some(Draft { roles: vec![new_role(0)], ..Draft::default() });
+            Task::none()
+        }
+        Message::NewTeamFromPreset(index) => {
+            if let Some(preset) = TEAM_PRESETS.get(index) {
+                state.team_detail = None;
+                state.selected_role = None;
+                state.draft = Some(preset.draft());
+            }
             Task::none()
         }
         Message::EditTeam(id) => {
@@ -384,6 +575,37 @@ mod tests {
 
     fn client() -> Client {
         Client::new("http://127.0.0.1:1", "k")
+    }
+
+    #[test]
+    fn presets_are_well_formed_rosters() {
+        for preset in TEAM_PRESETS {
+            let draft = preset.draft();
+            assert!(draft.id.is_none(), "{}: a preset is a new draft", preset.name);
+            let ids: Vec<&str> = draft.roles.iter().map(|r| r.id.as_str()).collect();
+            for role in &draft.roles {
+                assert_eq!(ids.iter().filter(|i| **i == role.id).count(), 1, "duplicate id");
+                // A parent that names nothing would drop the role out of the
+                // tree layout, which is how the roster is drawn and saved.
+                if let Some(parent) = &role.parent_id {
+                    assert!(ids.contains(&parent.as_str()), "{}: dangling parent", preset.name);
+                }
+            }
+            assert_eq!(draft.roles.iter().filter(|r| r.parent_id.is_none()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn picking_a_preset_fills_the_editor() {
+        let mut s = State::default();
+        let _ = update(&mut s, &client(), Message::NewTeamFromPreset(1));
+        let draft = s.draft.expect("draft");
+        assert_eq!(draft.name, TEAM_PRESETS[1].name);
+        assert_eq!(draft.roles.len(), 3);
+        // Out of range is a no-op, not a panic.
+        let mut s = State::default();
+        let _ = update(&mut s, &client(), Message::NewTeamFromPreset(999));
+        assert!(s.draft.is_none());
     }
 
     #[test]
