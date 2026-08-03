@@ -54,6 +54,7 @@ class ChatCompletionRequest(BaseModel):
 
     messages: list[Any]
     model: str | None = None
+    provider: str | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
     temperature: float | None = None
@@ -208,6 +209,10 @@ async def chat_completions(
         sm = sanitize_llm_model_alias(req.model.strip())
         if sm:
             payload["model"] = sm
+    if req.provider is not None and req.provider.strip():
+        # The proxy validates the hint and routes to that provider
+        # (llm_proxy/routes/llm.py); unknown providers come back as 400.
+        payload["provider"] = req.provider.strip().lower()
     if req.tools is not None:
         payload["tools"] = req.tools
     if req.tool_choice is not None:

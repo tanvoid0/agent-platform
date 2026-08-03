@@ -1,8 +1,9 @@
 //! Native desktop app: iced daemon owning the Python server sidecar.
 //!
-//! Ollama-style background behavior: closing the window hides the app (daemon
-//! keeps running with zero windows, server keeps serving on its fixed port);
-//! the tray offers Show / Restart / Quit. Quit kills the child we spawned and
+//! Ollama-style background behavior: the window's close button asks whether to
+//! quit or minimize to tray; tray keeps the daemon running with zero windows
+//! (server keeps serving on its fixed port); the tray offers Show / Restart /
+//! Quit. Quit kills the child we spawned and
 //! hard-exits — `iced::exit()` hangs on Windows wgpu teardown (verified in the
 //! Phase 0 spike), and the tray icon must be dropped first or it lingers.
 
@@ -16,6 +17,8 @@ mod domain;
 mod graph;
 mod library;
 mod library_view;
+mod memory;
+mod memory_view;
 mod modelops;
 mod modelops_view;
 mod notify;
@@ -27,7 +30,10 @@ mod screen;
 mod shell;
 mod stt;
 mod ui;
+mod workflows;
+mod workflows_view;
 
+use agent_platform_client::sse::ChatChunk;
 use agent_platform_client::types::SystemStatus;
 use agent_platform_client::Client;
 use iced::{window, Element, Subscription, Task};
@@ -40,26 +46,32 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 /// entries long instead of nine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
+    Dashboard,
     Processes,
     Projects,
     Teams,
+    Workflows,
     Chat,
     Assistant,
+    Memory,
     Settings,
 }
 
 impl Screen {
     /// Whether this screen is useless without the API. Settings opens either
     /// way — it is the page holding Status and Logs, which is where the user
-    /// finds out why the server is down.
+    /// finds out why the server is down. Memory is a local file, readable and
+    /// editable whether or not anything is running.
     pub fn needs_server(self) -> bool {
-        !matches!(self, Screen::Settings)
+        // Dashboard is the landing page and reports server health itself, so it
+        // must render against a dead API rather than hide behind the guard.
+        !matches!(self, Screen::Settings | Screen::Memory | Screen::Dashboard)
     }
 
-    /// The two assistants share one sidebar entry and one tab strip: same
-    /// conversation surface, plain on one tab and voiced with a HUD on the other.
+    /// The assistants share one sidebar entry and one tab strip: the same
+    /// conversation surface plain, voiced with a HUD, and what it remembers.
     pub fn is_chat(self) -> bool {
-        matches!(self, Screen::Chat | Screen::Assistant)
+        matches!(self, Screen::Chat | Screen::Assistant | Screen::Memory)
     }
 }
 
@@ -121,6 +133,8 @@ pub struct App {
     pub settings: Settings,
     pub client: Client,
     pub window: Option<window::Id>,
+    /// A quit-or-tray dialog is already up; further close clicks are ignored.
+    close_prompt: bool,
     tray: Option<TrayIcon>,
     pub screen: Screen,
     /// Which tab the Settings page shows; remembered across visits.
@@ -140,7 +154,10 @@ pub struct App {
     pub modelops: modelops::State,
     pub chat: chat::State,
     pub assistant: assistant::State,
+    /// What both assistants remember about the user, across restarts.
+    pub memory: memory::Store,
     pub providers: providers::State,
+    pub workflows: workflows::State,
 }
 
 impl App {
@@ -168,6 +185,10 @@ impl App {
     pub fn view_available(&self) -> bool {
         let needs_server = match self.screen {
             Screen::Settings => self.settings_tab.needs_server(),
+            // Both tabbed pages gate per tab rather than per page: each holds at
+            // least one tab that works with the server down, and the tab strip
+            // is how the user reaches it.
+            s if s.is_chat() => false,
             other => other.needs_server(),
         };
         !needs_server || self.server_ready()
@@ -178,6 +199,8 @@ impl App {
 pub enum Message {
     Tray(String),
     WindowOpened(window::Id),
+    WindowCloseRequested(window::Id),
+    WindowCloseChoice(window::Id, rfd::MessageDialogResult),
     WindowClosed(window::Id),
     Nav(Screen),
     NavSettings(SettingsTab),
@@ -200,13 +223,17 @@ pub enum Message {
     ModelOps(modelops::Message),
     Chat(chat::Message),
     Assistant(assistant::Message),
+    Memory(memory::Message),
     Providers(providers::Message),
+    Workflows(workflows::Message),
 }
 
 fn open_window() -> Task<Message> {
     let (_id, task) = window::open(window::Settings {
         size: iced::Size::new(1440.0, 900.0),
         min_size: Some(iced::Size::new(820.0, 560.0)),
+        // Close is intercepted: we ask quit-or-tray instead of just closing.
+        exit_on_close_request: false,
         ..window::Settings::default()
     });
     task.map(Message::WindowOpened)
@@ -305,16 +332,19 @@ fn boot() -> (App, Task<Message>) {
 
     let minimized =
         settings.start_minimized || std::env::args().any(|a| a == "--minimized");
+    let (chat_provider, chat_model) =
+        (settings.chat_provider.clone(), settings.chat_model.clone());
 
     let app = App {
         shell: sh,
         settings,
         client,
         window: None,
+        close_prompt: false,
         tray,
-        screen: Screen::Processes,
+        screen: Screen::Dashboard,
         settings_tab: SettingsTab::Providers,
-        chat_tab: Screen::Chat,
+        chat_tab: Screen::Assistant,
         status: None,
         status_error: None,
         child_alive: false,
@@ -332,9 +362,11 @@ fn boot() -> (App, Task<Message>) {
         processes: processes::State::default(),
         library: library::State::default(),
         modelops: modelops::State::default(),
-        chat: chat::State::default(),
+        chat: chat::State::with_defaults(chat_provider, chat_model),
         assistant: assistant::State::new(),
+        memory: memory::Store::load(&app_dir),
         providers: providers::State::default(),
+        workflows: workflows::State::default(),
     };
     let task = if minimized { Task::none() } else { open_window() };
     let bootstrap = Task::batch([
@@ -361,11 +393,19 @@ fn enter_screen(app: &App) -> Task<Message> {
         return Task::none();
     }
     match app.screen {
+        // Status is polled globally; the dashboard has nothing extra to fetch.
+        Screen::Dashboard => Task::none(),
         Screen::Processes => Task::done(Message::Processes(processes::Message::ListTick)),
         Screen::Projects | Screen::Teams => {
             Task::done(Message::Library(library::Message::Refresh))
         }
-        Screen::Chat | Screen::Assistant => Task::none(),
+        Screen::Workflows => Task::done(Message::Workflows(workflows::Message::Refresh)),
+        // The dropdowns need the provider catalog once; chat itself works
+        // without it, so a failed load costs nothing but empty pickers.
+        Screen::Chat if app.chat.catalog.is_empty() => {
+            chat::load_catalog(&app.client).map(Message::Chat)
+        }
+        Screen::Chat | Screen::Assistant | Screen::Memory => Task::none(),
         Screen::Settings => match app.settings_tab {
             SettingsTab::Logs => Task::done(Message::LogsTick),
             SettingsTab::ModelOps => Task::done(Message::ModelOps(modelops::Message::Refresh)),
@@ -400,6 +440,32 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::WindowOpened(id) => {
             app.window = Some(id);
             Task::none()
+        }
+        Message::WindowCloseRequested(id) => {
+            if app.close_prompt {
+                return Task::none();
+            }
+            app.close_prompt = true;
+            let dialog = rfd::AsyncMessageDialog::new()
+                .set_title("Agent Platform")
+                .set_description("Close the app, or keep it running in the tray?")
+                .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                    "Close".to_string(),
+                    "Minimize to tray".to_string(),
+                    "Cancel".to_string(),
+                ));
+            Task::perform(dialog.show(), move |r| Message::WindowCloseChoice(id, r))
+        }
+        Message::WindowCloseChoice(id, result) => {
+            app.close_prompt = false;
+            match result {
+                rfd::MessageDialogResult::Custom(s) if s == "Close" => quit(app),
+                rfd::MessageDialogResult::Custom(s) if s == "Minimize to tray" => {
+                    window::close(id)
+                }
+                // Cancel, Esc, or dialog dismissed: keep the window.
+                _ => Task::none(),
+            }
         }
         Message::WindowClosed(id) => {
             if app.window == Some(id) {
@@ -556,12 +622,55 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::ModelOps(msg) => {
             modelops::update(&mut app.modelops, &app.client, msg).map(Message::ModelOps)
         }
-        Message::Chat(msg) => chat::update(&mut app.chat, &app.client, msg).map(Message::Chat),
-        Message::Assistant(msg) => {
-            assistant::update(&mut app.assistant, &app.client, msg).map(Message::Assistant)
+        // Both assistants take the same two memory hooks: recall refreshed
+        // before every message (so an edit in the dashboard lands on the next
+        // turn, not the next restart) and one harvest when a reply completes.
+        Message::Chat(msg) => {
+            let closed = matches!(msg, chat::Message::Chunk(ChatChunk::Done));
+            app.chat.system = app.memory.system_block();
+            let turn = chat::update(&mut app.chat, &app.client, msg).map(Message::Chat);
+            // The provider/model override survives restarts: any change lands
+            // in settings.json the moment it is made.
+            if app.settings.chat_provider != app.chat.provider
+                || app.settings.chat_model != app.chat.model
+            {
+                app.settings.chat_provider = app.chat.provider.clone();
+                app.settings.chat_model = app.chat.model.clone();
+                if let Err(e) = app.settings.save(&app.shell.data_dir) {
+                    app.shell.log_line(format!("[shell] could not save settings: {e}"));
+                }
+            }
+            match closed {
+                false => turn,
+                true => Task::batch([
+                    turn,
+                    app.memory
+                        .harvest(&app.client, &app.chat.messages, "Chat")
+                        .map(Message::Memory),
+                ]),
+            }
         }
+        Message::Assistant(msg) => {
+            let closed = matches!(msg, assistant::Message::Chunk(ChatChunk::Done));
+            app.assistant.memory = app.memory.system_block();
+            let turn =
+                assistant::update(&mut app.assistant, &app.client, msg).map(Message::Assistant);
+            match closed {
+                false => turn,
+                true => Task::batch([
+                    turn,
+                    app.memory
+                        .harvest(&app.client, &app.assistant.messages, assistant::NAME)
+                        .map(Message::Memory),
+                ]),
+            }
+        }
+        Message::Memory(msg) => memory::update(&mut app.memory, msg).map(Message::Memory),
         Message::Providers(msg) => {
             providers::update(&mut app.providers, &app.client, msg).map(Message::Providers)
+        }
+        Message::Workflows(msg) => {
+            workflows::update(&mut app.workflows, &app.client, msg).map(Message::Workflows)
         }
     }
 }
@@ -580,6 +689,7 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
 fn subscription(app: &App) -> Subscription<Message> {
     let mut subs = vec![
         window::close_events().map(Message::WindowClosed),
+        window::close_requests().map(Message::WindowCloseRequested),
         // Tray menu events: global receiver, polled.
         Subscription::run(|| {
             iced::stream::channel(16, async |mut out| {
@@ -641,7 +751,8 @@ fn subscription(app: &App) -> Subscription<Message> {
             }));
         }
     }
-    if live && app.screen == Screen::Assistant {
+    // The Dashboard embeds E.V.'s live HUD, so it needs the same heartbeat.
+    if live && (app.screen == Screen::Assistant || app.screen == Screen::Dashboard) {
         subs.push(
             iced::time::every(assistant::TICK)
                 .map(|_| Message::Assistant(assistant::Message::Tick)),
@@ -678,8 +789,15 @@ mod tests {
     #[test]
     fn diagnostics_stay_reachable_without_a_server() {
         assert!(!Screen::Settings.needs_server());
-        for screen in
-            [Screen::Processes, Screen::Projects, Screen::Teams, Screen::Chat, Screen::Assistant]
+        assert!(!Screen::Dashboard.needs_server(), "the landing page must open against a dead API");
+        for screen in [
+            Screen::Processes,
+            Screen::Projects,
+            Screen::Teams,
+            Screen::Workflows,
+            Screen::Chat,
+            Screen::Assistant,
+        ]
         {
             assert!(screen.needs_server(), "{screen:?} would render against a dead API");
         }

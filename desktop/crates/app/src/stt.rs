@@ -13,7 +13,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 const MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin";
 const MODEL_FILE: &str = "ggml-base.en-q5_1.bin";
-const WHISPER_RATE: u32 = 16_000;
+pub const WHISPER_RATE: u32 = 16_000;
 
 /// Under half a second of audio is a stray click, not an utterance.
 pub const MIN_SAMPLES: usize = (WHISPER_RATE / 2) as usize;
@@ -202,39 +202,153 @@ pub fn band_freq(i: usize, count: usize) -> f32 {
     BAND_LO * (BAND_HI / BAND_LO).powf(i as f32 / (count.max(2) - 1) as f32)
 }
 
+/// Hann window applied once — every band that follows sees the same frame.
+fn hann(mono: &[f32]) -> Vec<f32> {
+    let n = mono.len() as f32;
+    mono.iter()
+        .enumerate()
+        .map(|(j, x)| x * (0.5 - 0.5 * (std::f32::consts::TAU * j as f32 / n).cos()))
+        .collect()
+}
+
+/// Magnitude at one frequency over an already-windowed frame. Goertzel: a full
+/// FFT for a couple of dozen bins would be more code and more work.
+fn goertzel(windowed: &[f32], rate: u32, freq: f32) -> f32 {
+    let w = std::f32::consts::TAU * freq / rate as f32;
+    let coeff = 2.0 * w.cos();
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for x in windowed {
+        let s = x + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s;
+    }
+    let power = (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0);
+    power.sqrt() / (windowed.len() as f32 * 0.25)
+}
+
 /// Log-spaced band magnitudes of `mono`, normalized to 0..1, written into
-/// `out`. Goertzel per band: a full FFT for two dozen bins would be more code
-/// and more work, and this runs every frame.
+/// `out`. This runs every frame, for the HUD.
 pub fn bands(mono: &[f32], rate: u32, out: &mut [f32]) {
     let n = mono.len();
     if n < 256 || rate == 0 || out.len() < 2 {
         out.fill(0.0);
         return;
     }
-    // Hann once, not once per band — the window is the same for all of them.
-    let windowed: Vec<f32> = mono
-        .iter()
-        .enumerate()
-        .map(|(j, x)| x * (0.5 - 0.5 * (std::f32::consts::TAU * j as f32 / n as f32).cos()))
-        .collect();
+    let windowed = hann(mono);
     let count = out.len();
     let last = (count - 1) as f32;
     for (i, slot) in out.iter_mut().enumerate() {
-        let w = std::f32::consts::TAU * band_freq(i, count) / rate as f32;
-        let coeff = 2.0 * w.cos();
-        let (mut s1, mut s2) = (0.0f32, 0.0f32);
-        for x in &windowed {
-            let s = x + coeff * s1 - s2;
-            s2 = s1;
-            s1 = s;
-        }
-        let power = (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0);
-        let mag = power.sqrt() / (n as f32 * 0.25);
+        let mag = goertzel(&windowed, rate, band_freq(i, count));
         // Voice is bass-heavy; tilt the gain up with frequency or the top half
         // of the spectrum never moves.
         let tilt = 1.0 + 2.5 * (i as f32 / last);
         *slot = (mag * BAND_GAIN * tilt).sqrt().clamp(0.0, 1.0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Voice print
+// ---------------------------------------------------------------------------
+
+/// Mel filters behind the cepstrum, and how many coefficients are kept. 13 is
+/// the standard speech count; the first (overall loudness) is dropped, because
+/// how loud you were is not who you are.
+const MFCC_BANDS: usize = 26;
+const MFCC_KEEP: usize = 13;
+/// A print is the per-coefficient mean and spread over an utterance: the mean
+/// carries the timbre of the voice, the spread carries how it moves.
+pub const PRINT_DIM: usize = MFCC_KEEP * 2;
+pub type VoicePrint = [f32; PRINT_DIM];
+
+/// Mel-spaced filter centres, 80 Hz–6 kHz. Mel rather than the HUD's plain log
+/// spacing: it is the scale these features were designed on.
+fn mel_center(i: usize) -> f32 {
+    let mel = |f: f32| 2595.0 * (1.0 + f / 700.0).log10();
+    let (lo, hi) = (mel(80.0), mel(6_000.0));
+    let m = lo + (hi - lo) * (i as f32 / (MFCC_BANDS - 1) as f32);
+    700.0 * (10f32.powf(m / 2595.0) - 1.0)
+}
+
+/// A speaker print for one utterance, or `None` if there was not enough voiced
+/// audio to characterize.
+///
+/// This is cepstral statistics, not a neural embedding: it separates voices
+/// that differ in pitch and timbre reliably, and similar voices poorly. It
+/// costs no dependency, no model download and no enrollment wizard, which is
+/// the trade being made.
+/// ponytail: upgrade path is an ECAPA/wespeaker ONNX embedding via `ort` —
+/// worth it only if this misfires in practice.
+pub fn voice_print(mono: &[f32], rate: u32) -> Option<VoicePrint> {
+    let frame = (rate as usize * 25) / 1000;
+    let hop = (rate as usize * 10) / 1000;
+    if rate == 0 || frame == 0 || mono.len() < frame * 8 {
+        return None;
+    }
+    // Frames far below the utterance's own peak are pauses between words;
+    // averaging them in would print the room, not the speaker.
+    let peak = mono.iter().fold(0.0_f32, |a, b| a.max(b.abs()));
+    if peak < 1e-3 {
+        return None; // silence has no timbre to print
+    }
+    let quiet = peak * 0.08;
+
+    let (mut sums, mut squares) = ([0.0_f32; MFCC_KEEP], [0.0_f32; MFCC_KEEP]);
+    let mut frames = 0_usize;
+    let mut start = 0;
+    while start + frame <= mono.len() {
+        let slice = &mono[start..start + frame];
+        start += hop;
+        let rms = (slice.iter().map(|s| s * s).sum::<f32>() / frame as f32).sqrt();
+        if rms < quiet {
+            continue;
+        }
+        let windowed = hann(slice);
+        let logs: Vec<f32> = (0..MFCC_BANDS)
+            .map(|i| (goertzel(&windowed, rate, mel_center(i)) + 1e-6).ln())
+            .collect();
+        // DCT-II, dropping coefficient 0 with the loudness it carries.
+        for (k, (sum, sq)) in sums.iter_mut().zip(squares.iter_mut()).enumerate() {
+            let kk = (k + 1) as f32;
+            let c: f32 = logs
+                .iter()
+                .enumerate()
+                .map(|(n, e)| {
+                    e * (std::f32::consts::PI * kk * (n as f32 + 0.5) / MFCC_BANDS as f32)
+                        .cos()
+                })
+                .sum();
+            *sum += c;
+            *sq += c * c;
+        }
+        frames += 1;
+    }
+    if frames < 10 {
+        return None;
+    }
+
+    let n = frames as f32;
+    let mut print = [0.0_f32; PRINT_DIM];
+    for k in 0..MFCC_KEEP {
+        let mean = sums[k] / n;
+        print[k] = mean;
+        print[MFCC_KEEP + k] = ((squares[k] / n) - mean * mean).max(0.0).sqrt();
+    }
+    // L2-normalize so comparison is a plain dot product and loudness, mic gain
+    // and utterance length drop out of it.
+    let norm = print.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm < 1e-6 {
+        return None;
+    }
+    for v in print.iter_mut() {
+        *v /= norm;
+    }
+    Some(print)
+}
+
+/// Cosine similarity of two prints, in -1..1. Same speaker on the same mic
+/// lands near 1; a different voice drops away from it.
+pub fn print_similarity(a: &VoicePrint, b: &VoicePrint) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -357,5 +471,54 @@ mod tests {
         out.fill(1.0);
         bands(&tone(1_000.0)[..64], rate, &mut out);
         assert!(out.iter().all(|b| *b == 0.0));
+    }
+
+    /// A crude voice: harmonics of `f0` shaped by two formants. Different
+    /// pitch and different formants is what "a different person" means here.
+    fn voiced(f0: f32, formants: [f32; 2], rate: u32, secs: f32, phase: f32) -> Vec<f32> {
+        let n = (rate as f32 * secs) as usize;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / rate as f32 + phase;
+                let mut s = 0.0;
+                for h in 1..40 {
+                    let f = f0 * h as f32;
+                    if f > 6_000.0 {
+                        break;
+                    }
+                    let gain: f32 =
+                        formants.iter().map(|c| 1.0 / (1.0 + ((f - c) / 140.0).powi(2))).sum();
+                    s += gain * (std::f32::consts::TAU * f * t).sin();
+                }
+                // Syllable-rate envelope, so the spread half of the print is
+                // not measuring a perfectly steady tone.
+                s * 0.1 * (0.6 + 0.4 * (std::f32::consts::TAU * 4.0 * t).sin())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn voice_prints_separate_two_speakers() {
+        let rate = 16_000;
+        let me = voice_print(&voiced(120.0, [700.0, 1_200.0], rate, 2.0, 0.0), rate).unwrap();
+        let me_again =
+            voice_print(&voiced(120.0, [700.0, 1_200.0], rate, 1.4, 0.37), rate).unwrap();
+        let someone_else =
+            voice_print(&voiced(210.0, [450.0, 2_500.0], rate, 2.0, 0.0), rate).unwrap();
+
+        let same = print_similarity(&me, &me_again);
+        let other = print_similarity(&me, &someone_else);
+        // Measured on these two: same 1.00, different 0.79 — which is where
+        // `assistant::VOICE_MATCH` (0.82) was set. Real voices are noisier than
+        // synthetic ones, so that threshold leans towards letting you through.
+        assert!(same > 0.9, "same voice should match itself closely, got {same}");
+        assert!(
+            same - other > 0.1,
+            "speakers must separate: same {same}, other {other}"
+        );
+
+        // Too little audio to characterize is `None`, never a bogus print.
+        assert!(voice_print(&voiced(120.0, [700.0, 1_200.0], rate, 0.05, 0.0), rate).is_none());
+        assert!(voice_print(&vec![0.0; rate as usize], rate).is_none());
     }
 }

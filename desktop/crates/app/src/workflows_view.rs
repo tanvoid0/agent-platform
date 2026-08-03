@@ -1,0 +1,243 @@
+//! Workflows screen: the list, a JSON step editor, and per-run results.
+//!
+//! Reads top to bottom: editor (when open), then the workflows, then the runs
+//! of whichever workflow is selected. No canvas, no node graph — a workflow is
+//! a short list of steps, and a list renders a list best.
+
+use crate::ui::{self, space, Icon, Tone};
+use crate::workflows::{Message, State};
+use agent_platform_client::types::{WorkflowInfo, WorkflowRunInfo};
+use iced::widget::{column, container, row, text_editor};
+use iced::{Element, Length};
+
+pub fn view(state: &State) -> Element<'_, Message> {
+    let mut blocks: Vec<Element<'_, Message>> = Vec::new();
+
+    if let Some(err) = &state.error {
+        blocks.push(ui::alert(
+            Tone::Danger,
+            err.clone(),
+            Some(ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss)),
+        ));
+    }
+    if let Some(notice) = &state.notice {
+        blocks.push(ui::alert(
+            Tone::Success,
+            notice.clone(),
+            Some(ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss)),
+        ));
+    }
+
+    if let Some(editor) = &state.editor {
+        blocks.push(editor_card(state, editor));
+    }
+
+    let list: Element<'_, Message> = if state.items.is_empty() {
+        ui::empty_state_icon(
+            Icon::Zap,
+            "No workflows yet. A workflow is a fixed list of HTTP or action steps \
+             the server runs for you — on demand, on a timer, or when another app \
+             calls its run endpoint.",
+        )
+    } else {
+        ui::stack(state.items.iter().map(|wf| workflow_card(state, wf)).collect()).into()
+    };
+    blocks.push(ui::section("Workflows", None, list));
+
+    if let Some(selected) = state.selected {
+        if let Some(wf) = state.items.iter().find(|w| w.id == selected) {
+            blocks.push(ui::section(
+                "Recent runs",
+                Some(ui::muted(format!("\"{}\", newest first.", wf.name))),
+                runs_view(state),
+            ));
+        }
+    }
+
+    ui::page(
+        "Workflows",
+        Some(ui::muted(
+            "Your own automations: fixed steps, run by hand, on a schedule, or \
+             from other apps over the API.",
+        )),
+        Some(
+            ui::cluster(vec![
+                ui::button_secondary(Icon::Refresh, "Refresh", Message::Refresh),
+                ui::button_default(Icon::Plus, "New workflow", Message::New),
+            ])
+            .into(),
+        ),
+        ui::stack_lg(blocks),
+    )
+}
+
+fn editor_card<'a>(state: &'a State, editor: &'a crate::workflows::Editor) -> Element<'a, Message> {
+    let title = if editor.id.is_some() { "Edit workflow" } else { "New workflow" };
+    ui::card_with_header(
+        title,
+        Some(ui::muted(
+            "Steps run top to bottom. Reference earlier data with \
+             {{trigger.body.…}} and {{steps.<id>.output.…}}.",
+        )),
+        None,
+        ui::stack(vec![
+            ui::field("Name", ui::input("What this automation does", &editor.name, Message::NameChanged)),
+            ui::field(
+                "Description",
+                ui::input("Optional", &editor.description, Message::DescriptionChanged),
+            ),
+            ui::field(
+                "Run every (seconds)",
+                ui::input("Leave empty for manual/API only", &editor.interval, Message::IntervalChanged),
+            ),
+            ui::field(
+                "Steps (JSON)",
+                ui::code(
+                    text_editor(&editor.steps)
+                        .on_action(Message::StepsEdited)
+                        .font(iced::Font::MONOSPACE)
+                        .height(240),
+                ),
+            ),
+            ui::cluster(vec![
+                if state.busy {
+                    ui::button_secondary(Icon::Clock, "Saving…", Message::Save)
+                } else {
+                    ui::button_default(Icon::Save, "Save", Message::Save)
+                },
+                ui::button_ghost(Icon::X, "Cancel", Message::CancelEditor),
+            ])
+            .into(),
+        ]),
+    )
+}
+
+fn workflow_card<'a>(state: &'a State, wf: &'a WorkflowInfo) -> Element<'a, Message> {
+    let mut badges = vec![if wf.enabled {
+        ui::badge("enabled", Tone::Success)
+    } else {
+        ui::badge("disabled", Tone::Neutral)
+    }];
+    badges.push(ui::badge(format!("{} steps", wf.steps.len()), Tone::Neutral));
+    if let Some(seconds) = wf.interval_seconds {
+        badges.push(ui::badge(format!("every {}", human_secs(seconds)), Tone::Info));
+    }
+
+    let selected = state.selected == Some(wf.id);
+    let mut lines = vec![
+        ui::cluster(vec![ui::body(wf.name.clone()), ui::spacer()].into_iter().chain(badges).collect())
+            .into(),
+    ];
+    if let Some(desc) = &wf.description {
+        lines.push(ui::muted(desc.clone()));
+    }
+    lines.push(
+        ui::cluster(vec![
+            ui::button_secondary(
+                Icon::Play,
+                if state.busy { "Running…" } else { "Run now" },
+                Message::RunNow(wf.id),
+            ),
+            ui::button_ghost(
+                Icon::Scroll,
+                if selected { "Hide runs" } else { "Runs" },
+                Message::Select(wf.id),
+            ),
+            ui::button_ghost(Icon::Pencil, "Edit", Message::Edit(wf.id)),
+            ui::button_ghost(
+                if wf.enabled { Icon::Pause } else { Icon::Play },
+                if wf.enabled { "Disable" } else { "Enable" },
+                Message::SetEnabled(wf.id, !wf.enabled),
+            ),
+            ui::spacer(),
+            ui::button_destructive(Icon::Trash, "Delete", Message::Delete(wf.id)),
+        ])
+        .into(),
+    );
+
+    ui::card(ui::stack(lines))
+}
+
+fn runs_view(state: &State) -> Element<'_, Message> {
+    if state.runs.is_empty() {
+        return ui::empty_state_icon(Icon::Inbox, "No runs yet. Press \"Run now\" to try it.");
+    }
+    ui::stack(state.runs.iter().map(|run| run_row(state, run)).collect()).into()
+}
+
+fn run_row<'a>(state: &'a State, run: &'a WorkflowRunInfo) -> Element<'a, Message> {
+    let tone = match run.status.as_str() {
+        "succeeded" => Tone::Success,
+        "failed" => Tone::Danger,
+        _ => Tone::Warning,
+    };
+    let expanded = state.expanded_run == Some(run.id);
+
+    let mut lines: Vec<Element<'a, Message>> = vec![row![
+        ui::badge(run.status.clone(), tone),
+        ui::muted(format!("#{} · {} · {}", run.id, run.trigger, human_time(&run.started_at))),
+        ui::spacer(),
+        ui::button_ghost(
+            Icon::Eye,
+            if expanded { "Hide steps" } else { "Steps" },
+            Message::ToggleRun(run.id),
+        ),
+    ]
+    .spacing(space::SM)
+    .align_y(iced::Alignment::Center)
+    .into()];
+
+    if let Some(err) = &run.error {
+        lines.push(ui::caption(err.clone()));
+    }
+    if expanded {
+        lines.push(ui::code(ui::stack(run.steps.iter().map(step_row).collect())));
+    }
+
+    ui::card(ui::stack(lines))
+}
+
+fn step_row<'a>(
+    step: &'a agent_platform_client::types::WorkflowStepResult,
+) -> Element<'a, Message> {
+    let (icon, tone) = match step.status.as_str() {
+        "succeeded" => (Icon::CheckCircle, Tone::Success),
+        "failed" => (Icon::XCircle, Tone::Danger),
+        _ => (Icon::Clock, Tone::Neutral),
+    };
+    let mut cells: Vec<Element<'a, Message>> = vec![
+        ui::badge_icon(icon, step.status.clone(), tone),
+        ui::mono(step.id.clone()),
+    ];
+    if let Some(ms) = step.duration_ms {
+        cells.push(ui::muted(format!("{ms} ms")));
+    }
+    if let Some(err) = &step.error {
+        cells.push(ui::muted(err.clone()));
+    } else if let Some(output) = &step.output {
+        let text = serde_json::to_string(output).unwrap_or_default();
+        cells.push(container(ui::muted(truncate(&text, 160))).width(Length::Fill).into());
+    }
+    column![ui::cluster(cells)].padding(iced::Padding::from([2.0, 0.0])).into()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+fn human_secs(seconds: i64) -> String {
+    match seconds {
+        s if s < 120 => format!("{s}s"),
+        s if s < 7200 => format!("{}m", s / 60),
+        s => format!("{}h", s / 3600),
+    }
+}
+
+/// `2026-08-04T09:30:12.345` → `2026-08-04 09:30:12`; anything shorter passes through.
+fn human_time(iso: &str) -> String {
+    iso.chars().take(19).collect::<String>().replace('T', " ")
+}

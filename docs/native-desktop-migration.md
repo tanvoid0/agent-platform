@@ -140,7 +140,7 @@ talks to `/api/v1` exclusively):
   `client/src/types.rs` with it); `scripts/start.py` opens `/docs` instead of
   `/config`.
 
-### 5. Packaging — Windows done, macOS/Linux not started
+### 5. Packaging — Windows done, macOS/Linux deferred (no platform access)
 - Bundle the Python runtime the same way the Tauri payload did (uv's managed
   CPython, relocatable) — done, `scripts/bundle_server.py` produces
   `desktop/payload/`.
@@ -162,10 +162,12 @@ talks to `/api/v1` exclusively):
 - `scripts/build_installer.py` orchestrates `cargo build --release` →
   `scripts/bundle_server.py` → `iscc desktop/installer/agent-platform.iss`,
   producing `dist/agent-platform-setup.exe`. It fails with a clear message if
-  `iscc` isn't on PATH rather than skipping the step. **Not yet run
-  end-to-end**: Inno Setup is not installed on this machine, so the `.iss`
-  script is untested against a real `iscc` — install Inno Setup
-  (https://jrsoftware.org/isinfo.php) and run the script to verify.
+  `iscc` is missing rather than skipping the step; since Inno Setup's own
+  installer never adds it to PATH, the script also checks the default
+  per-user and per-machine install dirs. **Verified end-to-end 2026-08-04**:
+  clean `iscc` compile (48.6 MiB setup exe), then a silent install/uninstall
+  round-trip — files land as `{app}\agent-platform.exe` + `{app}\server\`
+  (matching `resolve_server()`), and uninstall leaves nothing behind.
 - Signing: needs the developer's own code-signing certificate — this repo
   does not generate or ship a self-signed one, since that provides no trust
   benefit and would misrepresent the binary as verified. `scripts/build_installer.py`
@@ -173,10 +175,12 @@ talks to `/api/v1` exclusively):
   only if `AGENT_PLATFORM_SIGN_CERT` is set in the environment; otherwise it
   prints a note and ships unsigned. Manual equivalent:
   `signtool sign /f cert.pfx /p <password> /t <timestamp-url> agent-platform.exe`.
-- macOS and Linux: not implemented. The Rust already branches on platform
-  (`cfg(windows)` guards) but packaging, icon formats (`.icns`/`.desktop`),
-  and signing/notarization (Apple notarization, Linux package signing) for
-  those platforms is still open — this has only ever been built and run on
+- macOS and Linux: not implemented — deliberately deferred, no machine or CI
+  runner for either platform is available. The Rust already branches on
+  platform (`cfg(windows)` guards) but packaging, icon formats
+  (`.icns`/`.desktop`), and signing/notarization (Apple notarization, Linux
+  package signing) wait until access exists; a compile check on those
+  platforms comes first, since this has only ever been built and run on
   Windows.
 
 ### 6. Native file dialogs and job-completion notifications — done
@@ -236,18 +240,22 @@ and a preset filled the team editor with its roster.
 
 ### Packaging
 
-Unchanged from section 5: the Inno Setup script has never been compiled by a
-real `iscc` — still not installed on this machine, so this cannot be closed
-here — and macOS/Linux packaging, icon formats and signing are not started.
-Nothing else in the migration is open.
+The Windows installer is closed: compiled by a real `iscc` and verified with a
+silent install/uninstall round-trip on 2026-08-04 (see section 5).
+
+macOS/Linux packaging is **deliberately deferred, not open work**: no macOS or
+Linux machine (or CI runner) is currently available, and the app has never
+compiled off Windows — a compile check comes before any packaging. Revisit
+when access to either platform exists. Nothing else in the migration is open.
 
 ### Repo leftovers from the web era
 
 The root `package.json` is not dead weight — `pnpm start`, `pnpm smoke` and
 `pnpm docker:up` are the documented entrypoints in the README and every script
-in it shells to Python. What is left over is smaller: both `package-lock.json`
-and `pnpm-lock.yaml` are checked in for a single devDependency (`kill-port`),
-so one of the two lockfiles is redundant.
+in it shells to Python. The one leftover — `package-lock.json` and
+`pnpm-lock.yaml` both checked in for a single devDependency (`kill-port`) —
+is resolved: `package-lock.json` was dropped, `pnpm-lock.yaml` stays (the
+README's commands are pnpm).
 
 ## Running it
 

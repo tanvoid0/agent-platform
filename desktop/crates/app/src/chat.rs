@@ -2,7 +2,7 @@
 //! server's chat endpoint is stateless, so the whole history is sent each turn.
 
 use agent_platform_client::sse::{self, ChatChunk};
-use agent_platform_client::types::{ChatCompletionBody, ChatMessage};
+use agent_platform_client::types::{ChatCompletionBody, ChatMessage, ProviderEntry};
 use agent_platform_client::Client;
 use iced::Task;
 
@@ -18,7 +18,13 @@ pub struct State {
     /// push rather than per frame.
     pub md: Vec<Vec<iced::widget::markdown::Item>>,
     pub draft: String,
+    /// Provider/model override for this thread; empty = the server's default.
+    /// The plain screen persists the pair in `shell::Settings`.
+    pub provider: String,
     pub model: String,
+    /// Providers the proxy knows, for the header dropdowns. Loaded on screen
+    /// entry; empty until then (the dropdowns just have nothing to offer).
+    pub catalog: Vec<ProviderEntry>,
     pub sending: bool,
     /// An assistant turn is open and collecting deltas — the next one appends to
     /// it rather than starting another bubble.
@@ -39,7 +45,9 @@ impl Default for State {
             messages: Vec::new(),
             md: Vec::new(),
             draft: String::new(),
+            provider: String::new(),
             model: String::new(),
+            catalog: Vec::new(),
             sending: false,
             streaming: false,
             error: None,
@@ -50,6 +58,11 @@ impl Default for State {
 }
 
 impl State {
+    /// The plain screen's thread, opened on the persisted provider/model pair.
+    pub fn with_defaults(provider: String, model: String) -> Self {
+        Self { provider, model, ..Self::default() }
+    }
+
     /// A thread owned by something else on screen, addressed by `key`.
     pub fn scoped(key: &str) -> Self {
         Self { scroll: format!("chat-transcript:{key}").into(), ..Self::default() }
@@ -61,7 +74,7 @@ impl State {
 
     fn push_turn(&mut self, role: &str, content: String) {
         self.md.push(iced::widget::markdown::parse(&content).collect());
-        self.messages.push(ChatMessage { role: role.into(), content });
+        self.messages.push(ChatMessage::text(role, content));
     }
 
     /// Append a streamed delta to the assistant turn in flight, opening one if
@@ -82,15 +95,42 @@ impl State {
         let system = self
             .system
             .iter()
-            .map(|c| ChatMessage { role: "system".into(), content: c.clone() });
+            .map(|c| ChatMessage::text("system", c.clone()));
         system.chain(self.messages.iter().cloned()).collect()
     }
+
+    pub fn provider_ids(&self) -> Vec<String> {
+        self.catalog.iter().map(|p| p.id.clone()).collect()
+    }
+
+    /// Models the chosen provider offers; every provider's models when no
+    /// provider is picked (the proxy resolves an alias to its provider).
+    pub fn model_options(&self) -> Vec<String> {
+        self.catalog
+            .iter()
+            .filter(|p| self.provider.is_empty() || p.id == self.provider)
+            .flat_map(|p| p.models.options.iter().cloned())
+            .collect()
+    }
+}
+
+/// Fetch the provider catalog for the dropdowns.
+pub fn load_catalog(client: &Client) -> Task<Message> {
+    let client = client.clone();
+    Task::perform(
+        async move { client.llm_providers().await.map(|c| c.providers).map_err(|e| e.to_string()) },
+        Message::CatalogLoaded,
+    )
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     DraftChanged(String),
+    ProviderChanged(String),
     ModelChanged(String),
+    /// Back to the server's default provider and model.
+    UseDefaults,
+    CatalogLoaded(Result<Vec<agent_platform_client::types::ProviderEntry>, String>),
     Send,
     /// One chunk of the streamed reply.
     Chunk(ChatChunk),
@@ -105,10 +145,30 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.draft = v;
             Task::none()
         }
+        Message::ProviderChanged(v) => {
+            // The picked model belongs to the old provider; keep it only if
+            // the new one also offers it.
+            state.provider = v;
+            if !state.model_options().iter().any(|m| m == &state.model) {
+                state.model.clear();
+            }
+            Task::none()
+        }
         Message::ModelChanged(v) => {
             state.model = v;
             Task::none()
         }
+        Message::UseDefaults => {
+            state.provider.clear();
+            state.model.clear();
+            Task::none()
+        }
+        Message::CatalogLoaded(Ok(providers)) => {
+            state.catalog = providers;
+            Task::none()
+        }
+        // The dropdowns just stay empty; chat itself still works on defaults.
+        Message::CatalogLoaded(Err(_)) => Task::none(),
         Message::Send => {
             let prompt = state.draft.trim().to_string();
             if prompt.is_empty() || state.sending {
@@ -121,8 +181,10 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             let body = ChatCompletionBody {
                 messages: state.wire_messages(),
                 model: non_empty(&state.model),
+                provider: non_empty(&state.provider),
                 temperature: None,
                 max_tokens: None,
+                tools: None,
                 stream: Some(true),
             };
             Task::batch([
@@ -134,6 +196,8 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.push_delta(&text);
             iced::widget::operation::snap_to_end(state.scroll_id())
         }
+        // This screen sends no tools, so no tool calls can arrive.
+        Message::Chunk(ChatChunk::ToolCall(_)) => Task::none(),
         Message::Chunk(ChatChunk::Done) => {
             state.sending = false;
             state.streaming = false;

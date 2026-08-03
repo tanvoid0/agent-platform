@@ -12,7 +12,7 @@ path = "src/main.rs"
 agent-platform-client = { path = "../client" }
 iced = { version = "0.14", features = ["tokio", "canvas", "markdown", "svg", "advanced"] }
 tray-icon = "0.24"
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "process"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,7 +20,7 @@ dirs = "6"
 dark-light = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 getrandom = "0.2"
-rfd = "0.15"
+rfd = { version = "0.15", features = ["common-controls-v6"] }
 notify-rust = "4"
 tts = "0.26"
 msedge-tts = "0.2"
@@ -29,6 +29,9 @@ cpal = "0.15"
 whisper-rs = "0.16"
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
 iced_fonts = { version = "0.3.0", features = ["lucide", "advanced_text"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

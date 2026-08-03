@@ -84,10 +84,42 @@ pub fn drain_frames(buf: &mut String) -> Vec<String> {
 pub enum ChatChunk {
     /// A piece of assistant text. Concatenating every `Delta` yields the full reply.
     Delta(String),
+    /// A fragment of a streamed tool call; concatenate `arguments` per `index`.
+    ToolCall(ToolCallDelta),
     /// The stream ended cleanly (`data: [DONE]`, or the body closed).
     Done,
     /// Transport failure or an error frame from the proxy; the stream ends after this.
     Failed(String),
+}
+
+/// One `delta.tool_calls[i]` fragment. `id` and `name` arrive on the first
+/// fragment of a call; `arguments` streams across many.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments: String,
+}
+
+/// Extract tool-call fragments from one `chat.completion.chunk` payload.
+pub fn chat_tool_calls(payload: &str) -> Vec<ToolCallDelta> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { return Vec::new() };
+    let Some(arr) = v.pointer("/choices/0/delta/tool_calls").and_then(|a| a.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|tc| ToolCallDelta {
+            index: tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize,
+            id: tc.get("id").and_then(|s| s.as_str()).map(str::to_string),
+            name: tc.pointer("/function/name").and_then(|s| s.as_str()).map(str::to_string),
+            arguments: tc
+                .pointer("/function/arguments")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .collect()
 }
 
 /// Extract the assistant text delta from one `chat.completion.chunk` payload.
@@ -175,6 +207,9 @@ pub fn chat_stream(
                                     pending.push_back(ChatChunk::Failed(msg));
                                     break;
                                 }
+                            }
+                            for d in chat_tool_calls(&payload) {
+                                pending.push_back(ChatChunk::ToolCall(d));
                             }
                         }
                         Some((None, ChatState::Reading(conn, pending)))
@@ -341,6 +376,23 @@ mod tests {
             None
         );
         assert_eq!(chat_delta("[DONE]").unwrap(), None, "non-JSON frames are ignored");
+    }
+
+    #[test]
+    fn chat_tool_calls_reads_streamed_fragments() {
+        // First fragment carries id + name, later ones only argument text.
+        let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"run_command","arguments":"{\"com"}}]}}]}"#;
+        let d = &chat_tool_calls(first)[0];
+        assert_eq!((d.index, d.id.as_deref(), d.name.as_deref()), (0, Some("call_1"), Some("run_command")));
+        assert_eq!(d.arguments, "{\"com");
+
+        let later = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"mand\": \"dir\"}"}}]}}]}"#;
+        let d = &chat_tool_calls(later)[0];
+        assert_eq!((d.id.as_deref(), d.name.as_deref()), (None, None));
+        assert_eq!(d.arguments, "mand\": \"dir\"}");
+
+        assert!(chat_tool_calls(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).is_empty());
+        assert!(chat_tool_calls("[DONE]").is_empty());
     }
 
     #[test]

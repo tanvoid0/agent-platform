@@ -14,12 +14,14 @@ use iced::widget::canvas::{self, Frame, Geometry, LineCap, Path, Stroke, Text};
 use iced::widget::{canvas as canvas_widget, column, container, markdown, scrollable};
 use iced::{mouse, Color, Element, Length, Point, Radians, Rectangle, Renderer, Theme};
 
-pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
-    let mode = state.mode();
-    let hud = container(
+/// The live HUD canvas alone, for embedding outside this screen (the
+/// Dashboard). Whoever shows it must also run the `assistant::Tick`
+/// subscription, or the canvas freezes.
+pub fn hud(state: &State, height: f32) -> Element<'_, Message> {
+    container(
         canvas_widget(Hud {
             phase: state.phase,
-            mode,
+            mode: state.mode(),
             prev: state.mode_prev,
             mix: ease_out(state.mode_t),
             level: state.mic_level,
@@ -28,14 +30,21 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
             boot: ease_out(state.boot),
             elapsed: state.elapsed,
             floor: state.floor,
+            voice_sim: state.voice_sim,
             bands: &state.bands,
             wave: &state.wave,
         })
         .width(Length::Fill)
-        .height(224),
+        .height(height),
     )
     .style(theme::code_block)
-    .width(Length::Fill);
+    .width(Length::Fill)
+    .into()
+}
+
+pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
+    let mode = state.mode();
+    let hud = hud(state, 224.0);
 
     let status = ui::cluster(vec![
         ui::badge(
@@ -55,6 +64,16 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
             },
         ),
         ui::caption(format!("VOICE {}", if state.voice { "ON" } else { "MUTED" })),
+        // Voice ID is a filter on who gets answered, so its state is never
+        // hidden: learning, locked on, or told this was someone else.
+        match (state.voice_enrolled(), state.voice_sim) {
+            (false, _) if state.armed() => ui::caption("Learning your voice…".to_string()),
+            (true, Some(sim)) if sim < crate::assistant::VOICE_MATCH => {
+                ui::caption("Different voice — parked, not sent".to_string())
+            }
+            (true, _) => ui::caption("Voice ID locked".to_string()),
+            _ => ui::caption(String::new()),
+        },
         // Hands-free answers whatever it hears, so say out loud what gets it to
         // answer: being named, or replying inside the follow-up window.
         ui::caption(if state.armed() {
@@ -76,8 +95,12 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
             .zip(&state.md)
             .map(|(m, items)| {
                 let is_user = m.role == "user";
-                let (label, tone) =
-                    if is_user { ("YOU", Tone::Neutral) } else { ("E.V.", Tone::Danger) };
+                let (label, tone) = match m.role.as_str() {
+                    "user" => ("YOU", Tone::Neutral),
+                    // The terminal's answer to a run_command call — fenced output.
+                    "tool" => ("TERMINAL", Tone::Info),
+                    _ => ("E.V.", Tone::Danger),
+                };
                 let content: Element<'_, Message> = if is_user {
                     ui::body(m.content.clone())
                 } else {
@@ -114,6 +137,13 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
                 ui::button_ghost(Icon::Volume, "Mute", Message::ToggleVoice)
             } else {
                 ui::button_ghost(Icon::VolumeOff, "Unmute", Message::ToggleVoice)
+            },
+            // Only offered once there is something to forget — wrong person
+            // enrolled, or a new mic that changed how you sound.
+            if state.voice_enrolled() {
+                ui::button_ghost(Icon::XCircle, "Forget voice", Message::ForgetVoice)
+            } else {
+                iced::widget::Space::new().into()
             },
             if state.sending {
                 ui::badge("…", Tone::Warning)
@@ -193,6 +223,8 @@ struct Hud<'a> {
     /// The room's learned noise floor (raw RMS) — reported so a gate that
     /// refuses to open has a visible reason.
     floor: f32,
+    /// How close the last utterance was to the enrolled voice, if there is one.
+    voice_sim: Option<f32>,
     bands: &'a [f32],
     wave: &'a [f32],
 }
@@ -693,6 +725,12 @@ impl canvas::Program<Message> for Hud<'_> {
                 "PK       — Hz".to_string()
             },
             format!("NF  {nf:>6.1} dB"),
+            // Voice ID: the number the speaker check actually decided on, so
+            // its threshold can be judged against your own voice.
+            match self.voice_sim {
+                Some(sim) => format!("VID {sim:>6.2}"),
+                None => "VID      —".to_string(),
+            },
             format!("T+  {:02}:{:02}", secs / 60, secs % 60),
         ];
         for (i, line) in readouts.iter().enumerate() {

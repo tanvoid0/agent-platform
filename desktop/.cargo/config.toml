@@ -1,0 +1,7 @@
+# whisper-rs builds whisper.cpp via cmake; this machine only has the
+# VS-bundled cmake, which is not on PATH. Harmless elsewhere: the env var is
+# only consulted by the cmake crate, and a PATH cmake wins when this file is
+# absent. ponytail: machine-specific path — put cmake on PATH to drop this.
+[env]
+CMAKE = "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe"
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"

@@ -117,6 +117,11 @@ impl Client {
         Self::handle(resp).await
     }
 
+    async fn put_json<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
+        let resp = self.authed(self.http.put(self.url(path)).json(body)).send().await?;
+        Self::handle(resp).await
+    }
+
     async fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let resp = self.authed(self.http.delete(self.url(path))).send().await?;
         Self::handle(resp).await
@@ -257,18 +262,8 @@ impl Client {
         self.delete_json(&format!("/api/v1/projects/{id}")).await
     }
 
-    // -- Chat ----------------------------------------------------------------
-
-    /// Returns the assistant message content; falls back to the raw body string
-    /// when the response is not OpenAI-shaped (mirrors the web client).
-    pub async fn chat(&self, body: &ChatCompletionBody) -> Result<String> {
-        let raw: Value = self.post_json("/api/v1/chat", body).await?;
-        Ok(raw
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| raw.to_string()))
-    }
+    // Chat lives in `sse::chat_stream` — every caller wants the reply as it
+    // arrives, so there is no buffered variant.
 
     // -- System --------------------------------------------------------------
 
@@ -360,6 +355,33 @@ impl Client {
 
     pub async fn llm_providers(&self) -> Result<ProviderCatalog> {
         self.get_json("/api/v1/llm-proxy/ui/providers").await
+    }
+
+    // -- Workflows -------------------------------------------------------------
+
+    pub async fn workflows(&self) -> Result<WorkflowsListResponse> {
+        self.get_json("/api/v1/workflows").await
+    }
+
+    pub async fn create_workflow(&self, body: &WorkflowBody) -> Result<WorkflowInfo> {
+        self.post_json("/api/v1/workflows", body).await
+    }
+
+    pub async fn update_workflow(&self, id: i64, body: &WorkflowBody) -> Result<WorkflowInfo> {
+        self.put_json(&format!("/api/v1/workflows/{id}"), body).await
+    }
+
+    pub async fn delete_workflow(&self, id: i64) -> Result<Value> {
+        self.delete_json(&format!("/api/v1/workflows/{id}")).await
+    }
+
+    /// Runs synchronously server-side; the response is the finished run.
+    pub async fn run_workflow(&self, id: i64, input: &Value) -> Result<WorkflowRunInfo> {
+        self.post_json(&format!("/api/v1/workflows/{id}/run"), input).await
+    }
+
+    pub async fn workflow_runs(&self, id: i64) -> Result<WorkflowRunsResponse> {
+        self.get_json(&format!("/api/v1/workflows/{id}/runs?limit=20")).await
     }
 }
 

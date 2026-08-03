@@ -1,24 +1,147 @@
-//! E.V. — the onboard suit AI. Same stateless chat endpoint as `chat.rs`,
-//! plus a persona system prompt, an animated HUD, and spoken replies.
+//! E.V. — Extra-Vehicular Assistant, the onboard suit AI. Same stateless chat
+//! endpoint as `chat.rs`, plus a persona system prompt, an animated HUD, spoken
+//! replies, and the long-term memory in `memory.rs`.
 //!
 //! Voice: Microsoft Edge neural TTS (AriaNeural over the free websocket
 //! endpoint — no key, needs internet) played through rodio; falls back to the
 //! platform's native engine (SAPI/WinRT, AVSpeech, speech-dispatcher) offline.
 
 use agent_platform_client::sse::{self, ChatChunk};
-use agent_platform_client::types::{ChatCompletionBody, ChatMessage};
+use agent_platform_client::types::{ChatCompletionBody, ChatMessage, ToolCall};
 use agent_platform_client::Client;
 use iced::Task;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use tts::Tts;
 
-const PERSONA: &str = "You are E.V., the onboard suit AI of this Agent Platform. \
+/// What the assistant is called, everywhere the user can see it — window
+/// labels, the HUD readout, and the byline on a memory it contributed.
+pub const NAME: &str = "E.V.";
+
+const PERSONA: &str = "You are E.V. (Extra-Vehicular Assistant), the onboard \
+suit AI of this Agent Platform. \
 Style: a superhero suit's heads-up-display assistant — calm, quick-witted, \
 protective, with a dry quip now and then. You monitor systems, analyze the \
-situation, and give tactical, actionable answers. Your replies may be spoken \
-aloud, so keep them short, conversational and free of markdown, bullet lists \
-or code fences unless the user asks for code. Answer directly first; skip filler.";
+situation, and give tactical, actionable answers. Answer directly first; skip \
+filler. Your replies render as markdown in the HUD and may also be read aloud \
+(markdown is stripped for speech) — use lists, bold and code fences whenever \
+they make the answer clearer, and keep the prose short and conversational. \
+You have a real terminal on the user's machine via the run_command tool \
+(PowerShell on Windows). When a question concerns the local machine — files, \
+git, processes, system state — run a command and answer from its output \
+instead of guessing. Never run destructive commands unless explicitly asked.";
+
+/// Rounds of tool calls allowed per user turn before the model is forced to
+/// answer in text (tools withheld from the request past the cap).
+const MAX_TOOL_ROUNDS: u8 = 5;
+/// Hard deadline on one command; past it the process is killed.
+const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Output kept per command — both for the model and the transcript.
+const MAX_TOOL_OUTPUT: usize = 8_000;
+
+/// The one tool E.V. carries: a terminal.
+fn tools_spec() -> serde_json::Value {
+    serde_json::json!([{
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run one shell command on the user's machine (PowerShell on \
+                            Windows, sh elsewhere) and return its combined stdout/stderr.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "The command line to execute." }
+                },
+                "required": ["command"]
+            }
+        }
+    }])
+}
+
+/// The `command` a call asked to run, or its raw arguments while they are
+/// still streaming/malformed — shown in the transcript either way.
+fn command_of(call: &ToolCall) -> String {
+    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+        .ok()
+        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
+        .unwrap_or_else(|| call.function.arguments.clone())
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolOutcome {
+    /// `tool_call_id` the result answers.
+    pub id: String,
+    pub output: String,
+}
+
+/// Execute one shell command, capped by `TOOL_TIMEOUT` and `MAX_TOOL_OUTPUT`.
+/// Errors come back as text — the model reads them and corrects itself.
+async fn run_command(command: String) -> String {
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-lc", &command]);
+        c
+    };
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no console flash
+    cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
+    let out = match tokio::time::timeout(TOOL_TIMEOUT, cmd.output()).await {
+        Err(_) => return format!("(timed out after {}s)", TOOL_TIMEOUT.as_secs()),
+        Ok(Err(e)) => return format!("(failed to start: {e})"),
+        Ok(Ok(out)) => out,
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    if !out.status.success() {
+        text.push_str(&format!("\n(exit code {})", out.status.code().unwrap_or(-1)));
+    }
+    if text.trim().is_empty() {
+        text = "(no output)".into();
+    }
+    if text.len() > MAX_TOOL_OUTPUT {
+        let mut cut = MAX_TOOL_OUTPUT;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n… (truncated)");
+    }
+    text
+}
+
+/// Run every call of one round, in order. Sequential on purpose: the calls in
+/// a round often depend on the same working state (cd, files just written).
+async fn run_tools(calls: Vec<ToolCall>) -> Vec<ToolOutcome> {
+    let mut results = Vec::with_capacity(calls.len());
+    for call in calls {
+        let output = if call.function.name == "run_command" {
+            match serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                .ok()
+                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
+            {
+                Some(cmd) => run_command(cmd).await,
+                None => format!(
+                    "error: run_command needs {{\"command\": \"…\"}}, got: {}",
+                    call.function.arguments
+                ),
+            }
+        } else {
+            format!("error: unknown tool {:?}", call.function.name)
+        };
+        results.push(ToolOutcome { id: call.id, output });
+    }
+    results
+}
 
 const EDGE_VOICE: &str = "Microsoft Server Speech Text to Speech Voice (en-US, AriaNeural)";
 
@@ -79,6 +202,14 @@ const FOLLOW_UP: f32 = 12.0;
 /// How much louder than the floor an utterance's peak must be to read as
 /// close-talk rather than someone else's conversation across the room.
 const CLOSE_TALK_SNR: f32 = 5.0;
+/// Cosine similarity to the enrolled voice below which an utterance is treated
+/// as somebody else. Deliberately forgiving: a stranger reaching the model is
+/// recoverable, but E.V. ignoring the person it belongs to is not. Watch the
+/// HUD's `VID` readout against your own voice and tighten it if strangers get
+/// through.
+pub const VOICE_MATCH: f32 = 0.82;
+/// Utterances averaged into the enrolled print before it stops being provisional.
+const ENROLL_UTTERANCES: u32 = 4;
 
 /// Is this frame shaped like a voice? Fans and traffic sit under 200 Hz, hiss
 /// and keyboard clatter spread flat across everything; speech puts most of its
@@ -89,18 +220,31 @@ fn voice_like(bands: &[f32; BANDS]) -> bool {
     if total < 0.05 {
         return false;
     }
-    let speech: f32 = bands
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| (200.0..3600.0).contains(&crate::stt::band_freq(*i, BANDS)))
-        .map(|(_, v)| *v)
-        .sum();
-    speech / total > 0.55
+    let (mut speech, mut bins) = (0.0, 0);
+    for (i, v) in bands.iter().enumerate() {
+        if (150.0..4000.0).contains(&crate::stt::band_freq(i, BANDS)) {
+            speech += v;
+            bins += 1;
+        }
+    }
+    // Compare against what a *flat* spectrum would score, not a fixed number:
+    // the bins are log-spaced, so most of them already fall inside the speech
+    // window and white noise clears any fixed threshold. Speech has to be more
+    // concentrated than noise, which is the only claim actually being made.
+    //
+    // The margin is thin on purpose. These are display bands — sqrt-compressed,
+    // with the HUD's high-frequency tilt — so real speech concentrates only a
+    // few points above flat while noise sits at or below it; a 1.1 margin put
+    // the bar above actual speech and made hands-free deaf.
+    speech / total > (bins as f32 / bands.len() as f32) * 1.03
 }
 
-/// Whitelist of how whisper spells "E.V." when someone says it out loud.
-const NAMES: [&str; 9] =
-    ["ev", "eev", "eve", "evie", "evee", "eevee", "heavy", "evy", "ivy"];
+/// Whitelist of how whisper spells "E.V." when someone says it out loud. The
+/// three-letter spellings stay: people who used to say "E.V.A." still do, and
+/// a name the assistant no longer answers to is a bug report.
+const NAMES: [&str; 12] = [
+    "eva", "ava", "evah", "ev", "eev", "eve", "evie", "evee", "eevee", "heavy", "evy", "ivy",
+];
 /// Words allowed to precede the name.
 const OPENERS: [&str; 6] = ["hey", "ok", "okay", "yo", "hi", "hello"];
 
@@ -142,6 +286,9 @@ pub struct State {
     pub sending: bool,
     pub error: Option<String>,
     pub voice: bool,
+    /// Long-term recall, refreshed by the app before every message. `None` when
+    /// memory is off or empty — see `memory::Store::system_block`.
+    pub memory: Option<String>,
     /// Seconds of animation time, monotonic while the screen is open.
     pub phase: f32,
     /// Smoothed mic input level (0..1) while recording — drives the HUD meter.
@@ -178,12 +325,24 @@ pub struct State {
     voiced: f32,
     /// Loudest frame of the current utterance, for the close-talk check.
     peak: f32,
-    /// `phase` when E.V. last spoke to you, or when you armed it: inside the
+    /// `phase` when E.V. last finished a reply, or when you armed it: inside the
     /// follow-up window you don't have to say its name.
     last_reply: f32,
+    /// Armed, and nothing has been said yet. Pressing the mic button is intent
+    /// enough on its own — the first utterance after it goes through however
+    /// long you took to start talking.
+    awaiting_first: bool,
     /// `phase` while E.V.'s own voice is playing — the mic hears the speakers,
     /// so capture stays shut until a beat after it stops.
     spoke_at: f32,
+    /// The enrolled speaker, learned from the utterances E.V. accepted —
+    /// there is no enrollment wizard, the first few things you say are it.
+    voice_print: Option<crate::stt::VoicePrint>,
+    /// How many utterances have been averaged into that print.
+    enrolled: u32,
+    /// Similarity of the last utterance to the enrolled voice, for the HUD.
+    /// `None` before enrollment, or when the audio was too short to print.
+    pub voice_sim: Option<f32>,
     /// The mic, open the whole time hands-free listening is armed.
     recorder: Option<crate::stt::Recorder>,
     transcribing: bool,
@@ -196,6 +355,10 @@ pub struct State {
     tts_failed: bool,
     /// An assistant turn is open and collecting deltas.
     streaming: bool,
+    /// Tool calls of the round in flight, assembled from streamed fragments.
+    tool_buf: Vec<ToolCall>,
+    /// Tool rounds taken since the user last spoke; capped by MAX_TOOL_ROUNDS.
+    tool_rounds: u8,
     /// Streamed speech text past the last sentence boundary — not enough to say
     /// yet, held until the sentence closes or the stream ends.
     speech_buf: String,
@@ -220,9 +383,91 @@ impl State {
         self.recorder.is_some()
     }
 
+    /// Whatever was just said counts as aimed at E.V. even though nobody named
+    /// it: either it is the first thing since you armed the mic, or E.V. only
+    /// just stopped talking and this is the other half of the exchange.
+    ///
+    /// Measured from `spoke_at` — the last frame E.V.'s voice was playing — and
+    /// not from when its text finished. The gate is held shut while E.V. speaks,
+    /// so a window timed from the end of generation is already partly spent by
+    /// the time you are physically able to answer, and a long spoken reply eats
+    /// all of it.
+    fn follow_up_open(&self) -> bool {
+        self.awaiting_first
+            || since(self.phase, self.last_reply.max(self.spoke_at)) < FOLLOW_UP
+    }
+
+    /// Fold an accepted utterance into the enrolled voice. The first few carry
+    /// full weight (that is the enrollment), then it tracks slowly — a voice
+    /// changes with a cold, a headset or the time of day.
+    fn learn_voice(&mut self, print: Option<crate::stt::VoicePrint>) {
+        let Some(heard) = print else { return };
+        match &mut self.voice_print {
+            None => self.voice_print = Some(heard),
+            Some(known) => {
+                let w = if self.enrolled < ENROLL_UTTERANCES {
+                    1.0 / (self.enrolled + 1) as f32
+                } else {
+                    0.1
+                };
+                for (k, h) in known.iter_mut().zip(heard) {
+                    *k += (h - *k) * w;
+                }
+                // Averaging two unit vectors does not give a unit vector, and
+                // the similarity test assumes one.
+                let norm = known.iter().map(|v| v * v).sum::<f32>().sqrt();
+                if norm > 1e-6 {
+                    for v in known.iter_mut() {
+                        *v /= norm;
+                    }
+                }
+            }
+        }
+        self.enrolled += 1;
+    }
+
+    /// Forget the enrolled voice — wrong person enrolled, or a new mic.
+    pub fn forget_voice(&mut self) {
+        self.voice_print = None;
+        self.enrolled = 0;
+        self.voice_sim = None;
+    }
+
+    /// Whether a voice has been learned well enough to reject strangers.
+    pub fn voice_enrolled(&self) -> bool {
+        self.enrolled >= ENROLL_UTTERANCES
+    }
+
     fn push_turn(&mut self, role: &str, content: String) {
         self.md.push(iced::widget::markdown::parse(&content).collect());
-        self.messages.push(ChatMessage { role: role.into(), content });
+        self.messages.push(ChatMessage::text(role, content));
+    }
+
+    /// Fire the chat request for the current history: persona, recall, then
+    /// every visible turn (including tool calls and their results).
+    fn request(&self, client: &Client) -> Task<Message> {
+        let mut messages = vec![ChatMessage::text("system", PERSONA)];
+        // Recall after the persona: who E.V. is comes first, then who it
+        // is talking to.
+        if let Some(recall) = &self.memory {
+            messages.push(ChatMessage::text("system", recall.clone()));
+        }
+        messages.extend(self.messages.iter().cloned());
+        let body = ChatCompletionBody {
+            messages,
+            model: None,
+            provider: None,
+            temperature: None,
+            max_tokens: None,
+            // Past the round cap the tools disappear from the request, which
+            // forces a text answer instead of an endless loop.
+            tools: (self.tool_rounds < MAX_TOOL_ROUNDS).then(tools_spec),
+            stream: Some(true),
+        };
+        Task::batch([
+            iced::widget::operation::snap_to_end(transcript_id()),
+            Task::run(sse::chat_stream(client.clone(), body), Message::Chunk),
+        ])
     }
 
     /// Append a streamed delta to the assistant turn in flight, opening one if
@@ -377,6 +622,28 @@ impl State {
     }
 }
 
+/// Post-capture triage: does a closed utterance go to the transcriber, or was
+/// it too brief to be an instruction / too far from the mic to have been aimed
+/// at one? Someone else's conversation carries, but it carries quietly.
+///
+/// The close-talk test is *relative* to the learned room floor; the divisor
+/// clamp only guards digital silence. Clamping it at `ABS_FLOOR` — as this
+/// once did — quietly turned the test into "peak above 0.03 absolute", which a
+/// low-gain mic never reaches: the gate would open (that bar is `ABS_FLOOR`),
+/// show Listening, then drop every utterance right here.
+fn keep_utterance(voiced: f32, samples: usize, peak: f32, floor: f32) -> bool {
+    voiced >= MIN_VOICED
+        && samples >= crate::stt::MIN_SAMPLES
+        && peak / floor.max(1e-4) >= CLOSE_TALK_SNR
+}
+
+/// Seconds between two `phase` readings. `phase` wraps every hour, so a plain
+/// subtraction goes hugely negative across the wrap — which would read as "E.V.
+/// just spoke" forever and leave both timers stuck in their open state.
+fn since(now: f32, then: f32) -> f32 {
+    (now - then).rem_euclid(3600.0)
+}
+
 /// Shortest chunk worth sending to the synthesizer. Below this the per-clip
 /// overhead costs more than the sentence saves, and "Hm." on its own is a
 /// worse listen than waiting for the clause it belongs to.
@@ -485,14 +752,19 @@ pub enum Message {
     Send,
     /// Toggle: first press starts the mic, second press stops and transcribes.
     Listen,
-    Heard(Result<String, String>),
+    /// A finished utterance: what was said, and the voice that said it.
+    Heard(Result<(String, Option<crate::stt::VoicePrint>), String>),
     OpenMicSettings,
     LinkClicked(String),
     /// One chunk of the streamed reply.
     Chunk(ChatChunk),
+    /// The terminal finished a round of tool calls; results go back to the model.
+    ToolResults(Vec<ToolOutcome>),
     Synthesized(Result<Vec<u8>, String>),
     ToggleVoice,
     Clear,
+    /// Drop the enrolled voice and learn the next speaker from scratch.
+    ForgetVoice,
     DismissError,
     /// Animation heartbeat; only runs while the Assistant screen is visible.
     Tick,
@@ -513,21 +785,42 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.push_turn("user", prompt);
             state.draft.clear();
             state.sending = true;
-
-            let mut messages =
-                vec![ChatMessage { role: "system".into(), content: PERSONA.into() }];
-            messages.extend(state.messages.iter().cloned());
-            let body = ChatCompletionBody {
-                messages,
-                model: None,
-                temperature: None,
-                max_tokens: None,
-                stream: Some(true),
-            };
-            Task::batch([
-                iced::widget::operation::snap_to_end(transcript_id()),
-                Task::run(sse::chat_stream(client.clone(), body), Message::Chunk),
-            ])
+            state.tool_rounds = 0;
+            state.tool_buf.clear();
+            state.request(client)
+        }
+        Message::Chunk(ChatChunk::ToolCall(d)) => {
+            // Fragments assemble by index: id and name arrive first, the
+            // arguments JSON drips in across many chunks.
+            while state.tool_buf.len() <= d.index {
+                state.tool_buf.push(ToolCall::default());
+            }
+            let tc = &mut state.tool_buf[d.index];
+            if let Some(id) = d.id {
+                tc.id = id;
+            }
+            if let Some(name) = d.name {
+                tc.function.name = name;
+            }
+            tc.function.arguments.push_str(&d.arguments);
+            Task::none()
+        }
+        Message::ToolResults(results) => {
+            for r in results {
+                // Wire content is the raw output; the transcript shows it fenced.
+                state
+                    .md
+                    .push(iced::widget::markdown::parse(&format!("````text\n{}\n````", r.output)).collect());
+                state.messages.push(ChatMessage {
+                    role: "tool".into(),
+                    content: r.output,
+                    tool_calls: None,
+                    tool_call_id: Some(r.id),
+                });
+            }
+            state.tool_rounds += 1;
+            // Still `sending`: the reply continues with the results in hand.
+            state.request(client)
         }
         Message::Chunk(ChatChunk::Delta(text)) => {
             state.push_delta(&text);
@@ -539,17 +832,39 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             ])
         }
         Message::Chunk(ChatChunk::Done) => {
-            state.sending = false;
-            state.streaming = false;
-            // Opens the follow-up window: the answer invites a follow-up, and
-            // having to say "E.V." again mid-conversation is not conversation.
-            state.last_reply = state.phase;
-            // The tail after the last terminator is a sentence too.
+            let streamed = std::mem::take(&mut state.streaming);
+            // Whatever was said this round gets spoken either way; the tail
+            // after the last terminator is a sentence too.
             if state.voice && !state.speech_buf.trim().is_empty() {
                 let tail = std::mem::take(&mut state.speech_buf);
                 state.enqueue_speech(&tail);
             }
             state.speech_buf.clear();
+            if !state.tool_buf.is_empty() {
+                // Tool round: attach the calls to the assistant turn (opening
+                // one if the model sent no text), show what runs, and keep
+                // `sending` — the HUD stays in Thinking while the terminal works.
+                let calls = std::mem::take(&mut state.tool_buf);
+                if !streamed {
+                    state.push_turn("assistant", String::new());
+                }
+                let last = state.messages.len() - 1;
+                state.messages[last].tool_calls = Some(calls.clone());
+                let mut shown = state.messages[last].content.clone();
+                for c in &calls {
+                    shown.push_str(&format!("\n\n```\n$ {}\n```", command_of(c)));
+                }
+                state.md[last] = iced::widget::markdown::parse(&shown).collect();
+                return Task::batch([
+                    iced::widget::operation::snap_to_end(transcript_id()),
+                    state.next_synthesis(),
+                    Task::perform(run_tools(calls), Message::ToolResults),
+                ]);
+            }
+            state.sending = false;
+            // Opens the follow-up window: the answer invites a follow-up, and
+            // having to say "E.V." again mid-conversation is not conversation.
+            state.last_reply = state.phase;
             Task::batch([
                 iced::widget::operation::snap_to_end(transcript_id()),
                 state.next_synthesis(),
@@ -558,6 +873,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Chunk(ChatChunk::Failed(e)) => {
             state.sending = false;
             state.streaming = false;
+            state.tool_buf.clear();
             state.error = Some(e);
             // Speak what did arrive rather than cutting off mid-word.
             if state.voice && !state.speech_buf.trim().is_empty() {
@@ -583,8 +899,10 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                     state.onset = 0;
                     state.floor = ABS_FLOOR;
                     // You just pressed the button, so the next thing you say is
-                    // obviously for E.V. — no need to name it.
+                    // obviously for E.V. — no need to name it, and no deadline
+                    // to say it by.
                     state.last_reply = state.phase;
+                    state.awaiting_first = true;
                 }
                 Err(e) => state.error = Some(e),
             }
@@ -593,11 +911,31 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Heard(result) => {
             state.transcribing = false;
             match result {
-                Ok(text) if !text.trim().is_empty() => {
+                Ok((text, print)) if !text.trim().is_empty() => {
+                    // Whose voice was that? Until enrolled, everything that got
+                    // through the gate counts as yours; after that, a voice this
+                    // far from the enrolled one is somebody else in the room.
+                    state.voice_sim = match (state.voice_print, print) {
+                        (Some(known), Some(heard)) => {
+                            Some(crate::stt::print_similarity(&known, &heard))
+                        }
+                        _ => None,
+                    };
+                    // Nothing is rejected while still enrolling: the print those
+                    // first utterances build is what the test compares against.
+                    let mine = !state.voice_enrolled()
+                        || state.voice_sim.is_none_or(|sim| sim >= VOICE_MATCH);
+                    if mine {
+                        state.learn_voice(print);
+                    }
                     // Addressed by name, or spoken inside the follow-up window
                     // after E.V.'s last reply → it was meant for E.V.
-                    let follow_up = state.phase - state.last_reply < FOLLOW_UP;
-                    match (addressed(&text), follow_up) {
+                    let follow_up = state.follow_up_open() && mine;
+                    state.awaiting_first = false;
+                    // Another voice never auto-sends, however it phrased itself:
+                    // it lands in the composer for you to send or discard.
+                    let addressed = if mine { addressed(&text) } else { None };
+                    match (addressed, follow_up) {
                         (Some(body), _) if !body.trim().is_empty() => {
                             state.draft = body.to_string();
                             update(state, client, Message::Send)
@@ -663,7 +1001,13 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.messages.clear();
             state.md.clear();
             state.streaming = false;
+            state.tool_buf.clear();
+            state.tool_rounds = 0;
             state.error = None;
+            Task::none()
+        }
+        Message::ForgetVoice => {
+            state.forget_voice();
             Task::none()
         }
         Message::LinkClicked(url) => {
@@ -757,7 +1101,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 || state.transcribing
                 || state.synthesizing
                 || mode == Mode::Speaking
-                || state.phase - state.spoke_at < ECHO_TAIL;
+                || since(state.phase, state.spoke_at) < ECHO_TAIL;
 
             match state.capture {
                 None => {
@@ -785,15 +1129,8 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                         state.capture = None;
                         state.hang = 0.0;
                         let voiced = std::mem::take(&mut state.voiced);
-                        let snr = state.peak / state.floor.max(ABS_FLOOR);
-                        state.peak = 0.0;
-                        // Too brief to be an instruction, or too far from the
-                        // mic to have been aimed at one: someone else's
-                        // conversation carries, but it carries quietly.
-                        if voiced < MIN_VOICED
-                            || samples.len() < crate::stt::MIN_SAMPLES
-                            || snr < CLOSE_TALK_SNR
-                        {
+                        let peak = std::mem::take(&mut state.peak);
+                        if !keep_utterance(voiced, samples.len(), peak, state.floor) {
                             return Task::none();
                         }
                         state.transcribing = true;
@@ -805,7 +1142,15 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(180),
                                     tokio::task::spawn_blocking(move || {
+                                        // The print comes from the same audio,
+                                        // on the same thread: whose voice it
+                                        // was is part of what was heard.
+                                        let print = crate::stt::voice_print(
+                                            &samples,
+                                            crate::stt::WHISPER_RATE,
+                                        );
                                         crate::stt::transcribe(&samples)
+                                            .map(|text| (text, print))
                                     }),
                                 )
                                 .await
@@ -901,14 +1246,14 @@ mod tests {
     #[test]
     fn heard_text_autosends_and_silence_does_not() {
         let mut s = State { transcribing: true, ..State::new() };
-        let _ = update(&mut s, &client(), Message::Heard(Ok("run diagnostics".into())));
+        let _ = update(&mut s, &client(), Message::Heard(Ok(("run diagnostics".into(), None))));
         assert!(!s.transcribing);
         assert_eq!(s.messages.len(), 1);
         assert_eq!(s.messages[0].content, "run diagnostics");
         assert!(s.sending);
 
         let mut s = State { transcribing: true, ..State::new() };
-        let _ = update(&mut s, &client(), Message::Heard(Ok("  ".into())));
+        let _ = update(&mut s, &client(), Message::Heard(Ok(("  ".into(), None))));
         assert!(s.messages.is_empty());
         assert!(!s.sending);
 
@@ -922,14 +1267,14 @@ mod tests {
         // Outside the follow-up window, unaddressed speech is parked in the
         // composer — heard, but not answered.
         let mut s = State { transcribing: true, phase: 60.0, ..State::new() };
-        let _ = update(&mut s, &client(), Message::Heard(Ok("so anyway I told him no".into())));
+        let _ = update(&mut s, &client(), Message::Heard(Ok(("so anyway I told him no".into(), None))));
         assert!(s.messages.is_empty(), "room chatter must not reach the model");
         assert_eq!(s.draft, "so anyway I told him no");
         assert!(!s.sending);
 
         // Naming E.V. sends it, and the name itself is not part of the question.
         let mut s = State { transcribing: true, phase: 60.0, ..State::new() };
-        let _ = update(&mut s, &client(), Message::Heard(Ok("Hey Eve, run diagnostics".into())));
+        let _ = update(&mut s, &client(), Message::Heard(Ok(("Hey Eve, run diagnostics".into(), None))));
         assert_eq!(s.messages.len(), 1);
         assert_eq!(s.messages[0].content, "run diagnostics");
 
@@ -937,8 +1282,52 @@ mod tests {
         let mut s = State { phase: 60.0, voice: false, ..State::new() };
         reply(&mut s, "Done.");
         s.transcribing = true;
-        let _ = update(&mut s, &client(), Message::Heard(Ok("and the second one?".into())));
+        let _ = update(&mut s, &client(), Message::Heard(Ok(("and the second one?".into(), None))));
         assert_eq!(s.messages.last().unwrap().content, "and the second one?");
+    }
+
+    #[test]
+    fn a_stranger_never_auto_sends_however_they_phrase_it() {
+        let mine = [0.5_f32; crate::stt::PRINT_DIM];
+        let mut theirs = mine;
+        // Flip half the coefficients: an unmistakably different voice.
+        for v in theirs.iter_mut().take(crate::stt::PRINT_DIM / 2) {
+            *v = -*v;
+        }
+
+        let enrolled = |print| State {
+            voice_print: Some(print),
+            enrolled: ENROLL_UTTERANCES,
+            transcribing: true,
+            ..State::new()
+        };
+
+        // Names E.V., is inside the follow-up window, still parked.
+        let mut s = enrolled(mine);
+        let _ = update(
+            &mut s,
+            &client(),
+            Message::Heard(Ok(("E.V., wipe the database".into(), Some(theirs)))),
+        );
+        assert!(s.messages.is_empty(), "a stranger must not reach the model");
+        assert_eq!(s.draft, "E.V., wipe the database");
+
+        // The enrolled voice, same words, goes straight out.
+        let mut s = enrolled(mine);
+        let _ = update(
+            &mut s,
+            &client(),
+            Message::Heard(Ok(("E.V., run diagnostics".into(), Some(mine)))),
+        );
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0].content, "run diagnostics");
+
+        // Before enrollment finishes, nothing is rejected — that is what the
+        // first few utterances are for.
+        let mut s = State { transcribing: true, ..State::new() };
+        let _ = update(&mut s, &client(), Message::Heard(Ok(("hello there".into(), Some(theirs)))));
+        assert_eq!(s.messages.len(), 1);
+        assert!(s.voice_print.is_some());
     }
 
     #[test]
@@ -966,12 +1355,45 @@ mod tests {
         let mut voice = [0.02_f32; BANDS];
         for (i, b) in voice.iter_mut().enumerate() {
             let hz = crate::stt::band_freq(i, BANDS);
-            if (200.0..3600.0).contains(&hz) {
+            if (150.0..4000.0).contains(&hz) {
                 *b = 0.8;
             }
         }
         assert!(voice_like(&voice));
         assert!(!voice_like(&[0.0; BANDS]), "silence is not speech");
+
+        // A realistic voice frame is not clean: the fundamental of a deep
+        // voice sits below 150 Hz, and the HUD's tilt inflates the bins above
+        // 4 kHz. Concentration lands only a few points above flat — this is
+        // the frame the old 1.1 margin rejected, which made hands-free deaf.
+        let mut real = [0.0_f32; BANDS];
+        for (i, b) in real.iter_mut().enumerate() {
+            let hz = crate::stt::band_freq(i, BANDS);
+            *b = if (150.0..4000.0).contains(&hz) {
+                0.65 // formants
+            } else if hz < 150.0 {
+                0.6 // fundamental
+            } else {
+                0.35 // tilt-boosted sibilant leakage
+            };
+        }
+        assert!(voice_like(&real), "a bass-heavy real voice must open the gate");
+    }
+
+    #[test]
+    fn a_quiet_mic_keeps_its_utterance_and_noise_still_drops() {
+        let second = crate::stt::WHISPER_RATE as usize;
+        // Low-gain mic in a quiet room: peak 0.012 is only twice ABS_FLOOR but
+        // 6x the actual learned floor. Clamping the divisor at ABS_FLOOR made
+        // this read as SNR 2 and silently dropped every utterance.
+        assert!(keep_utterance(1.0, 2 * second, 0.012, 0.002));
+        // Same room, someone talking across it: not enough over the floor.
+        assert!(!keep_utterance(1.0, 2 * second, 0.008, 0.002));
+        // Loud room, distant conversation: relative test still rejects.
+        assert!(!keep_utterance(1.0, 2 * second, 0.03, 0.01));
+        // A cough is loud but too brief; a stray click is too few samples.
+        assert!(!keep_utterance(0.1, 2 * second, 0.1, 0.002));
+        assert!(!keep_utterance(1.0, second / 4, 0.1, 0.002));
     }
 
     #[test]
@@ -997,8 +1419,181 @@ mod tests {
     #[test]
     fn voiced_reply_enters_synthesis() {
         let mut s = State::new();
-        let _ = update(&mut s, &client(), Message::Replied(Ok("hi".into())));
+        reply(&mut s, "hi");
         assert!(s.synthesizing);
         assert_eq!(s.mode(), Mode::Thinking);
+    }
+
+    #[test]
+    fn the_first_sentence_is_synthesized_before_the_reply_ends() {
+        let mut s = State { draft: "status".into(), ..State::new() };
+        let _ = update(&mut s, &client(), Message::Send);
+        // Mid-stream: one closed sentence, one still arriving.
+        let _ = update(
+            &mut s,
+            &client(),
+            Message::Chunk(ChatChunk::Delta("Systems are nominal, boss. And the".into())),
+        );
+        assert!(s.synthesizing, "sentence one goes out while the reply is still streaming");
+        assert_eq!(s.speaking.as_deref(), Some("Systems are nominal, boss."));
+        assert_eq!(s.speech_buf, "And the", "the open clause waits for its terminator");
+        assert!(s.sending, "the turn is not over yet");
+
+        // The tail flushes at end of stream even without a terminator.
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Delta(" rest".into())));
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Done));
+        assert_eq!(s.speech_queue.front().map(String::as_str), Some("And the rest"));
+        assert_eq!(s.messages.last().unwrap().content, "Systems are nominal, boss. And the rest");
+        assert!(!s.sending);
+    }
+
+    #[test]
+    fn a_tool_round_runs_the_terminal_and_keeps_the_turn_open() {
+        use agent_platform_client::sse::ToolCallDelta;
+        let mut s = State { draft: "how much disk is free?".into(), voice: false, ..State::new() };
+        let _ = update(&mut s, &client(), Message::Send);
+
+        // The model narrates, then asks for the terminal in streamed fragments.
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Delta("Checking.".into())));
+        for d in [
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("run_command".into()),
+                arguments: "{\"command\": \"Get-".into(),
+            },
+            ToolCallDelta { index: 0, arguments: "PSDrive C\"}".into(), ..Default::default() },
+        ] {
+            let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::ToolCall(d)));
+        }
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Done));
+
+        let turn = s.messages.last().unwrap();
+        let calls = turn.tool_calls.as_ref().expect("calls attached to the assistant turn");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.arguments, "{\"command\": \"Get-PSDrive C\"}");
+        assert_eq!(command_of(&calls[0]), "Get-PSDrive C");
+        assert!(s.sending, "the turn stays open while the terminal works");
+        assert!(s.tool_buf.is_empty());
+
+        // Results come back: a tool message joins the wire history and the
+        // request goes out again with the round counted.
+        let _ = update(
+            &mut s,
+            &client(),
+            Message::ToolResults(vec![ToolOutcome { id: "call_1".into(), output: "Free: 120G".into() }]),
+        );
+        let tool = s.messages.last().unwrap();
+        assert_eq!(tool.role, "tool");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool.content, "Free: 120G");
+        assert_eq!(s.tool_rounds, 1);
+        assert!(s.sending);
+        assert_eq!(s.messages.len(), s.md.len(), "transcript and markdown stay aligned");
+    }
+
+    #[test]
+    fn a_tool_only_reply_still_gets_an_assistant_turn() {
+        use agent_platform_client::sse::ToolCallDelta;
+        let mut s = State { draft: "list files".into(), voice: false, ..State::new() };
+        let _ = update(&mut s, &client(), Message::Send);
+        // No text at all — straight to the tool.
+        let d = ToolCallDelta {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("run_command".into()),
+            arguments: "{\"command\": \"ls\"}".into(),
+        };
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::ToolCall(d)));
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Done));
+        let turn = s.messages.last().unwrap();
+        assert_eq!(turn.role, "assistant");
+        assert_eq!(turn.content, "");
+        assert!(turn.tool_calls.is_some());
+    }
+
+    #[tokio::test]
+    async fn run_command_captures_output_and_reports_failure() {
+        let out = run_command(if cfg!(windows) { "echo hello" } else { "echo hello" }.into()).await;
+        assert!(out.contains("hello"), "got: {out:?}");
+        let out = run_command("exit 3".into()).await;
+        assert!(out.contains("exit code 3"), "got: {out:?}");
+    }
+
+    #[test]
+    fn hush_drops_queued_speech() {
+        let mut s = State::new();
+        reply(&mut s, "One thing and another thing. Then a second sentence here.");
+        s.audio_queue.push_back(vec![0u8; 4]);
+        s.hush();
+        assert!(s.speech_queue.is_empty());
+        assert!(s.audio_queue.is_empty());
+        assert!(s.speech_buf.is_empty());
+    }
+
+    /// Feed a transcript in as if the mic had just closed on it.
+    fn heard(s: &mut State, text: &str) {
+        s.transcribing = true;
+        let _ = update(s, &client(), Message::Heard(Ok((text.into(), None))));
+    }
+
+    #[test]
+    fn a_long_spoken_reply_does_not_eat_the_follow_up_window() {
+        // Generation finished 30 s ago — but E.V. was reading the answer out
+        // loud for most of it and only just stopped, and the gate was shut the
+        // whole time. The reply to it is still a reply.
+        let mut s = State {
+            phase: 100.0,
+            last_reply: 70.0,
+            spoke_at: 99.5,
+            voice: false,
+            ..State::new()
+        };
+        assert!(s.follow_up_open());
+        heard(&mut s, "and the second one?");
+        assert_eq!(s.messages.last().unwrap().content, "and the second one?");
+        assert!(s.sending, "it should have sent itself, not parked in the composer");
+    }
+
+    #[test]
+    fn the_first_thing_said_after_arming_sends_however_long_you_took() {
+        // Pressed the mic button, then thought about it for a minute.
+        let mut s =
+            State { phase: 300.0, last_reply: 0.0, awaiting_first: true, ..State::new() };
+        assert!(s.follow_up_open());
+        heard(&mut s, "run diagnostics");
+        assert_eq!(s.messages.last().unwrap().content, "run diagnostics");
+        assert!(s.sending);
+
+        // ...and the *second* unaddressed thing, long after, is back to being
+        // room noise: it parks rather than answering whoever is talking.
+        s.sending = false;
+        s.phase = 400.0;
+        heard(&mut s, "so anyway I told him no");
+        assert_eq!(s.messages.len(), 1, "no new turn");
+        assert_eq!(s.draft, "so anyway I told him no");
+    }
+
+    #[test]
+    fn the_hourly_phase_wrap_does_not_jam_either_timer() {
+        // `phase` wrapped 0.5 s ago; the events it is compared against are just
+        // before the wrap. Plain subtraction would read as -3599 and leave the
+        // follow-up window stuck open and the mic gate stuck shut.
+        assert_eq!(since(0.5, 3599.0), 1.5);
+        assert!(since(0.5, 3599.0) < FOLLOW_UP, "still inside the window, correctly");
+
+        let s = State { phase: 100.0, last_reply: 3590.0, spoke_at: 3590.0, ..State::new() };
+        assert!(!s.follow_up_open(), "110 s after E.V. spoke is not a follow-up");
+    }
+
+    #[test]
+    fn sentences_split_on_terminators_but_not_inside_words() {
+        let mut buf = "Shields are at 82.5 percent, boss. Next up.".to_string();
+        // The decimal point does not close a sentence — no whitespace follows it.
+        assert_eq!(take_sentence(&mut buf).as_deref(), Some("Shields are at 82.5 percent, boss."));
+        assert_eq!(buf, "Next up.");
+        // Too short to be worth a clip on its own; it waits for more text.
+        assert_eq!(take_sentence(&mut buf), None);
+        assert_eq!(buf, "Next up.");
     }
 }

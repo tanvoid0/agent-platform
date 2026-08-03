@@ -81,11 +81,21 @@ pub struct Settings {
     pub port: u16,
     pub start_minimized: bool,
     pub theme: ThemeMode,
+    /// Chat screen's provider/model override, kept across restarts.
+    /// Empty = the server's default.
+    pub chat_provider: String,
+    pub chat_model: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { port: DEFAULT_PORT, start_minimized: false, theme: ThemeMode::default() }
+        Self {
+            port: DEFAULT_PORT,
+            start_minimized: false,
+            theme: ThemeMode::default(),
+            chat_provider: String::new(),
+            chat_model: String::new(),
+        }
     }
 }
 
@@ -522,7 +532,12 @@ mod tests {
     #[test]
     fn settings_roundtrip_and_defaults() {
         let dir = std::env::temp_dir().join(format!("ap-settings-test-{}", std::process::id()));
-        let s = Settings { port: 12345, start_minimized: true, theme: ThemeMode::Light };
+        let s = Settings {
+            port: 12345,
+            start_minimized: true,
+            theme: ThemeMode::Light,
+            ..Settings::default()
+        };
         s.save(&dir).unwrap();
         let loaded = Settings::load(&dir);
         assert_eq!(loaded.port, 12345);

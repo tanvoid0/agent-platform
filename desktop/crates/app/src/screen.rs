@@ -14,20 +14,28 @@ const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
     (
         "WORKSPACE",
         &[
+            (Screen::Dashboard, Icon::Gauge, "Dashboard"),
             (Screen::Processes, Icon::Activity, "Processes"),
             (Screen::Projects, Icon::Folder, "Projects"),
             (Screen::Teams, Icon::Users, "Teams"),
+            (Screen::Workflows, Icon::Zap, "Workflows"),
         ],
     ),
     // One entry, two tabs: see [`chat_view`].
     ("ASSISTANTS", &[(Screen::Chat, Icon::Message, "Chat")]),
 ];
 
-/// The chat tab strip: the plain thread and the voiced one, in that order.
-const CHAT_TABS: [(Screen, &str); 2] = [(Screen::Chat, "Chat"), (Screen::Assistant, "E.V.")];
+/// The chat tab strip: the voiced assistant first (it is the headline act), the
+/// plain thread, and what the two of them remember about you.
+const CHAT_TABS: [(Screen, &str); 3] = [
+    (Screen::Assistant, crate::assistant::NAME),
+    (Screen::Chat, "Chat"),
+    (Screen::Memory, "Memory"),
+];
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = match app.screen {
+        Screen::Dashboard => dashboard_view(app),
         Screen::Settings => settings_view(app),
         _ if !app.view_available() => blocked_view(app, screen_title(app.screen)),
         Screen::Processes => crate::processes_view::view(&app.processes, &app.settings.theme.resolve())
@@ -38,7 +46,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
         Screen::Teams => crate::library_view::view(&app.library, crate::library_view::Kind::Teams)
             .map(Message::Library),
-        Screen::Chat | Screen::Assistant => chat_view(app),
+        Screen::Workflows => crate::workflows_view::view(&app.workflows).map(Message::Workflows),
+        Screen::Chat | Screen::Assistant | Screen::Memory => chat_view(app),
     };
 
     row![
@@ -59,11 +68,14 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     for (group, entries) in NAV {
         items.push(ui::nav_group(group));
         for (screen, glyph, label) in *entries {
-            items.push(if screen.needs_server() && !ready {
-                ui::nav_item_locked(*glyph, label)
-            } else if screen.is_chat() {
-                // One entry for both chat tabs; it returns to the last one open.
+            items.push(if screen.is_chat() {
+                // One entry for the whole chat page; it returns to the last tab
+                // open. Never locked — Memory is a local file, so the page has
+                // something to show even with the server down (the two tabs that
+                // need it are guarded individually, as in Settings).
                 ui::nav_item(*glyph, label, app.screen.is_chat(), Message::Nav(app.chat_tab))
+            } else if screen.needs_server() && !ready {
+                ui::nav_item_locked(*glyph, label)
             } else {
                 ui::nav_item(*glyph, label, app.screen == *screen, Message::Nav(*screen))
             });
@@ -105,6 +117,78 @@ fn sidebar(app: &App) -> Element<'_, Message> {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard — E.V. front and center, the platform's vitals around it
+// ---------------------------------------------------------------------------
+
+/// The landing page: E.V.'s live HUD with a way in, then stat tiles fed by the
+/// same global status poll every other screen uses. Renders with the server
+/// down — the server tile is then exactly the thing worth looking at.
+fn dashboard_view(app: &App) -> Element<'_, Message> {
+    let mode = app.assistant.mode();
+    let (mode_label, mode_tone) = match mode {
+        crate::assistant::Mode::Idle => ("SYSTEMS NOMINAL", Tone::Success),
+        crate::assistant::Mode::Armed => ("MIC LIVE · MONITORING", Tone::Info),
+        crate::assistant::Mode::Listening => ("LISTENING", Tone::Danger),
+        crate::assistant::Mode::Thinking => ("ANALYZING", Tone::Warning),
+        crate::assistant::Mode::Speaking => ("TRANSMITTING", Tone::Info),
+    };
+    let (srv_label, srv_tone) = server_label(app.server_state());
+
+    let mut blocks: Vec<Element<'_, Message>> = vec![
+        crate::assistant_view::hud(&app.assistant, 224.0).map(Message::Assistant),
+        ui::cluster(vec![
+            ui::badge(mode_label, mode_tone),
+            ui::badge(srv_label, srv_tone),
+            ui::spacer(),
+            ui::button_default(Icon::Message, "Talk to E.V.", Message::Nav(Screen::Assistant)),
+        ])
+        .into(),
+    ];
+
+    let mut tiles = vec![ui::stat(
+        Icon::Sparkles,
+        "Memories",
+        app.memory.visible().len().to_string(),
+    )];
+    if let Some(status) = &app.status {
+        let ok = |r: &ReadinessReport| {
+            format!("{}/{}", r.checks.iter().filter(|c| c.ok).count(), r.checks.len())
+        };
+        tiles.extend([
+            ui::stat(Icon::Activity, "Active processes", status.processes.active.to_string()),
+            ui::stat(Icon::Scroll, "Total processes", status.processes.total.to_string()),
+            ui::stat(Icon::Clock, "Uptime", uptime(status.uptime_seconds)),
+            ui::stat(Icon::CheckCircle, "Readiness", ok(&status.readiness)),
+            ui::stat(Icon::Plug, "LLM proxy", ok(&status.llm_proxy)),
+        ]);
+    }
+    blocks.push(ui::cluster(tiles).into());
+
+    if app.status.is_none() {
+        blocks.push(ui::empty_state_icon(
+            Icon::Clock,
+            "Platform stats appear as soon as the server answers.",
+        ));
+    }
+
+    ui::page(
+        "Dashboard",
+        Some(ui::muted("E.V. and the platform's vitals at a glance.")),
+        None,
+        ui::stack_lg(blocks),
+    )
+}
+
+fn uptime(seconds: f64) -> String {
+    let s = seconds as u64;
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m {}s", s / 60, s % 60),
+        _ => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Settings — one page, four tabs
 // ---------------------------------------------------------------------------
 
@@ -140,22 +224,69 @@ fn settings_view(app: &App) -> Element<'_, Message> {
 // Chat — one page, two tabs
 // ---------------------------------------------------------------------------
 
-/// The two assistants on one page: `Chat` is the plain thread, `E.V.` the same
-/// conversation with a HUD, a persona and a voice. Tabbed rather than two
-/// sidebar entries because they are one destination — "talk to the model" —
-/// with two levels of ceremony.
+/// The assistants on one page: `Chat` is the plain thread, `E.V.` the same
+/// conversation with a HUD, a persona and a voice, and `Memory` what the two of
+/// them have learned about you. Tabbed rather than three sidebar entries because
+/// they are one destination — "talk to the model" — at three levels of ceremony.
+///
+/// Gating is per tab, as in [`settings_view`]: Memory is a local file and opens
+/// whether or not the server is answering.
 fn chat_view(app: &App) -> Element<'_, Message> {
     let tabs = ui::segmented(
         CHAT_TABS.map(|(screen, label)| (label, app.screen == screen, Message::Nav(screen))),
     );
     let body = match app.screen {
+        _ if app.screen.needs_server() && !app.server_ready() => {
+            blocked_view(app, screen_title(app.screen))
+        }
+        Screen::Memory => crate::memory_view::view(&app.memory).map(Message::Memory),
         Screen::Assistant => {
             crate::assistant_view::view(&app.assistant, &app.settings.theme.resolve())
                 .map(Message::Assistant)
         }
         _ => crate::chat_view::view(&app.chat, &app.settings.theme.resolve()).map(Message::Chat),
     };
-    tabbed(tabs, body)
+    match memory_notice(app) {
+        Some(banner) => tabbed(tabs, column![banner, body].spacing(space::SM).into()),
+        None => tabbed(tabs, body),
+    }
+}
+
+/// The "memory updated" banner: shown in the chat the facts came from, right
+/// after a harvest saves something, so a wrong guess can be discarded without a
+/// trip to the Memory tab.
+fn memory_notice(app: &App) -> Option<Element<'_, Message>> {
+    let source = match app.screen {
+        Screen::Chat => "Chat",
+        Screen::Assistant => crate::assistant::NAME,
+        _ => return None,
+    };
+    let notice = app.memory.notice.as_ref().filter(|n| n.source == source)?;
+
+    let mut lines: Vec<Element<'_, Message>> =
+        notice.facts.iter().map(|(_, text)| ui::muted(format!("• {text}"))).collect();
+    lines.push(
+        ui::cluster(vec![
+            ui::button_ghost(Icon::Check, "Keep", Message::Memory(crate::memory::Message::NoticeKeep)),
+            ui::button_ghost(
+                Icon::Trash,
+                "Discard",
+                Message::Memory(crate::memory::Message::NoticeDiscard),
+            ),
+            ui::button_ghost(
+                Icon::Sparkles,
+                "Open Memory",
+                Message::Nav(Screen::Memory),
+            ),
+        ])
+        .into(),
+    );
+
+    Some(
+        container(ui::alert(Tone::Info, "Memory updated", Some(ui::stack(lines).into())))
+            .padding(iced::Padding { top: 0.0, right: space::LG, bottom: 0.0, left: space::LG })
+            .into(),
+    )
 }
 
 /// Tab strip over a body. The strip is chrome, so it sits outside the tab's own

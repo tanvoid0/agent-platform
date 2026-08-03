@@ -19,6 +19,7 @@ env/
 
 # Runtime / build
 data/
+dist/
 app/static/dist/
 node_modules/
 .agents/

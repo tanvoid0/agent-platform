@@ -69,10 +69,19 @@ def main() -> None:
             "been built and run there. macOS/Linux packaging is not implemented."
         )
 
-    iscc = shutil.which("iscc")
+    # Inno Setup's installer never adds itself to PATH, so also try its
+    # default per-user and per-machine install dirs.
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Inno Setup 6" / "ISCC.exe",
+        Path("C:/Program Files (x86)/Inno Setup 6/ISCC.exe"),
+    ]
+    iscc = shutil.which("iscc") or next(
+        (str(p) for p in candidates if p.is_file()), None
+    )
     if not iscc:
         sys.exit(
-            "iscc (Inno Setup Compiler) not found on PATH.\n"
+            "iscc (Inno Setup Compiler) not found on PATH or in its default "
+            "install locations.\n"
             "Install Inno Setup from https://jrsoftware.org/isinfo.php and re-run."
         )
 

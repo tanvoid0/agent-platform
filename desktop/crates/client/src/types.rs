@@ -309,10 +309,44 @@ pub struct ProjectBody {
 // Chat (POST /api/v1/chat, OpenAI-shaped)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Assistant turn that asked for tools (OpenAI shape).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Set on `role: "tool"` result messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// A plain text turn — the shape every message had before tool calls.
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self { role: role.into(), content: content.into(), ..Self::default() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ToolFunction,
+}
+
+impl Default for ToolCall {
+    fn default() -> Self {
+        Self { id: String::new(), call_type: "function".into(), function: ToolFunction::default() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ToolFunction {
+    pub name: String,
+    /// JSON-encoded arguments, streamed in fragments and concatenated.
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,10 +354,17 @@ pub struct ChatCompletionBody {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Provider hint (`ollama`, `gemini`, …); the proxy routes to it and picks
+    /// its default model when `model` is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<i64>,
+    /// OpenAI tool definitions, passed through by the server verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<serde_json::Value>,
     /// Set by `sse::chat_stream`; leave `None` for the buffered `Client::chat`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
@@ -586,4 +627,74 @@ pub struct EnvUpdate {
 pub struct EnvSaveResponse {
     pub ok: bool,
     pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Workflows (mirrors app/workflows/schemas.py)
+// ---------------------------------------------------------------------------
+
+/// Steps stay `Value`: the server owns the schema, and the editor round-trips
+/// raw JSON rather than re-validating a shape the API already validates.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowInfo {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub steps: Vec<Value>,
+    pub enabled: bool,
+    pub interval_seconds: Option<i64>,
+    pub next_run_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowsListResponse {
+    pub workflows: Vec<WorkflowInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WorkflowBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub clear_interval: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowStepResult {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub output: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowRunInfo {
+    pub id: i64,
+    pub workflow_id: i64,
+    pub trigger: String,
+    pub status: String,
+    pub input: Value,
+    pub steps: Vec<WorkflowStepResult>,
+    pub error: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowRunsResponse {
+    pub runs: Vec<WorkflowRunInfo>,
 }

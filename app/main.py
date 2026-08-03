@@ -33,6 +33,8 @@ from playground.routes import router as playground_router
 from coder.routes import router as coder_router
 from model_ops.routes import router as model_ops_router
 from workspace_routes import files_router as workspace_files_router, router as workspace_router
+from workflows import router as workflows_router
+from workflows.engine import start_scheduler as start_workflow_scheduler, stop_scheduler as stop_workflow_scheduler
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -53,9 +55,11 @@ async def lifespan(app: FastAPI):
     from services.startup_recovery import schedule_startup_recovery
 
     schedule_startup_recovery()
+    start_workflow_scheduler()
     try:
         yield
     finally:
+        stop_workflow_scheduler()
         await cache.stop_background_refresh()
 
 
@@ -84,6 +88,7 @@ app.include_router(me_workspace_router, prefix="/api/v1", dependencies=_api_deps
 app.include_router(workspace_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(workspace_files_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(action_orchestrator_router, prefix="/api/v1", dependencies=_api_deps)
+app.include_router(workflows_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(api_tokens_router, prefix="/api/v1", dependencies=_api_deps)
 # Additional routers at /api/v1 prefix
 app.include_router(todos_router, prefix="/api/v1", dependencies=_api_deps)

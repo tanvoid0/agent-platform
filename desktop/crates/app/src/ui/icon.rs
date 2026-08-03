@@ -58,6 +58,7 @@ icons! {
     Plug => plug,
     Gauge => gauge,
     Scroll => scroll_text,
+    Zap => zap,
 
     // actions
     Refresh => refresh_cw,

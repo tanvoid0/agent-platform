@@ -13,6 +13,7 @@ import assistant.models  # noqa: F401 — assistant tables
 import playground.models  # noqa: F401 — playground chat tables
 import coder.models  # noqa: F401 — coder agent chat tables
 import model_ops.models  # noqa: F401 — model build/train tables
+import workflows.models  # noqa: F401 — workflow automation tables
 from database import create_db_and_tables
 from llm_proxy.core.provider_config import clear_runtime_provider_bases
 from llm_proxy.services.model_capabilities import clear_capability_cache
