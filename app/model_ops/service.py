@@ -287,11 +287,44 @@ def append_job_log(job: ModelBuildJob, text: str) -> None:
             f.write("\n")
 
 
+# Training logs grow to hundreds of MB; never read one whole just to show its end.
+_LOG_TAIL_BYTES = 256 * 1024
+
+
 def read_job_log_tail(job: ModelBuildJob, lines: int = 80) -> str:
     if not job.log_path or not Path(job.log_path).exists():
         return ""
-    content = Path(job.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    path = Path(job.log_path)
+    with path.open("rb") as f:
+        size = f.seek(0, 2)
+        f.seek(max(0, size - _LOG_TAIL_BYTES))
+        blob = f.read()
+    content = blob.decode("utf-8", errors="replace").splitlines()
+    if size > _LOG_TAIL_BYTES and content:
+        content = content[1:]  # the window almost certainly cut the first line in half
     return "\n".join(content[-lines:])
+
+
+def read_job_log_since(job: ModelBuildJob, offset: int) -> tuple[str, int]:
+    """Log bytes appended since ``offset``, plus the new offset.
+
+    Byte offsets, not string lengths: a tail window slides as the file grows, so slicing
+    one by a previous length re-sends or skips lines. Restarts from 0 if the file shrank.
+    """
+    if not job.log_path:
+        return "", offset
+    path = Path(job.log_path)
+    if not path.exists():
+        return "", offset
+    size = path.stat().st_size
+    if size < offset:
+        offset = 0
+    if size == offset:
+        return "", offset
+    with path.open("rb") as f:
+        f.seek(offset)
+        blob = f.read()
+    return blob.decode("utf-8", errors="replace"), offset + len(blob)
 
 
 def job_to_out(session: Session, job: ModelBuildJob, api_prefix: str = "/api/v1") -> ModelBuildJobOut:

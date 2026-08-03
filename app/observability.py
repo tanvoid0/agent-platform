@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -109,8 +110,49 @@ class JsonLogFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=True, default=str)
 
 
+class RingBufferHandler(logging.Handler):
+    """Keeps the last N formatted records so the app can serve its own log.
+
+    Stdout is where these lines really live, but nobody running the desktop app or a container has
+    a terminal attached to it. This is the same lines, addressable over HTTP, with a sequence
+    number so a poller can ask for what it has not seen instead of re-reading everything.
+    """
+
+    def __init__(self, capacity: int = 2000) -> None:
+        super().__init__()
+        self._records: deque[tuple[int, str]] = deque(maxlen=capacity)
+        self._next_seq = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record)
+        except Exception:  # a broken record must not take down the caller's request
+            return
+        # `emit` is called with the handler lock held, so the counter needs no lock of its own.
+        self._records.append((self._next_seq, line))
+        self._next_seq += 1
+
+    def snapshot(self, after: int = 0) -> dict[str, Any]:
+        records = list(self._records)
+        oldest = records[0][0] if records else after
+        return {
+            "lines": [line for seq, line in records if seq >= after],
+            "next": self._next_seq,
+            # Non-zero once the ring wrapped past what the caller last saw, so a gap is visible
+            # rather than silent.
+            "dropped": max(0, oldest - after),
+        }
+
+
+_RING_HANDLER: RingBufferHandler | None = None
+
+
+def log_ring() -> RingBufferHandler | None:
+    return _RING_HANDLER
+
+
 def setup_logging() -> None:
-    global _LOGGING_CONFIGURED
+    global _LOGGING_CONFIGURED, _RING_HANDLER
     if _LOGGING_CONFIGURED:
         return
 
@@ -120,9 +162,14 @@ def setup_logging() -> None:
     handler.setFormatter(JsonLogFormatter())
     handler.addFilter(StructuredContextFilter())
 
+    ring = RingBufferHandler(int(os.getenv("AGENT_PLATFORM_LOG_RING") or 2000))
+    ring.setFormatter(JsonLogFormatter())
+    ring.addFilter(StructuredContextFilter())
+
     root = logging.getLogger()
-    root.handlers = [handler]
+    root.handlers = [handler, ring]
     root.setLevel(level)
+    _RING_HANDLER = ring
     _LOGGING_CONFIGURED = True
 
 

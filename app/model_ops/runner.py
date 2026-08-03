@@ -52,7 +52,17 @@ def _stage_script(stage: str, project: str, offline_eval: bool) -> list[str]:
         body += f"from model_ops.pipeline.eval import run_eval\nrun_eval({project!r}, offline={offline_eval!r})\n"
     else:
         raise ValueError(f"Unknown stage: {stage}")
-    return [sys.executable, "-c", body]
+    return [_train_python(), "-c", body]
+
+
+def _train_python() -> str:
+    """Interpreter for GPU stages.
+
+    Desktop and Docker keep torch in a second environment so the API server stays small, so the
+    training interpreter is not the one running this process. Falls back to ``sys.executable``.
+    """
+    override = (os.environ.get("MODEL_OPS_PYTHON") or "").strip()
+    return override or sys.executable
 
 
 async def _run_subprocess_stage(cmd: list[str], job: ModelBuildJob) -> int:

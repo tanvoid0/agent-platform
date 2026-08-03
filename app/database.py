@@ -256,6 +256,40 @@ def create_db_and_tables() -> None:
         _seed_todo_domain_if_empty()
         logger.info("Todo domain seeded")
 
+        logger.info("Starting default project seeding...")
+        _seed_default_project_if_empty()
+        logger.info("Default project seeded")
+
+
+def _seed_default_project_if_empty() -> None:
+    """Give a fresh install one project to work in.
+
+    Processes can run unassigned, but anything project-scoped degrades silently without a
+    project row: the assistant skips `store_user_profile` with "no project", and
+    `record_board_visit` drops the "Continue planning" pointer. Seeding one means a new
+    install is usable without the user first creating a project by hand.
+    """
+    from sqlmodel import Session, select
+
+    from models import Project, Workspace
+
+    with Session(engine) as session:
+        if session.exec(select(Project).limit(1)).first():
+            return
+        # Attach to the tenant the tenancy migration already seeds, so the project is visible
+        # to a workspace-scoped token rather than stranded outside every workspace.
+        workspace = session.exec(
+            select(Workspace).where(Workspace.slug == "default")
+        ).first()
+        session.add(
+            Project(
+                name="My Project",
+                description="Starter project — rename it, or add your own under Projects.",
+                workspace_id=workspace.id if workspace else None,
+            )
+        )
+        session.commit()
+
 
 def _seed_todo_domain_if_empty() -> None:
     from sqlmodel import Session

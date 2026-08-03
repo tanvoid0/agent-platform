@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
@@ -456,17 +457,20 @@ async def model_jobs_stream(
         raise HTTPException(status_code=404, detail="Job not found")
 
     async def _gen():
-        from model_ops.service import read_job_log_tail
+        from model_ops.service import read_job_log_since, read_job_log_tail
 
-        last_len = 0
+        # Send recent context once, then only the bytes appended after it.
+        offset = Path(job.log_path).stat().st_size if job.log_path and Path(job.log_path).exists() else 0
+        first = read_job_log_tail(job, lines=200)
         while True:
             job_ref = get_job(session, job_id)
             if job_ref is None:
                 break
-            tail = read_job_log_tail(job_ref, lines=200)
-            if len(tail) > last_len:
-                chunk = tail[last_len:]
-                last_len = len(tail)
+            if first:
+                chunk, first = first, ""
+            else:
+                chunk, offset = read_job_log_since(job_ref, offset)
+            if chunk:
                 payload = json.dumps({"log": chunk, "status": job_ref.status, "stage": job_ref.current_stage})
                 yield f"event: log\ndata: {payload}\n\n"
             if job_ref.status in ("succeeded", "failed", "cancelled"):

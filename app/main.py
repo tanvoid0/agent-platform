@@ -26,6 +26,7 @@ from observability import RequestLoggingMiddleware, setup_logging
 from process_routes import router as process_router
 from projects_routes import router as projects_router
 from startup_validation import assert_startup_config
+from system_routes import router as system_router
 from workspaces_routes import router as workspaces_router, me_router as me_workspace_router
 from teams_routes import router as teams_router
 from todos.routes import router as todos_router
@@ -105,14 +106,35 @@ app.include_router(coder_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(model_ops_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(chat_router, prefix="/api/v1", dependencies=_api_deps)
 app.include_router(llm_proxy_admin_router, prefix="/api/v1/llm-proxy", dependencies=_api_deps)
+app.include_router(system_router, prefix="/api/v1", dependencies=_api_deps)
 
 _cors_origins = [
     o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
 ] or ["*"]
 # Browsers reject Access-Control-Allow-Origin: * together with Allow-Credentials: true.
 _cors_allow_credentials = "*" not in _cors_origins
+
+
+class LoggingCORSMiddleware(CORSMiddleware):
+    """CORS with the rejected origin in the log.
+
+    A failed preflight is a bare 400 with no request-log line, so a client whose origin is not on
+    the list looks identical to a broken server. Naming the origin turns that into a one-line fix.
+    """
+
+    def preflight_response(self, request_headers):
+        response = super().preflight_response(request_headers)
+        if response.status_code == 400:
+            logging.getLogger("agent_platform").warning(
+                "CORS preflight rejected: origin=%r allowed=%s",
+                request_headers.get("origin"),
+                _cors_origins,
+            )
+        return response
+
+
 app.add_middleware(
-    CORSMiddleware,
+    LoggingCORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],

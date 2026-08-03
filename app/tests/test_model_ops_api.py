@@ -245,3 +245,46 @@ def test_model_ops_prepare_stage_integration(client, model_ops_data_dir):
     lines = train_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) >= 1
 
+
+
+def test_job_log_reads_are_incremental_and_windowed(tmp_path):
+    """SSE log streaming must slice by byte offset, not by tail-string length."""
+    from types import SimpleNamespace
+
+    from model_ops import service
+    from model_ops.service import read_job_log_since, read_job_log_tail
+
+    log = tmp_path / "job.log"
+    log.write_text("".join(f"line {i}\n" for i in range(500)), encoding="utf-8")
+    job = SimpleNamespace(log_path=str(log))
+
+    # Tail keeps only the last N lines, and never reads the whole file.
+    tail = read_job_log_tail(job, lines=200).splitlines()
+    assert len(tail) == 200
+    assert tail[-1] == "line 499"
+
+    # Streaming from the end sees nothing until the writer appends.
+    offset = log.stat().st_size
+    chunk, offset = read_job_log_since(job, offset)
+    assert chunk == ""
+
+    with log.open("a", encoding="utf-8") as f:
+        f.write("line 500\n")
+    chunk, offset = read_job_log_since(job, offset)
+    assert chunk.rstrip("\r\n") == "line 500"  # text-mode writers emit CRLF on Windows
+    assert offset == log.stat().st_size
+
+    # Second poll with no writes must not re-send anything (the old length-slice bug).
+    chunk, offset = read_job_log_since(job, offset)
+    assert chunk == ""
+
+    # A truncated/rotated log restarts from 0 instead of returning garbage.
+    log.write_text("fresh\n", encoding="utf-8")
+    chunk, offset = read_job_log_since(job, offset)
+    assert chunk.rstrip("\r\n") == "fresh"
+
+    # A log larger than the tail window drops the half-line the window cut.
+    log.write_text("x" * (service._LOG_TAIL_BYTES + 10) + "\ntail line\n", encoding="utf-8")
+    windowed = read_job_log_tail(job, lines=200).splitlines()
+    assert windowed[-1] == "tail line"
+    assert len(windowed) == 1
