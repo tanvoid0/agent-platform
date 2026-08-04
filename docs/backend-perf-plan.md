@@ -208,13 +208,30 @@ the plan above, all discovered during implementation:
 4. **`open_stream` keeps its 2-tuple**, now always returning `None` as the second
    element, so the six `response, client = await ...` call sites are untouched.
 
-`app/tests/test_upstream_pooling.py` is the regression guard. Verified it
-discriminates: 3 sequential GETs over one pooled connection vs **3 connections**
-with per-call clients, so it fails loudly if a per-call `httpx.AsyncClient()`
-returns.
+### Regression guards
 
-Not committed — working tree also carries unrelated in-flight edits to
-`desktop/crates/app/src/main.rs` and `services/speech-service/`.
+Both were checked against the broken version, not just the working one — a guard
+that cannot fail is not a guard.
+
+- `app/tests/test_upstream_pooling.py` — 3 sequential GETs share **1** connection.
+  Per-call clients produce **3**, confirmed directly.
+- `app/tests/test_auth_context_propagation.py` — a log record emitted *inside* a
+  handler carries `workspace_id`. Confirmed a `def` dependency loses the write
+  (handler sees `None`) while the `async def` form keeps it, so this fails if
+  anyone "simplifies" the auth dependency to a plain `def`.
+
+### Live smoke test
+
+Booted the real server (not just TestClient), minted a workspace token, and drove
+the changed paths: the `agp_` auth path through `asyncio.to_thread` (5 consecutive
+authenticated calls, all 200), the de-asynced `get_thread` cascade, and the
+de-asynced stream-response builders. 22 requests served, **zero errors or
+tracebacks** in the log.
+
+One honest caveat from that run: every `workspace_id` log line came from
+`agent_platform.request`, the middleware logger, which re-derives from
+`request.state`. So the live run did *not* by itself prove the contextvar path —
+that is what the dedicated test above is for.
 
 ## What this does not fix
 
