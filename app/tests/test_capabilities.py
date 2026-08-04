@@ -197,6 +197,34 @@ def test_speech_forwarded_with_defaults_when_backend_configured(client, monkeypa
     assert captured["body"]["response_format"] == "mp3"
 
 
+def test_speech_sends_bearer_only_when_a_key_is_set(client, monkeypatch):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", MASTER_KEY)
+    monkeypatch.setenv("SPEECH_API_BASE", "http://127.0.0.1:8123")
+
+    seen = []
+
+    async def fake_post_with_retry(url, **kwargs):
+        seen.append(kwargs.get("headers") or {})
+        return type(
+            "R",
+            (),
+            {"status_code": 200, "content": b"ID3", "headers": {"content-type": "audio/mpeg"}},
+        )()
+
+    monkeypatch.setattr("llm_proxy.routes.llm.post_with_retry", fake_post_with_retry)
+
+    # Local server: no key configured, so nothing is sent upstream.
+    monkeypatch.delenv("SPEECH_API_KEY", raising=False)
+    c.post("/v1/audio/speech", json={"input": "one"}, headers=_master_headers())
+    assert "Authorization" not in seen[-1]
+
+    # Hosted upstream: the configured key rides along.
+    monkeypatch.setenv("SPEECH_API_KEY", "sk-speech")
+    c.post("/v1/audio/speech", json={"input": "two"}, headers=_master_headers())
+    assert seen[-1]["Authorization"] == "Bearer sk-speech"
+
+
 def test_speech_rejects_empty_input(client, monkeypatch):
     c, _mock_cls, _mock_inst = client
     monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", MASTER_KEY)

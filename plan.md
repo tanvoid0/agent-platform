@@ -61,9 +61,9 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
 - **UX polish pass** — drive the app, audit each screen against the `ui/` kit;
   newer screens (workflows, providers, memory, history sidebar) landed fast.
 - **E.V. voice** — `POST /v1/audio/speech` proxies whatever `SPEECH_API_BASE`
-  points at (Piper/Kokoro or a provider) and the desktop tries it before its own
-  engines; still open is upstream key handling for hosted providers, and picking
-  a self-hosted model. Roadmap in `docs/ev-voice-roadmap.md`.
+  points at (Piper/Kokoro or a hosted provider, keyed by `SPEECH_API_KEY`) and
+  the desktop tries it before its own engines. Open: pick and stand up a
+  self-hosted model. Roadmap in `docs/ev-voice-roadmap.md`.
 - **Assistant roadmap** — `docs/practical-assistant-roadmap.md`. Its phases are
   server-complete but UI-unported: todo boards and the assistant dashboard have
   no native screen (the desktop `assistant.rs` is the E.V. voice HUD).

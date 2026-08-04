@@ -37,12 +37,15 @@ Defaults are `SPEECH_DEFAULT_MODEL=tts-1` and `SPEECH_DEFAULT_VOICE=alloy`
 
 ## TTS — options to explore (in rough order of effort)
 
-1. **Provider TTS via BYOK** (lowest effort, best quality, costs per char)
-   - OpenAI `gpt-4o-mini-tts` / ElevenLabs / Azure Speech.
-   - Path: point `SPEECH_API_BASE` at the provider. The endpoint is built; what
-     is missing is per-provider key handling — the route sends no upstream
-     `Authorization`, so a hosted provider needs its key wired through the way
-     the chat providers do it.
+1. **Provider TTS** (lowest effort, best quality, costs per char) — **wired**
+   - Point `SPEECH_API_BASE` at the provider and set `SPEECH_API_KEY`; it is
+     sent as `Authorization: Bearer`. One key for whatever the base URL is,
+     not a key per named provider — the route already requires an OpenAI-shaped
+     upstream, and every hosted one of those takes a bearer token.
+   - Exercised against a stub upstream only — no hosted provider has been
+     called with a real key yet. A backend with its own auth scheme
+     (ElevenLabs' `xi-api-key`) needs a gateway in front, or a row of its own
+     in `speech_backends.py`.
 
 2. **Self-hosted open source** (no per-use cost, build-it-yourself appeal)
    - **Piper** — fast CPU ONNX, real-time on modest hardware, decent quality.

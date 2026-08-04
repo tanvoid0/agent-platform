@@ -49,6 +49,18 @@ def speech_local_configured() -> bool:
     return bool(speech_local_api_base())
 
 
+def speech_api_key() -> str:
+    """Bearer token for the upstream, empty for a local server that wants none.
+
+    One key for whatever ``SPEECH_API_BASE`` points at, rather than a key per
+    named provider: the route already requires an OpenAI-shaped upstream, and
+    every hosted one of those authenticates with a bearer token. A backend with
+    its own scheme (ElevenLabs' ``xi-api-key``) needs a gateway in front, or its
+    own row here.
+    """
+    return _from_env_or_dotenv("SPEECH_API_KEY") or ""
+
+
 def speech_default_model() -> str:
     return _from_env_or_dotenv("SPEECH_DEFAULT_MODEL") or DEFAULT_SPEECH_MODEL
 

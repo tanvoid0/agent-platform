@@ -35,6 +35,7 @@ from llm_proxy.services.image_backends import (
 from llm_proxy.services.speech_backends import (
     DEFAULT_SPEECH_FORMAT,
     SPEECH_PROVIDER_IDS,
+    speech_api_key,
     speech_default_model,
     speech_default_voice,
     speech_provider_configured,
@@ -964,9 +965,14 @@ async def audio_speech(
             raise HTTPException(status_code=400, detail=f"{field} must be a string")
         body[field] = (value or "").strip() or default
 
+    headers = {"Content-Type": "application/json"}
+    # Hosted upstreams need a key; a local Piper/Kokoro server takes none.
+    if key := speech_api_key():
+        headers["Authorization"] = f"Bearer {key}"
+
     r = await post_with_retry(
         speech_upstream_url(prov),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         json_body=body,
         timeout=120.0,
         context="audio_speech",
