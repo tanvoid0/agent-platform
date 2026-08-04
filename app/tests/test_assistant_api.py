@@ -1,6 +1,6 @@
 """Tests for Personal Assistant API."""
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 from sqlmodel import Session, select
@@ -8,6 +8,7 @@ from sqlmodel import Session, select
 from chat_usage import LlmUsageOut
 from assistant.models import AssistantChatThread, AssistantDomainProfile, AssistantReview
 from models import Project
+from time_utils import utc_now_naive
 from todos.models import TodoBoard, TodoItem
 from todos.seeds import seed_todo_domain_if_empty
 
@@ -46,7 +47,7 @@ def test_assistant_create_item_with_schedule(client, test_engine):
     dash = c.get(f"/api/v1/assistant/dashboard?project_id={project_id}").json()
     board_id = dash["board_id"]
 
-    due = (datetime.utcnow() + timedelta(days=1)).isoformat()
+    due = (utc_now_naive() + timedelta(days=1)).isoformat()
     r = c.post(
         f"/api/v1/todos/boards/{board_id}/items",
         json={
@@ -284,7 +285,7 @@ def test_assistant_apply_create_item(client, test_engine):
     board_id = dash["board_id"]
     category_id = dash["categories"][0]["id"]
 
-    due = (datetime.utcnow() + timedelta(days=2)).isoformat()
+    due = (utc_now_naive() + timedelta(days=2)).isoformat()
     r = c.post(
         f"/api/v1/assistant/chat/apply?project_id={project_id}",
         json={
@@ -894,7 +895,7 @@ def test_send_clears_stale_informational_pending(client, test_engine):
     project_id = pr.json()["id"]
 
     with Session(test_engine) as session:
-        now = datetime.utcnow()
+        now = utc_now_naive()
         chat = AssistantChatThread(
             project_id=project_id,
             title="Stale pending chat",
@@ -1033,7 +1034,7 @@ def test_assistant_reset_clears_board_and_chat(client, test_engine):
     )
 
     with Session(test_engine) as session:
-        now = datetime.utcnow()
+        now = utc_now_naive()
         chat = AssistantChatThread(
             project_id=project_id,
             title="Old chat",
@@ -1050,8 +1051,8 @@ def test_assistant_reset_clears_board_and_chat(client, test_engine):
         profile = AssistantDomainProfile(
             project_id=project_id,
             domain="fitness",
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
+            created_at=utc_now_naive(),
+            updated_at=utc_now_naive(),
         )
         profile.set_profile({"weight_kg": 70})
         session.add(profile)
@@ -1121,7 +1122,6 @@ def test_dismiss_review_persists(client, test_engine):
     project_id = pr.json()["id"]
 
     from assistant.models import AssistantReview
-    from time_utils import utc_now_naive
 
     with Session(test_engine) as session:
         now = utc_now_naive()
