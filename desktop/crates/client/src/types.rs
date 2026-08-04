@@ -714,3 +714,77 @@ pub struct WorkflowAssistResponse {
     /// Server-validated replacement steps; `None` means "no change proposed".
     pub steps: Option<Vec<Value>>,
 }
+
+// -- Todos -------------------------------------------------------------------
+
+/// Item statuses, in board order. The server validates against the same list
+/// (`TODO_STATUSES` in `app/todos/models.py`).
+pub const TODO_STATUSES: [&str; 5] = ["plan", "backlog", "in_progress", "review", "done"];
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TodoBoardSummary {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub category_count: i64,
+    pub item_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TodoBoardsResponse {
+    pub boards: Vec<TodoBoardSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TodoCategory {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TodoItem {
+    pub id: i64,
+    pub category_id: Option<i64>,
+    pub title: String,
+    pub description: String,
+    pub status: String,
+    pub priority: i64,
+    pub tags: Vec<String>,
+    pub due_at: Option<String>,
+}
+
+/// A board with everything on it — one request renders the whole kanban.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TodoBoardDetail {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub categories: Vec<TodoCategory>,
+    pub items: Vec<TodoItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TodoBoardBody {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TodoItemBody {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<i64>,
+}
+
+/// Partial update: only the fields present are changed.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TodoItemPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<i64>,
+}

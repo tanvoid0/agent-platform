@@ -367,6 +367,41 @@ impl Client {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    // -- Todos -----------------------------------------------------------------
+
+    pub async fn todo_boards(&self) -> Result<TodoBoardsResponse> {
+        self.get_json("/api/v1/todos/boards").await
+    }
+
+    /// The whole board — categories and items in one response.
+    pub async fn todo_board(&self, id: i64) -> Result<TodoBoardDetail> {
+        self.get_json(&format!("/api/v1/todos/boards/{id}")).await
+    }
+
+    pub async fn create_todo_board(&self, body: &TodoBoardBody) -> Result<TodoBoardSummary> {
+        self.post_json("/api/v1/todos/boards", body).await
+    }
+
+    pub async fn delete_todo_board(&self, id: i64) -> Result<()> {
+        self.delete_json::<serde::de::IgnoredAny>(&format!("/api/v1/todos/boards/{id}"))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn create_todo_item(&self, board: i64, body: &TodoItemBody) -> Result<TodoItem> {
+        self.post_json(&format!("/api/v1/todos/boards/{board}/items"), body).await
+    }
+
+    pub async fn update_todo_item(&self, id: i64, body: &TodoItemPatch) -> Result<TodoItem> {
+        self.patch_json(&format!("/api/v1/todos/items/{id}"), body).await
+    }
+
+    pub async fn delete_todo_item(&self, id: i64) -> Result<()> {
+        self.delete_json::<serde::de::IgnoredAny>(&format!("/api/v1/todos/items/{id}"))
+            .await
+            .map(|_| ())
+    }
+
     // -- LLM providers ---------------------------------------------------------
 
     pub async fn llm_env(&self) -> Result<LlmEnv> {

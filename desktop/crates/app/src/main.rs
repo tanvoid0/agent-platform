@@ -31,6 +31,8 @@ mod screen;
 mod shell;
 mod stt;
 mod ui;
+mod todos;
+mod todos_view;
 mod workflows;
 mod workflows_view;
 
@@ -52,6 +54,7 @@ pub enum Screen {
     Projects,
     Teams,
     Workflows,
+    Plans,
     Chat,
     Assistant,
     Memory,
@@ -161,6 +164,7 @@ pub struct App {
     pub history: history::Store,
     pub providers: providers::State,
     pub workflows: workflows::State,
+    pub todos: todos::State,
 }
 
 impl App {
@@ -230,6 +234,7 @@ pub enum Message {
     History(history::Message),
     Providers(providers::Message),
     Workflows(workflows::Message),
+    Todos(todos::Message),
 }
 
 /// The 32×32 frame of the app icon as RGBA, for the title bar and the tray.
@@ -395,6 +400,7 @@ fn boot() -> (App, Task<Message>) {
         history: history::Store::load(&app_dir),
         providers: providers::State::default(),
         workflows: workflows::State::default(),
+        todos: todos::State::default(),
     };
     let task = if minimized { Task::none() } else { open_window() };
     let bootstrap = Task::batch([
@@ -428,6 +434,7 @@ fn enter_screen(app: &App) -> Task<Message> {
             Task::done(Message::Library(library::Message::Refresh))
         }
         Screen::Workflows => Task::done(Message::Workflows(workflows::Message::Refresh)),
+        Screen::Plans => Task::done(Message::Todos(todos::Message::Refresh)),
         // The dropdowns need the provider catalog once; chat itself works
         // without it, so a failed load costs nothing but empty pickers.
         Screen::Chat if app.chat.catalog.is_empty() => {
@@ -767,6 +774,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Providers(msg) => {
             providers::update(&mut app.providers, &app.client, msg).map(Message::Providers)
         }
+        Message::Todos(msg) => todos::update(&mut app.todos, &app.client, msg).map(Message::Todos),
         Message::Workflows(msg) => {
             workflows::update(&mut app.workflows, &app.client, msg).map(Message::Workflows)
         }
@@ -903,6 +911,7 @@ mod tests {
             Screen::Projects,
             Screen::Teams,
             Screen::Workflows,
+            Screen::Plans,
             Screen::Chat,
             Screen::Assistant,
         ]

@@ -84,6 +84,9 @@ icons! {
     VolumeOff => volume_x,
     Search => search,
     Settings => settings,
+    ChevronLeft => chevron_left,
+    ChevronRight => chevron_right,
+    ListChecks => list_checks,
 
     // theme
     Sun => sun,
