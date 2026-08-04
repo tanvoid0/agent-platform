@@ -559,7 +559,7 @@ impl State {
     /// Start synthesizing the next queued sentence, if the synthesizer is free.
     /// Runs a sentence ahead of playback, which is the whole point: the clip for
     /// sentence N+1 is being made while N is still coming out of the speakers.
-    fn next_synthesis(&mut self) -> Task<Message> {
+    fn next_synthesis(&mut self, client: &Client) -> Task<Message> {
         if self.synthesizing {
             return Task::none();
         }
@@ -568,8 +568,17 @@ impl State {
         };
         self.synthesizing = true;
         self.speaking = Some(text.clone());
+        let client = client.clone();
         Task::perform(
             async move {
+                // The server's own voice first (`SPEECH_API_BASE`: a hosted
+                // provider, or a local Piper/Kokoro). It answers 501 when no
+                // backend is configured, which is the common case — so this is
+                // a loopback round-trip, not a real cost, and turning the
+                // backend on takes effect without restarting the app.
+                if let Ok(bytes) = client.speech(&text).await {
+                    return Ok(bytes);
+                }
                 tokio::task::spawn_blocking(move || synthesize(&text))
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()))
@@ -902,7 +911,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             // reply is still being generated — that is the whole latency win.
             Task::batch([
                 iced::widget::operation::snap_to_end(transcript_id()),
-                state.next_synthesis(),
+                state.next_synthesis(client),
             ])
         }
         Message::Chunk(ChatChunk::Done) => {
@@ -931,7 +940,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 state.md[last] = iced::widget::markdown::parse(&shown).collect();
                 return Task::batch([
                     iced::widget::operation::snap_to_end(transcript_id()),
-                    state.next_synthesis(),
+                    state.next_synthesis(client),
                     Task::perform(run_tools(calls), Message::ToolResults),
                 ]);
             }
@@ -941,7 +950,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.last_reply = state.phase;
             Task::batch([
                 iced::widget::operation::snap_to_end(transcript_id()),
-                state.next_synthesis(),
+                state.next_synthesis(client),
             ])
         }
         Message::Chunk(ChatChunk::Failed(e)) => {
@@ -955,7 +964,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 state.enqueue_speech(&tail);
             }
             state.speech_buf.clear();
-            state.next_synthesis()
+            state.next_synthesis(client)
         }
         Message::Listen => {
             // Toggle hands-free listening. Off drops the stream, which is the
@@ -1056,7 +1065,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 }
             }
             state.drain_audio();
-            state.next_synthesis()
+            state.next_synthesis(client)
         }
         Message::OpenMicSettings => {
             // ms-settings: deep link straight to Privacy → Microphone.

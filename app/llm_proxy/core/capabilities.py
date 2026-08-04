@@ -25,14 +25,20 @@ from llm_proxy.services.image_backends import (
     image_provider_configured,
     is_image_provider,
 )
+from llm_proxy.services.speech_backends import (
+    SPEECH_PROVIDER_IDS,
+    is_speech_provider,
+    speech_provider_configured,
+)
 
-Modality = Literal["chat", "vision_input", "embeddings", "image_generation"]
+Modality = Literal["chat", "vision_input", "embeddings", "image_generation", "speech"]
 
 MODALITIES: tuple[Modality, ...] = (
     "chat",
     "vision_input",
     "embeddings",
     "image_generation",
+    "speech",
 )
 
 # Per-provider declared modalities. Keep in sync with each backend's real
@@ -47,6 +53,8 @@ _PROVIDER_MODALITIES: dict[str, frozenset[Modality]] = {
     "gemini": frozenset({"chat", "vision_input", "embeddings"}),
     # Image backend (separate registry; see services.image_backends).
     "image_local": frozenset({"image_generation"}),
+    # Speech backend (separate registry; see services.speech_backends).
+    "speech_local": frozenset({"speech"}),
 }
 
 # Chat-only default for providers registered later without a modality row.
@@ -69,15 +77,17 @@ def modality_map(provider: str) -> dict[str, bool]:
 
 
 def _is_configured(provider: str) -> bool:
-    """Configured check across both the chat and image registries."""
+    """Configured check across the chat, image and speech registries."""
     if is_image_provider(provider):
         return image_provider_configured(provider)
+    if is_speech_provider(provider):
+        return speech_provider_configured(provider)
     return provider_configured(provider)
 
 
 def _providers_by_local_preference() -> list[str]:
-    """All capability providers (chat + image), local backends first."""
-    providers = list(SUPPORTED_PROVIDER_IDS) + list(IMAGE_PROVIDER_IDS)
+    """All capability providers (chat + image + speech), local backends first."""
+    providers = list(SUPPORTED_PROVIDER_IDS) + list(IMAGE_PROVIDER_IDS) + list(SPEECH_PROVIDER_IDS)
     return sorted(
         providers,
         key=lambda pid: PROVIDER_LOCAL_SORT_ORDER.get(pid, 99),

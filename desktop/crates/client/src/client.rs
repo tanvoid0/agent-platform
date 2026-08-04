@@ -343,6 +343,30 @@ impl Client {
         Self::handle(resp).await
     }
 
+    /// Synthesize speech through the server's configured backend, returning the
+    /// audio bytes. The body is audio, not JSON, so this bypasses `handle`.
+    ///
+    /// A 501 means no speech backend is configured — the caller is expected to
+    /// fall back to a local engine rather than treat it as a failure.
+    pub async fn speech(&self, text: &str) -> Result<Vec<u8>> {
+        let resp = self
+            .authed(
+                self.http
+                    .post(self.url("/v1/audio/speech"))
+                    .json(&serde_json::json!({ "input": text })),
+            )
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await?;
+            let body: Option<Value> = serde_json::from_str(&text).ok();
+            let message = body.as_ref().map(detail_message).unwrap_or(text);
+            return Err(Error::Api { status: status.as_u16(), message, body });
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     // -- LLM providers ---------------------------------------------------------
 
     pub async fn llm_env(&self) -> Result<LlmEnv> {

@@ -17,13 +17,32 @@ Status as of 2026-08-03. E.V. lives in `desktop/crates/app/src/assistant.rs` /
   (WinRT `SpeechRecognizer` was tried first and abandoned: its online backend
   no longer transcribes on current Windows 11 builds.)
 
+## The server route — done 2026-08-04
+
+`POST /v1/audio/speech` exists on the FastAPI app and is what the desktop tries
+first for every sentence; Edge neural, then the native engine, remain the
+fallbacks (in that order, per sentence, so a backend that dies mid-reply does
+not silence the rest of it).
+
+It is a thin proxy to whatever answers at `SPEECH_API_BASE` in the OpenAI speech
+shape — a hosted provider, or a local Piper/Kokoro server, the choice below is
+now a deployment question rather than a code one. Registry and capability
+routing mirror image generation: `llm_proxy/services/speech_backends.py`, the
+`speech` modality in `core/capabilities.py`, `speech_local` in
+`/v1/capabilities`. Unconfigured answers a structured 501, which the desktop
+reads as "use your own engine".
+
+Defaults are `SPEECH_DEFAULT_MODEL=tts-1` and `SPEECH_DEFAULT_VOICE=alloy`
+(see `.env.example`); the desktop sends only `input` and takes them.
+
 ## TTS — options to explore (in rough order of effort)
 
 1. **Provider TTS via BYOK** (lowest effort, best quality, costs per char)
    - OpenAI `gpt-4o-mini-tts` / ElevenLabs / Azure Speech.
-   - Path: add `/v1/audio/speech` proxy endpoint to the FastAPI server (mirrors
-     the existing chat proxy + provider-key model), desktop client hits it the
-     same way it hits `/chat`. Keys already managed by the Providers screen.
+   - Path: point `SPEECH_API_BASE` at the provider. The endpoint is built; what
+     is missing is per-provider key handling — the route sends no upstream
+     `Authorization`, so a hosted provider needs its key wired through the way
+     the chat providers do it.
 
 2. **Self-hosted open source** (no per-use cost, build-it-yourself appeal)
    - **Piper** — fast CPU ONNX, real-time on modest hardware, decent quality.
@@ -32,14 +51,16 @@ Status as of 2026-08-03. E.V. lives in `desktop/crates/app/src/assistant.rs` /
      Current best quality/size ratio.
    - **F5-TTS / XTTS-v2** — voice cloning (give E.V. a custom voice), GPU
      preferred, slower.
-   - Integration path: the Python sidecar already exists — serve the model from
-     a `/v1/audio/speech` endpoint in the same FastAPI app. Desktop code needs
-     zero changes beyond pointing `synthesize()` at it. This is the recommended
-     route for a self-built voice.
+   - Integration path: run one of them behind an OpenAI-shaped server and set
+     `SPEECH_API_BASE` — no desktop or proxy change. Serving the model in-process
+     from the sidecar is the other option, and costs a heavy Python dependency
+     in the packaged payload. This is the recommended route for a self-built
+     voice.
 
 3. **Latency polish (applies to any backend)**
-   - Split reply into sentences, synthesize per sentence, queue chunks into one
-     rodio sink → first audio in ~0.5s instead of waiting for the full reply.
+   - ~~Split reply into sentences, synthesize per sentence, queue chunks into
+     one rodio sink~~ — **done**: `take_sentence` + `speech_queue` in
+     `assistant.rs`, first audio lands while the reply is still streaming.
    - Cache greeting/ack phrases ("On it.", "Systems nominal.") as local files.
 
 ## STT — options to explore

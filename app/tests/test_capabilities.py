@@ -98,13 +98,15 @@ def test_capabilities_endpoint_shape(client, monkeypatch):
     assert body["object"] == "capabilities"
     assert "image_generation" in body["modalities"]
     assert set(body["providers"]) == set(
-        ["ollama", "lm_studio", "aimlapi", "anthropic", "gemini", "image_local"]
+        ["ollama", "lm_studio", "aimlapi", "anthropic", "gemini", "image_local", "speech_local"]
     )
     assert "chat" in body["providers"]["ollama"]
     assert "configured" in body["providers"]["ollama"]
     assert body["providers"]["image_local"]["image_generation"] is True
     # No IMAGE_API_BASE in test env => image backend unconfigured, unresolved.
     assert body["resolved"]["image_generation"] is None
+    assert body["providers"]["speech_local"]["speech"] is True
+    assert body["resolved"]["speech"] is None
 
 
 def test_catalog_capabilities_include_modalities(client, monkeypatch):
@@ -142,6 +144,65 @@ def test_images_501_when_no_backend_configured(client, monkeypatch):
     )
     assert r.status_code == 501
     assert r.json()["error"]["code"] == "capability_unavailable"
+
+
+def test_speech_501_when_no_backend_configured(client, monkeypatch):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", MASTER_KEY)
+    monkeypatch.delenv("SPEECH_API_BASE", raising=False)
+    r = c.post(
+        "/v1/audio/speech",
+        json={"input": "Systems nominal."},
+        headers=_master_headers(),
+    )
+    assert r.status_code == 501
+    assert r.json()["error"]["code"] == "capability_unavailable"
+
+
+def test_speech_forwarded_with_defaults_when_backend_configured(client, monkeypatch):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", MASTER_KEY)
+    monkeypatch.setenv("SPEECH_API_BASE", "http://127.0.0.1:8123")
+
+    captured = {}
+
+    async def fake_post_with_retry(url, **kwargs):
+        captured["url"] = url
+        captured["body"] = kwargs.get("json_body")
+        return type(
+            "R",
+            (),
+            {
+                "status_code": 200,
+                "content": b"ID3audio",
+                "headers": {"content-type": "audio/mpeg"},
+            },
+        )()
+
+    monkeypatch.setattr("llm_proxy.routes.llm.post_with_retry", fake_post_with_retry)
+
+    r = c.post(
+        "/v1/audio/speech",
+        json={"input": "Systems nominal."},
+        headers=_master_headers(),
+    )
+    assert r.status_code == 200
+    assert r.content == b"ID3audio"
+    assert r.headers["content-type"] == "audio/mpeg"
+    assert captured["url"] == "http://127.0.0.1:8123/v1/audio/speech"
+    assert captured["body"]["input"] == "Systems nominal."
+    # Model, voice and format fall back to the configured defaults.
+    assert captured["body"]["model"] == "tts-1"
+    assert captured["body"]["voice"] == "alloy"
+    assert captured["body"]["response_format"] == "mp3"
+
+
+def test_speech_rejects_empty_input(client, monkeypatch):
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", MASTER_KEY)
+    monkeypatch.setenv("SPEECH_API_BASE", "http://127.0.0.1:8123")
+    r = c.post("/v1/audio/speech", json={"input": "   "}, headers=_master_headers())
+    assert r.status_code == 400
 
 
 def test_images_forwarded_when_backend_configured(client, monkeypatch):

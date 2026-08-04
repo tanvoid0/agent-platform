@@ -32,6 +32,14 @@ from llm_proxy.services.image_backends import (
     image_provider_configured,
     image_upstream_url,
 )
+from llm_proxy.services.speech_backends import (
+    DEFAULT_SPEECH_FORMAT,
+    SPEECH_PROVIDER_IDS,
+    speech_default_model,
+    speech_default_voice,
+    speech_provider_configured,
+    speech_upstream_url,
+)
 from llm_proxy.core.config_cache import load_config_yaml_dict, read_env_file_parsed
 from llm_proxy.core.errors import LlmProxyError
 from llm_proxy.core.provider_config import (
@@ -830,6 +838,11 @@ async def capabilities(
             **modality_map(provider),
             "configured": image_provider_configured(provider),
         }
+    for provider in SPEECH_PROVIDER_IDS:
+        matrix[provider] = {
+            **modality_map(provider),
+            "configured": speech_provider_configured(provider),
+        }
     resolved = {
         capability: resolve_provider_for_capability(capability) for capability in MODALITIES
     }
@@ -907,6 +920,61 @@ async def images_generations(
         content=r.content,
         status_code=r.status_code,
         media_type=r.headers.get("content-type", "application/json"),
+    )
+
+
+@router.post("/v1/audio/speech")
+async def audio_speech(
+    request: Request,
+    principal: TokenPrincipal = Depends(require_valid_token),
+) -> Response:
+    """OpenAI-style text-to-speech, routed to the configured speech backend.
+
+    The response body is audio, so it is returned as-is with the upstream's
+    content type rather than parsed. No speech backend configured => structured
+    501, which is what the desktop app reads as "use your own voice engine".
+    """
+    require_scope(principal, "chat:write")
+    try:
+        body: dict[str, Any] = await request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+
+    body = dict(body)
+    text = body.get("input")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="input is required")
+
+    raw_provider_hint = body.pop("provider", None)
+    hint = ""
+    if raw_provider_hint is not None:
+        if not isinstance(raw_provider_hint, str):
+            raise HTTPException(status_code=400, detail="provider must be a string")
+        hint = raw_provider_hint.strip().lower()
+
+    prov = require_provider_for_capability("speech", preferred=hint or None)
+
+    for field, default in (
+        ("model", speech_default_model()),
+        ("voice", speech_default_voice()),
+        ("response_format", DEFAULT_SPEECH_FORMAT),
+    ):
+        value = body.get(field)
+        if value is not None and not isinstance(value, str):
+            raise HTTPException(status_code=400, detail=f"{field} must be a string")
+        body[field] = (value or "").strip() or default
+
+    r = await post_with_retry(
+        speech_upstream_url(prov),
+        headers={"Content-Type": "application/json"},
+        json_body=body,
+        timeout=120.0,
+        context="audio_speech",
+    )
+    return Response(
+        content=r.content,
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "audio/mpeg"),
     )
 
 
