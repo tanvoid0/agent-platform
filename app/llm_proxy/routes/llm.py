@@ -33,9 +33,9 @@ from llm_proxy.services.image_backends import (
     image_upstream_url,
 )
 from llm_proxy.services.speech_backends import (
-    DEFAULT_SPEECH_FORMAT,
     SPEECH_PROVIDER_IDS,
     speech_api_key,
+    speech_default_format,
     speech_default_model,
     speech_default_voice,
     speech_provider_configured,
@@ -958,7 +958,7 @@ async def audio_speech(
     for field, default in (
         ("model", speech_default_model()),
         ("voice", speech_default_voice()),
-        ("response_format", DEFAULT_SPEECH_FORMAT),
+        ("response_format", speech_default_format()),
     ):
         value = body.get(field)
         if value is not None and not isinstance(value, str):

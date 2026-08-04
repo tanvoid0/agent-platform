@@ -1,0 +1,5 @@
+# Speech service deps. Piper itself is NOT here — install it separately, either
+# `pip install piper-tts` (ships a `piper` console script) or a release binary
+# pointed at by PIPER_BIN. See README.
+fastapi>=0.110
+uvicorn[standard]>=0.29

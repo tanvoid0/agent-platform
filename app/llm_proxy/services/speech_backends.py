@@ -69,6 +69,12 @@ def speech_default_voice() -> str:
     return _from_env_or_dotenv("SPEECH_DEFAULT_VOICE") or DEFAULT_SPEECH_VOICE
 
 
+def speech_default_format() -> str:
+    """Audio format asked of the upstream. A Piper server writes WAV and takes
+    no transcoder, so it wants ``wav`` here; hosted providers default to mp3."""
+    return _from_env_or_dotenv("SPEECH_DEFAULT_FORMAT") or DEFAULT_SPEECH_FORMAT
+
+
 def is_speech_provider(provider: str) -> bool:
     return (provider or "").strip().lower() in SPEECH_PROVIDER_IDS
 
