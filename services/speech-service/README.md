@@ -70,11 +70,15 @@ In the platform's `.env`:
 ```
 SPEECH_API_BASE=http://127.0.0.1:8123
 SPEECH_DEFAULT_FORMAT=wav
+SPEECH_DEFAULT_VOICE=en_US-amy-medium
 ```
 
-No `SPEECH_API_KEY` — this service takes no auth, so bind it to loopback.
-`SPEECH_DEFAULT_FORMAT=wav` because Piper writes WAV and transcoding to MP3
-would mean an ffmpeg dependency for nothing; the desktop decodes either.
+All three matter. No `SPEECH_API_KEY` — this service takes no auth, so bind it
+to loopback. `SPEECH_DEFAULT_FORMAT=wav` because Piper writes WAV and
+transcoding to MP3 would mean an ffmpeg dependency for nothing; the desktop
+decodes either. `SPEECH_DEFAULT_VOICE` because the proxy's own default is
+OpenAI's `alloy`, which Piper does not have — leave it unset and every request
+404s with the voices you do have listed.
 
 Then the capability router lights up:
 

@@ -29,3 +29,6 @@ skills-lock.json
 desktop/target/
 desktop/payload/*
 !desktop/payload/.gitkeep
+
+# Piper voice models (60 MB+ each; download per README)
+services/speech-service/voices/
