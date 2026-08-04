@@ -51,6 +51,7 @@ dependencies = [
  "iced_fonts",
  "msedge-tts",
  "notify-rust",
+ "png 0.17.16",
  "reqwest",
  "rfd",
  "rodio",

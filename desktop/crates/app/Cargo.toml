@@ -29,6 +29,9 @@ cpal = "0.15"
 whisper-rs = "0.16"
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
 iced_fonts = { version = "0.3.0", features = ["lucide", "advanced_text"] }
+# Decodes the frames inside icon.ico for the window and tray icons. Already in
+# the tree via iced's svg backend, so this costs no extra build.
+png = "0.17"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }

@@ -232,10 +232,37 @@ pub enum Message {
     Workflows(workflows::Message),
 }
 
+/// The 32×32 frame of the app icon as RGBA, for the title bar and the tray.
+///
+/// `icon.ico` is the same file `build.rs` embeds in the exe, but that resource
+/// only reaches Explorer and the taskbar: winit leaves the window class icon
+/// unset, so without this the title bar shows Windows' default. Every frame in
+/// the file is an 8-bit RGBA PNG, which is the only encoding handled here — an
+/// ICO holding BMP frames would need the DIB path too.
+fn icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
+    const ICO: &[u8] = include_bytes!("../icon.ico");
+    // ICONDIR: 6-byte header, then one 16-byte ICONDIRENTRY per frame, whose
+    // first byte is the width (0 meaning 256) and whose last two fields are
+    // the frame's byte length and offset.
+    let count = u16::from_le_bytes([ICO[4], ICO[5]]) as usize;
+    let entry = (0..count).map(|i| 6 + i * 16).find(|&o| ICO[o] == 32)?;
+    let len = u32::from_le_bytes(ICO[entry + 8..entry + 12].try_into().ok()?) as usize;
+    let off = u32::from_le_bytes(ICO[entry + 12..entry + 16].try_into().ok()?) as usize;
+    let mut reader = png::Decoder::new(ICO.get(off..off + len)?).read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    buf.truncate(info.buffer_size());
+    Some((buf, info.width, info.height))
+}
+
 fn open_window() -> Task<Message> {
     let (_id, task) = window::open(window::Settings {
         size: iced::Size::new(1440.0, 900.0),
         min_size: Some(iced::Size::new(820.0, 560.0)),
+        icon: icon_rgba().and_then(|(rgba, w, h)| window::icon::from_rgba(rgba, w, h).ok()),
         // Close is intercepted: we ask quit-or-tray instead of just closing.
         exit_on_close_request: false,
         ..window::Settings::default()
@@ -243,13 +270,9 @@ fn open_window() -> Task<Message> {
     task.map(Message::WindowOpened)
 }
 
-fn tray_icon_image() -> tray_icon::Icon {
-    // Solid teal placeholder; real icon lands with packaging (Phase 5).
-    let mut rgba = Vec::with_capacity(32 * 32 * 4);
-    for _ in 0..(32 * 32) {
-        rgba.extend_from_slice(&[0x14, 0xb8, 0xa6, 0xff]);
-    }
-    tray_icon::Icon::from_rgba(rgba, 32, 32).expect("tray icon")
+fn tray_icon_image() -> Option<tray_icon::Icon> {
+    let (rgba, w, h) = icon_rgba()?;
+    tray_icon::Icon::from_rgba(rgba, w, h).ok()
 }
 
 fn build_tray(port: u16) -> Option<TrayIcon> {
@@ -266,7 +289,7 @@ fn build_tray(port: u16) -> Option<TrayIcon> {
     TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Agent Platform")
-        .with_icon(tray_icon_image())
+        .with_icon(tray_icon_image()?)
         .build()
         .ok()
 }
@@ -857,6 +880,16 @@ fn main() -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A silent `None` here means an unbranded title bar and no tray icon, and
+    /// neither failure is visible in a build log.
+    #[test]
+    fn the_app_icon_decodes_out_of_the_ico() {
+        let (rgba, w, h) = icon_rgba().expect("no 32x32 RGBA frame in icon.ico");
+        assert_eq!((w, h), (32, 32));
+        assert_eq!(rgba.len(), 32 * 32 * 4);
+        assert!(rgba.chunks(4).any(|px| px[3] > 0), "every pixel is transparent");
+    }
 
     /// The guard is only useful if it leaves a way out. Settings must open with
     /// no server, and at least one of its tabs must work there — that is where
