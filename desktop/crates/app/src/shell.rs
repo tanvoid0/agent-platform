@@ -65,7 +65,7 @@ impl ThemeMode {
         let dark = match self {
             ThemeMode::Light => false,
             ThemeMode::Dark => true,
-            ThemeMode::System => !matches!(dark_light::detect(), Ok(dark_light::Mode::Light)),
+            ThemeMode::System => system_is_dark(),
         };
         if dark {
             crate::ui::theme::dark_theme()
@@ -73,6 +73,24 @@ impl ThemeMode {
             crate::ui::theme::light_theme()
         }
     }
+}
+
+/// OS dark-mode probe with a short TTL cache. `resolve()` runs on every render
+/// (60/s while the HUD animates) and `dark_light::detect()` hits the registry,
+/// so the raw call is cached; 2s still picks up an OS theme switch promptly.
+fn system_is_dark() -> bool {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((at, dark)) = *cache {
+        if at.elapsed() < Duration::from_secs(2) {
+            return dark;
+        }
+    }
+    let dark = !matches!(dark_light::detect(), Ok(dark_light::Mode::Light));
+    *cache = Some((Instant::now(), dark));
+    dark
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
