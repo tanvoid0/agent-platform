@@ -3,11 +3,12 @@
 Replacing the Tauri + WebView2 shell with a native Rust UI (iced), keeping the
 existing Python server as a child process.
 
-**Status:** Phases 0–5 complete on Windows (visual pass, pixel office dropped,
-old stacks and server UI-serving deleted, file dialogs + notifications wired,
-packaging done). Open: three unported web features, the Windows installer
-untested against a real Inno Setup compile, and macOS/Linux packaging/signing
-not started — see [Still open](#still-open).
+**Status:** Complete on Windows. Phases 0–5 done (visual pass, pixel office
+dropped, old stacks and server UI-serving deleted, file dialogs + notifications
+wired), the three unported web features landed 2026-08-03, and the Windows
+installer was compiled and round-tripped 2026-08-04. Only macOS/Linux
+packaging/signing remains, deliberately deferred for lack of platform access —
+see [Still open](#still-open).
 
 ## Why
 

@@ -1,5 +1,18 @@
 # Practical Multi-Agent Assistant — Phased Roadmap
 
+> **Stale below this line (2026-08-04).** Every phase was implemented against
+> the `web/` React app, which the native-desktop migration deleted
+> ([ADR 0005](./adr/0005-native-iced-desktop-headless-server.md)). The server
+> halves survive and are live — `app/todos/`, `app/assistant/`,
+> `/api/v1/assistant/*`, planner profiles, board templates, action orchestrator.
+> The UI halves are gone: the desktop app has **no todos/kanban or assistant
+> dashboard screen** (`desktop/crates/app/src/assistant.rs` is the E.V. voice
+> HUD, a different thing). So "Done" in the status table means *server done, UI
+> unported*. Any `.tsx` path, `/app/…` route, or `cd web && pnpm run test` below
+> refers to deleted files. Porting these screens to iced is open work; treat the
+> phase tables as a spec of server behaviour to build against, not a record of
+> shipped UI.
+
 Handoff for evolving **agent-platform** from a simulation-first orchestration demo into a **practical daily planning assistant**: personal planning, nutrition, fitness, travel, shopping, mentorship, coding help, and calendar organisation — without breaking existing process/team/simulation flows.
 
 **Related:** [ADR 0001](./adr/0001-agent-platform-orchestration.md) (server authority), [action-orchestrator-api.md](./action-orchestrator-api.md), `app/todos/`, `web/src/features/todos/`.

@@ -62,7 +62,9 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
   newer screens (workflows, providers, memory, history sidebar) landed fast.
 - **E.V. voice** — self-built open-source TTS eventually; roadmap in
   `docs/ev-voice-roadmap.md`.
-- **Assistant roadmap** — `docs/practical-assistant-roadmap.md`.
+- **Assistant roadmap** — `docs/practical-assistant-roadmap.md`. Its phases are
+  server-complete but UI-unported: todo boards and the assistant dashboard have
+  no native screen (the desktop `assistant.rs` is the E.V. voice HUD).
 - **Project sub-groups** — `Project` is a flat folder (no `parent_id`/tags);
   nested groups if career workflows demand it.
 - **Document routing** — per-model native PDF/vision vs derived markdown
