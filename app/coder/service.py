@@ -253,7 +253,7 @@ def _coder_context_usage(llm_messages: list[dict[str, Any]]) -> ContextUsageOut:
     )
 
 
-async def get_thread(session: Session, thread_id: int | None = None) -> dict[str, Any]:
+def get_thread(session: Session, thread_id: int | None = None) -> dict[str, Any]:
     thread = _resolve_thread(session, thread_id)
     llm_messages = _llm_messages_from_history(thread.get_messages())
     ctx = _coder_context_usage(llm_messages)

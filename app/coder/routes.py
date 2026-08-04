@@ -102,13 +102,13 @@ def coder_context_usage(
 
 
 @router.get("/chat/thread", response_model=CoderThreadOut)
-async def coder_thread(
+def coder_thread(
     thread_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     require_scope(principal, "chat:write")
-    data = await get_thread(session, thread_id=thread_id)
+    data = get_thread(session, thread_id=thread_id)
     return CoderThreadOut(**data)
 
 
@@ -158,7 +158,7 @@ async def coder_chat_send(
 
 
 @router.post("/chat/stream")
-async def coder_chat_stream(
+def coder_chat_stream(
     body: CoderChatSendRequest = ...,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
@@ -190,7 +190,7 @@ async def coder_chat_stream(
 
 
 @router.post("/chat/retry")
-async def coder_chat_retry(
+def coder_chat_retry(
     body: CoderRetryRequest = ...,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
@@ -222,7 +222,7 @@ async def coder_chat_retry(
 
 
 @router.post("/chat/approve")
-async def coder_chat_approve(
+def coder_chat_approve(
     body: CoderApprovalRequest = ...,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),

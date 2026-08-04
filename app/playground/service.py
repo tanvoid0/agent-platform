@@ -111,7 +111,7 @@ def _playground_context_usage(llm_messages: list[dict[str, str]]) -> ContextUsag
     )
 
 
-async def get_thread(session: Session, thread_id: int | None = None) -> dict[str, Any]:
+def get_thread(session: Session, thread_id: int | None = None) -> dict[str, Any]:
     thread = _resolve_thread(session, thread_id)
     llm_messages = _build_llm_messages(thread.get_messages(), "")
     # _build_llm_messages appends empty user msg; drop it for context estimate.

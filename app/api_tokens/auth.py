@@ -9,6 +9,7 @@ isolation) and usage attribution.
 
 from __future__ import annotations
 
+import asyncio
 import secrets as _secrets
 from typing import NamedTuple
 
@@ -41,6 +42,56 @@ class TokenPrincipal(NamedTuple):
     workspace_id: int | None = None  # None => master-key / unrestricted caller
 
 
+def _resolve_agp_token(session: Session, raw: str, required_scope: str | None) -> TokenPrincipal:
+    """Blocking half of `agp_...` auth: two queries, a rate-limit counter, a throttled commit.
+
+    Split out so the dependency can run it off the event loop. Sets no contextvars —
+    the caller does that, on the loop, where the write is actually visible.
+    """
+    row = session.exec(
+        select(ApiToken).where(ApiToken.token_hash == hash_token(raw))
+    ).first()
+    if row is None:
+        raise TokenNotFoundError("Invalid API token")
+    if row.status == "revoked":
+        raise TokenRevokedError("This token has been revoked.", token_prefix=row.prefix)
+    if row.status == "held":
+        raise TokenHeldError(
+            row.held_reason or "This token is temporarily on hold.",
+            token_prefix=row.prefix,
+        )
+    if row.expires_at and row.expires_at < utc_now_naive():
+        raise TokenExpiredError("This token has expired.", token_prefix=row.prefix)
+
+    ws = session.get(Workspace, row.workspace_id)
+    if ws is None or ws.archived_at is not None:
+        raise TokenRevokedError(
+            "This token's workspace has been archived.",
+            token_prefix=row.prefix,
+        )
+
+    scopes = row.scopes
+    if required_scope and required_scope not in scopes and "*" not in scopes:
+        raise InsufficientScopeError(
+            f"Token lacks required scope '{required_scope}'.", token_prefix=row.prefix
+        )
+
+    check_and_increment(row.id, row.rate_limit_per_minute)
+
+    now = utc_now_naive()
+    if not row.last_used_at or (now - row.last_used_at).total_seconds() > _LAST_USED_THROTTLE_SECONDS:
+        row.last_used_at = now
+        session.add(row)
+        session.commit()
+
+    return TokenPrincipal(
+        project_id=row.project_id,
+        token_id=row.id,
+        scopes=scopes,
+        workspace_id=row.workspace_id,
+    )
+
+
 def verify_project_api_token(required_scope: str | None = None):
     async def _dependency(
         request: Request,
@@ -58,50 +109,14 @@ def verify_project_api_token(required_scope: str | None = None):
         raw = authorization[7:].strip()
 
         if raw.startswith(_TOKEN_PREFIX_MARKER):
-            row = session.exec(
-                select(ApiToken).where(ApiToken.token_hash == hash_token(raw))
-            ).first()
-            if row is None:
-                raise TokenNotFoundError("Invalid API token")
-            if row.status == "revoked":
-                raise TokenRevokedError("This token has been revoked.", token_prefix=row.prefix)
-            if row.status == "held":
-                raise TokenHeldError(
-                    row.held_reason or "This token is temporarily on hold.",
-                    token_prefix=row.prefix,
-                )
-            if row.expires_at and row.expires_at < utc_now_naive():
-                raise TokenExpiredError("This token has expired.", token_prefix=row.prefix)
-
-            ws = session.get(Workspace, row.workspace_id)
-            if ws is None or ws.archived_at is not None:
-                raise TokenRevokedError(
-                    "This token's workspace has been archived.",
-                    token_prefix=row.prefix,
-                )
-
-            scopes = row.scopes
-            if required_scope and required_scope not in scopes and "*" not in scopes:
-                raise InsufficientScopeError(
-                    f"Token lacks required scope '{required_scope}'.", token_prefix=row.prefix
-                )
-
-            check_and_increment(row.id, row.rate_limit_per_minute)
-
-            now = utc_now_naive()
-            if not row.last_used_at or (now - row.last_used_at).total_seconds() > _LAST_USED_THROTTLE_SECONDS:
-                row.last_used_at = now
-                session.add(row)
-                session.commit()
-
-            principal = TokenPrincipal(
-                project_id=row.project_id,
-                token_id=row.id,
-                scopes=scopes,
-                workspace_id=row.workspace_id,
+            # Off the event loop: this runs on every authenticated request, and a
+            # blocking round trip here stalls every other request and in-flight
+            # SSE stream sharing the loop.
+            principal = await asyncio.to_thread(
+                _resolve_agp_token, session, raw, required_scope
             )
-            request.state.workspace_id = row.workspace_id
-            update_request_context(workspace_id=row.workspace_id)
+            request.state.workspace_id = principal.workspace_id
+            update_request_context(workspace_id=principal.workspace_id)
             return principal
 
         if not _secrets.compare_digest(raw, expected_master_key):

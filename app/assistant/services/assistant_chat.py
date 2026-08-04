@@ -634,7 +634,7 @@ def format_apply_summary(result: Any) -> str:
     return " ".join(parts)
 
 
-async def get_thread(
+def get_thread(
     session: Session, project_id: int, *, thread_id: int | None = None
 ) -> dict[str, Any]:
     thread = _resolve_thread(session, project_id, thread_id)

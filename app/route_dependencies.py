@@ -18,7 +18,7 @@ class SessionWithAuth(NamedTuple):
     client_hdr: str | None
 
 
-async def session_with_auth(
+def session_with_auth(
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(agent_platform_client_header),
 ) -> SessionWithAuth:

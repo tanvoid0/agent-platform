@@ -147,7 +147,7 @@ def chat_threads_create(
 
 
 @router.get("/chat/context-usage", response_model=ContextUsageOut)
-async def chat_context_usage(
+def chat_context_usage(
     project_id: int = Depends(require_assistant_project),
     thread_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
@@ -156,12 +156,12 @@ async def chat_context_usage(
 
 
 @router.get("/chat/thread", response_model=ChatThreadOut)
-async def chat_thread(
+def chat_thread(
     project_id: int = Depends(require_assistant_project),
     thread_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
 ):
-    data = await get_thread(session, project_id, thread_id=thread_id)
+    data = get_thread(session, project_id, thread_id=thread_id)
     return ChatThreadOut(**data)
 
 

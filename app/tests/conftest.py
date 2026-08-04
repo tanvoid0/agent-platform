@@ -49,6 +49,18 @@ def _api_routes_without_bearer_by_default(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_speech_backend_by_default(monkeypatch):
+    """Match CI: no speech upstream is configured unless a test configures one.
+
+    Same hazard as the master key above — a developer with SPEECH_API_BASE in
+    `.env` gets a resolved speech backend (and its default voice) where the
+    tests expect none.
+    """
+    for var in ("SPEECH_API_BASE", "SPEECH_API_KEY", "SPEECH_DEFAULT_VOICE", "SPEECH_DEFAULT_FORMAT"):
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_config_dir(tmp_path_factory, monkeypatch):
     """Keep CONFIG_DIR (config.yaml, .env, capability cache) inside the test's tmp dir.
 

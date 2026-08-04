@@ -446,7 +446,7 @@ def model_jobs_get(
     summary="Stream build job logs (SSE)",
     description="Server-sent events with log lines. Content-Type: text/event-stream.",
 )
-async def model_jobs_stream(
+def model_jobs_stream(
     job_id: int,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),

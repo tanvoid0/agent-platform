@@ -35,6 +35,10 @@ def test_post_retries_until_success_within_budget(monkeypatch):
     calls = {"n": 0}
 
     class FakeAsyncClient:
+        # The client is pooled and reused now, so it is probed for liveness
+        # rather than opened per call.
+        is_closed = False
+
         async def __aenter__(self):
             return self
 
@@ -60,6 +64,10 @@ def test_post_gives_up_after_budget_exhausted(monkeypatch):
     calls = {"n": 0}
 
     class FakeAsyncClient:
+        # The client is pooled and reused now, so it is probed for liveness
+        # rather than opened per call.
+        is_closed = False
+
         async def __aenter__(self):
             return self
 

@@ -17,6 +17,12 @@ from llm_proxy.core.errors import LlmProxyError
 
 logger = logging.getLogger("llm_proxy")
 
+# Pool shared by every upstream call. Generous ceiling: one process fans out to
+# many providers at once (agents, chat, catalog probes, loopback Ollama).
+_POOL_LIMITS = httpx.Limits(
+    max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0
+)
+
 
 def _sanitize_url_for_log(url: str) -> str:
     try:
@@ -186,6 +192,34 @@ class UpstreamHttpClient:
             if rate_limit_backoff_ms is not None
             else int(os.environ.get("ORCHESTRATOR_HTTP_RATE_LIMIT_BACKOFF_MS", "400")),
         )
+        self._client: httpx.AsyncClient | None = None
+        self._client_loop: asyncio.AbstractEventLoop | None = None
+
+    def _shared(self) -> httpx.AsyncClient:
+        """The pooled client for the running loop, created on first use.
+
+        Rebuilt when the loop changes: a pooled connection belongs to the loop that
+        opened it, and the test suite builds a fresh loop per TestClient. Production
+        has one loop, so this resolves once and then always hits the same client.
+        The superseded client is dropped rather than closed — its loop is already
+        gone, so there is nothing left to await on.
+        """
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._client.is_closed or self._client_loop is not loop:
+            self._client = httpx.AsyncClient(limits=_POOL_LIMITS)
+            self._client_loop = loop
+        return self._client
+
+    async def aclose(self) -> None:
+        """Release the pool. Called from the app lifespan on shutdown."""
+        client, self._client, self._client_loop = self._client, None, None
+        if client is None:
+            return
+        try:
+            if not client.is_closed:
+                await client.aclose()
+        except Exception:
+            logger.debug("upstream pool close failed", exc_info=True)
 
     def _backoff_seconds(self, attempt: int, backoff_ms: int | None = None) -> float:
         base = ((backoff_ms if backoff_ms is not None else self._backoff_ms) / 1000.0) * (2**attempt)
@@ -214,8 +248,9 @@ class UpstreamHttpClient:
         last: httpx.RequestError | None = None
         for attempt in range(self._max_retries):
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    return await client.get(url, headers=headers, params=params)
+                return await self._shared().get(
+                    url, headers=headers, params=params, timeout=timeout
+                )
             except httpx.RequestError as e:
                 last = e
                 safe = _sanitize_url_for_log(url)
@@ -252,8 +287,9 @@ class UpstreamHttpClient:
         safe = _sanitize_url_for_log(url)
         while True:
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    response = await client.post(url, headers=headers, json=json_body)
+                response = await self._shared().post(
+                    url, headers=headers, json=json_body, timeout=timeout
+                )
             except httpx.RequestError as e:
                 if should_retry_transport(e, transport_attempt, self._max_retries):
                     delay = self._backoff_seconds(transport_attempt)
@@ -301,24 +337,29 @@ class UpstreamHttpClient:
         json_body: Any = None,
         timeout: float = 300.0,
         context: str = "chat_stream",
-    ) -> tuple[httpx.Response, httpx.AsyncClient]:
+    ) -> tuple[httpx.Response, httpx.AsyncClient | None]:
         """
         Open a streaming POST. Caller must drain the body and call ``aclose_stream``.
 
         Retries transport failures and upstream rate-limit responses (status only —
         the body is unread at this point, so a 429/503 is closed and retried without
         sniffing the message text).
+
+        The second element is always ``None``: the client is pooled and outlives the
+        stream, so callers close the response and leave the client alone. It stays in
+        the tuple so the ``response, client = await ...`` call sites keep working.
         """
         transport_attempt = 0
         rate_limit_attempt = 0
         safe = _sanitize_url_for_log(url)
         while True:
-            client = httpx.AsyncClient(timeout=timeout)
+            client = self._shared()
             try:
-                req = client.build_request("POST", url, headers=headers, json=json_body)
+                req = client.build_request(
+                    "POST", url, headers=headers, json=json_body, timeout=timeout
+                )
                 response = await client.send(req, stream=True)
             except httpx.RequestError as e:
-                await client.aclose()
                 if should_retry_transport(e, transport_attempt, self._max_retries):
                     delay = self._backoff_seconds(transport_attempt)
                     logger.warning(
@@ -350,12 +391,12 @@ class UpstreamHttpClient:
                     safe,
                     response.status_code,
                 )
-                await aclose_stream(response, client)
+                await aclose_stream(response, None)
                 await asyncio.sleep(delay)
                 rate_limit_attempt += 1
                 continue
 
-            return response, client
+            return response, None
 
 
 default_upstream_client = UpstreamHttpClient()
@@ -363,3 +404,4 @@ default_upstream_client = UpstreamHttpClient()
 get_with_retry = default_upstream_client.get
 post_with_retry = default_upstream_client.post
 stream_chat_completion = default_upstream_client.open_stream
+aclose_upstream_pool = default_upstream_client.aclose

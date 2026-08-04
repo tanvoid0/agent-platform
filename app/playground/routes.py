@@ -91,13 +91,13 @@ def playground_context_usage(
 
 
 @router.get("/chat/thread", response_model=PlaygroundThreadOut)
-async def playground_thread(
+def playground_thread(
     thread_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),
 ):
     require_scope(principal, "chat:write")
-    data = await get_thread(session, thread_id=thread_id)
+    data = get_thread(session, thread_id=thread_id)
     return PlaygroundThreadOut(**data)
 
 
@@ -140,7 +140,7 @@ async def playground_chat_send(
 
 
 @router.post("/chat/stream")
-async def playground_chat_stream(
+def playground_chat_stream(
     body: PlaygroundChatSendRequest = ...,
     session: Session = Depends(get_session),
     principal: TokenPrincipal = Depends(require_valid_token),

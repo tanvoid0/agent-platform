@@ -99,13 +99,18 @@ def _fake_llm_sequence(monkeypatch, responses: list[dict]):
             return {"capabilities": ["completion", "tools"]}
 
     class FakeClient:
+        # Patching `coder.service.httpx.AsyncClient` reaches the httpx module
+        # itself, so the pooled upstream client gets this fake too: it has to
+        # answer the liveness probe and tolerate the per-request timeout.
+        is_closed = False
+
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, *args):
             return None
 
-        async def post(self, url, headers=None, json=None):
+        async def post(self, url, headers=None, json=None, **kw):
             # The agent turn probes Ollama for per-model capabilities before it
             # sends tools; answer it here so the scripted chat sequence stays aligned.
             if "/api/show" in url:

@@ -18,6 +18,7 @@ from llm_proxy.core.errors import register_exception_handlers
 from llm_proxy.core.middleware import RequestIdMiddleware
 from llm_proxy.routes.llm import router as llm_proxy_router
 from llm_proxy.services.model_catalog_cache import get_catalog_cache
+from llm_proxy.services.upstream_http import aclose_upstream_pool
 from health_checks import app_readiness_payload
 from llm_proxy_env import llm_proxy_master_key
 from observability import RequestLoggingMiddleware, setup_logging
@@ -61,6 +62,7 @@ async def lifespan(app: FastAPI):
     finally:
         stop_workflow_scheduler()
         await cache.stop_background_refresh()
+        await aclose_upstream_pool()
 
 
 _env = (os.getenv("AGENT_PLATFORM_ENV") or "development").strip().lower()

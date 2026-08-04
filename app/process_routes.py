@@ -122,7 +122,7 @@ def list_processes(
         "for status. Requires scope process:write; project-scoped tokens are pinned to their own project."
     ),
 )
-async def start_process(
+def start_process(
     req: StartProcessRequest,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
@@ -233,7 +233,7 @@ def list_process_events(
 
 
 @router.post("/processes/{process_id}/approve")
-async def approve_dag(
+def approve_dag(
     process_id: int,
     req: ApproveDagRequest,
     background_tasks: BackgroundTasks,
@@ -274,7 +274,7 @@ async def approve_dag(
 
 
 @router.post("/processes/{process_id}/tasks/{task_id}/review")
-async def review_task(
+def review_task(
     process_id: int,
     task_id: int,
     req: ReviewTaskRequest,
@@ -371,7 +371,7 @@ def cancel_process(
 
 
 @router.post("/processes/{process_id}/sync")
-async def sync_process(
+def sync_process(
     process_id: int,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
@@ -522,7 +522,7 @@ async def sync_process(
 
 
 @router.post("/processes/{process_id}/retry")
-async def retry_process(
+def retry_process(
     process_id: int,
     background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
@@ -594,7 +594,7 @@ async def retry_process(
 
 
 @router.post("/processes/{process_id}/tasks/{task_id}/retry")
-async def retry_failed_task(
+def retry_failed_task(
     process_id: int,
     task_id: int,
     background_tasks: BackgroundTasks,
@@ -647,7 +647,7 @@ async def retry_failed_task(
 
 
 @router.get("/processes/{process_id}/stream")
-async def stream_process_events(
+def stream_process_events(
     process_id: int,
     client_hdr: str | None = Depends(agent_platform_client_header),
     principal: TokenPrincipal = Depends(require_valid_token),
