@@ -61,14 +61,21 @@ fn catalog_card(state: &State) -> Element<'_, Message> {
                         ("not configured", Tone::Neutral)
                     };
                     let mut cells = vec![
-                        ui::body(p.label.clone()),
+                        // Fixed name column: with the name filling, each row
+                        // split its slack differently and the badges stepped
+                        // left and right down the list.
+                        container(ui::body(p.label.clone())).width(180).into(),
                         ui::badge(label, tone),
                         ui::spacer(),
                     ];
                     if p.local {
                         cells.push(ui::badge("local", Tone::Info));
                     }
-                    cells.push(ui::caption(format!("{} models · {}", p.models.options.len(), p.models.source)));
+                    cells.push(ui::caption(format!(
+                        "{} · {}",
+                        ui::count(p.models.options.len(), "model", "models"),
+                        p.models.source
+                    )));
                     let mut rows = vec![ui::cluster(cells).into()];
                     // The catalog degrades quietly to aliases or hard-coded
                     // fallbacks, which looks like success unless it is said.
@@ -83,7 +90,7 @@ fn catalog_card(state: &State) -> Element<'_, Message> {
     };
 
     ui::card_with_header(
-        "Providers",
+        "Catalog",
         Some(ui::muted("What the proxy can reach right now.")),
         None,
         list,

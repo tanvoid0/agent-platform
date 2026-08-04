@@ -460,7 +460,7 @@ fn events_view(state: &State) -> Element<'_, Message> {
             .width(280)
             .into(),
         ui::spacer(),
-        ui::caption(format!("{} events", state.events.len())),
+        ui::caption(ui::count(state.events.len(), "event", "events")),
     ])
     .into();
 

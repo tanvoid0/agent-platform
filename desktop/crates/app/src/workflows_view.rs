@@ -42,7 +42,9 @@ pub fn view(state: &State) -> Element<'_, Message> {
     } else {
         ui::stack(state.items.iter().map(|wf| workflow_card(state, wf)).collect()).into()
     };
-    blocks.push(ui::section("Workflows", None, list));
+    // No wrapping section: every workflow is already a card, and a "Workflows"
+    // card under the "Workflows" page title was a box inside a box.
+    blocks.push(list);
 
     if let Some(selected) = state.selected {
         if let Some(wf) = state.items.iter().find(|w| w.id == selected) {
@@ -142,7 +144,7 @@ fn workflow_card<'a>(state: &'a State, wf: &'a WorkflowInfo) -> Element<'a, Mess
     } else {
         ui::badge("disabled", Tone::Neutral)
     }];
-    badges.push(ui::badge(format!("{} steps", wf.steps.len()), Tone::Neutral));
+    badges.push(ui::badge(ui::count(wf.steps.len(), "step", "steps"), Tone::Neutral));
     if let Some(seconds) = wf.interval_seconds {
         badges.push(ui::badge(format!("every {}", human_secs(seconds)), Tone::Info));
     }

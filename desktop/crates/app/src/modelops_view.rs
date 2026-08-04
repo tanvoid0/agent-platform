@@ -76,7 +76,14 @@ fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
 
 fn projects_card(state: &State) -> Element<'_, Message> {
     if state.projects.is_empty() {
-        return ui::card(ui::empty_state_icon(Icon::Cpu, "No model projects yet."));
+        // Keep the header the populated card has, so the empty page is not a
+        // nameless box between two titled ones.
+        return ui::card_with_header(
+            "Model projects",
+            Some(ui::muted("Pick a project, choose stages, and run the pipeline.")),
+            None,
+            ui::empty_state_icon(Icon::Cpu, "No model projects yet."),
+        );
     }
 
     let rows: Vec<Element<'_, Message>> = state
@@ -89,7 +96,10 @@ fn projects_card(state: &State) -> Element<'_, Message> {
                     ui::body(p.name.clone()),
                     ui::caption(p.description.clone().unwrap_or_else(|| "—".into())),
                     ui::spacer(),
-                    ui::badge(format!("{} versions", p.registry_entries.len()), Tone::Neutral),
+                    ui::badge(
+                        ui::count(p.registry_entries.len(), "version", "versions"),
+                        Tone::Neutral,
+                    ),
                 ]),
                 selected,
                 Message::Select(p.name.clone()),

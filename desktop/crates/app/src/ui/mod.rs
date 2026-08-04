@@ -362,6 +362,13 @@ pub fn field<'a, M: 'a>(label: &'a str, value: impl Into<Element<'a, M>>) -> Ele
     .into()
 }
 
+/// `3 steps` / `1 step` — a count with its noun, so a badge never reads
+/// "1 steps". Both forms are passed in; English plurals are not guessable
+/// ("memory" → "memories").
+pub fn count(n: usize, singular: &str, plural: &str) -> String {
+    format!("{n} {}", if n == 1 { singular } else { plural })
+}
+
 /// `<Badge>` — rounded-full status pill.
 pub fn badge<'a, M: 'a>(label: impl text::IntoFragment<'a>, tone: Tone) -> Element<'a, M> {
     container(text(label).size(font::XS).style(theme::text_tone(tone)))

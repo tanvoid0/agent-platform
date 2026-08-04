@@ -84,7 +84,7 @@ pub fn view(store: &Store) -> Element<'_, crate::memory::Message> {
             ))
             .width(260)
             .into(),
-            ui::badge(format!("{}", store.items.len()), Tone::Neutral),
+            ui::badge(ui::count(store.items.len(), "memory", "memories"), Tone::Neutral),
         ])
         .into()),
         list,
@@ -96,17 +96,18 @@ pub fn view(store: &Store) -> Element<'_, crate::memory::Message> {
             "Durable facts the assistants picked up from your conversations, and \
              carry into new ones. Everything here is stored locally.",
         )),
-        Some(
-            ui::cluster(vec![
-                ui::button_outline(
-                    if store.enabled { Icon::Check } else { Icon::X },
-                    if store.enabled { "Memory on" } else { "Memory off" },
-                    Message::ToggleEnabled,
-                ),
-                ui::button_destructive(Icon::Trash, "Forget all", Message::ForgetAll),
-            ])
-            .into(),
-        ),
+        Some({
+            let mut actions = vec![ui::button_outline(
+                if store.enabled { Icon::Check } else { Icon::X },
+                if store.enabled { "Memory on" } else { "Memory off" },
+                Message::ToggleEnabled,
+            )];
+            // A red "Forget all" with nothing to forget is alarm without stakes.
+            if !store.items.is_empty() {
+                actions.push(ui::button_destructive(Icon::Trash, "Forget all", Message::ForgetAll));
+            }
+            ui::cluster(actions).into()
+        }),
         ui::stack_lg(blocks),
     )
 }

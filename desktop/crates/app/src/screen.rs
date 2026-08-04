@@ -720,12 +720,15 @@ fn logs_view(app: &App) -> Element<'_, Message> {
         scrollable(lines).height(Length::Fill).anchor_bottom().into()
     };
 
-    ui::page(
+    // `page_fixed`, not `page`: the log tail scrolls itself. Inside the outer
+    // scrollable the two bars stacked, and the right-hand badge sat under the
+    // outer one, clipped.
+    ui::page_fixed(
         "Logs",
         Some(ui::muted(
             "Server output, including startup and migrations — visible before the API answers.",
         )),
         None,
-        column![toolbar, ui::code(body)].spacing(space::MD),
+        column![toolbar, ui::code(body)].spacing(space::MD).height(Length::Fill),
     )
 }

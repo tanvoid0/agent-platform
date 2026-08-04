@@ -128,7 +128,7 @@ fn team_list(state: &State) -> Element<'_, Message> {
                 ])
                 .into(),
                 ui::spacer(),
-                ui::badge(format!("{} roles", t.role_count), Tone::Neutral),
+                ui::badge(ui::count(t.role_count as usize, "role", "roles"), Tone::Neutral),
                 ui::button_outline(Icon::Pencil, "Edit", Message::EditTeam(t.id)),
                 ui::button_destructive(Icon::Trash, "Delete", Message::DeleteTeam(t.id)),
             ]))
