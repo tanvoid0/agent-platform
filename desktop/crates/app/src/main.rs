@@ -15,6 +15,7 @@ mod chat;
 mod chat_view;
 mod domain;
 mod graph;
+mod history;
 mod library;
 mod library_view;
 mod memory;
@@ -156,6 +157,8 @@ pub struct App {
     pub assistant: assistant::State,
     /// What both assistants remember about the user, across restarts.
     pub memory: memory::Store,
+    /// Past conversations of both assistants, across restarts.
+    pub history: history::Store,
     pub providers: providers::State,
     pub workflows: workflows::State,
 }
@@ -224,6 +227,7 @@ pub enum Message {
     Chat(chat::Message),
     Assistant(assistant::Message),
     Memory(memory::Message),
+    History(history::Message),
     Providers(providers::Message),
     Workflows(workflows::Message),
 }
@@ -365,6 +369,7 @@ fn boot() -> (App, Task<Message>) {
         chat: chat::State::with_defaults(chat_provider, chat_model),
         assistant: assistant::State::new(),
         memory: memory::Store::load(&app_dir),
+        history: history::Store::load(&app_dir),
         providers: providers::State::default(),
         workflows: workflows::State::default(),
     };
@@ -627,8 +632,22 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         // turn, not the next restart) and one harvest when a reply completes.
         Message::Chat(msg) => {
             let closed = matches!(msg, chat::Message::Chunk(ChatChunk::Done));
+            // Autosave at the moments the thread actually changed shape: the
+            // user's turn going in, and the reply closing (or dying).
+            let save = closed
+                || matches!(
+                    msg,
+                    chat::Message::Send | chat::Message::Chunk(ChatChunk::Failed(_))
+                );
+            if matches!(msg, chat::Message::Clear) {
+                // The cleared thread stays in the history; the tab starts fresh.
+                app.history.close("Chat");
+            }
             app.chat.system = app.memory.system_block();
             let turn = chat::update(&mut app.chat, &app.client, msg).map(Message::Chat);
+            if save {
+                app.history.autosave("Chat", &app.chat.messages, &app.chat.reasoning);
+            }
             // The provider/model override survives restarts: any change lands
             // in settings.json the moment it is made.
             if app.settings.chat_provider != app.chat.provider
@@ -652,9 +671,24 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Assistant(msg) => {
             let closed = matches!(msg, assistant::Message::Chunk(ChatChunk::Done));
+            let save = closed
+                || matches!(
+                    msg,
+                    assistant::Message::Send | assistant::Message::Chunk(ChatChunk::Failed(_))
+                );
+            if matches!(msg, assistant::Message::Clear) {
+                app.history.close(assistant::NAME);
+            }
             app.assistant.memory = app.memory.system_block();
             let turn =
                 assistant::update(&mut app.assistant, &app.client, msg).map(Message::Assistant);
+            if save {
+                app.history.autosave(
+                    assistant::NAME,
+                    &app.assistant.messages,
+                    &app.assistant.reasoning,
+                );
+            }
             match closed {
                 false => turn,
                 true => Task::batch([
@@ -666,6 +700,47 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::Memory(msg) => memory::update(&mut app.memory, msg).map(Message::Memory),
+        Message::History(msg) => {
+            // The sidebar only renders on the two chat tabs, so the screen names
+            // the thread the action applies to.
+            let ev = app.screen == Screen::Assistant;
+            let source = if ev { assistant::NAME } else { "Chat" };
+            let busy = if ev { app.assistant.sending } else { app.chat.sending };
+            // Swapping the thread out from under a streaming reply would append
+            // the rest of it to the wrong conversation.
+            if busy {
+                return Task::none();
+            }
+            let load = |app: &mut App, messages: Vec<_>, reasoning: Vec<_>| {
+                if ev {
+                    app.assistant.load_thread(messages, reasoning);
+                } else {
+                    app.chat.load_thread(messages, reasoning);
+                }
+            };
+            match msg {
+                history::Message::New => {
+                    app.history.close(source);
+                    load(app, Vec::new(), Vec::new());
+                }
+                history::Message::Select(id) => {
+                    if app.history.current(source) == Some(id) {
+                        return Task::none();
+                    }
+                    if let Some(c) = app.history.open(source, id) {
+                        load(app, c.messages, c.reasoning);
+                    }
+                }
+                history::Message::Delete(id) => {
+                    let was_open = app.history.current(source) == Some(id);
+                    app.history.delete(id);
+                    if was_open {
+                        load(app, Vec::new(), Vec::new());
+                    }
+                }
+            }
+            Task::none()
+        }
         Message::Providers(msg) => {
             providers::update(&mut app.providers, &app.client, msg).map(Message::Providers)
         }

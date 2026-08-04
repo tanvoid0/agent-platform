@@ -18,6 +18,7 @@ from action_orchestrator.routes import _check_client_access, action_client_scope
 from client_scope import merged_client_id, require_client_id_enabled
 from database import get_session
 from time_utils import utc_now_naive
+from workflows.assist import AssistRequest, AssistResponse, assist as run_assist
 from workflows.engine import execute_workflow
 from workflows.models import Workflow, WorkflowRun
 from workflows.schemas import (
@@ -189,6 +190,20 @@ async def run_workflow(
         raise HTTPException(status_code=400, detail="Workflow is disabled")
     run = await execute_workflow(wf.id, input_data=body or {}, trigger="api")
     return _run_to_response(run)
+
+
+@router.post("/workflows/assist", response_model=AssistResponse)
+async def assist_workflow(
+    req: AssistRequest,
+    _client_hdr: str | None = Depends(action_client_scope),
+):
+    """Chat-style help: generate, review or edit a steps array. Stateless — the
+    current draft travels in the request, the (validated) replacement comes back."""
+    try:
+        return await run_assist(req)
+    except Exception as e:
+        logger.exception("workflow assist failed")
+        raise HTTPException(status_code=502, detail=f"Assistant unavailable: {e}")
 
 
 @router.get("/workflows/{workflow_id}/runs")

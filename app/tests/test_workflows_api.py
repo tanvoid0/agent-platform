@@ -8,6 +8,72 @@ import workflows.engine as wf_engine
 from workflows.engine import StepError, resolve_templates
 
 
+# === AI assist ===
+
+def _mock_llm(monkeypatch, content: str):
+    async def fake(messages, **kwargs):
+        _mock_llm.messages = messages
+        return content, 10, 0.0
+
+    import workflows.assist as assist_mod
+    monkeypatch.setattr(assist_mod, "call_llm", fake)
+
+
+def test_assist_generates_steps(client, monkeypatch):
+    c, _, _ = client
+    _mock_llm(monkeypatch, """{"reply": "Added a health check.",
+        "steps": [{"id": "ping", "type": "http", "params": {"url": "http://x/health"}}]}""")
+    resp = c.post("/api/v1/workflows/assist", json={"message": "check health of x"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["reply"] == "Added a health check."
+    assert data["steps"][0]["id"] == "ping"
+    # the draft context reached the model
+    assert "check health of x" in _mock_llm.messages[1]["content"]
+
+
+def test_assist_review_without_changes_and_invalid_steps(client, monkeypatch):
+    c, _, _ = client
+    # review verdict, no steps
+    _mock_llm(monkeypatch, '{"reply": "Looks fine.", "steps": null}')
+    data = c.post("/api/v1/workflows/assist", json={
+        "message": "review this",
+        "steps": [{"id": "a", "type": "http", "params": {"url": "http://x"}}],
+    }).json()
+    assert data["reply"] == "Looks fine."
+    assert data["steps"] is None
+
+    # invalid model output is neutered, not 500ed
+    _mock_llm(monkeypatch, '{"reply": "Here.", "steps": [{"id": "BAD ID", "type": "http"}]}')
+    data = c.post("/api/v1/workflows/assist", json={"message": "x"}).json()
+    assert data["steps"] is None
+    assert "discarded" in data["reply"]
+
+    # non-JSON output becomes a plain reply
+    _mock_llm(monkeypatch, "Sorry, I can only help with workflows.")
+    data = c.post("/api/v1/workflows/assist", json={"message": "x"}).json()
+    assert data["steps"] is None
+    assert "Sorry" in data["reply"]
+
+
+def test_assist_strips_markdown_fences(client, monkeypatch):
+    c, _, _ = client
+    _mock_llm(monkeypatch, """```json
+{"reply": "ok", "steps": [{"id": "a", "type": "http", "params": {"url": "http://x"}}]}
+```""")
+    data = c.post("/api/v1/workflows/assist", json={"message": "x"}).json()
+    assert data["steps"] is not None
+
+
+def test_assist_strips_reasoning_think_block(client, monkeypatch):
+    c, _, _ = client
+    _mock_llm(monkeypatch, """<think>User wants a health check. One http step.</think>
+{"reply": "ok", "steps": [{"id": "a", "type": "http", "params": {"url": "http://x"}}]}""")
+    data = c.post("/api/v1/workflows/assist", json={"message": "x"}).json()
+    assert data["steps"] is not None
+    assert "think" not in data["reply"]
+
+
 # === Template resolver (pure) ===
 
 def test_resolve_templates():
@@ -217,6 +283,67 @@ def test_run_real_http_roundtrip(client):
         assert received["post"] == {"auth": "t-123"}
     finally:
         server.shutdown()
+
+
+def test_complex_chain_templates_headers_and_mixed_steps(client, monkeypatch):
+    """Five steps: http → template into url/header/body, an action step fed from
+    an earlier output, list indexing, and an embedded-template string."""
+    c, _, _ = client
+    resp = c.post("/api/v1/action-sets", json={
+        "name": "notify",
+        "actions": [{"action_id": "alert", "name": "Alert", "description": "d",
+                     "execution_mode": "server", "endpoint": "http://svc/alert"}],
+    })
+    set_id = resp.json()["id"]
+
+    calls = []
+    monkeypatch.setattr(wf_engine, "_execute_http", _fake_http({
+        "http://api/users": {"status": 200, "body": {"users": [
+            {"name": "ada", "token": "tk-1"}, {"name": "bob", "token": "tk-2"}]}},
+        "http://api/users/bob/orders": {"status": 200, "body": {"orders": [{"total": 42}]}},
+        "http://audit/log": {"status": 200, "body": "ok"},
+        "http://svc/alert": {"status": 200, "body": {"sent": True}},
+    }, calls))
+
+    wf = _create_workflow(c, [
+        {"id": "users", "type": "http", "params": {"url": "http://api/users"}},
+        # list indexing + embedded template building a url
+        {"id": "orders", "type": "http",
+         "params": {"url": "http://api/users/{{steps.users.output.body.users.1.name}}/orders",
+                    "headers": {"Authorization": "Bearer {{steps.users.output.body.users.1.token}}"}}},
+        # whole-value template keeps the number type
+        {"id": "audit", "type": "http",
+         "params": {"url": "http://audit/log", "method": "POST",
+                    "body": {"user": "{{trigger.body.requested_by}}",
+                             "total": "{{steps.orders.output.body.orders.0.total}}"}}},
+        # action step consuming an earlier step's output
+        {"id": "notify", "type": "action",
+         "params": {"action_set_id": set_id, "action_id": "alert",
+                    "arguments": {"text": "order total {{steps.orders.output.body.orders.0.total}}"}}},
+    ])
+    run = c.post(f"/api/v1/workflows/{wf['id']}/run", json={"requested_by": "cli"}).json()
+    assert run["status"] == "succeeded", run
+
+    by_url = {call["url"]: call for call in calls}
+    assert by_url["http://api/users/bob/orders"]["headers"] == {"Authorization": "Bearer tk-2"}
+    assert by_url["http://audit/log"]["body"] == {"user": "cli", "total": 42}  # int preserved
+    assert by_url["http://svc/alert"]["body"] == {"text": "order total 42"}
+
+
+def test_missing_template_path_fails_that_step(client, monkeypatch):
+    c, _, _ = client
+    monkeypatch.setattr(wf_engine, "_execute_http", _fake_http({
+        "http://ok": {"status": 200, "body": {}},
+    }, []))
+    wf = _create_workflow(c, [
+        {"id": "first", "type": "http", "params": {"url": "http://ok"}},
+        {"id": "bad", "type": "http",
+         "params": {"url": "http://ok", "body": {"x": "{{steps.first.output.body.nope}}"}}},
+    ])
+    run = c.post(f"/api/v1/workflows/{wf['id']}/run").json()
+    assert run["status"] == "failed"
+    assert "template path not found" in run["error"]
+    assert {s["id"]: s["status"] for s in run["steps"]} == {"first": "succeeded", "bad": "failed"}
 
 
 def test_scheduler_runs_due_workflows(client, monkeypatch):

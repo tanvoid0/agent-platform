@@ -73,6 +73,29 @@ pub fn view(state: &State) -> Element<'_, Message> {
 
 fn editor_card<'a>(state: &'a State, editor: &'a crate::workflows::Editor) -> Element<'a, Message> {
     let title = if editor.id.is_some() { "Edit workflow" } else { "New workflow" };
+
+    // Notion-style helper: describe the change in prose; the reply lands here
+    // and any proposed steps land straight in the editor above.
+    let mut assist: Vec<Element<'a, Message>> = vec![ui::cluster(vec![
+        container(ui::input_submit(
+            "Ask AI to draft, review or change these steps…",
+            &editor.assist_prompt,
+            Message::AssistPromptChanged,
+            Message::AskAssist,
+        ))
+        .width(Length::Fill)
+        .into(),
+        ui::button_secondary(
+            Icon::Sparkles,
+            if editor.assist_busy { "Thinking…" } else { "Ask AI" },
+            Message::AskAssist,
+        ),
+    ])
+    .into()];
+    if let Some(reply) = &editor.assist_reply {
+        assist.push(ui::muted(reply.clone()));
+    }
+
     ui::card_with_header(
         title,
         Some(ui::muted(
@@ -99,6 +122,7 @@ fn editor_card<'a>(state: &'a State, editor: &'a crate::workflows::Editor) -> El
                         .height(240),
                 ),
             ),
+            ui::field("Assistant", ui::stack(assist)),
             ui::cluster(vec![
                 if state.busy {
                     ui::button_secondary(Icon::Clock, "Saving…", Message::Save)
@@ -135,7 +159,7 @@ fn workflow_card<'a>(state: &'a State, wf: &'a WorkflowInfo) -> Element<'a, Mess
         ui::cluster(vec![
             ui::button_secondary(
                 Icon::Play,
-                if state.busy { "Running…" } else { "Run now" },
+                if state.running == Some(wf.id) { "Running…" } else { "Run now" },
                 Message::RunNow(wf.id),
             ),
             ui::button_ghost(

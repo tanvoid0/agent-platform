@@ -240,16 +240,77 @@ fn chat_view(app: &App) -> Element<'_, Message> {
             blocked_view(app, screen_title(app.screen))
         }
         Screen::Memory => crate::memory_view::view(&app.memory).map(Message::Memory),
-        Screen::Assistant => {
+        Screen::Assistant => with_history(
+            app,
+            crate::assistant::NAME,
             crate::assistant_view::view(&app.assistant, &app.settings.theme.resolve())
-                .map(Message::Assistant)
-        }
-        _ => crate::chat_view::view(&app.chat, &app.settings.theme.resolve()).map(Message::Chat),
+                .map(Message::Assistant),
+        ),
+        _ => with_history(
+            app,
+            "Chat",
+            crate::chat_view::view(&app.chat, &app.settings.theme.resolve()).map(Message::Chat),
+        ),
     };
     match memory_notice(app) {
         Some(banner) => tabbed(tabs, column![banner, body].spacing(space::SM).into()),
         None => tabbed(tabs, body),
     }
+}
+
+/// A chat body with the past-conversations sidebar on its left. Only the two
+/// live threads get one — Memory has no thread to save.
+fn with_history<'a>(
+    app: &'a App,
+    source: &str,
+    body: Element<'a, Message>,
+) -> Element<'a, Message> {
+    row![
+        history_panel(app, source),
+        ui::separator_vertical(),
+        container(body).width(Length::Fill).height(Length::Fill),
+    ]
+    .into()
+}
+
+/// The sidebar itself: New chat on top, then this tab's saved conversations,
+/// most recently touched first. Clicking a row loads it; the trash forgets it.
+fn history_panel<'a>(app: &'a App, source: &str) -> Element<'a, Message> {
+    let current = app.history.current(source);
+    let rows = app.history.visible(source);
+    let mut items: Vec<Element<'_, Message>> = vec![ui::button_secondary(
+        Icon::Plus,
+        "New chat",
+        Message::History(crate::history::Message::New),
+    )];
+    if rows.is_empty() {
+        items.push(ui::caption("Past chats appear here."));
+    }
+    for c in rows {
+        items.push(
+            ui::cluster(vec![
+                container(ui::nav_item(
+                    Icon::Message,
+                    &c.title,
+                    current == Some(c.id),
+                    Message::History(crate::history::Message::Select(c.id)),
+                ))
+                .width(Length::Fill)
+                .into(),
+                ui::icon_button(
+                    Icon::Trash,
+                    Message::History(crate::history::Message::Delete(c.id)),
+                ),
+            ])
+            .into(),
+        );
+    }
+    container(scrollable(Column::with_children(items).spacing(2.0)).height(Length::Fill))
+        .width(224)
+        .padding(space::SM)
+        .height(Length::Fill)
+        .style(ui::theme::sidebar)
+        .into()
 }
 
 /// The "memory updated" banner: shown in the chat the facts came from, right

@@ -17,6 +17,11 @@ pub struct State {
     /// Parsed markdown per message, same indices as `messages` — parsed once at
     /// push rather than per frame.
     pub md: Vec<Vec<iced::widget::markdown::Item>>,
+    /// Chain-of-thought per message, same indices — empty for everything except
+    /// assistant turns from a reasoning model. Display-only: never sent back.
+    pub reasoning: Vec<String>,
+    /// Messages whose thinking section the user has expanded.
+    pub reasoning_open: std::collections::HashSet<usize>,
     pub draft: String,
     /// Provider/model override for this thread; empty = the server's default.
     /// The plain screen persists the pair in `shell::Settings`.
@@ -27,8 +32,9 @@ pub struct State {
     pub catalog: Vec<ProviderEntry>,
     pub sending: bool,
     /// An assistant turn is open and collecting deltas — the next one appends to
-    /// it rather than starting another bubble.
-    streaming: bool,
+    /// it rather than starting another bubble. Public so the view can keep the
+    /// live turn's thinking section open while it streams.
+    pub streaming: bool,
     pub error: Option<String>,
     /// Scope context sent ahead of the thread and never shown in it. Set by
     /// callers that chat *about* something (a run, a subagent); `None` for the
@@ -44,6 +50,8 @@ impl Default for State {
         Self {
             messages: Vec::new(),
             md: Vec::new(),
+            reasoning: Vec::new(),
+            reasoning_open: Default::default(),
             draft: String::new(),
             provider: String::new(),
             model: String::new(),
@@ -72,8 +80,27 @@ impl State {
         self.scroll.clone()
     }
 
+    /// Replace the thread with a saved conversation (empty = a fresh one).
+    /// Callers guard against an in-flight send; the draft is left alone.
+    pub fn load_thread(&mut self, messages: Vec<ChatMessage>, reasoning: Vec<String>) {
+        self.md = messages
+            .iter()
+            .map(|m| iced::widget::markdown::parse(&m.content).collect())
+            .collect();
+        self.reasoning = if reasoning.len() == messages.len() {
+            reasoning
+        } else {
+            vec![String::new(); messages.len()]
+        };
+        self.messages = messages;
+        self.reasoning_open.clear();
+        self.streaming = false;
+        self.error = None;
+    }
+
     fn push_turn(&mut self, role: &str, content: String) {
         self.md.push(iced::widget::markdown::parse(&content).collect());
+        self.reasoning.push(String::new());
         self.messages.push(ChatMessage::text(role, content));
     }
 
@@ -88,6 +115,23 @@ impl State {
         let last = self.messages.len() - 1;
         self.messages[last].content.push_str(text);
         self.md[last] = iced::widget::markdown::parse(&self.messages[last].content).collect();
+    }
+
+    /// Append a reasoning delta — same turn-opening rule as `push_delta`, since
+    /// a thinking model's reasoning arrives before its first content token.
+    fn push_reasoning(&mut self, text: &str) {
+        if !self.streaming {
+            self.push_turn("assistant", String::new());
+            self.streaming = true;
+        }
+        let last = self.messages.len() - 1;
+        self.reasoning[last].push_str(text);
+    }
+
+    /// Is this the streaming turn whose answer hasn't started yet? The view
+    /// keeps that one's thinking section open without a click.
+    pub fn reasoning_live(&self, idx: usize) -> bool {
+        self.streaming && idx + 1 == self.messages.len() && self.messages[idx].content.is_empty()
     }
 
     /// The wire history: scope context first, then the visible turns.
@@ -134,6 +178,8 @@ pub enum Message {
     Send,
     /// One chunk of the streamed reply.
     Chunk(ChatChunk),
+    /// Show/hide the thinking section of message `idx`.
+    ToggleReasoning(usize),
     LinkClicked(String),
     Clear,
     DismissError,
@@ -196,6 +242,16 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.push_delta(&text);
             iced::widget::operation::snap_to_end(state.scroll_id())
         }
+        Message::Chunk(ChatChunk::Reasoning(text)) => {
+            state.push_reasoning(&text);
+            iced::widget::operation::snap_to_end(state.scroll_id())
+        }
+        Message::ToggleReasoning(idx) => {
+            if !state.reasoning_open.remove(&idx) {
+                state.reasoning_open.insert(idx);
+            }
+            Task::none()
+        }
         // This screen sends no tools, so no tool calls can arrive.
         Message::Chunk(ChatChunk::ToolCall(_)) => Task::none(),
         Message::Chunk(ChatChunk::Done) => {
@@ -215,6 +271,8 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Clear => {
             state.messages.clear();
             state.md.clear();
+            state.reasoning.clear();
+            state.reasoning_open.clear();
             state.streaming = false;
             state.error = None;
             Task::none()
@@ -305,6 +363,29 @@ mod tests {
         assert_eq!(s.messages[1].content, "Hello there");
         assert_eq!(s.md.len(), s.messages.len());
         assert!(!s.sending);
+    }
+
+    #[test]
+    fn reasoning_collects_apart_from_the_reply_and_stays_off_the_wire() {
+        let mut s = State { draft: "hi".into(), ..State::default() };
+        let _ = update(&mut s, &client(), Message::Send);
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Reasoning("hmm, ".into())));
+        // Reasoning alone opens the turn — the bubble exists while it thinks.
+        assert_eq!(s.messages.len(), 2);
+        assert!(s.reasoning_live(1));
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Reasoning("ok".into())));
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Delta("Answer".into())));
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Done));
+        assert_eq!(s.reasoning[1], "hmm, ok");
+        assert_eq!(s.messages[1].content, "Answer");
+        assert!(!s.reasoning_live(1));
+        // The wire history carries the answer only.
+        assert!(s.wire_messages().iter().all(|m| !m.content.contains("hmm")));
+
+        let _ = update(&mut s, &client(), Message::ToggleReasoning(1));
+        assert!(s.reasoning_open.contains(&1));
+        let _ = update(&mut s, &client(), Message::ToggleReasoning(1));
+        assert!(!s.reasoning_open.contains(&1));
     }
 
     #[test]

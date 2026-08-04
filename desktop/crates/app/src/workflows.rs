@@ -5,7 +5,9 @@
 //! owns the step schema and validates on save, so the app round-trips the JSON
 //! verbatim and surfaces the server's error message when it is rejected.
 
-use agent_platform_client::types::{WorkflowBody, WorkflowInfo, WorkflowRunInfo};
+use agent_platform_client::types::{
+    WorkflowAssistBody, WorkflowAssistResponse, WorkflowBody, WorkflowInfo, WorkflowRunInfo,
+};
 use agent_platform_client::Client;
 use iced::widget::text_editor;
 use iced::Task;
@@ -28,6 +30,25 @@ pub struct Editor {
     /// Raw seconds; empty means "no schedule".
     pub interval: String,
     pub steps: text_editor::Content,
+    /// The "ask AI" side of the editor: prompt in, last reply out.
+    pub assist_prompt: String,
+    pub assist_reply: Option<String>,
+    pub assist_busy: bool,
+}
+
+impl Editor {
+    fn new(id: Option<i64>, name: &str, description: &str, interval: &str, steps: &str) -> Self {
+        Editor {
+            id,
+            name: name.to_string(),
+            description: description.to_string(),
+            interval: interval.to_string(),
+            steps: text_editor::Content::with_text(steps),
+            assist_prompt: String::new(),
+            assist_reply: None,
+            assist_busy: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -38,6 +59,8 @@ pub struct State {
     /// Which run's per-step results are unfolded.
     pub expanded_run: Option<i64>,
     pub editor: Option<Editor>,
+    /// Which workflow is mid-run; only that card's button says "Running…".
+    pub running: Option<i64>,
     pub busy: bool,
     pub error: Option<String>,
     pub notice: Option<String>,
@@ -61,6 +84,9 @@ pub enum Message {
     DescriptionChanged(String),
     IntervalChanged(String),
     StepsEdited(text_editor::Action),
+    AssistPromptChanged(String),
+    AskAssist,
+    AssistReplied(Result<Box<WorkflowAssistResponse>, String>),
     CancelEditor,
     Save,
     Saved(Result<Box<WorkflowInfo>, String>),
@@ -69,6 +95,17 @@ pub enum Message {
 
 fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
     r.map_err(|e| e.to_string())
+}
+
+/// Step errors can carry a whole HTML error page; the banner needs one line,
+/// the full text stays in the run's step results.
+fn truncate_error(e: &str) -> String {
+    const MAX: usize = 220;
+    if e.chars().count() <= MAX {
+        e.to_string()
+    } else {
+        format!("{}… (full error in the run's steps)", e.chars().take(MAX).collect::<String>())
+    }
 }
 
 pub fn refresh(client: &Client) -> Task<Message> {
@@ -150,7 +187,10 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             Task::none()
         }
         Message::RunNow(id) => {
-            state.busy = true;
+            if state.running.is_some() {
+                return Task::none(); // one run at a time; the button already says so
+            }
+            state.running = Some(id);
             let client = client.clone();
             Task::perform(
                 async move {
@@ -160,17 +200,20 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             )
         }
         Message::RanNow(result) => {
-            state.busy = false;
+            state.running = None;
             match result {
                 Ok(run) => {
-                    state.notice = Some(match run.status.as_str() {
-                        "succeeded" => format!("Run #{} succeeded.", run.id),
-                        _ => format!(
-                            "Run #{} failed: {}",
+                    // A failed run is bad news and must look like it; only a
+                    // clean run goes in the green banner.
+                    if run.status == "succeeded" {
+                        state.notice = Some(format!("Run #{} succeeded.", run.id));
+                    } else {
+                        state.error = Some(format!(
+                            "Run #{} failed — {}",
                             run.id,
-                            run.error.as_deref().unwrap_or("unknown error")
-                        ),
-                    });
+                            truncate_error(run.error.as_deref().unwrap_or("unknown error"))
+                        ));
+                    }
                     // Fold the fresh run in ourselves when its workflow is the
                     // open one — no second fetch for data we already hold.
                     if state.selected == Some(run.workflow_id) {
@@ -203,25 +246,19 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             refresh(client)
         }
         Message::New => {
-            state.editor = Some(Editor {
-                id: None,
-                name: String::new(),
-                description: String::new(),
-                interval: String::new(),
-                steps: text_editor::Content::with_text(STEPS_TEMPLATE),
-            });
+            state.editor = Some(Editor::new(None, "", "", "", STEPS_TEMPLATE));
             Task::none()
         }
         Message::Edit(id) => {
             if let Some(wf) = state.items.iter().find(|w| w.id == id) {
                 let steps = serde_json::to_string_pretty(&wf.steps).unwrap_or_default();
-                state.editor = Some(Editor {
-                    id: Some(id),
-                    name: wf.name.clone(),
-                    description: wf.description.clone().unwrap_or_default(),
-                    interval: wf.interval_seconds.map(|s| s.to_string()).unwrap_or_default(),
-                    steps: text_editor::Content::with_text(&steps),
-                });
+                state.editor = Some(Editor::new(
+                    Some(id),
+                    &wf.name,
+                    wf.description.as_deref().unwrap_or(""),
+                    &wf.interval_seconds.map(|s| s.to_string()).unwrap_or_default(),
+                    &steps,
+                ));
             }
             Task::none()
         }
@@ -246,6 +283,51 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::StepsEdited(action) => {
             if let Some(ed) = &mut state.editor {
                 ed.steps.perform(action);
+            }
+            Task::none()
+        }
+        Message::AssistPromptChanged(v) => {
+            if let Some(ed) = &mut state.editor {
+                ed.assist_prompt = v;
+            }
+            Task::none()
+        }
+        Message::AskAssist => {
+            let Some(ed) = &mut state.editor else { return Task::none() };
+            let message = ed.assist_prompt.trim().to_string();
+            if message.is_empty() || ed.assist_busy {
+                return Task::none();
+            }
+            ed.assist_busy = true;
+            // The untouched boilerplate is not a draft worth defending — sending
+            // it made the model keep the example.com step in its answers.
+            let steps_text = ed.steps.text();
+            let is_template = steps_text.trim() == STEPS_TEMPLATE.trim();
+            let body = WorkflowAssistBody {
+                message,
+                name: (!ed.name.trim().is_empty()).then(|| ed.name.trim().to_string()),
+                // An unparseable draft is simply not sent; the model starts fresh.
+                steps: (!is_template).then(|| serde_json::from_str(&steps_text).ok()).flatten(),
+            };
+            let client = client.clone();
+            Task::perform(
+                async move { err_string(client.workflow_assist(&body).await).map(Box::new) },
+                Message::AssistReplied,
+            )
+        }
+        Message::AssistReplied(result) => {
+            let Some(ed) = &mut state.editor else { return Task::none() };
+            ed.assist_busy = false;
+            match result {
+                Ok(resp) => {
+                    if let Some(steps) = &resp.steps {
+                        let pretty = serde_json::to_string_pretty(steps).unwrap_or_default();
+                        ed.steps = text_editor::Content::with_text(&pretty);
+                    }
+                    ed.assist_reply = Some(resp.reply);
+                    ed.assist_prompt.clear();
+                }
+                Err(e) => ed.assist_reply = Some(format!("Assistant error: {e}")),
             }
             Task::none()
         }
@@ -308,13 +390,7 @@ mod tests {
     use super::*;
 
     fn editor(name: &str, steps: &str, interval: &str, id: Option<i64>) -> Editor {
-        Editor {
-            id,
-            name: name.to_string(),
-            description: String::new(),
-            interval: interval.to_string(),
-            steps: text_editor::Content::with_text(steps),
-        }
+        Editor::new(id, name, "", interval, steps)
     }
 
     #[test]
@@ -339,4 +415,58 @@ mod tests {
         // …but on edit it means "remove the schedule".
         assert!(editor_body(&editor("wf", "[]", "", Some(3))).unwrap().clear_interval);
     }
+
+    #[test]
+    fn failed_run_lands_in_the_error_banner_not_the_notice() {
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let mut s = State::default();
+        let run: WorkflowRunInfo = serde_json::from_value(serde_json::json!({
+            "id": 3, "workflow_id": 1, "trigger": "api", "status": "failed",
+            "input": {}, "steps": [], "error": "step 'fetch': http 404",
+            "started_at": "2026-08-04T00:00:00", "finished_at": null
+        }))
+        .unwrap();
+        let _ = update(&mut s, &client, Message::RunNow(1));
+        assert_eq!(s.running, Some(1));
+        // a second Run click on any card is ignored while one is in flight
+        let _ = update(&mut s, &client, Message::RunNow(2));
+        assert_eq!(s.running, Some(1));
+
+        let _ = update(&mut s, &client, Message::RanNow(Ok(Box::new(run))));
+        assert_eq!(s.running, None);
+        assert!(s.notice.is_none());
+        assert!(s.error.as_deref().unwrap().contains("http 404"));
+
+        let long = "x".repeat(1000);
+        assert!(truncate_error(&long).len() < 300);
+    }
+
+    #[test]
+    fn assist_reply_replaces_steps_and_clears_prompt() {
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let mut s = State::default();
+        s.editor = Some(editor("wf", "[]", "", None));
+        s.editor.as_mut().unwrap().assist_prompt = "add a health check".into();
+
+        let resp = WorkflowAssistResponse {
+            reply: "Added.".into(),
+            steps: Some(vec![serde_json::json!(
+                {"id": "ping", "type": "http", "params": {"url": "http://x"}}
+            )]),
+        };
+        let _ = update(&mut s, &client, Message::AssistReplied(Ok(Box::new(resp))));
+
+        let ed = s.editor.as_ref().unwrap();
+        assert!(ed.steps.text().contains("\"ping\""));
+        assert_eq!(ed.assist_reply.as_deref(), Some("Added."));
+        assert!(ed.assist_prompt.is_empty());
+
+        // a review with no steps leaves the draft alone
+        let before = ed.steps.text();
+        let resp = WorkflowAssistResponse { reply: "Looks fine.".into(), steps: None };
+        let _ = update(&mut s, &client, Message::AssistReplied(Ok(Box::new(resp))));
+        assert_eq!(s.editor.as_ref().unwrap().steps.text(), before);
+    }
+
+    use agent_platform_client::Client;
 }

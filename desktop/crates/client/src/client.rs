@@ -383,6 +383,11 @@ impl Client {
     pub async fn workflow_runs(&self, id: i64) -> Result<WorkflowRunsResponse> {
         self.get_json(&format!("/api/v1/workflows/{id}/runs?limit=20")).await
     }
+
+    /// Chat-style generate/review/edit of a workflow's steps.
+    pub async fn workflow_assist(&self, body: &WorkflowAssistBody) -> Result<WorkflowAssistResponse> {
+        self.post_json("/api/v1/workflows/assist", body).await
+    }
 }
 
 /// Minimal percent-encoding for path segments (model project names).

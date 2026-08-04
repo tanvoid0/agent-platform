@@ -27,20 +27,30 @@ pub fn panel<'a>(
             .messages
             .iter()
             .zip(&state.md)
-            .map(|(m, items)| {
+            .enumerate()
+            .map(|(i, (m, items))| {
                 let is_user = m.role == "user";
                 let (label, tone) = match m.role.as_str() {
                     "user" => ("You", Tone::Neutral),
                     "assistant" => ("Assistant", Tone::Info),
                     other => (other, Tone::Neutral),
                 };
-                let content: Element<'_, Message> = if is_user {
+                let mut parts: Vec<Element<'_, Message>> = Vec::new();
+                // A reasoning model's chain-of-thought rides above the reply:
+                // open while it streams (before the answer starts), collapsed
+                // behind a toggle after.
+                let reasoning = state.reasoning.get(i).map(String::as_str).unwrap_or("");
+                if !reasoning.is_empty() {
+                    let open = state.reasoning_live(i) || state.reasoning_open.contains(&i);
+                    parts.push(ui::thinking(reasoning, open, Message::ToggleReasoning(i)));
+                }
+                parts.push(if is_user {
                     ui::body(m.content.clone())
                 } else {
                     markdown::view(items, markdown::Settings::from(iced_theme))
                         .map(Message::LinkClicked)
-                };
-                ui::turn(label, tone, is_user, content)
+                });
+                ui::turn(label, tone, is_user, column(parts).spacing(space::XS).into())
             })
             .collect();
         scrollable(

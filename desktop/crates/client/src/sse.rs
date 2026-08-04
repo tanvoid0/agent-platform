@@ -84,6 +84,11 @@ pub fn drain_frames(buf: &mut String) -> Vec<String> {
 pub enum ChatChunk {
     /// A piece of assistant text. Concatenating every `Delta` yields the full reply.
     Delta(String),
+    /// A piece of the model's chain-of-thought — `delta.reasoning_content` from
+    /// providers that stream it as its own field (DeepSeek et al.), or text
+    /// between inline `<think>…</think>` tags (Ollama-hosted reasoning models).
+    /// Display-only: never part of the reply text or the wire history.
+    Reasoning(String),
     /// A fragment of a streamed tool call; concatenate `arguments` per `index`.
     ToolCall(ToolCallDelta),
     /// The stream ended cleanly (`data: [DONE]`, or the body closed).
@@ -143,6 +148,88 @@ pub fn chat_delta(payload: &str) -> std::result::Result<Option<String>, String> 
         .map(str::to_string))
 }
 
+/// Extract the reasoning delta from one `chat.completion.chunk` payload.
+/// `reasoning_content` is the DeepSeek-style field; `reasoning` is what
+/// OpenRouter and some proxies rename it to.
+pub fn chat_reasoning(payload: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    ["/choices/0/delta/reasoning_content", "/choices/0/delta/reasoning"]
+        .iter()
+        .find_map(|p| v.pointer(p).and_then(|c| c.as_str()))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Splits inline `<think>…</think>` reasoning out of the content stream, for
+/// models that put their chain-of-thought in the text itself rather than in
+/// `reasoning_content`. A tag can arrive split across deltas, so the longest
+/// tail that could still become a tag is withheld until the next delta (or the
+/// end of the stream) resolves it.
+#[derive(Default)]
+pub struct ThinkFilter {
+    thinking: bool,
+    buf: String,
+}
+
+impl ThinkFilter {
+    /// Feed one content delta; get back the pieces it resolves to, in order.
+    pub fn push(&mut self, text: &str) -> Vec<ChatChunk> {
+        self.buf.push_str(text);
+        let mut out = Vec::new();
+        loop {
+            let tag = if self.thinking { THINK_CLOSE } else { THINK_OPEN };
+            match self.buf.find(tag) {
+                Some(pos) => {
+                    let before = self.buf[..pos].to_string();
+                    self.buf.drain(..pos + tag.len());
+                    self.emit(&mut out, before);
+                    self.thinking = !self.thinking;
+                }
+                None => {
+                    // Withheld bytes are ASCII (they matched the tag's prefix),
+                    // so the cut is always a char boundary.
+                    let cut = self.buf.len() - partial_tag_len(&self.buf, tag);
+                    let text = self.buf[..cut].to_string();
+                    self.buf.drain(..cut);
+                    self.emit(&mut out, text);
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// Flush whatever is withheld at end of stream — a dangling partial tag
+    /// was ordinary text after all.
+    pub fn finish(&mut self) -> Vec<ChatChunk> {
+        let rest = std::mem::take(&mut self.buf);
+        let mut out = Vec::new();
+        self.emit(&mut out, rest);
+        out
+    }
+
+    fn emit(&self, out: &mut Vec<ChatChunk>, text: String) {
+        if !text.is_empty() {
+            out.push(if self.thinking {
+                ChatChunk::Reasoning(text)
+            } else {
+                ChatChunk::Delta(text)
+            });
+        }
+    }
+}
+
+/// Length of the longest suffix of `s` that is a proper prefix of `tag`.
+fn partial_tag_len(s: &str, tag: &str) -> usize {
+    let max = tag.len().saturating_sub(1).min(s.len());
+    (1..=max)
+        .rev()
+        .find(|&k| tag.as_bytes().starts_with(&s.as_bytes()[s.len() - k..]))
+        .unwrap_or(0)
+}
+
 /// Stream `POST /api/v1/chat` with `stream: true`, yielding assistant text deltas.
 ///
 /// Unlike `process_stream` this never reconnects: a chat completion is not
@@ -171,7 +258,10 @@ pub fn chat_stream(
                 match resp {
                     Ok(r) if r.status().is_success() => {
                         let conn = CurrentConn { stream: Box::pin(r.bytes_stream()), buf: String::new() };
-                        Some((None, ChatState::Reading(Box::new(conn), Default::default())))
+                        Some((
+                            None,
+                            ChatState::Reading(Box::new(conn), Default::default(), Default::default()),
+                        ))
                     }
                     // Errors arrive as a normal JSON body (the route returns the
                     // upstream status before it starts streaming).
@@ -186,10 +276,11 @@ pub fn chat_stream(
                     Err(e) => Some((Some(ChatChunk::Failed(e.to_string())), ChatState::End)),
                 }
             }
-            ChatState::Reading(mut conn, mut pending) => {
+            ChatState::Reading(mut conn, mut pending, mut think) => {
                 if let Some(item) = pending.pop_front() {
                     let done = matches!(item, ChatChunk::Done | ChatChunk::Failed(_));
-                    let next = if done { ChatState::End } else { ChatState::Reading(conn, pending) };
+                    let next =
+                        if done { ChatState::End } else { ChatState::Reading(conn, pending, think) };
                     return Some((Some(item), next));
                 }
                 match conn.stream.next().await {
@@ -197,26 +288,37 @@ pub fn chat_stream(
                         conn.buf.push_str(&String::from_utf8_lossy(&chunk));
                         for payload in drain_frames(&mut conn.buf) {
                             if payload.trim() == "[DONE]" {
+                                pending.extend(think.finish());
                                 pending.push_back(ChatChunk::Done);
                                 break;
                             }
                             match chat_delta(&payload) {
-                                Ok(Some(text)) => pending.push_back(ChatChunk::Delta(text)),
+                                // Content runs through the think filter, which
+                                // reroutes inline <think>…</think> spans.
+                                Ok(Some(text)) => pending.extend(think.push(&text)),
                                 Ok(None) => {}
                                 Err(msg) => {
+                                    pending.extend(think.finish());
                                     pending.push_back(ChatChunk::Failed(msg));
                                     break;
                                 }
+                            }
+                            if let Some(text) = chat_reasoning(&payload) {
+                                pending.push_back(ChatChunk::Reasoning(text));
                             }
                             for d in chat_tool_calls(&payload) {
                                 pending.push_back(ChatChunk::ToolCall(d));
                             }
                         }
-                        Some((None, ChatState::Reading(conn, pending)))
+                        Some((None, ChatState::Reading(conn, pending, think)))
                     }
                     Some(Err(e)) => Some((Some(ChatChunk::Failed(e.to_string())), ChatState::End)),
                     // Body closed without [DONE]: whatever arrived is the reply.
-                    None => Some((Some(ChatChunk::Done), ChatState::End)),
+                    None => {
+                        pending.extend(think.finish());
+                        pending.push_back(ChatChunk::Done);
+                        Some((None, ChatState::Reading(conn, pending, think)))
+                    }
                 }
             }
             ChatState::End => None,
@@ -227,7 +329,7 @@ pub fn chat_stream(
 
 enum ChatState {
     Start(Client, Box<crate::types::ChatCompletionBody>),
-    Reading(Box<CurrentConn>, std::collections::VecDeque<ChatChunk>),
+    Reading(Box<CurrentConn>, std::collections::VecDeque<ChatChunk>, ThinkFilter),
     End,
 }
 
@@ -393,6 +495,69 @@ mod tests {
 
         assert!(chat_tool_calls(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).is_empty());
         assert!(chat_tool_calls("[DONE]").is_empty());
+    }
+
+    #[test]
+    fn chat_reasoning_reads_both_field_spellings() {
+        let ds = r#"{"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#;
+        assert_eq!(chat_reasoning(ds).as_deref(), Some("hmm"));
+        let or = r#"{"choices":[{"delta":{"reasoning":"hmm"}}]}"#;
+        assert_eq!(chat_reasoning(or).as_deref(), Some("hmm"));
+        assert_eq!(chat_reasoning(r#"{"choices":[{"delta":{"content":"hi"}}]}"#), None);
+        assert_eq!(chat_reasoning("[DONE]"), None);
+    }
+
+    /// Flatten filter output into (reasoning, content) strings.
+    fn run_filter(deltas: &[&str]) -> (String, String) {
+        let mut f = ThinkFilter::default();
+        let (mut think, mut text) = (String::new(), String::new());
+        let mut chunks: Vec<ChatChunk> = deltas.iter().flat_map(|d| f.push(d)).collect();
+        chunks.extend(f.finish());
+        for c in chunks {
+            match c {
+                ChatChunk::Reasoning(s) => think.push_str(&s),
+                ChatChunk::Delta(s) => text.push_str(&s),
+                _ => unreachable!(),
+            }
+        }
+        (think, text)
+    }
+
+    #[test]
+    fn think_filter_splits_inline_tags() {
+        let (think, text) = run_filter(&["<think>let me see</think>Answer."]);
+        assert_eq!(think, "let me see");
+        assert_eq!(text, "Answer.");
+    }
+
+    #[test]
+    fn think_filter_handles_tags_split_across_deltas() {
+        let (think, text) = run_filter(&["<th", "ink>rea", "soning</thi", "nk>The answer"]);
+        assert_eq!(think, "reasoning");
+        assert_eq!(text, "The answer");
+    }
+
+    #[test]
+    fn think_filter_passes_plain_text_through() {
+        let (think, text) = run_filter(&["Hello", " there"]);
+        assert_eq!(think, "");
+        assert_eq!(text, "Hello there");
+    }
+
+    #[test]
+    fn think_filter_flushes_a_dangling_partial_tag_as_text() {
+        // "<th" at end of stream was never a tag; the user gets it back.
+        let (think, text) = run_filter(&["price is a <th"]);
+        assert_eq!(think, "");
+        assert_eq!(text, "price is a <th");
+    }
+
+    #[test]
+    fn think_filter_unclosed_think_stays_reasoning() {
+        // Stream died mid-thought: the partial thinking is still shown as such.
+        let (think, text) = run_filter(&["<think>half a tho"]);
+        assert_eq!(think, "half a tho");
+        assert_eq!(text, "");
     }
 
     #[test]

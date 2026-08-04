@@ -498,6 +498,21 @@ pub fn turn<'a, M: 'a>(
     if is_user { c.style(theme::code_block).into() } else { c.into() }
 }
 
+/// Collapsible chain-of-thought section above a reasoning model's reply: a
+/// ghost toggle, and the thought stream in muted text while open. Shown only
+/// when the model actually streamed reasoning — callers skip it otherwise.
+pub fn thinking<'a, M: 'a + Clone>(reasoning: &'a str, open: bool, toggle: M) -> Element<'a, M> {
+    let head = button_ghost(
+        Icon::Sparkles,
+        if open { "Hide thinking" } else { "Thinking" },
+        toggle,
+    );
+    if !open {
+        return head;
+    }
+    Column::with_children(vec![head, muted(reasoning)]).spacing(space::XS).into()
+}
+
 /// `<Input>` with a leading glyph (search fields, filters).
 pub fn input_icon<'a, M: 'a + Clone>(
     glyph: Icon,

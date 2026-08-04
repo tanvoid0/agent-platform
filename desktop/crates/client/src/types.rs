@@ -309,15 +309,15 @@ pub struct ProjectBody {
 // Chat (POST /api/v1/chat, OpenAI-shaped)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
     /// Assistant turn that asked for tools (OpenAI shape).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     /// Set on `role: "tool"` result messages.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
 
@@ -328,7 +328,7 @@ impl ChatMessage {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -342,7 +342,7 @@ impl Default for ToolCall {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolFunction {
     pub name: String,
     /// JSON-encoded arguments, streamed in fragments and concatenated.
@@ -697,4 +697,20 @@ pub struct WorkflowRunInfo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowRunsResponse {
     pub runs: Vec<WorkflowRunInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowAssistBody {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowAssistResponse {
+    pub reply: String,
+    /// Server-validated replacement steps; `None` means "no change proposed".
+    pub steps: Option<Vec<Value>>,
 }

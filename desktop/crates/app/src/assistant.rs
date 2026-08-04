@@ -282,6 +282,12 @@ pub struct State {
     /// Parsed markdown per message, same indices as `messages` — parsed once
     /// at push, not per frame (the HUD redraws at 60 fps).
     pub md: Vec<Vec<iced::widget::markdown::Item>>,
+    /// Chain-of-thought per message, same indices — empty except for assistant
+    /// turns from a reasoning model. Display-only: never on the wire, and
+    /// never spoken (the voice reads the reply, not the deliberation).
+    pub reasoning: Vec<String>,
+    /// Messages whose thinking section the user has expanded.
+    pub reasoning_open: std::collections::HashSet<usize>,
     pub draft: String,
     pub sending: bool,
     pub error: Option<String>,
@@ -353,8 +359,9 @@ pub struct State {
     playback: Option<(Vec<f32>, u32)>,
     tts: Option<Tts>,
     tts_failed: bool,
-    /// An assistant turn is open and collecting deltas.
-    streaming: bool,
+    /// An assistant turn is open and collecting deltas. Public so the view can
+    /// keep the live turn's thinking section open while it streams.
+    pub streaming: bool,
     /// Tool calls of the round in flight, assembled from streamed fragments.
     tool_buf: Vec<ToolCall>,
     /// Tool rounds taken since the user last spoke; capped by MAX_TOOL_ROUNDS.
@@ -438,9 +445,61 @@ impl State {
         self.enrolled >= ENROLL_UTTERANCES
     }
 
+    /// Replace the thread with a saved conversation (empty = a fresh one).
+    /// Callers guard against an in-flight send; the draft and the mic are left
+    /// alone. Rebuilds the transcript the way the live stream renders it: tool
+    /// results fenced, tool calls shown as the command they ran.
+    pub fn load_thread(&mut self, messages: Vec<ChatMessage>, reasoning: Vec<String>) {
+        self.hush();
+        self.md = messages
+            .iter()
+            .map(|m| {
+                let mut shown = if m.role == "tool" {
+                    format!("````text\n{}\n````", m.content)
+                } else {
+                    m.content.clone()
+                };
+                for c in m.tool_calls.iter().flatten() {
+                    shown.push_str(&format!("\n\n```\n$ {}\n```", command_of(c)));
+                }
+                iced::widget::markdown::parse(&shown).collect()
+            })
+            .collect();
+        self.reasoning = if reasoning.len() == messages.len() {
+            reasoning
+        } else {
+            vec![String::new(); messages.len()]
+        };
+        self.messages = messages;
+        self.reasoning_open.clear();
+        self.streaming = false;
+        self.tool_buf.clear();
+        self.tool_rounds = 0;
+        self.error = None;
+    }
+
     fn push_turn(&mut self, role: &str, content: String) {
         self.md.push(iced::widget::markdown::parse(&content).collect());
+        self.reasoning.push(String::new());
         self.messages.push(ChatMessage::text(role, content));
+    }
+
+    /// Append a reasoning delta — opens the turn like `push_delta`, since a
+    /// thinking model reasons before its first reply token. Never enqueued for
+    /// speech.
+    fn push_reasoning(&mut self, text: &str) {
+        if !self.streaming {
+            self.push_turn("assistant", String::new());
+            self.streaming = true;
+        }
+        let last = self.messages.len() - 1;
+        self.reasoning[last].push_str(text);
+    }
+
+    /// Is this the streaming turn whose answer hasn't started yet? The view
+    /// keeps that one's thinking section open without a click.
+    pub fn reasoning_live(&self, idx: usize) -> bool {
+        self.streaming && idx + 1 == self.messages.len() && self.messages[idx].content.is_empty()
     }
 
     /// Fire the chat request for the current history: persona, recall, then
@@ -758,6 +817,8 @@ pub enum Message {
     LinkClicked(String),
     /// One chunk of the streamed reply.
     Chunk(ChatChunk),
+    /// Show/hide the thinking section of message `idx`.
+    ToggleReasoning(usize),
     /// The terminal finished a round of tool calls; results go back to the model.
     ToolResults(Vec<ToolOutcome>),
     Synthesized(Result<Vec<u8>, String>),
@@ -811,6 +872,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 state
                     .md
                     .push(iced::widget::markdown::parse(&format!("````text\n{}\n````", r.output)).collect());
+                state.reasoning.push(String::new());
                 state.messages.push(ChatMessage {
                     role: "tool".into(),
                     content: r.output,
@@ -821,6 +883,18 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.tool_rounds += 1;
             // Still `sending`: the reply continues with the results in hand.
             state.request(client)
+        }
+        Message::Chunk(ChatChunk::Reasoning(text)) => {
+            // Shown in the transcript, never spoken: E.V. reading its own
+            // chain-of-thought aloud would bury the answer.
+            state.push_reasoning(&text);
+            iced::widget::operation::snap_to_end(transcript_id())
+        }
+        Message::ToggleReasoning(idx) => {
+            if !state.reasoning_open.remove(&idx) {
+                state.reasoning_open.insert(idx);
+            }
+            Task::none()
         }
         Message::Chunk(ChatChunk::Delta(text)) => {
             state.push_delta(&text);
@@ -1000,6 +1074,8 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.hush();
             state.messages.clear();
             state.md.clear();
+            state.reasoning.clear();
+            state.reasoning_open.clear();
             state.streaming = false;
             state.tool_buf.clear();
             state.tool_rounds = 0;
@@ -1227,6 +1303,26 @@ mod tests {
 
         let _ = update(&mut s, &client(), Message::ToggleVoice);
         assert!(s.voice);
+    }
+
+    #[test]
+    fn reasoning_is_shown_but_never_spoken() {
+        let mut s = State::new(); // voice on
+        let _ = update(
+            &mut s,
+            &client(),
+            Message::Chunk(ChatChunk::Reasoning("User asks for status; check the basics.".into())),
+        );
+        // Reasoning alone opened the turn and nothing went to the synthesizer.
+        assert_eq!(s.messages.len(), 1);
+        assert!(s.reasoning_live(0));
+        assert!(!s.synthesizing);
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Delta("Systems nominal.".into())));
+        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Done));
+        assert_eq!(s.reasoning[0], "User asks for status; check the basics.");
+        assert_eq!(s.messages[0].content, "Systems nominal.");
+        // What reached the voice is the reply, not the deliberation.
+        assert_eq!(s.speaking.as_deref(), Some("Systems nominal."));
     }
 
     #[test]
