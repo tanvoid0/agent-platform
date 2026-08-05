@@ -57,6 +57,59 @@ impl ApiError {
     }
 }
 
+/// `Path`, but rejecting like FastAPI does.
+///
+/// axum answers `/todos/items/abc` with a plain-text 400 (`Cannot parse "abc"
+/// to a i64`); FastAPI answers 422 with the validation envelope. Every migrated
+/// route with an id in its path would otherwise differ on the same request.
+pub struct PathId<T>(pub T);
+
+impl<T, S> axum::extract::FromRequestParts<S> for PathId<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        use axum::extract::rejection::PathRejection;
+        use axum::extract::{path::ErrorKind, Path};
+
+        match Path::<T>::from_request_parts(parts, state).await {
+            Ok(Path(value)) => Ok(PathId(value)),
+            Err(PathRejection::FailedToDeserializePathParams(err)) => {
+                let key = match err.kind() {
+                    ErrorKind::ParseErrorAtKey { key, .. }
+                    | ErrorKind::InvalidUtf8InPathParam { key }
+                    | ErrorKind::DeserializeError { key, .. } => key.clone(),
+                    // A single path param deserializes without a key, so the
+                    // name comes from the route pattern instead — otherwise the
+                    // caller is told "path" where FastAPI names the parameter.
+                    _ => last_path_param(parts).unwrap_or_else(|| "path".to_string()),
+                };
+                Err(ApiError::validation(vec![json!({
+                    "type": "int_parsing",
+                    "loc": ["path", key],
+                    "msg": "Input should be a valid integer, unable to parse string as an integer",
+                })]))
+            }
+            Err(other) => Err(ApiError::new(other.status(), other.body_text())),
+        }
+    }
+}
+
+/// `"/api/v1/todos/items/{item_id}"` → `"item_id"`.
+fn last_path_param(parts: &axum::http::request::Parts) -> Option<String> {
+    let matched = parts.extensions.get::<axum::extract::MatchedPath>()?;
+    matched
+        .as_str()
+        .rsplit('/')
+        .find_map(|seg| seg.strip_prefix('{')?.strip_suffix('}').map(str::to_string))
+}
+
 fn code_for(status: StatusCode) -> &'static str {
     match status.as_u16() {
         400 => "bad_request",

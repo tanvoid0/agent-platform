@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
 use crate::auth::Principal;
-use crate::error::ApiError;
+use crate::error::{ApiError, PathId};
 use crate::wire::{check_len, sql_now, sql_time};
 use crate::AppState;
 
@@ -527,7 +527,7 @@ fn trimmed(value: Option<String>) -> Option<String> {
 async fn get_team(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(team_id): Path<i64>,
+    PathId(team_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     let row = load_row(&state, team_id).await?;
     assert_visible(&principal, &row)?;
@@ -537,7 +537,7 @@ async fn get_team(
 async fn update_team(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(team_id): Path<i64>,
+    PathId(team_id): PathId<i64>,
     body: Option<Json<Value>>,
 ) -> Result<Response, ApiError> {
     let row = load_row(&state, team_id).await?;
@@ -632,7 +632,7 @@ async fn update_team(
 async fn delete_team(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(team_id): Path<i64>,
+    PathId(team_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     let row = load_row(&state, team_id).await?;
     assert_owned(&principal, &row)?;

@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch};
@@ -28,7 +28,7 @@ use serde_json::{json, Map, Value};
 use sqlx::FromRow;
 
 use crate::auth::Principal;
-use crate::error::ApiError;
+use crate::error::{ApiError, PathId};
 use crate::teams::{random_palette_color, stable_palette_color};
 use crate::wire::{check_len, sql_now, sql_time, sql_time_opt};
 use crate::AppState;
@@ -547,7 +547,7 @@ async fn apply_board_template(state: &AppState, board_id: i64, slug: &str) -> Re
 async fn get_board(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(board_id): Path<i64>,
+    PathId(board_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:read")?;
     assert_board_access(&state, &principal, board_id).await?;
@@ -604,7 +604,7 @@ struct BoardUpdate {
 async fn update_board(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(board_id): Path<i64>,
+    PathId(board_id): PathId<i64>,
     body: Option<Json<BoardUpdate>>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
@@ -652,7 +652,7 @@ async fn update_board(
 async fn delete_board(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(board_id): Path<i64>,
+    PathId(board_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
     assert_board_access(&state, &principal, board_id).await?;
@@ -674,7 +674,7 @@ async fn delete_board(
 async fn list_categories(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(board_id): Path<i64>,
+    PathId(board_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:read")?;
     assert_board_access(&state, &principal, board_id).await?;
@@ -706,7 +706,7 @@ struct CategoryCreate {
 async fn create_category(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(board_id): Path<i64>,
+    PathId(board_id): PathId<i64>,
     body: Option<Json<CategoryCreate>>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
@@ -782,7 +782,7 @@ struct CategoryUpdate {
 async fn update_category(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path((board_id, category_id)): Path<(i64, i64)>,
+    PathId((board_id, category_id)): PathId<(i64, i64)>,
     body: Option<Json<CategoryUpdate>>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
@@ -850,7 +850,7 @@ async fn load_item(state: &AppState, item_id: i64) -> Result<ItemOut, ApiError> 
 async fn list_items(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(board_id): Path<i64>,
+    PathId(board_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:read")?;
     assert_board_access(&state, &principal, board_id).await?;
@@ -927,7 +927,7 @@ fn tuple_repr(values: &[&str]) -> String {
 async fn create_item(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(board_id): Path<i64>,
+    PathId(board_id): PathId<i64>,
     body: Option<Json<ItemCreate>>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
@@ -995,7 +995,7 @@ fn datetime_to_sql(raw: &str) -> String {
 async fn get_item(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(item_id): Path<i64>,
+    PathId(item_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:read")?;
     assert_item_access(&state, &principal, item_id).await?;
@@ -1005,7 +1005,7 @@ async fn get_item(
 async fn update_item(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(item_id): Path<i64>,
+    PathId(item_id): PathId<i64>,
     body: Option<Json<Value>>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
@@ -1110,7 +1110,7 @@ where
 async fn delete_item(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(item_id): Path<i64>,
+    PathId(item_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
     assert_item_access(&state, &principal, item_id).await?;
@@ -1150,7 +1150,7 @@ struct EventRow {
 async fn item_events(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(item_id): Path<i64>,
+    PathId(item_id): PathId<i64>,
     Query(q): Query<EventQuery>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:read")?;

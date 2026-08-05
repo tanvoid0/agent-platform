@@ -68,7 +68,9 @@ screen in `crates/app` stay untouched per migration.
    Python, because they run through the LLM proxy and the orchestrator. Those
    Python routes write `todo_items` and `todo_item_events`, so that table now has
    two writers. The call was Benson's: visible progress over waiting for
-   `llm_proxy`. What bounds the damage is that Rust writes one column per
+   `llm_proxy`. Workflows is split the same way — `run` (the engine) and
+   `assist` (the LLM) stay in Python, and Rust reads `workflow_runs` without
+   writing it except on delete. What bounds the damage is that Rust writes one column per
    statement and never a whole row, so a rename cannot clobber an agent's
    `plan_json`; the reverse is still possible, because SQLAlchemy flushes whole
    rows. The exception ends when `llm_proxy` moves. Nothing else gets this
@@ -123,7 +125,7 @@ screen in `crates/app` stay untouched per migration.
 |---|--------|----------|
 | 1 | auth (`api_auth.py`, `api_tokens/`) | every other slice needs the principal; the proxy must reject before forwarding |
 | 2 | `/health`, `/` | zero coupling — the only two routes that depend on no Python-owned fact |
-| 3 | projects ✅, teams ✅, todo CRUD ✅ (split — see below), workflows | leaf tables, no LLM, ~1.5k LOC |
+| 3 | projects ✅, teams ✅, todo CRUD ✅, workflow CRUD ✅ (the last two split — see below) | leaf tables, no LLM, ~1.5k LOC |
 | 4 | `llm_proxy/` | ~3k LOC; also where `local_llm.rs` moves so the cloud binary gets in-process inference |
 | 5 | processes / orchestrator / action_orchestrator | FastAPI `BackgroundTasks` + `asyncio.create_task` → tokio; needs a `startup_recovery` equivalent |
 | 6 | assistant, chat, coder | largest and highest-churn |
@@ -193,6 +195,14 @@ a 404.
   ephemeral address. The daemon passes `AGENT_PLATFORM_PUBLIC_HOST`/`_PORT` and
   `system_routes.py` prefers them, so the field keeps meaning "the address you
   reached us on". That is the one Python change this slice needed.
+- **A proxied route inside a migrated prefix has to be declared.**
+  `POST /workflows/assist` matches `/workflows/{workflow_id}`, so leaving it out
+  gave a `405` instead of falling through to Python. Routing a path explicitly at
+  `proxy::forward` is how a route stays with Python inside a prefix Rust owns.
+- **Path params reject like FastAPI, via `error::PathId`.** axum answers
+  `/todos/items/abc` with a plain-text `400`; FastAPI answers `422` with the
+  validation envelope naming the parameter. Every migrated route with an id was
+  affected, so the extractor is shared rather than fixed per route.
 - **Foreign keys are turned off on the Rust pool.** sqlx enables
   `PRAGMA foreign_keys` per connection; SQLAlchemy leaves SQLite's default off.
   The schema declares FKs the data does not honour, so with them on, deleting a

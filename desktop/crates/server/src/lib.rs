@@ -2,8 +2,9 @@
 //!
 //! Binds the public port, handles the domains that have been migrated, and
 //! reverse-proxies everything else to the Python server it spawns as a child.
-//! Migrated so far: auth, `/health`, `/`, projects, teams, and todo CRUD
-//! (the agent-driven todo routes still belong to Python — see `todos`).
+//! Migrated so far: auth, `/health`, `/`, projects, teams, todo CRUD and
+//! workflow CRUD. The routes that need the LLM proxy or the orchestrator stay
+//! with Python — see the `todos` and `workflows` module docs.
 
 pub mod auth;
 pub mod error;
@@ -13,6 +14,7 @@ pub mod teams;
 pub mod todos;
 pub mod upstream;
 pub mod wire;
+pub mod workflows;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -154,6 +156,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(projects::routes())
         .merge(teams::routes())
         .merge(todos::routes())
+        .merge(workflows::routes())
         .fallback(proxy::forward)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

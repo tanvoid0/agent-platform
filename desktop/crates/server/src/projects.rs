@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -25,7 +25,7 @@ use serde_json::{json, Map, Value};
 use sqlx::FromRow;
 
 use crate::auth::Principal;
-use crate::error::ApiError;
+use crate::error::{ApiError, PathId};
 use crate::wire::{iso_from_sql, sql_now, sql_time};
 use crate::AppState;
 
@@ -269,7 +269,7 @@ async fn create_project(
 async fn get_project(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(project_id): Path<i64>,
+    PathId(project_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     assert_access(&state, &principal, project_id).await?;
     Ok(Json(load_project(&state, project_id).await?).into_response())
@@ -278,7 +278,7 @@ async fn get_project(
 async fn update_project(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(project_id): Path<i64>,
+    PathId(project_id): PathId<i64>,
     body: Option<Json<ProjectUpdate>>,
 ) -> Result<Response, ApiError> {
     let Json(req) = body.unwrap_or_default();
@@ -321,7 +321,7 @@ async fn update_project(
 async fn delete_project(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(project_id): Path<i64>,
+    PathId(project_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     assert_access(&state, &principal, project_id).await?;
     load_project(&state, project_id).await?;
@@ -385,7 +385,7 @@ struct WorkspaceStateRow {
 async fn get_workspace_state(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(project_id): Path<i64>,
+    PathId(project_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     assert_access(&state, &principal, project_id).await?;
     let row: WorkspaceStateRow =
@@ -408,7 +408,7 @@ async fn get_workspace_state(
 async fn put_workspace_state(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(project_id): Path<i64>,
+    PathId(project_id): PathId<i64>,
     body: Option<Json<Value>>,
 ) -> Result<Response, ApiError> {
     assert_access(&state, &principal, project_id).await?;
@@ -477,7 +477,7 @@ async fn planning_context(state: &AppState, project_id: i64) -> Result<Value, Ap
 async fn get_planning_context(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(project_id): Path<i64>,
+    PathId(project_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     assert_access(&state, &principal, project_id).await?;
     Ok(Json(planning_context(&state, project_id).await?).into_response())
@@ -486,7 +486,7 @@ async fn get_planning_context(
 async fn patch_planning_context(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Path(project_id): Path<i64>,
+    PathId(project_id): PathId<i64>,
     body: Option<Json<Value>>,
 ) -> Result<Response, ApiError> {
     assert_access(&state, &principal, project_id).await?;
