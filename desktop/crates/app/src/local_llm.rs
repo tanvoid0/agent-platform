@@ -132,10 +132,15 @@ fn tools_preamble(tools: &serde_json::Value) -> String {
     for t in tools.as_array().map(Vec::as_slice).unwrap_or_default() {
         let f = t.get("function").unwrap_or(t);
         let Some(name) = f.get("name").and_then(|n| n.as_str()) else { continue };
-        let args: Vec<&str> = f
+        let required: Vec<&str> = f
+            .pointer("/parameters/required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let args: Vec<String> = f
             .pointer("/parameters/properties")
             .and_then(|p| p.as_object())
-            .map(|p| p.keys().map(String::as_str).collect())
+            .map(|p| p.iter().map(|(k, v)| parameter(k, v, &required)).collect())
             .unwrap_or_default();
         listed.push_str(&format!("- {name}({})", args.join(", ")));
         if let Some(d) = f.get("description").and_then(|d| d.as_str()) {
@@ -143,8 +148,10 @@ fn tools_preamble(tools: &serde_json::Value) -> String {
         }
         listed.push('\n');
     }
-    // The parameter *names* rather than the raw JSON schema: a model shown the
-    // schema tends to copy its keys ("type": "object") into the arguments.
+    // A signature line rather than the raw JSON schema: a model shown the schema
+    // tends to copy its keys ("type": "object") into the arguments. Names alone
+    // were not enough either — a number went in quoted, an optional argument was
+    // invented — so the type, the `?`, and any enum come along in prose form.
     format!(
         "You can run tools. To call one, reply with exactly one JSON object and \
          nothing else, in this form:\n\
@@ -152,6 +159,32 @@ fn tools_preamble(tools: &serde_json::Value) -> String {
          Do not wrap it in code fences and do not explain it. Otherwise answer \
          normally, in prose. Your tools:\n{listed}"
     )
+}
+
+/// One parameter as a signature fragment: `path: string`, `depth?: integer`,
+/// `mode: string (read|write)`. Optional is marked with `?` rather than spelled
+/// out, and a nameless type falls back to nothing at all — half a signature
+/// still beats none.
+fn parameter(name: &str, schema: &serde_json::Value, required: &[&str]) -> String {
+    let mut out = name.to_string();
+    if !required.contains(&name) {
+        out.push('?');
+    }
+    if let Some(ty) = schema.get("type").and_then(|t| t.as_str()) {
+        out.push_str(&format!(": {ty}"));
+    }
+    // The allowed values matter more than the type does when there are only a
+    // few of them, and a model handed a closed set tends to stay inside it.
+    if let Some(values) = schema.get("enum").and_then(|e| e.as_array()) {
+        let listed: Vec<String> = values
+            .iter()
+            .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+            .collect();
+        if !listed.is_empty() {
+            out.push_str(&format!(" ({})", listed.join("|")));
+        }
+    }
+    out
 }
 
 /// Turn the model's finished JSON call into the chunk the UI already knows how
@@ -670,6 +703,44 @@ mod tests {
 
         assert!(parse_call("Sure, I can help").is_none());
         assert!(parse_call(r#"{"arguments": {}}"#).is_none(), "a call needs a name");
+    }
+
+    /// The preamble is the only thing the model learns the tools from, so what
+    /// it says about each argument is what shows up in the call.
+    #[test]
+    fn the_preamble_signs_each_tool_with_its_arguments() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "  Read a file.  ",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "lines": {"type": "integer"},
+                        "mode": {"type": "string", "enum": ["text", "bytes"]},
+                    },
+                    "required": ["path"],
+                },
+            },
+        }]);
+        let preamble = tools_preamble(&tools);
+        assert!(preamble.contains("read_file("), "{preamble}");
+        assert!(preamble.contains("path: string"), "required takes no ?: {preamble}");
+        assert!(preamble.contains("lines?: integer"), "optional is marked: {preamble}");
+        assert!(preamble.contains("mode?: string (text|bytes)"), "{preamble}");
+        assert!(preamble.contains(": Read a file."), "{preamble}");
+        // The schema's own keys must not travel — they end up copied into the
+        // arguments of the call.
+        assert!(!preamble.contains("\"type\": \"object\""), "{preamble}");
+        assert!(preamble.contains(CALL_PREFIX), "the shape to reply in: {preamble}");
+
+        // A tool with no parameters block still gets a line, and one without a
+        // name is skipped rather than listed as a callable blank.
+        let bare = tools_preamble(&serde_json::json!([{"name": "ping"}, {"description": "x"}]));
+        assert!(bare.contains("- ping()"), "{bare}");
+        assert_eq!(bare.matches("- ").count(), 1, "{bare}");
     }
 
     /// The model has to see its own tool call, or the result that follows it
