@@ -44,9 +44,16 @@ impl ApiError {
         }
     }
 
-    /// One pydantic-style entry for a string-length violation on a body field.
+    /// One pydantic-style entry for a violation on a body field.
     pub fn field_error(field: &str, kind: &'static str, msg: &str) -> Value {
-        json!({ "type": kind, "loc": ["body", field], "msg": msg })
+        Self::field_error_at(&[field], kind, msg)
+    }
+
+    /// Same, for a field nested inside the body (`["roster", "roles", "0", "id"]`).
+    pub fn field_error_at(path: &[&str], kind: &str, msg: &str) -> Value {
+        let mut loc = vec![Value::from("body")];
+        loc.extend(path.iter().map(|p| Value::from(*p)));
+        json!({ "type": kind, "loc": loc, "msg": msg })
     }
 }
 

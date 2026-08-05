@@ -19,13 +19,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::{NaiveDateTime, Utc};
+use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::FromRow;
 
 use crate::auth::Principal;
 use crate::error::ApiError;
+use crate::wire::{iso_from_sql, sql_now, sql_time};
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -60,25 +61,14 @@ pub struct ProjectOut {
     pub name: String,
     pub description: Option<String>,
     pub color: Option<String>,
-    #[serde(serialize_with = "iso8601")]
-    pub created_at: NaiveDateTime,
-    #[serde(serialize_with = "iso8601")]
-    pub updated_at: NaiveDateTime,
+    #[serde(serialize_with = "sql_time")]
+    pub created_at: String,
+    #[serde(serialize_with = "sql_time")]
+    pub updated_at: String,
 }
 
 const PROJECT_COLUMNS: &str =
     "id, workspace_id, name, description, color, created_at, updated_at";
-
-/// Python hands these to the JSON encoder as `datetime`, which renders
-/// `datetime.isoformat()` — microseconds only when non-zero.
-fn iso8601<S: serde::Serializer>(at: &NaiveDateTime, s: S) -> Result<S::Ok, S::Error> {
-    let text = if at.and_utc().timestamp_subsec_micros() == 0 {
-        at.format("%Y-%m-%dT%H:%M:%S").to_string()
-    } else {
-        at.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
-    };
-    s.serialize_str(&text)
-}
 
 #[derive(Debug, Deserialize)]
 pub struct ProjectCreate {
@@ -259,7 +249,7 @@ async fn create_project(
         return Err(ApiError::not_found("Workspace not found"));
     }
 
-    let now = Utc::now().naive_utc();
+    let now = sql_now();
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO project (workspace_id, name, description, color, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
@@ -268,8 +258,8 @@ async fn create_project(
     .bind(req.name.unwrap_or_default().trim())
     .bind(trimmed(req.description))
     .bind(trimmed(req.color))
-    .bind(now)
-    .bind(now)
+    .bind(&now)
+    .bind(&now)
     .fetch_one(&state.pool)
     .await?;
 
@@ -375,7 +365,7 @@ fn workspace_root() -> Option<PathBuf> {
 
 async fn touch(state: &AppState, project_id: i64) -> Result<(), ApiError> {
     sqlx::query("UPDATE project SET updated_at = ? WHERE id = ?")
-        .bind(Utc::now().naive_utc())
+        .bind(sql_now())
         .bind(project_id)
         .execute(&state.pool)
         .await?;
@@ -389,7 +379,7 @@ async fn touch(state: &AppState, project_id: i64) -> Result<(), ApiError> {
 #[derive(FromRow)]
 struct WorkspaceStateRow {
     workspace_payload_json: Option<String>,
-    updated_at: NaiveDateTime,
+    updated_at: String,
 }
 
 async fn get_workspace_state(
@@ -412,7 +402,7 @@ async fn get_workspace_state(
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .filter(Value::is_object);
 
-    Ok(Json(json!({ "payload": payload, "updated_at": iso_value(row.updated_at) })).into_response())
+    Ok(Json(json!({ "payload": payload, "updated_at": iso_from_sql(&row.updated_at) })).into_response())
 }
 
 async fn put_workspace_state(
@@ -427,22 +417,15 @@ async fn put_workspace_state(
     let payload = body
         .and_then(|Json(v)| v.get("payload").cloned())
         .unwrap_or_else(|| json!({}));
-    let now = Utc::now().naive_utc();
+    let now = sql_now();
     sqlx::query("UPDATE project SET workspace_payload_json = ?, updated_at = ? WHERE id = ?")
         .bind(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into()))
-        .bind(now)
+        .bind(&now)
         .bind(project_id)
         .execute(&state.pool)
         .await?;
 
-    Ok(Json(json!({ "payload": payload, "updated_at": iso_value(now) })).into_response())
-}
-
-fn iso_value(at: NaiveDateTime) -> Value {
-    let mut buf = Vec::new();
-    let mut ser = serde_json::Serializer::new(&mut buf);
-    iso8601(&at, &mut ser).ok();
-    serde_json::from_slice(&buf).unwrap_or(Value::Null)
+    Ok(Json(json!({ "payload": payload, "updated_at": iso_from_sql(&now) })).into_response())
 }
 
 // ---------------------------------------------------------------------------

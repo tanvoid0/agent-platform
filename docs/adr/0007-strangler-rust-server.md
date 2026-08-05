@@ -107,7 +107,7 @@ screen in `crates/app` stay untouched per migration.
 |---|--------|----------|
 | 1 | auth (`api_auth.py`, `api_tokens/`) | every other slice needs the principal; the proxy must reject before forwarding |
 | 2 | `/health`, `/` | zero coupling — the only two routes that depend on no Python-owned fact |
-| 3 | projects ✅, then todos, teams, workflows | leaf tables, no LLM, ~1.5k LOC |
+| 3 | projects ✅, teams ✅, then todos, workflows | leaf tables, no LLM, ~1.5k LOC |
 | 4 | `llm_proxy/` | ~3k LOC; also where `local_llm.rs` moves so the cloud binary gets in-process inference |
 | 5 | processes / orchestrator / action_orchestrator | FastAPI `BackgroundTasks` + `asyncio.create_task` → tokio; needs a `startup_recovery` equivalent |
 | 6 | assistant, chat, coder | largest and highest-churn |
@@ -177,6 +177,14 @@ a 404.
   ephemeral address. The daemon passes `AGENT_PLATFORM_PUBLIC_HOST`/`_PORT` and
   `system_routes.py` prefers them, so the field keeps meaning "the address you
   reached us on". That is the one Python change this slice needed.
+- **Timestamps are read and written as text, not as `NaiveDateTime`.** Two
+  separate diffs, both invisible to every test: the seeded team rows were written
+  by aware-datetime code and carry `+00:00`, which Python renders with a trailing
+  `Z` and a `NaiveDateTime` decode silently drops; and binding a `NaiveDateTime`
+  stores *nanoseconds* on Windows, so a row Rust wrote read back as
+  `…036520900` here and `…036520` from Python. `wire::sql_now` writes exactly
+  what SQLAlchemy writes and `wire::iso_from_sql` renders exactly what pydantic
+  renders. Anything storing a timestamp goes through them.
 - The proxy forwards the caller's `Host` header. Dropping it looked tidier until
   a trailing-slash `307` came back with `location: http://127.0.0.1:<ephemeral>/…`
   — FastAPI builds redirect targets from `Host`, so the client would have been

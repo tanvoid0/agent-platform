@@ -2,13 +2,15 @@
 //!
 //! Binds the public port, handles the domains that have been migrated, and
 //! reverse-proxies everything else to the Python server it spawns as a child.
-//! No domain is migrated yet — slice 1 is the scaffold, the proxy, and auth.
+//! Migrated so far: auth, `/health`, `/`, projects, teams.
 
 pub mod auth;
 pub mod error;
 pub mod projects;
 pub mod proxy;
+pub mod teams;
 pub mod upstream;
+pub mod wire;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -142,6 +144,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", axum::routing::get(health))
         .route("/", axum::routing::get(root))
         .merge(projects::routes())
+        .merge(teams::routes())
         .fallback(proxy::forward)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
