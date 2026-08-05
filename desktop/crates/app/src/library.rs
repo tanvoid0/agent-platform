@@ -255,7 +255,15 @@ pub struct State {
     pub viewport: crate::graph::Viewport,
     pub busy: bool,
     pub error: Option<String>,
-    pub notice: Option<String>,
+    pub notice: crate::domain::Toast,
+    /// A delete waiting on the in-app confirm dialog.
+    pub confirm: Option<Confirm>,
+}
+
+/// What the confirm dialog is asking about, and the message a Yes sends.
+pub struct Confirm {
+    pub what: &'static str,
+    pub then: Message,
 }
 
 impl State {
@@ -300,6 +308,7 @@ pub enum Message {
     DeleteTeam(i64),
     DeleteProjectConfirmed(i64),
     DeleteTeamConfirmed(i64),
+    CancelConfirm,
     Done(Result<String, String>),
     DismissNotice,
 }
@@ -334,17 +343,6 @@ fn edit_role(state: &mut State, id: &str, f: impl FnOnce(&mut RosterRole)) {
     if let Some(role) = state.draft.as_mut().and_then(|d| d.roles.iter_mut().find(|r| r.id == id)) {
         f(role);
     }
-}
-
-/// Yes/No dialog, then `confirmed` — mirrors the close prompt in `main.rs`.
-fn confirm(what: &str, confirmed: Message) -> Task<Message> {
-    let dialog = rfd::AsyncMessageDialog::new()
-        .set_title("Agent Platform")
-        .set_description(format!("Delete this {what}? This cannot be undone."))
-        .set_buttons(rfd::MessageButtons::YesNo);
-    Task::future(async move { dialog.show().await == rfd::MessageDialogResult::Yes }).then(
-        move |yes| if yes { Task::done(confirmed.clone()) } else { Task::none() },
-    )
 }
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
@@ -546,9 +544,21 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 Message::Done,
             )
         }
-        Message::DeleteProject(id) => confirm("project", Message::DeleteProjectConfirmed(id)),
-        Message::DeleteTeam(id) => confirm("team", Message::DeleteTeamConfirmed(id)),
+        Message::DeleteProject(id) => {
+            state.confirm =
+                Some(Confirm { what: "project", then: Message::DeleteProjectConfirmed(id) });
+            Task::none()
+        }
+        Message::DeleteTeam(id) => {
+            state.confirm = Some(Confirm { what: "team", then: Message::DeleteTeamConfirmed(id) });
+            Task::none()
+        }
+        Message::CancelConfirm => {
+            state.confirm = None;
+            Task::none()
+        }
         Message::DeleteProjectConfirmed(id) => {
+            state.confirm = None;
             state.busy = true;
             let client = client.clone();
             Task::perform(
@@ -557,6 +567,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             )
         }
         Message::DeleteTeamConfirmed(id) => {
+            state.confirm = None;
             state.busy = true;
             let client = client.clone();
             Task::perform(
@@ -568,7 +579,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.busy = false;
             match result {
                 Ok(msg) => {
-                    state.notice = Some(msg);
+                    state.notice.set(msg);
                     state.draft = None;
                     state.team_detail = None;
                     state.selected_role = None;
@@ -581,7 +592,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             }
         }
         Message::DismissNotice => {
-            state.notice = None;
+            state.notice.clear();
             state.error = None;
             Task::none()
         }
@@ -667,6 +678,25 @@ mod tests {
         let id = s.draft.as_ref().unwrap().roles[0].id.clone();
         let _ = update(&mut s, &client(), Message::RoleParentChanged(id.clone(), Some(id)));
         assert_eq!(s.draft.unwrap().roles[0].parent_id, None);
+    }
+
+    /// A delete only arms the in-app dialog; nothing leaves until it is
+    /// answered, and either answer takes the dialog back down.
+    #[test]
+    fn delete_asks_before_it_deletes() {
+        let mut s = State::default();
+        let _ = update(&mut s, &client(), Message::DeleteProject(7));
+        assert!(matches!(s.confirm.as_ref().map(|c| c.what), Some("project")));
+        assert!(!s.busy, "arming a dialog is not work in flight");
+
+        let _ = update(&mut s, &client(), Message::CancelConfirm);
+        assert!(s.confirm.is_none());
+
+        let _ = update(&mut s, &client(), Message::DeleteTeam(7));
+        let then = s.confirm.as_ref().unwrap().then.clone();
+        assert!(matches!(then, Message::DeleteTeamConfirmed(7)));
+        let _ = update(&mut s, &client(), then);
+        assert!(s.confirm.is_none() && s.busy);
     }
 
     #[test]

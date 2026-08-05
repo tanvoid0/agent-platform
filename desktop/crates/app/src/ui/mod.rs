@@ -18,7 +18,7 @@ use iced::widget::{
 };
 use iced::{Element, Length, Padding};
 
-pub use icon::{icon, icon_muted, Icon};
+pub use icon::{icon_muted, Icon};
 pub use theme::{font, space, ButtonVariant, Tone};
 
 // ---------------------------------------------------------------------------
@@ -350,6 +350,81 @@ pub fn cluster<'a, M: 'a>(children: Vec<Element<'a, M>>) -> Row<'a, M> {
     Row::with_children(children)
         .spacing(space::SM)
         .align_y(iced::Alignment::Center)
+}
+
+// ---------------------------------------------------------------------------
+// Dialog (shadcn `Dialog` / `AlertDialog`)
+// ---------------------------------------------------------------------------
+
+/// Draw `dialog` centered over `base` on a scrim — shadcn's `DialogOverlay` +
+/// `DialogContent`. The app owns its modals rather than handing them to the OS,
+/// so a confirmation looks like the rest of the app and not like Windows.
+pub fn modal<'a, M: 'a>(
+    base: impl Into<Element<'a, M>>,
+    dialog: impl Into<Element<'a, M>>,
+    max_width: f32,
+) -> Element<'a, M> {
+    let overlay = container(container(dialog.into()).max_width(max_width))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .padding(space::LG)
+        .style(theme::scrim);
+    iced::widget::stack![base.into(), overlay].into()
+}
+
+/// `<Toaster>` — pins `toast` to the bottom-right corner over `base`. Unlike
+/// [`modal`] it lays no scrim and consumes no clicks, so the page underneath
+/// stays usable while the message is up.
+pub fn toast_layer<'a, M: 'a>(
+    base: impl Into<Element<'a, M>>,
+    toast: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    let layer = container(container(toast.into()).max_width(420))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::Alignment::End)
+        .align_y(iced::Alignment::End)
+        .padding(space::LG);
+    iced::widget::stack![base.into(), layer].into()
+}
+
+/// `<Toast>` — one transient message: tone glyph, text, close button. The
+/// success half of what used to be an inline banner; errors stay in the page
+/// because they are not transient.
+pub fn toast<'a, M: 'a + Clone>(
+    message: impl text::IntoFragment<'a>,
+    tone: Tone,
+    on_dismiss: M,
+) -> Element<'a, M> {
+    container(
+        row![
+            tone_icon(tone).glyph().size(font::SM).style(theme::text_tone(tone)),
+            text(message).size(font::SM).width(Length::Fill).style(theme::text_default),
+            icon_button(Icon::X, on_dismiss),
+        ]
+        .spacing(space::SM)
+        .align_y(iced::Alignment::Center),
+    )
+    .padding(space::MD)
+    .style(theme::card)
+    .into()
+}
+
+/// `<AlertDialog>` — title, one line of prose, right-aligned buttons. Pair with
+/// [`modal`]; the last action reads as the primary one, as in shadcn.
+pub fn confirm_dialog<'a, M: 'a>(
+    title_text: impl text::IntoFragment<'a>,
+    description: impl text::IntoFragment<'a>,
+    actions: Vec<Element<'a, M>>,
+) -> Element<'a, M> {
+    let mut buttons = vec![spacer()];
+    buttons.extend(actions);
+    card(
+        column![heading(title_text), muted(description), cluster(buttons)]
+            .spacing(space::MD),
+    )
 }
 
 // ---------------------------------------------------------------------------

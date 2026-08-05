@@ -23,16 +23,13 @@ const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
         ],
     ),
     // One entry, two tabs: see [`chat_view`].
-    ("ASSISTANTS", &[(Screen::Chat, Icon::Message, "Assistants")]),
+    ("ASSISTANTS", &[(Screen::Assistant, Icon::Message, "Assistants")]),
 ];
 
-/// The chat tab strip: the voiced assistant first (it is the headline act), the
-/// plain thread, and what the two of them remember about you.
-const CHAT_TABS: [(Screen, &str); 3] = [
-    (Screen::Assistant, crate::assistant::NAME),
-    (Screen::Chat, "Chat"),
-    (Screen::Memory, "Memory"),
-];
+/// The chat tab strip: the assistant, and what it remembers about you. Text and
+/// voice are one screen — the toggle lives in its header, not out here.
+const CHAT_TABS: [(Screen, &str); 2] =
+    [(Screen::Assistant, crate::assistant::NAME), (Screen::Memory, "Memory")];
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = match app.screen {
@@ -49,15 +46,57 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .map(Message::Library),
         Screen::Workflows => crate::workflows_view::view(&app.workflows).map(Message::Workflows),
         Screen::Plans => crate::todos_view::view(&app.todos).map(Message::Todos),
-        Screen::Chat | Screen::Assistant | Screen::Memory => chat_view(app),
+        Screen::Assistant | Screen::Memory => chat_view(app),
     };
 
-    row![
+    let shell = row![
         sidebar(app),
         ui::separator_vertical(),
         container(content).width(Length::Fill).height(Length::Fill),
-    ]
-    .into()
+    ];
+
+    let shell: Element<'_, Message> = match notice(app) {
+        Some((text, _)) => {
+            ui::toast_layer(shell, ui::toast(text, Tone::Success, Message::NoticeExpired))
+        }
+        None => shell.into(),
+    };
+
+    // Close-button prompt: drawn in-app so quitting looks like the rest of the
+    // app rather than like a Windows message box.
+    if app.close_prompt.is_none() {
+        return shell;
+    }
+    ui::modal(
+        shell,
+        ui::confirm_dialog(
+            "Close Agent Platform?",
+            "The server keeps running in the tray unless you close the app.",
+            vec![
+                ui::button_ghost(Icon::X, "Cancel", Message::CloseCancelled),
+                ui::button_secondary(Icon::Monitor, "Minimize to tray", Message::MinimizeToTray),
+                ui::button_destructive(Icon::Stop, "Close", Message::CloseConfirmed),
+            ],
+        ),
+        460.0,
+    )
+}
+
+/// The transient message of whatever screen is open, with the generation
+/// counter the toast timer keys on. Screens keep their own `notice`; this is
+/// the one place that turns them into a toast.
+pub fn notice(app: &App) -> Option<(String, u64)> {
+    match app.screen {
+        Screen::Projects | Screen::Teams => app.library.notice.get(),
+        Screen::Processes => app.processes.notice.get(),
+        Screen::Workflows => app.workflows.notice.get(),
+        Screen::Settings => match app.settings_tab {
+            SettingsTab::Providers => app.providers.notice.get(),
+            SettingsTab::ModelOps => app.modelops.notice.get(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,10 +297,10 @@ fn settings_view(app: &App) -> Element<'_, Message> {
 // Chat — one page, two tabs
 // ---------------------------------------------------------------------------
 
-/// The assistants on one page: `Chat` is the plain thread, `E.V.` the same
-/// conversation with a HUD, a persona and a voice, and `Memory` what the two of
-/// them have learned about you. Tabbed rather than three sidebar entries because
-/// they are one destination — "talk to the model" — at three levels of ceremony.
+/// The assistant on one page: `E.V.` is the conversation — plain text, or with
+/// the HUD and a voice behind its own toggle — and `Memory` is what it has
+/// learned about you. Tabbed rather than two sidebar entries because they are
+/// one destination.
 ///
 /// Gating is per tab, as in [`settings_view`]: Memory is a local file and opens
 /// whether or not the server is answering.
@@ -274,16 +313,11 @@ fn chat_view(app: &App) -> Element<'_, Message> {
             blocked_view(app, screen_title(app.screen))
         }
         Screen::Memory => crate::memory_view::view(&app.memory).map(Message::Memory),
-        Screen::Assistant => with_history(
+        _ => with_history(
             app,
             crate::assistant::NAME,
             crate::assistant_view::view(&app.assistant, &app.settings.theme.resolve())
                 .map(Message::Assistant),
-        ),
-        _ => with_history(
-            app,
-            "Chat",
-            crate::chat_view::view(&app.chat, &app.settings.theme.resolve()).map(Message::Chat),
         ),
     };
     match memory_notice(app) {
@@ -352,7 +386,6 @@ fn history_panel<'a>(app: &'a App, source: &str) -> Element<'a, Message> {
 /// trip to the Memory tab.
 fn memory_notice(app: &App) -> Option<Element<'_, Message>> {
     let source = match app.screen {
-        Screen::Chat => "Chat",
         Screen::Assistant => crate::assistant::NAME,
         _ => return None,
     };
@@ -410,8 +443,12 @@ fn tabbed<'a>(tabs: Element<'a, Message>, body: Element<'a, Message>) -> Element
 /// learn why a screen is locked.
 fn brand(app: &App) -> Element<'_, Message> {
     let (label, tone) = server_label(app.server_state());
+    // The mark ships on a near-black plate; on a light sidebar that reads as a
+    // hole, so the plate follows the active theme.
+    let dark = ui::theme::tokens(&app.settings.theme.resolve()).dark;
+    let mark = iced::widget::image(crate::logo_handle(dark)).width(24).height(24);
     ui::stack(vec![
-        ui::cluster(vec![ui::icon(Icon::Server), ui::body("Agent Platform")]).into(),
+        ui::cluster(vec![mark.into(), ui::body("Agent Platform")]).into(),
         ui::badge(label, tone),
     ])
     .into()
@@ -536,6 +573,8 @@ fn status_view(app: &App) -> Element<'_, Message> {
     }
 
     blocks.push(server_card(app));
+    #[cfg(feature = "local-llm")]
+    blocks.push(local_llm_card(app));
     blocks.push(api_card(app));
 
     if let Some(status) = &app.status {
@@ -602,6 +641,93 @@ fn server_card(app: &App) -> Element<'_, Message> {
         Some(ui::muted("The Python API process this app owns.")),
         actions,
         ui::stack(rows),
+    )
+}
+
+/// In-process inference, per [ADR 0006](../../../../docs/adr/0006-in-process-rust-core.md).
+///
+/// Only in a `local-llm` build: without the feature there is no engine to point
+/// at a file, and the settings keys are inert. Lives on Status rather than Model
+/// ops because it is the one model surface that works with the server down.
+///
+/// Both keys are read once, at the first local turn — a swap needs a restart,
+/// which is what the header button is for. The weights themselves come and go on
+/// their own (an idle timeout), and "Free VRAM" is the way to hurry that along
+/// before a training job wants the card.
+#[cfg(feature = "local-llm")]
+fn local_llm_card(app: &App) -> Element<'_, Message> {
+    let path = app.settings.local_model_path.trim();
+    let (state, tone) = match path {
+        "" => ("Off — every turn goes to the server", Tone::Neutral),
+        _ if crate::local_llm::loaded() => ("Loaded in VRAM", Tone::Success),
+        p if std::path::Path::new(p).is_file() => ("Ready — loads on the next turn", Tone::Success),
+        _ => ("File is missing", Tone::Danger),
+    };
+    let engine = match crate::inference::last_turn_was_local() {
+        Some(true) => ui::badge_icon(Icon::Cpu, "Answered in-process", Tone::Success),
+        Some(false) => ui::badge_icon(Icon::Plug, "Answered by the server", Tone::Neutral),
+        None => ui::muted("No turn yet this run"),
+    };
+
+    let mut picker = vec![ui::button_outline(Icon::FolderOpen, "Choose…", Message::PickLocalModel)];
+    if !path.is_empty() {
+        picker.push(ui::button_ghost(
+            Icon::X,
+            "Clear",
+            Message::SetLocalModel(Some(String::new())),
+        ));
+    }
+    if crate::local_llm::loaded() {
+        picker.push(ui::button_ghost(Icon::Zap, "Free VRAM", Message::UnloadLocalModel));
+    }
+
+    ui::card_with_header(
+        "Local model",
+        Some(ui::muted("Answer this app's own chat in-process instead of through the server.")),
+        Some(ui::button_outline(Icon::Refresh, "Restart app", Message::RestartApp)),
+        ui::stack(vec![
+            ui::field("State", ui::badge_icon(ui::tone_icon(tone), state, tone)),
+            ui::field(
+                "GGUF",
+                ui::stack(vec![
+                    if path.is_empty() { ui::muted("—") } else { ui::mono(path.to_string()) },
+                    ui::cluster(picker).into(),
+                ]),
+            ),
+            ui::field(
+                "Context",
+                container(ui::input("8192", &app.local_ctx_input, Message::SetLocalCtx))
+                    .width(Length::Fixed(140.0)),
+            ),
+            ui::field("Last turn", engine),
+            ui::field(
+                "Serve to the server",
+                ui::stack(vec![
+                    container(ui::input(
+                        "off",
+                        &app.local_server_port_input,
+                        Message::SetLocalServerPort,
+                    ))
+                    .width(Length::Fixed(140.0))
+                    .into(),
+                    match app.settings.local_server_port {
+                        0 => ui::caption(
+                            "A port here also answers the Python side, so server-run agents \
+                             can use this model. Empty leaves it off.",
+                        ),
+                        p => ui::caption(format!(
+                            "Point the proxy's OpenAI-compatible provider at \
+                             http://127.0.0.1:{p} (LM_STUDIO_API_BASE). Loopback only, no key \
+                             — like Ollama and LM Studio.",
+                        )),
+                    },
+                ]),
+            ),
+            ui::caption(
+                "A new model, context or port takes effect when the app restarts. The weights \
+                 themselves unload after five idle minutes.",
+            ),
+        ]),
     )
 }
 

@@ -44,9 +44,9 @@ pub fn hud(state: &State, height: impl Into<Length>) -> Element<'_, Message> {
 
 pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
     let mode = state.mode();
-    let hud = hud(state, 224.0);
 
-    let status = ui::cluster(vec![
+    // Only meaningful in voice mode: every line of it reports the mic.
+    let status = || -> Element<'_, Message> { ui::cluster(vec![
         ui::badge(
             match mode {
                 Mode::Idle => "SYSTEMS NOMINAL",
@@ -63,7 +63,6 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
                 Mode::Speaking => Tone::Info,
             },
         ),
-        ui::caption(format!("VOICE {}", if state.voice { "ON" } else { "MUTED" })),
         // Voice ID is a filter on who gets answered, so its state is never
         // hidden: learning, locked on, or told this was someone else.
         match (state.voice_enrolled(), state.voice_sim) {
@@ -82,10 +81,14 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
             "Hands-free is off".to_string()
         }),
     ])
-    .into();
+    .into() };
 
     let transcript: Element<'_, Message> = if state.messages.is_empty() {
-        ui::empty_state("Web-shooters primed. What do you need?")
+        ui::empty_state(if state.voice {
+            "Web-shooters primed. What do you need?"
+        } else {
+            "Ask E.V. anything."
+        })
     } else {
         // Open flow, not boxes: role tag over content, markdown for E.V.
         // Snap-to-end happens per new message; free scrolling in between.
@@ -129,42 +132,42 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
         .into()
     };
 
-    let composer_row: Element<'_, Message> = ui::cluster(vec![
-            container(ui::input_submit(
-                "Talk to E.V.…",
-                &state.draft,
-                Message::DraftChanged,
-                Message::Send,
-            ))
-            .width(Length::Fill)
-            .into(),
-            if state.armed() {
-                ui::button_destructive(Icon::MicOff, "Mic off", Message::Listen)
-            } else {
-                ui::button_secondary(Icon::Mic, "Hands-free", Message::Listen)
-            },
-            if state.voice {
-                ui::button_ghost(Icon::Volume, "Mute", Message::ToggleVoice)
-            } else {
-                ui::button_ghost(Icon::VolumeOff, "Unmute", Message::ToggleVoice)
-            },
-            // Only offered once there is something to forget — wrong person
-            // enrolled, or a new mic that changed how you sound.
-            if state.voice_enrolled() {
-                ui::button_ghost(Icon::XCircle, "Forget voice", Message::ForgetVoice)
-            } else {
-                iced::widget::Space::new().into()
-            },
-            if state.sending {
-                ui::badge("thinking…", Tone::Info)
-            } else {
-                ui::button_default(Icon::Send, "Send", Message::Send)
-            },
-    ])
-    .into();
-    let composer = ui::card(composer_row);
+    let mut composer_row: Vec<Element<'_, Message>> = vec![container(ui::input_submit(
+        if state.voice { "Talk to E.V.…" } else { "Message…" },
+        &state.draft,
+        Message::DraftChanged,
+        Message::Send,
+    ))
+    .width(Length::Fill)
+    .into()];
+    // The mic and the voice print only exist in voice mode — in text mode they
+    // would be controls for a thing that is not running.
+    if state.voice {
+        composer_row.push(if state.armed() {
+            ui::button_destructive(Icon::MicOff, "Mic off", Message::Listen)
+        } else {
+            ui::button_secondary(Icon::Mic, "Hands-free", Message::Listen)
+        });
+        // Only offered once there is something to forget — wrong person
+        // enrolled, or a new mic that changed how you sound.
+        if state.voice_enrolled() {
+            composer_row.push(ui::button_ghost(Icon::XCircle, "Forget voice", Message::ForgetVoice));
+        }
+    }
+    composer_row.push(if state.sending {
+        ui::badge("thinking…", Tone::Info)
+    } else {
+        ui::button_default(Icon::Send, "Send", Message::Send)
+    });
+    let composer = ui::card(ui::cluster(composer_row));
 
-    let mut blocks: Vec<Element<'_, Message>> = vec![hud.into(), status];
+    // Text mode is the same conversation without the theatre: no HUD canvas, no
+    // mic telemetry, so nothing on screen implies audio is running.
+    let mut blocks: Vec<Element<'_, Message>> = Vec::new();
+    if state.voice {
+        blocks.push(hud(state, 224.0));
+        blocks.push(status());
+    }
     if let Some(err) = &state.error {
         let mut row = vec![container(ui::alert_error(err.clone())).width(Length::Fill).into()];
         if err.contains("Privacy → Microphone") {
@@ -176,10 +179,45 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
     blocks.push(container(transcript).height(Length::Fill).into());
     blocks.push(composer);
 
+    // One thread, two skins: Text is the plain transcript, Voice adds the HUD,
+    // the mic and the spoken reply.
+    let mut actions: Vec<Element<'_, Message>> = vec![
+        ui::segmented([
+            ("Text", !state.voice, Message::ToggleVoice),
+            ("Voice", state.voice, Message::ToggleVoice),
+        ]),
+        container(ui::select(
+            "Provider (default)",
+            state.provider_ids(),
+            (!state.provider.is_empty()).then(|| state.provider.clone()),
+            Message::ProviderChanged,
+        ))
+        .width(170)
+        .into(),
+        container(ui::select(
+            "Model (default)",
+            state.model_options(),
+            (!state.model.is_empty()).then(|| state.model.clone()),
+            Message::ModelChanged,
+        ))
+        .width(220)
+        .into(),
+    ];
+    // pick_list cannot deselect, so going back to the server default needs its
+    // own button — shown only while an override is active.
+    if !state.provider.is_empty() || !state.model.is_empty() {
+        actions.push(ui::button_ghost(Icon::X, "Default", Message::UseDefaults));
+    }
+    actions.push(ui::button_outline(Icon::Trash, "Clear", Message::Clear));
+
     ui::page_fixed(
         "E.V.",
-        Some(ui::muted("Onboard suit AI. Replies are spoken unless muted.")),
-        Some(ui::button_outline(Icon::Trash, "Clear", Message::Clear)),
+        Some(ui::muted(if state.voice {
+            "Onboard suit AI. Replies are spoken."
+        } else {
+            "Onboard suit AI, in text."
+        })),
+        Some(ui::cluster(actions).into()),
         {
             let body: Element<'_, Message> =
                 column(blocks).spacing(space::MD).height(Length::Fill).into();
@@ -319,10 +357,17 @@ impl canvas::Program<Message> for Hud<'_> {
             Mode::Thinking => t.warning,
             Mode::Speaking => HOLO_CYAN,
         };
+        // Every stroke here is additive light on a dark field. On paper that
+        // reads as haze, so in light mode the palette is pushed toward ink:
+        // same hues, enough darkness to survive a white backdrop.
+        let ink = |c: Color| if t.dark { c } else { mix_color(c, Color::BLACK, 0.45) };
         // Colour crosses the mode change instead of cutting to it.
-        let accent = mix_color(hue(self.prev), hue(self.mode), self.mix);
-        let holo = fade(HOLO_CYAN, 0.75);
-        let web = Color { a: if t.dark { 0.40 } else { 0.55 }, ..SPIDEY_RED };
+        let accent = ink(mix_color(hue(self.prev), hue(self.mode), self.mix));
+        let holo = fade(ink(HOLO_CYAN), 0.75);
+        // Filament white is the brightest thing on a dark HUD; on light it has
+        // to be the darkest.
+        let hot = if t.dark { HOT } else { Color::from_rgb(0.05, 0.07, 0.12) };
+        let web = Color { a: if t.dark { 0.40 } else { 0.55 }, ..ink(SPIDEY_RED) };
 
         let mut frame = Frame::new(renderer, bounds.size());
         let (w, h) = (bounds.width, bounds.height);
@@ -433,7 +478,7 @@ impl canvas::Program<Message> for Hud<'_> {
             let line = Path::line(at(r_max * 0.16, a), at(r_max * (0.98 + e * 0.14), a));
             frame.stroke(
                 &line,
-                Stroke::default().with_color(fade(SPIDEY_RED, e * boot)).with_width(1.0 + e),
+                Stroke::default().with_color(fade(ink(SPIDEY_RED), e * boot)).with_width(1.0 + e),
             );
         }
         for (i, ring) in [0.34_f32, 0.55, 0.76, 0.97].iter().enumerate() {
@@ -471,7 +516,7 @@ impl canvas::Program<Message> for Hud<'_> {
             let travel = (self.phase * 1.6).fract();
             let r0 = r_max * (0.16 + travel * 0.82);
             let glint = Path::line(at(r0, a), at(r0 + r_max * 0.12, a));
-            glow(&mut frame, &glint, fade(HOT, hot_e * (1.0 - travel)), 1.6);
+            glow(&mut frame, &glint, fade(hot, hot_e * (1.0 - travel)), 1.6);
         }
 
         // -- Spectrum rim: mirrored bars, bass at 12 o'clock -----------------
@@ -498,7 +543,7 @@ impl canvas::Program<Message> for Hud<'_> {
         frame.stroke(
             &peaks,
             Stroke::default()
-                .with_color(fade(mix_color(accent, HOLO_CYAN, 0.35), 0.85 * boot))
+                .with_color(fade(mix_color(accent, ink(HOLO_CYAN), 0.35), 0.85 * boot))
                 .with_width(2.0)
                 .with_line_cap(LineCap::Round),
         );
@@ -513,7 +558,7 @@ impl canvas::Program<Message> for Hud<'_> {
             }
             let a = f * TAU - PI / 2.0;
             let bar = Path::line(at(r_in, a), at(r_in + r_max * (0.05 + 0.34 * e), a));
-            glow(&mut frame, &bar, fade(mix_color(accent, HOT, e - 0.4), boot), 1.8);
+            glow(&mut frame, &bar, fade(mix_color(accent, hot, e - 0.4), boot), 1.8);
         }
         // Peak-hold: a dashed ring parked at the loudest bin.
         const DASH: [f32; 2] = [3.0, 7.0];
@@ -601,7 +646,7 @@ impl canvas::Program<Message> for Hud<'_> {
                 }
             });
             frame.fill(&trail, fade(accent, 0.20 * lead * boot));
-            frame.fill(&Path::circle(orbit_point(theta), 3.0), fade(HOT, lead * boot));
+            frame.fill(&Path::circle(orbit_point(theta), 3.0), fade(hot, lead * boot));
         }
 
         // -- Core: halo stack, dashed iris, bass-driven disc ------------------
@@ -625,10 +670,10 @@ impl canvas::Program<Message> for Hud<'_> {
         });
         frame.stroke(
             &iris,
-            Stroke::default().with_color(fade(HOLO_CYAN, 0.7 * boot)).with_width(1.6),
+            Stroke::default().with_color(fade(ink(HOLO_CYAN), 0.7 * boot)).with_width(1.6),
         );
         frame.fill(&Path::circle(center, core_r), fade(accent, boot));
-        frame.fill(&Path::circle(center, core_r * 0.45), fade(HOT, (0.5 + self.beat * 0.5) * boot));
+        frame.fill(&Path::circle(center, core_r * 0.45), fade(hot, (0.5 + self.beat * 0.5) * boot));
         // Anamorphic flare on a transient — the "it heard that" tell.
         if self.beat > 0.02 {
             let f = self.beat * r_max * 1.5;
@@ -641,7 +686,7 @@ impl canvas::Program<Message> for Hud<'_> {
             frame.stroke(
                 &flare,
                 Stroke::default()
-                    .with_color(fade(HOT, self.beat * 0.5))
+                    .with_color(fade(hot, self.beat * 0.5))
                     .with_width(1.2)
                     .with_line_cap(LineCap::Round),
             );
@@ -658,10 +703,10 @@ impl canvas::Program<Message> for Hud<'_> {
             });
             frame.stroke(
                 &sweep,
-                Stroke::default().with_color(fade(t.warning, 0.12)).with_width(1.0),
+                Stroke::default().with_color(fade(ink(t.warning), 0.12)).with_width(1.0),
             );
             let edge = Path::line(center, at(r_max * 1.05, spin));
-            glow(&mut frame, &edge, fade(t.warning, 0.8), 1.4);
+            glow(&mut frame, &edge, fade(ink(t.warning), 0.8), 1.4);
         }
 
         // -- Chrome: brackets, telemetry, input meter -------------------------
@@ -707,8 +752,8 @@ impl canvas::Program<Message> for Hud<'_> {
                 let bar_h = bh * (0.4 + 0.6 * (i as f32 / METER as f32));
                 let bar =
                     Path::rectangle(Point::new(x, y0 + (bh - bar_h)), iced::Size::new(bw, bar_h));
-                let hot = if self.mode == Mode::Listening { SPIDEY_RED } else { t.success };
-                frame.fill(&bar, if i < lit { hot } else { fade(web, 0.5) });
+                let lit_c = ink(if self.mode == Mode::Listening { SPIDEY_RED } else { t.success });
+                frame.fill(&bar, if i < lit { lit_c } else { fade(web, 0.5) });
             }
             frame.fill_text(mono("INPUT".into(), Point::new(x0, y0 - 14.0), holo, 10.0));
         }

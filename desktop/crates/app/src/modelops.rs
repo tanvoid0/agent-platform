@@ -27,7 +27,7 @@ pub struct State {
     pub busy: bool,
     pub uploading: bool,
     pub error: Option<String>,
-    pub notice: Option<String>,
+    pub notice: crate::domain::Toast,
     /// Whether the first refresh has completed, so empty-state copy is
     /// only shown once we actually know the lists are empty.
     pub loaded: bool,
@@ -188,6 +188,10 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 process_id: None,
             };
             state.busy = true;
+            // A build is about to want this machine's GPU. Hand back whatever
+            // the in-process chat model is holding; the next turn reloads it.
+            #[cfg(feature = "local-llm")]
+            crate::local_llm::unload();
             let client = client.clone();
             Task::perform(
                 async move { err_string(client.start_model_build_job(&body).await).map(Box::new) },
@@ -319,7 +323,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.uploading = false;
             match result {
                 Ok(Some(msg)) => {
-                    state.notice = Some(msg);
+                    state.notice.set(msg);
                     refresh(client)
                 }
                 Ok(None) => Task::none(),
@@ -333,7 +337,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.busy = false;
             match result {
                 Ok(msg) => {
-                    state.notice = Some(msg);
+                    state.notice.set(msg);
                     refresh(client)
                 }
                 Err(e) => {
@@ -343,7 +347,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             }
         }
         Message::DismissNotice => {
-            state.notice = None;
+            state.notice.clear();
             state.error = None;
             Task::none()
         }

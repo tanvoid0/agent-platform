@@ -8,9 +8,10 @@
     "docker:up": "npm run sync:contract-enums && docker compose up --build",
     "docker:up:server": "npm run sync:contract-enums && docker compose -f docker-compose.agent-only.yml up --build",
     "postinstall": "python -m pip install -r app/requirements.txt",
+    "dev": "cargo run --manifest-path desktop/Cargo.toml -p agent-platform-desktop",
     "start": "python scripts/start.py",
-    "predev": "kill-port 18410 --silent",
-    "dev:server": "pnpm predev && python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410"
+    "kill:server-port": "kill-port 18410 --silent",
+    "dev:server": "pnpm kill:server-port && python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410"
   },
   "devDependencies": {
     "kill-port": "^2.0.1"

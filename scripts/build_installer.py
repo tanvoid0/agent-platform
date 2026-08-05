@@ -11,6 +11,10 @@ Orchestrates:
 Windows only — this app has only ever been built and run on Windows; macOS/Linux
 packaging (and their own signing/notarization) is not implemented.
 
+Cargo features come from AGENT_PLATFORM_FEATURES (comma-separated, e.g. "cuda"),
+which is how a build gets in-process inference — see ADR 0006. That build links
+llama.cpp as DLLs, which the installer picks up beside the exe.
+
 Signing is optional and off by default. Set AGENT_PLATFORM_SIGN_CERT to a .pfx
 path (and AGENT_PLATFORM_SIGN_PASSWORD, AGENT_PLATFORM_SIGN_TIMESTAMP_URL
 optionally) to sign agent-platform.exe before it's packaged. Without a real
@@ -62,6 +66,33 @@ def sign_exe() -> None:
     _run(cmd)
 
 
+def check_local_llm_dlls(features: str) -> None:
+    """A `local-llm` build is useless without llama.cpp's DLLs beside the exe.
+
+    The feature forces `dynamic-link` (two static ggmls will not link), so cargo
+    drops the DLLs in target\\release and the .iss picks them up with a wildcard.
+    A wildcard that quietly matches nothing is exactly how a broken installer
+    ships, hence this check rather than trusting the glob.
+    """
+    if not any(f in features.split(",") for f in ("local-llm", "cuda")):
+        return
+    found = {p.name for p in EXE.parent.glob("*.dll")}
+    missing = {"llama.dll", "ggml.dll", "ggml-base.dll"} - found
+    if missing:
+        sys.exit(
+            f"AGENT_PLATFORM_FEATURES={features} but {', '.join(sorted(missing))} "
+            f"is not in {EXE.parent} — the installed app would die at startup."
+        )
+    print(f"[installer] bundling {len(found)} llama.cpp/ggml DLL(s)")
+    if "cuda" in features.split(",") and not any(n.startswith("cudart64") for n in found):
+        # cuBLAS alone is several hundred MB, so the redistributables are not
+        # bundled: a CUDA build targets machines that already have the toolkit.
+        print(
+            "[installer] warning: CUDA build without the CUDA runtime DLLs — "
+            "target machines need the CUDA Toolkit on PATH or the app exits with 0xC0000135"
+        )
+
+
 def main() -> None:
     if sys.platform != "win32":
         sys.exit(
@@ -85,7 +116,12 @@ def main() -> None:
             "Install Inno Setup from https://jrsoftware.org/isinfo.php and re-run."
         )
 
-    _run(["cargo", "build", "--release", "-p", "agent-platform-desktop"], cwd=DESKTOP)
+    build = ["cargo", "build", "--release", "-p", "agent-platform-desktop"]
+    features = os.environ.get("AGENT_PLATFORM_FEATURES", "").strip()
+    if features:
+        build += ["--features", features]
+    _run(build, cwd=DESKTOP)
+    check_local_llm_dlls(features)
     _run([sys.executable, str(REPO / "scripts" / "bundle_server.py")])
     sign_exe()
     _run([iscc, str(ISS)])

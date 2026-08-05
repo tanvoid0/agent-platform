@@ -4,7 +4,7 @@ use crate::domain::{self, BoardColumn, BoardRow};
 use crate::processes::{Message, State, ViewMode};
 use crate::ui::{self, space, Icon, Tone};
 use agent_platform_client::types::{ProcessRecord, ReviewDecision, TaskNodeRecord};
-use iced::widget::{checkbox, column, container, row, scrollable, stack};
+use iced::widget::{checkbox, column, container, row, scrollable};
 use iced::{Element, Length, Theme};
 
 pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
@@ -17,7 +17,7 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
     // The review modal is an overlay, shadcn `Dialog`-style.
     match &state.review {
         None => main.into(),
-        Some(draft) => stack![main, review_modal(draft)].into(),
+        Some(draft) => ui::modal(main, review_modal(draft), 680.0),
     }
 }
 
@@ -137,9 +137,6 @@ fn detail_pane<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message>
 
     if let Some(err) = &state.error {
         blocks.push(dismissible(ui::alert_error(err.clone())));
-    }
-    if let Some(notice) = &state.notice {
-        blocks.push(dismissible(ui::alert(Tone::Info, notice.clone(), None)));
     }
 
     let Some(process) = state.selected_process() else {
@@ -593,12 +590,5 @@ fn review_modal(draft: &crate::processes::ReviewDraft) -> Element<'_, Message> {
         ]),
     );
 
-    container(container(dialog).max_width(680))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .padding(space::LG)
-        .style(crate::ui::theme::scrim)
-        .into()
+    dialog
 }

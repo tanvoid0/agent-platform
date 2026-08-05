@@ -61,10 +61,15 @@ pub enum Message {
 
 impl Store {
     pub fn load(dir: &Path) -> Self {
-        let saved: Saved = std::fs::read_to_string(dir.join(FILE))
+        let mut saved: Saved = std::fs::read_to_string(dir.join(FILE))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        // The plain Chat tab was merged into E.V.; its saved threads move with
+        // it, or they would sit in the file invisible to every sidebar.
+        for c in saved.items.iter_mut().filter(|c| c.source == "Chat") {
+            c.source = crate::assistant::NAME.to_string();
+        }
         let next_id =
             saved.next_id.max(saved.items.iter().map(|c| c.id + 1).max().unwrap_or(1)).max(1);
         Self { items: saved.items, next_id, dir: dir.to_path_buf(), current: HashMap::new() }
@@ -214,28 +219,43 @@ mod tests {
         assert_eq!(s.items.len(), 2);
     }
 
+    /// The plain Chat tab is gone; its saved threads must show up under E.V.
+    /// rather than sitting in the file with no sidebar that lists them.
+    #[test]
+    fn old_chat_threads_move_to_the_assistant_on_load() {
+        let dir = std::env::temp_dir().join(format!("ev-history-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Store::load(&dir);
+        s.autosave("Chat", &thread("plain chat"), &[]);
+
+        let reopened = Store::load(&dir);
+        assert!(reopened.visible("Chat").is_empty());
+        assert_eq!(reopened.visible(crate::assistant::NAME).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn conversations_survive_a_restart_and_tabs_stay_apart() {
         let dir = std::env::temp_dir()
             .join(format!("ev-history-persist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = Store::load(&dir);
-        s.autosave("Chat", &thread("plain chat"), &[]);
+        s.autosave("run 7", &thread("plain chat"), &[]);
         s.autosave("E.V.", &thread("suit check"), &[]);
 
         let mut reopened = Store::load(&dir);
         assert_eq!(reopened.items.len(), 2);
-        assert_eq!(reopened.current("Chat"), None, "which chat was open is session state");
-        assert_eq!(reopened.visible("Chat").len(), 1);
+        assert_eq!(reopened.current("run 7"), None, "which chat was open is session state");
+        assert_eq!(reopened.visible("run 7").len(), 1);
         assert_eq!(reopened.visible("E.V.")[0].title, "suit check");
 
-        let id = reopened.visible("Chat")[0].id;
-        let loaded = reopened.open("Chat", id).expect("saved conversation loads");
+        let id = reopened.visible("run 7")[0].id;
+        let loaded = reopened.open("run 7", id).expect("saved conversation loads");
         assert_eq!(loaded.messages[0].content, "plain chat");
-        assert_eq!(reopened.current("Chat"), Some(id));
+        assert_eq!(reopened.current("run 7"), Some(id));
 
         reopened.delete(id);
-        assert_eq!(reopened.current("Chat"), None, "deleting the open chat closes it");
+        assert_eq!(reopened.current("run 7"), None, "deleting the open chat closes it");
         assert_eq!(Store::load(&dir).items.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

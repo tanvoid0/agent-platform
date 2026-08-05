@@ -1,8 +1,10 @@
-//! Chat against the platform's LLM proxy. One thread, kept in memory — the
-//! server's chat endpoint is stateless, so the whole history is sent each turn.
+//! Chat against the platform's LLM proxy, scoped to something else on screen (a
+//! run, a subagent). One thread, kept in memory — the server's chat endpoint is
+//! stateless, so the whole history is sent each turn. The standalone chat screen
+//! was merged into `assistant.rs`; what is left here is the embedded panel.
 
 use agent_platform_client::sse::ChatChunk;
-use agent_platform_client::types::{ChatCompletionBody, ChatMessage, ProviderEntry};
+use agent_platform_client::types::{ChatCompletionBody, ChatMessage};
 use agent_platform_client::Client;
 use iced::Task;
 
@@ -23,13 +25,6 @@ pub struct State {
     /// Messages whose thinking section the user has expanded.
     pub reasoning_open: std::collections::HashSet<usize>,
     pub draft: String,
-    /// Provider/model override for this thread; empty = the server's default.
-    /// The plain screen persists the pair in `shell::Settings`.
-    pub provider: String,
-    pub model: String,
-    /// Providers the proxy knows, for the header dropdowns. Loaded on screen
-    /// entry; empty until then (the dropdowns just have nothing to offer).
-    pub catalog: Vec<ProviderEntry>,
     pub sending: bool,
     /// An assistant turn is open and collecting deltas — the next one appends to
     /// it rather than starting another bubble. Public so the view can keep the
@@ -53,9 +48,6 @@ impl Default for State {
             reasoning: Vec::new(),
             reasoning_open: Default::default(),
             draft: String::new(),
-            provider: String::new(),
-            model: String::new(),
-            catalog: Vec::new(),
             sending: false,
             streaming: false,
             error: None,
@@ -66,11 +58,6 @@ impl Default for State {
 }
 
 impl State {
-    /// The plain screen's thread, opened on the persisted provider/model pair.
-    pub fn with_defaults(provider: String, model: String) -> Self {
-        Self { provider, model, ..Self::default() }
-    }
-
     /// A thread owned by something else on screen, addressed by `key`.
     pub fn scoped(key: &str) -> Self {
         Self { scroll: format!("chat-transcript:{key}").into(), ..Self::default() }
@@ -142,39 +129,11 @@ impl State {
             .map(|c| ChatMessage::text("system", c.clone()));
         system.chain(self.messages.iter().cloned()).collect()
     }
-
-    pub fn provider_ids(&self) -> Vec<String> {
-        self.catalog.iter().map(|p| p.id.clone()).collect()
-    }
-
-    /// Models the chosen provider offers; every provider's models when no
-    /// provider is picked (the proxy resolves an alias to its provider).
-    pub fn model_options(&self) -> Vec<String> {
-        self.catalog
-            .iter()
-            .filter(|p| self.provider.is_empty() || p.id == self.provider)
-            .flat_map(|p| p.models.options.iter().cloned())
-            .collect()
-    }
-}
-
-/// Fetch the provider catalog for the dropdowns.
-pub fn load_catalog(client: &Client) -> Task<Message> {
-    let client = client.clone();
-    Task::perform(
-        async move { client.llm_providers().await.map(|c| c.providers).map_err(|e| e.to_string()) },
-        Message::CatalogLoaded,
-    )
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     DraftChanged(String),
-    ProviderChanged(String),
-    ModelChanged(String),
-    /// Back to the server's default provider and model.
-    UseDefaults,
-    CatalogLoaded(Result<Vec<agent_platform_client::types::ProviderEntry>, String>),
     Send,
     /// One chunk of the streamed reply.
     Chunk(ChatChunk),
@@ -191,30 +150,6 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.draft = v;
             Task::none()
         }
-        Message::ProviderChanged(v) => {
-            // The picked model belongs to the old provider; keep it only if
-            // the new one also offers it.
-            state.provider = v;
-            if !state.model_options().iter().any(|m| m == &state.model) {
-                state.model.clear();
-            }
-            Task::none()
-        }
-        Message::ModelChanged(v) => {
-            state.model = v;
-            Task::none()
-        }
-        Message::UseDefaults => {
-            state.provider.clear();
-            state.model.clear();
-            Task::none()
-        }
-        Message::CatalogLoaded(Ok(providers)) => {
-            state.catalog = providers;
-            Task::none()
-        }
-        // The dropdowns just stay empty; chat itself still works on defaults.
-        Message::CatalogLoaded(Err(_)) => Task::none(),
         Message::Send => {
             let prompt = state.draft.trim().to_string();
             if prompt.is_empty() || state.sending {
@@ -226,8 +161,8 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
 
             let body = ChatCompletionBody {
                 messages: state.wire_messages(),
-                model: non_empty(&state.model),
-                provider: non_empty(&state.provider),
+                model: None,
+                provider: None,
                 temperature: None,
                 max_tokens: None,
                 tools: None,
@@ -290,11 +225,6 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             Task::none()
         }
     }
-}
-
-fn non_empty(s: &str) -> Option<String> {
-    let t = s.trim();
-    (!t.is_empty()).then(|| t.to_string())
 }
 
 #[cfg(test)]

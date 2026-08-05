@@ -118,11 +118,12 @@ fn light_tokens() -> Tokens {
 /// shadcn default (zinc) — `.dark`.
 fn dark_tokens() -> Tokens {
     Tokens {
-        background: hsl(240.0, 10.0, 3.9),
+        // lifted off shadcn's 3.9% — that reads as flat black on a full-screen canvas
+        background: hsl(240.0, 6.0, 8.0),
         foreground: hsl(0.0, 0.0, 98.0),
-        card: hsl(240.0, 10.0, 3.9),
+        card: hsl(240.0, 6.0, 11.0),
         card_foreground: hsl(0.0, 0.0, 98.0),
-        popover: hsl(240.0, 10.0, 3.9),
+        popover: hsl(240.0, 6.0, 11.0),
         primary: hsl(0.0, 0.0, 98.0),
         primary_foreground: hsl(240.0, 5.9, 10.0),
         secondary: hsl(240.0, 3.7, 15.9),
@@ -309,10 +310,14 @@ pub fn code_block(theme: &Theme) -> container::Style {
 /// Backdrop for the HUD canvas, which paints a fixed dark palette in either
 /// theme — a light backdrop would swallow its white/cyan strokes.
 pub fn hud_backdrop(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color::from_rgb(0.04, 0.05, 0.08))),
-        ..code_block(theme)
-    }
+    // Deep space in dark, cold paper in light — the HUD inverts with the app
+    // instead of staying a black box in a light window.
+    let bg = if tokens(theme).dark {
+        Color::from_rgb(0.04, 0.05, 0.08)
+    } else {
+        Color::from_rgb(0.94, 0.95, 0.98)
+    };
+    container::Style { background: Some(Background::Color(bg)), ..code_block(theme) }
 }
 
 // -- buttons ----------------------------------------------------------------

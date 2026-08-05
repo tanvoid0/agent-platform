@@ -4,6 +4,9 @@
 //! the choice lives in one place. Without the `local-llm` feature there is no
 //! choice to make and this is a passthrough.
 
+#[cfg(feature = "local-llm")]
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use agent_platform_client::sse::{self, ChatChunk};
 use agent_platform_client::types::ChatCompletionBody;
 use agent_platform_client::Client;
@@ -12,23 +15,40 @@ use futures::Stream;
 /// The server answers unless in-process inference is built in, configured, and
 /// able to serve *this* request.
 ///
-/// Three things send a turn back to the server even with a local model loaded:
-/// tools (the local path does not do tool calls), an explicit provider, and an
-/// explicit model — the last two are the user naming an upstream, which is an
-/// answer to "who should handle this".
+/// Two things send a turn back to the server even with a local model loaded: an
+/// explicit provider and an explicit model. Both are the user naming an
+/// upstream, which is an answer to "who should handle this". Tools are handled
+/// locally — [`crate::local_llm`] recognises a call in the reply and holds it
+/// back from the stream.
 pub fn chat_stream(client: Client, body: ChatCompletionBody) -> impl Stream<Item = ChatChunk> {
     #[cfg(feature = "local-llm")]
-    if body.tools.is_none()
-        && body.provider.is_none()
-        && body.model.is_none()
-        && crate::local_llm::available()
-    {
+    if body.provider.is_none() && body.model.is_none() && crate::local_llm::available() {
+        LAST_LOCAL.store(1, Ordering::Relaxed);
         return futures::future::Either::Left(crate::local_llm::chat_stream(body));
     }
 
     #[cfg(feature = "local-llm")]
-    return futures::future::Either::Right(sse::chat_stream(client, body));
+    {
+        LAST_LOCAL.store(2, Ordering::Relaxed);
+        return futures::future::Either::Right(sse::chat_stream(client, body));
+    }
 
     #[cfg(not(feature = "local-llm"))]
     sse::chat_stream(client, body)
+}
+
+/// Which side answered last, for the Settings badge: `0` nothing yet, `1` here,
+/// `2` the server. Written where the choice is made, which is above.
+#[cfg(feature = "local-llm")]
+static LAST_LOCAL: AtomicU8 = AtomicU8::new(0);
+
+/// `None` until a turn has been routed. A badge is the only reader, so a relaxed
+/// load is enough — it is allowed to be one frame stale.
+#[cfg(feature = "local-llm")]
+pub fn last_turn_was_local() -> Option<bool> {
+    match LAST_LOCAL.load(Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
 }

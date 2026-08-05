@@ -97,7 +97,10 @@ engine (one owned thread, model resident, KV prefix reused across turns),
 [`inference.rs`](desktop/crates/app/src/inference.rs) is the single dispatch
 point, and everything is behind the `local-llm` feature, off by default.
 
-Turn it on by hand for now — there is no UI:
+Point it at a GGUF in **Settings → Status → Local model** (file picker, context
+box, and a badge saying which engine answered the last turn); both keys are read
+once at the first local turn, so a change wants the app restarted — the card has
+the button. The same two keys by hand:
 
 ```jsonc
 // %APPDATA%\com.tanvoid0.agentplatform\settings.json
@@ -119,24 +122,66 @@ AGENT_PLATFORM_TEST_GGUF=<path.gguf> cargo test -p agent-platform-desktop --feat
 
 Ordered by what unblocks what:
 
-1. **Settings UI** for `local_model_path` (file picker) and `local_n_ctx`, plus
-   a badge saying which engine answered the last turn. Without it nobody
-   discovers the feature. Lands in the Settings screen, so it wants any
-   in-flight `screen.rs` / `main.rs` work committed first.
-2. **Unload / VRAM policy.** The model stays resident for the life of the
-   process. Needs an idle timeout (Ollama's `keep_alive` shape) and a way to
-   drop the model when a model-ops job wants the VRAM.
-3. **Installer ships the DLLs.** `local-llm` forces `dynamic-link` — two static
-   ggmls (whisper's and llama's) will not link — so a packaged build has to
-   carry `ggml*.dll`, `llama.dll`, `llama-common.dll` beside the exe.
-   `scripts/build_installer.py` + `desktop/installer/agent-platform.iss`. Only
-   blocks the first packaged `local-llm` build.
-4. **Tool calls.** `inference.rs` sends any turn carrying tools to the server,
-   so E.V.'s tool rounds never run locally. Wants GBNF-constrained output.
-5. **Point the Python side here**, if server-run agents should share the engine.
-   Deliberately out of scope so far: the desktop would have to expose the
-   `/api/v1/model-ops/ollama/*` shape and the server would start depending on
-   the app being open.
+1. ~~**Settings UI**~~ — shipped: the *Local model* card on Settings → Status
+   (`screen.rs::local_llm_card`, `#[cfg(feature = "local-llm")]`), picker +
+   context box + last-turn engine badge from `inference::last_turn_was_local`.
+   It sits on Status rather than Model ops because that is the one model surface
+   that still works with the server down.
+2. ~~**Unload / VRAM policy.**~~ — shipped: the engine thread now owns the
+   weights instead of a `OnceLock`, so it can drop them. They unload after five
+   idle minutes (`IDLE_UNLOAD`, Ollama's `keep_alive` default) and reload on the
+   next turn; `local_llm::unload()` frees them early, wired to the *Free VRAM*
+   button on the Settings card and fired automatically when a model-ops build
+   job starts. Not covered: a partial offload, and a `keep_alive` setting —
+   the timeout is a constant.
+3. ~~**Installer ships the DLLs.**~~ — shipped: the `.iss` takes
+   `target\release\*.dll` (`skipifsourcedoesntexist`, so a default build packages
+   none), and `build_installer.py` passes `AGENT_PLATFORM_FEATURES` through to
+   cargo and refuses to package a `local-llm` build whose DLLs are missing:
+
+   ```powershell
+   $env:AGENT_PLATFORM_FEATURES = "cuda"; python scripts/build_installer.py
+   ```
+
+   Still open: a CUDA build does **not** carry the CUDA runtime (cuBLAS alone is
+   hundreds of MB), so it only installs onto machines that already have the
+   toolkit — the script warns. A CPU-only `local-llm` build has no such
+   dependency, and 11 tok/s against 123 is the price.
+4. ~~**Tool calls.**~~ — shipped, but by *recognition*, not GBNF. The
+   definitions go in as an extra system turn (this binding's
+   `apply_chat_template` takes no `tools`), the model is asked to answer with
+   one JSON object, and a reply opening `{"name"` is held back instead of
+   streamed, then handed over as the same `ChatChunk::ToolCall` the server's
+   relay emits — anything else streams as prose from its first character.
+   Verified against Qwen3-Coder-30B: a valid call, nothing leaked into the
+   transcript.
+
+   The GBNF part was tried and removed. In llama-cpp-2 0.1.154 a lazy grammar
+   either builds and never fires (`grammar_lazy`, and `grammar_lazy_patterns`
+   with an anchored pattern) or is rejected outright as `NullGrammar`; code that
+   never engages is worse than none, and a call that will not parse already
+   falls back to text. Revisit when the binding's trigger works — the
+   `ponytail:` note in `local_llm.rs` marks the spot. Also not covered:
+   per-tool argument schemas, and parallel calls (one call per turn).
+5. ~~**Point the Python side here.**~~ — shipped, and cheaper than the shape
+   this list assumed: the desktop serves an OpenAI-compatible
+   `/v1/chat/completions` + `/v1/models`
+   ([`local_server.rs`](desktop/crates/app/src/local_server.rs), hand-rolled
+   HTTP on loopback, one thread per connection), so the proxy's existing
+   OpenAI-compatible provider reaches it with **no Python change at all**:
+
+   ```jsonc
+   "local_server_port": 18411   // settings.json, or the Settings card; 0 = off
+   ```
+   ```bash
+   LM_STUDIO_API_BASE=http://127.0.0.1:18411
+   ```
+
+   Off by default, and the coupling is still real: with the endpoint configured,
+   server-run agents on that provider fail when the app is closed. Loopback and
+   unauthenticated, the same boundary Ollama and LM Studio draw. Not covered:
+   `/v1/embeddings`, and a caller's `model` is ignored — whatever GGUF is
+   configured answers.
 
 *The pre-desktop refactor checklist (`docs/refactor-handoff-followup.md`) is
 complete and the file is deleted: services extracted (`app/services/`),

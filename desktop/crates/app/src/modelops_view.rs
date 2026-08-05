@@ -13,9 +13,6 @@ pub fn view(state: &State) -> Element<'_, Message> {
     if let Some(err) = &state.error {
         blocks.push(dismissible(ui::alert_error(err.clone())));
     }
-    if let Some(notice) = &state.notice {
-        blocks.push(dismissible(ui::alert(Tone::Success, notice.clone(), None)));
-    }
     if let Some(draft) = &state.new_project {
         blocks.push(ui::card_with_header(
             "New model project",

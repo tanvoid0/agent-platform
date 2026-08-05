@@ -36,7 +36,7 @@ pub struct State {
     pub default_model: String,
     pub busy: bool,
     pub error: Option<String>,
-    pub notice: Option<String>,
+    pub notice: crate::domain::Toast,
 }
 
 impl State {
@@ -192,7 +192,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.busy = false;
             match result {
                 Ok(message) => {
-                    state.notice = Some(message);
+                    state.notice.set(message);
                     refresh(client)
                 }
                 Err(e) => {
@@ -202,7 +202,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             }
         }
         Message::Dismiss => {
-            state.notice = None;
+            state.notice.clear();
             state.error = None;
             Task::none()
         }

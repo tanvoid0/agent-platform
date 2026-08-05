@@ -34,9 +34,6 @@ pub fn view(state: &State, kind: Kind) -> Element<'_, Message> {
     if let Some(err) = &state.error {
         blocks.push(dismissible(ui::alert_error(err.clone())));
     }
-    if let Some(notice) = &state.notice {
-        blocks.push(dismissible(ui::alert(Tone::Success, notice.clone(), None)));
-    }
 
     blocks.push(match (&state.draft, kind) {
         (Some(_), Kind::Projects) => project_editor(state),
@@ -51,7 +48,23 @@ pub fn view(state: &State, kind: Kind) -> Element<'_, Message> {
         (None, true) => Some(ui::badge("working…", Tone::Info)),
         (None, false) => Some(ui::button_default(Icon::Plus, new_label, new_msg)),
     };
-    ui::page(title, Some(ui::muted(subtitle)), actions, ui::stack_lg(blocks))
+    let page = ui::page(title, Some(ui::muted(subtitle)), actions, ui::stack_lg(blocks));
+
+    match &state.confirm {
+        None => page,
+        Some(confirm) => ui::modal(
+            page,
+            ui::confirm_dialog(
+                format!("Delete this {}?", confirm.what),
+                "This cannot be undone.",
+                vec![
+                    ui::button_ghost(Icon::X, "Cancel", Message::CancelConfirm),
+                    ui::button_destructive(Icon::Trash, "Delete", confirm.then.clone()),
+                ],
+            ),
+            420.0,
+        ),
+    }
 }
 
 fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {

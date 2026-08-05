@@ -419,3 +419,54 @@ mod tests {
         assert!(parse_task_dependencies(&t).is_empty());
     }
 }
+
+/// A screen's transient success message. Carries a generation counter so two
+/// identical messages in a row are two toasts: the toast timer keys its
+/// countdown on `(text, seq)`, and equal text alone would let the second one
+/// inherit what was left of the first one's five seconds.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Toast {
+    text: Option<String>,
+    seq: u64,
+}
+
+impl Toast {
+    pub fn set(&mut self, text: impl Into<String>) {
+        self.text = Some(text.into());
+        self.seq = self.seq.wrapping_add(1);
+    }
+
+    pub fn clear(&mut self) {
+        self.text = None;
+    }
+
+    /// The message and which showing of it this is; `None` when nothing is up.
+    pub fn get(&self) -> Option<(String, u64)> {
+        self.text.clone().map(|t| (t, self.seq))
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.text.is_none()
+    }
+}
+
+#[cfg(test)]
+mod toast_tests {
+    use super::Toast;
+
+    /// The counter is the whole point: the same sentence twice must not look
+    /// like one unchanged toast to the timer keyed on it.
+    #[test]
+    fn the_same_message_twice_is_two_toasts() {
+        let mut t = Toast::default();
+        t.set("Project deleted.");
+        let first = t.get().expect("a message is up");
+        t.set("Project deleted.");
+        let second = t.get().unwrap();
+        assert_eq!(first.0, second.0);
+        assert_ne!(first.1, second.1, "the second showing gets its own countdown");
+
+        t.clear();
+        assert!(t.is_none() && t.get().is_none());
+    }
+}

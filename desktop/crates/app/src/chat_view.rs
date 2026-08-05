@@ -104,37 +104,3 @@ pub fn panel<'a>(
         .into()
 }
 
-pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
-    let mut actions = vec![
-        container(ui::select(
-            "Provider (default)",
-            state.provider_ids(),
-            (!state.provider.is_empty()).then(|| state.provider.clone()),
-            Message::ProviderChanged,
-        ))
-        .width(170)
-        .into(),
-        container(ui::select(
-            "Model (default)",
-            state.model_options(),
-            (!state.model.is_empty()).then(|| state.model.clone()),
-            Message::ModelChanged,
-        ))
-        .width(220)
-        .into(),
-    ];
-    // pick_list cannot deselect, so going back to the server default needs
-    // its own button — shown only while an override is active.
-    if !state.provider.is_empty() || !state.model.is_empty() {
-        actions.push(ui::button_ghost(Icon::X, "Default", Message::UseDefaults));
-    }
-    actions.push(ui::button_outline(Icon::Trash, "Clear", Message::Clear));
-    let actions = ui::cluster(actions);
-
-    ui::page_fixed(
-        "Chat",
-        Some(ui::muted("Talks to the same provider the agents use.")),
-        Some(actions.into()),
-        panel(state, iced_theme, "Ask the platform's model anything.", Length::Fill),
-    )
-}

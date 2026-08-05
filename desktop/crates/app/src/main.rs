@@ -20,6 +20,8 @@ mod inference;
 mod library;
 #[cfg(feature = "local-llm")]
 mod local_llm;
+#[cfg(feature = "local-llm")]
+mod local_server;
 mod library_view;
 mod memory;
 mod memory_view;
@@ -58,7 +60,6 @@ pub enum Screen {
     Teams,
     Workflows,
     Plans,
-    Chat,
     Assistant,
     Memory,
     Settings,
@@ -75,10 +76,10 @@ impl Screen {
         !matches!(self, Screen::Settings | Screen::Memory | Screen::Dashboard)
     }
 
-    /// The assistants share one sidebar entry and one tab strip: the same
-    /// conversation surface plain, voiced with a HUD, and what it remembers.
+    /// The assistant and its memory share one sidebar entry and one tab strip:
+    /// the conversation, and what it remembers of them.
     pub fn is_chat(self) -> bool {
-        matches!(self, Screen::Chat | Screen::Assistant | Screen::Memory)
+        matches!(self, Screen::Assistant | Screen::Memory)
     }
 }
 
@@ -140,12 +141,21 @@ pub struct App {
     pub settings: Settings,
     pub client: Client,
     pub window: Option<window::Id>,
-    /// A quit-or-tray dialog is already up; further close clicks are ignored.
-    close_prompt: bool,
+    /// Set while the in-app quit-or-tray prompt is up; holds the window whose
+    /// close was intercepted so "Minimize to tray" knows what to hide.
+    pub close_prompt: Option<window::Id>,
     tray: Option<TrayIcon>,
+    /// Which plate the tray icon currently carries, so the health poll can spot
+    /// an OS theme switch and repaint it.
+    tray_light_plate: bool,
     pub screen: Screen,
     /// Which tab the Settings page shows; remembered across visits.
     pub settings_tab: SettingsTab,
+    /// Edit buffer for the local model's context size — the settings field is a
+    /// `u32`, and a half-typed number is not one.
+    pub local_ctx_input: String,
+    /// The same, for the port the local model is served on. Empty means off.
+    pub local_server_port_input: String,
     /// Which of the two chat tabs the sidebar entry returns to.
     pub chat_tab: Screen,
     pub status: Option<SystemStatus>,
@@ -159,7 +169,6 @@ pub struct App {
     pub processes: processes::State,
     pub library: library::State,
     pub modelops: modelops::State,
-    pub chat: chat::State,
     pub assistant: assistant::State,
     /// What both assistants remember about the user, across restarts.
     pub memory: memory::Store,
@@ -210,7 +219,11 @@ pub enum Message {
     Tray(String),
     WindowOpened(window::Id),
     WindowCloseRequested(window::Id),
-    WindowCloseChoice(window::Id, rfd::MessageDialogResult),
+    CloseConfirmed,
+    MinimizeToTray,
+    CloseCancelled,
+    /// A toast's time is up (or its close button was pressed).
+    NoticeExpired,
     WindowClosed(window::Id),
     Nav(Screen),
     NavSettings(SettingsTab),
@@ -223,6 +236,13 @@ pub enum Message {
     ClearLogs,
     ToggleKeyRevealed,
     SetTheme(ThemeMode),
+    PickLocalModel,
+    /// The GGUF for in-process inference: `None` is a cancelled picker, and an
+    /// empty string clears the setting (back to server-answered turns).
+    SetLocalModel(Option<String>),
+    SetLocalCtx(String),
+    SetLocalServerPort(String),
+    UnloadLocalModel,
     Copy(&'static str, String),
     RestartServer,
     RestartApp,
@@ -231,7 +251,6 @@ pub enum Message {
     Processes(processes::Message),
     Library(library::Message),
     ModelOps(modelops::Message),
-    Chat(chat::Message),
     Assistant(assistant::Message),
     Memory(memory::Message),
     History(history::Message),
@@ -240,20 +259,20 @@ pub enum Message {
     Todos(todos::Message),
 }
 
-/// The 32×32 frame of the app icon as RGBA, for the title bar and the tray.
+/// One frame of the app icon as RGBA, picked by its edge in pixels.
 ///
 /// `icon.ico` is the same file `build.rs` embeds in the exe, but that resource
 /// only reaches Explorer and the taskbar: winit leaves the window class icon
 /// unset, so without this the title bar shows Windows' default. Every frame in
 /// the file is an 8-bit RGBA PNG, which is the only encoding handled here — an
 /// ICO holding BMP frames would need the DIB path too.
-fn icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
+fn frame_rgba(px: u8) -> Option<(Vec<u8>, u32, u32)> {
     const ICO: &[u8] = include_bytes!("../icon.ico");
     // ICONDIR: 6-byte header, then one 16-byte ICONDIRENTRY per frame, whose
     // first byte is the width (0 meaning 256) and whose last two fields are
     // the frame's byte length and offset.
     let count = u16::from_le_bytes([ICO[4], ICO[5]]) as usize;
-    let entry = (0..count).map(|i| 6 + i * 16).find(|&o| ICO[o] == 32)?;
+    let entry = (0..count).map(|i| 6 + i * 16).find(|&o| ICO[o] == px)?;
     let len = u32::from_le_bytes(ICO[entry + 8..entry + 12].try_into().ok()?) as usize;
     let off = u32::from_le_bytes(ICO[entry + 12..entry + 16].try_into().ok()?) as usize;
     let mut reader = png::Decoder::new(ICO.get(off..off + len)?).read_info().ok()?;
@@ -266,11 +285,48 @@ fn icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
     Some((buf, info.width, info.height))
 }
 
+/// The app icon with its plate recolored for the surface it will sit on.
+///
+/// The asset ships a near-black plate behind a red robot. On a dark surface that
+/// plate disappears, so the neutral pixels — the plate and its antialiased edge;
+/// the robot is saturated — are inverted into a light plate. Alpha is untouched,
+/// so the rounded corners survive.
+fn logo_rgba(px: u8, light_plate: bool) -> Option<(Vec<u8>, u32, u32)> {
+    let (mut rgba, w, h) = frame_rgba(px)?;
+    if light_plate {
+        for p in rgba.chunks_exact_mut(4) {
+            let (lo, hi) = (p[0].min(p[1]).min(p[2]), p[0].max(p[1]).max(p[2]));
+            if hi - lo <= 24 {
+                for c in &mut p[..3] {
+                    *c = 255 - *c;
+                }
+            }
+        }
+    }
+    Some((rgba, w, h))
+}
+
+/// The sidebar mark, cached per plate so the view does not re-upload a texture
+/// every frame. 48px covers the 28pt slot up to a 1.5× scale factor.
+pub fn logo_handle(dark_surface: bool) -> iced::widget::image::Handle {
+    use std::sync::OnceLock;
+    static CACHE: [OnceLock<iced::widget::image::Handle>; 2] = [OnceLock::new(), OnceLock::new()];
+    CACHE[dark_surface as usize]
+        .get_or_init(|| {
+            let (rgba, w, h) = logo_rgba(48, !dark_surface).expect("no 48x48 frame in icon.ico");
+            iced::widget::image::Handle::from_rgba(w, h, rgba)
+        })
+        .clone()
+}
+
 fn open_window() -> Task<Message> {
     let (_id, task) = window::open(window::Settings {
         size: iced::Size::new(1440.0, 900.0),
         min_size: Some(iced::Size::new(820.0, 560.0)),
-        icon: icon_rgba().and_then(|(rgba, w, h)| window::icon::from_rgba(rgba, w, h).ok()),
+        // Title bar and taskbar are OS chrome: the plate has to contrast with
+        // the *system* theme, not with whatever theme the app is set to.
+        icon: logo_rgba(32, shell::system_is_dark())
+            .and_then(|(rgba, w, h)| window::icon::from_rgba(rgba, w, h).ok()),
         // Close is intercepted: we ask quit-or-tray instead of just closing.
         exit_on_close_request: false,
         ..window::Settings::default()
@@ -278,8 +334,8 @@ fn open_window() -> Task<Message> {
     task.map(Message::WindowOpened)
 }
 
-fn tray_icon_image() -> Option<tray_icon::Icon> {
-    let (rgba, w, h) = icon_rgba()?;
+fn tray_icon_image(light_plate: bool) -> Option<tray_icon::Icon> {
+    let (rgba, w, h) = logo_rgba(32, light_plate)?;
     tray_icon::Icon::from_rgba(rgba, w, h).ok()
 }
 
@@ -297,7 +353,9 @@ fn build_tray(port: u16) -> Option<TrayIcon> {
     TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Agent Platform")
-        .with_icon(tray_icon_image()?)
+        // The notification area follows the system theme, so a dark system gets
+        // the light plate.
+        .with_icon(tray_icon_image(shell::system_is_dark())?)
         .build()
         .ok()
 }
@@ -369,16 +427,39 @@ fn boot() -> (App, Task<Message>) {
         settings.start_minimized || std::env::args().any(|a| a == "--minimized");
     let (chat_provider, chat_model) =
         (settings.chat_provider.clone(), settings.chat_model.clone());
+    let local_n_ctx = settings.local_n_ctx;
+    let local_server_port = settings.local_server_port;
+
+    // The OpenAI-compatible endpoint in front of the local model, for the
+    // server's own agents. Off unless a port is set, and a port that will not
+    // bind is a log line rather than a failed startup — the app's own chat does
+    // not need it.
+    #[cfg(feature = "local-llm")]
+    if settings.local_server_port != 0 {
+        match local_server::start(settings.local_server_port) {
+            Ok(addr) => sh.log_line(format!("[local-llm] serving OpenAI-compatible on http://{addr}")),
+            Err(e) => sh.log_line(format!(
+                "[local-llm] could not bind port {}: {e}",
+                settings.local_server_port
+            )),
+        }
+    }
 
     let app = App {
         shell: sh,
         settings,
         client,
         window: None,
-        close_prompt: false,
+        close_prompt: None,
         tray,
+        tray_light_plate: shell::system_is_dark(),
         screen: Screen::Dashboard,
         settings_tab: SettingsTab::Providers,
+        local_ctx_input: local_n_ctx.to_string(),
+        local_server_port_input: match local_server_port {
+            0 => String::new(),
+            p => p.to_string(),
+        },
         chat_tab: Screen::Assistant,
         status: None,
         status_error: None,
@@ -397,8 +478,7 @@ fn boot() -> (App, Task<Message>) {
         processes: processes::State::default(),
         library: library::State::default(),
         modelops: modelops::State::default(),
-        chat: chat::State::with_defaults(chat_provider, chat_model),
-        assistant: assistant::State::new(),
+        assistant: assistant::State::with_defaults(chat_provider, chat_model),
         memory: memory::Store::load(&app_dir),
         history: history::Store::load(&app_dir),
         providers: providers::State::default(),
@@ -412,6 +492,22 @@ fn boot() -> (App, Task<Message>) {
         Task::done(Message::Processes(processes::Message::ListTick)),
     ]);
     (app, task.chain(bootstrap))
+}
+
+/// What the context box accepts: digits only, and few enough of them that no
+/// context is a typo away from an allocation nobody has the VRAM for. The empty
+/// string is allowed through so the field can be cleared and retyped — it just
+/// does not parse, so the stored setting keeps its last good value.
+fn ctx_digits(raw: &str) -> String {
+    raw.chars().filter(char::is_ascii_digit).take(7).collect()
+}
+
+/// Persist `settings.json`, logging rather than failing: every caller is a
+/// preference change the user already made in the UI.
+fn save_settings(app: &mut App) {
+    if let Err(e) = app.settings.save(&app.shell.data_dir) {
+        app.shell.log_line(format!("[shell] could not save settings: {e}"));
+    }
 }
 
 fn quit(app: &mut App) -> ! {
@@ -440,10 +536,10 @@ fn enter_screen(app: &App) -> Task<Message> {
         Screen::Plans => Task::done(Message::Todos(todos::Message::Refresh)),
         // The dropdowns need the provider catalog once; chat itself works
         // without it, so a failed load costs nothing but empty pickers.
-        Screen::Chat if app.chat.catalog.is_empty() => {
-            chat::load_catalog(&app.client).map(Message::Chat)
+        Screen::Assistant if app.assistant.catalog.is_empty() => {
+            assistant::load_catalog(&app.client).map(Message::Assistant)
         }
-        Screen::Chat | Screen::Assistant | Screen::Memory => Task::none(),
+        Screen::Assistant | Screen::Memory => Task::none(),
         Screen::Settings => match app.settings_tab {
             SettingsTab::Logs => Task::done(Message::LogsTick),
             SettingsTab::ModelOps => Task::done(Message::ModelOps(modelops::Message::Refresh)),
@@ -480,31 +576,34 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::WindowCloseRequested(id) => {
-            if app.close_prompt {
-                return Task::none();
-            }
-            app.close_prompt = true;
-            let dialog = rfd::AsyncMessageDialog::new()
-                .set_title("Agent Platform")
-                .set_description("Close the app, or keep it running in the tray?")
-                .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
-                    "Close".to_string(),
-                    "Minimize to tray".to_string(),
-                    "Cancel".to_string(),
-                ));
-            Task::perform(dialog.show(), move |r| Message::WindowCloseChoice(id, r))
+            // The prompt is drawn in-app (see `screen::view`), so the choice
+            // arrives as one of the three messages below.
+            app.close_prompt = Some(id);
+            Task::none()
         }
-        Message::WindowCloseChoice(id, result) => {
-            app.close_prompt = false;
-            match result {
-                rfd::MessageDialogResult::Custom(s) if s == "Close" => quit(app),
-                rfd::MessageDialogResult::Custom(s) if s == "Minimize to tray" => {
-                    window::close(id)
-                }
-                // Cancel, Esc, or dialog dismissed: keep the window.
-                _ => Task::none(),
-            }
+        Message::NoticeExpired => {
+            // One clear for every screen that owns a `notice`: only one is on
+            // screen at a time, and a stale one behind it should go too. Errors
+            // are untouched — they stay as inline banners until dismissed.
+            app.library.notice.clear();
+            app.processes.notice.clear();
+            app.modelops.notice.clear();
+            app.providers.notice.clear();
+            app.workflows.notice.clear();
+            Task::none()
         }
+        Message::CloseCancelled => {
+            app.close_prompt = None;
+            Task::none()
+        }
+        Message::CloseConfirmed => {
+            app.close_prompt = None;
+            quit(app)
+        }
+        Message::MinimizeToTray => match app.close_prompt.take() {
+            Some(id) => window::close(id),
+            None => Task::none(),
+        },
         Message::WindowClosed(id) => {
             if app.window == Some(id) {
                 app.window = None;
@@ -527,6 +626,16 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::StatusTick => {
             app.child_alive = app.shell.server_running();
+            // The one timer that always runs, so it is also where an OS theme
+            // switch is noticed: the in-app theme re-resolves on every render,
+            // but the tray icon is a bitmap that has to be repainted.
+            let dark = shell::system_is_dark();
+            if dark != app.tray_light_plate {
+                app.tray_light_plate = dark;
+                if let (Some(tray), Some(icon)) = (&app.tray, tray_icon_image(dark)) {
+                    let _ = tray.set_icon(Some(icon));
+                }
+            }
             fetch_status(&app.client)
         }
         Message::StatusFetched(result) => {
@@ -602,9 +711,45 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SetTheme(mode) => {
             app.settings.theme = mode;
-            if let Err(e) = app.settings.save(&app.shell.data_dir) {
-                app.shell.log_line(format!("[shell] could not save settings: {e}"));
+            save_settings(app);
+            Task::none()
+        }
+        Message::PickLocalModel => Task::future(async {
+            rfd::AsyncFileDialog::new()
+                .set_title("Pick a GGUF model")
+                .add_filter("GGUF model", &["gguf"])
+                .pick_file()
+                .await
+                .map(|h| h.path().display().to_string())
+        })
+        .map(Message::SetLocalModel),
+        Message::SetLocalModel(None) => Task::none(),
+        Message::SetLocalModel(Some(path)) => {
+            app.settings.local_model_path = path;
+            save_settings(app);
+            Task::none()
+        }
+        Message::SetLocalCtx(raw) => {
+            app.local_ctx_input = ctx_digits(&raw);
+            if let Ok(n) = app.local_ctx_input.parse::<u32>() {
+                if n > 0 {
+                    app.settings.local_n_ctx = n;
+                    save_settings(app);
+                }
             }
+            Task::none()
+        }
+        Message::SetLocalServerPort(raw) => {
+            // Five digits caps it at the port space; an empty box is "off",
+            // which is what 0 means in the settings file.
+            app.local_server_port_input = ctx_digits(&raw).chars().take(5).collect();
+            app.settings.local_server_port = app.local_server_port_input.parse().unwrap_or(0);
+            save_settings(app);
+            Task::none()
+        }
+        Message::UnloadLocalModel => {
+            #[cfg(feature = "local-llm")]
+            local_llm::unload();
             Task::none()
         }
         Message::ToggleKeyRevealed => {
@@ -660,50 +805,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::ModelOps(msg) => {
             modelops::update(&mut app.modelops, &app.client, msg).map(Message::ModelOps)
         }
-        // Both assistants take the same two memory hooks: recall refreshed
-        // before every message (so an edit in the dashboard lands on the next
-        // turn, not the next restart) and one harvest when a reply completes.
-        Message::Chat(msg) => {
-            let closed = matches!(msg, chat::Message::Chunk(ChatChunk::Done));
-            // Autosave at the moments the thread actually changed shape: the
-            // user's turn going in, and the reply closing (or dying).
-            let save = closed
-                || matches!(
-                    msg,
-                    chat::Message::Send | chat::Message::Chunk(ChatChunk::Failed(_))
-                );
-            if matches!(msg, chat::Message::Clear) {
-                // The cleared thread stays in the history; the tab starts fresh.
-                app.history.close("Chat");
-            }
-            app.chat.system = app.memory.system_block();
-            let turn = chat::update(&mut app.chat, &app.client, msg).map(Message::Chat);
-            if save {
-                app.history.autosave("Chat", &app.chat.messages, &app.chat.reasoning);
-            }
-            // The provider/model override survives restarts: any change lands
-            // in settings.json the moment it is made.
-            if app.settings.chat_provider != app.chat.provider
-                || app.settings.chat_model != app.chat.model
-            {
-                app.settings.chat_provider = app.chat.provider.clone();
-                app.settings.chat_model = app.chat.model.clone();
-                if let Err(e) = app.settings.save(&app.shell.data_dir) {
-                    app.shell.log_line(format!("[shell] could not save settings: {e}"));
-                }
-            }
-            match closed {
-                false => turn,
-                true => Task::batch([
-                    turn,
-                    app.memory
-                        .harvest(&app.client, &app.chat.messages, "Chat")
-                        .map(Message::Memory),
-                ]),
-            }
-        }
+        // The assistant takes two memory hooks: recall refreshed before every
+        // message (so an edit in the dashboard lands on the next turn, not the
+        // next restart) and one harvest when a reply completes.
         Message::Assistant(msg) => {
             let closed = matches!(msg, assistant::Message::Chunk(ChatChunk::Done));
+            // Autosave at the moments the thread actually changed shape: the
+            // user's turn going in, and the reply closing (or dying).
             let save = closed
                 || matches!(
                     msg,
@@ -722,6 +830,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     &app.assistant.reasoning,
                 );
             }
+            // The provider/model override survives restarts: any change lands
+            // in settings.json the moment it is made.
+            if app.settings.chat_provider != app.assistant.provider
+                || app.settings.chat_model != app.assistant.model
+            {
+                app.settings.chat_provider = app.assistant.provider.clone();
+                app.settings.chat_model = app.assistant.model.clone();
+                save_settings(app);
+            }
             match closed {
                 false => turn,
                 true => Task::batch([
@@ -734,22 +851,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Memory(msg) => memory::update(&mut app.memory, msg).map(Message::Memory),
         Message::History(msg) => {
-            // The sidebar only renders on the two chat tabs, so the screen names
-            // the thread the action applies to.
-            let ev = app.screen == Screen::Assistant;
-            let source = if ev { assistant::NAME } else { "Chat" };
-            let busy = if ev { app.assistant.sending } else { app.chat.sending };
+            let source = assistant::NAME;
             // Swapping the thread out from under a streaming reply would append
             // the rest of it to the wrong conversation.
-            if busy {
+            if app.assistant.sending {
                 return Task::none();
             }
             let load = |app: &mut App, messages: Vec<_>, reasoning: Vec<_>| {
-                if ev {
-                    app.assistant.load_thread(messages, reasoning);
-                } else {
-                    app.chat.load_thread(messages, reasoning);
-                }
+                app.assistant.load_thread(messages, reasoning);
             };
             match msg {
                 history::Message::New => {
@@ -860,8 +969,12 @@ fn subscription(app: &App) -> Subscription<Message> {
             }));
         }
     }
-    // The Dashboard embeds E.V.'s live HUD, so it needs the same heartbeat.
-    if live && (app.screen == Screen::Assistant || app.screen == Screen::Dashboard) {
+    // The Dashboard embeds E.V.'s live HUD, so it needs the same heartbeat. On
+    // the assistant screen the tick is the HUD, the mic gate and the speech
+    // queue — all three are voice mode, so text mode runs at 0 fps.
+    let hud_live = (app.screen == Screen::Assistant && app.assistant.voice)
+        || app.screen == Screen::Dashboard;
+    if live && hud_live {
         subs.push(
             iced::time::every(assistant::TICK)
                 .map(|_| Message::Assistant(assistant::Message::Tick)),
@@ -872,6 +985,34 @@ fn subscription(app: &App) -> Subscription<Message> {
             iced::time::every(app.modelops.poll_interval())
                 .map(|_| Message::ModelOps(modelops::Message::JobTick)),
         );
+    }
+    // A toast clears itself. Keyed on the text, so a new message restarts the
+    // countdown instead of inheriting the old one's remaining time.
+    if let Some(keyed) = screen::notice(app) {
+        subs.push(Subscription::run_with(keyed, |_| {
+            futures::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Message::NoticeExpired
+            })
+        }));
+    }
+    // Esc dismisses the in-app modals, as the OS dialogs they replaced did.
+    let escape = |msg: Message| {
+        iced::keyboard::listen().filter_map(move |event| {
+            matches!(
+                event,
+                iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                }
+            )
+            .then(|| msg.clone())
+        })
+    };
+    if app.close_prompt.is_some() {
+        subs.push(escape(Message::CloseCancelled));
+    } else if app.library.confirm.is_some() {
+        subs.push(escape(Message::Library(library::Message::CancelConfirm)));
     }
     Subscription::batch(subs)
 }
@@ -895,14 +1036,47 @@ fn main() -> iced::Result {
 mod tests {
     use super::*;
 
+    /// The context box writes straight into a `u32` setting, so what it refuses
+    /// is the whole validation there is.
+    #[test]
+    fn the_context_box_takes_digits_and_nothing_else() {
+        assert_eq!(ctx_digits("8192"), "8192");
+        assert_eq!(ctx_digits("8k tokens"), "8");
+        assert_eq!(ctx_digits("-1"), "1");
+        // Clearing the field is allowed; it just does not parse, so the stored
+        // value stands until a new number is typed.
+        assert_eq!(ctx_digits(""), "");
+        assert!("".parse::<u32>().is_err());
+        // Longer than any real context, and short of overflowing the u32.
+        assert_eq!(ctx_digits("123456789").len(), 7);
+    }
+
     /// A silent `None` here means an unbranded title bar and no tray icon, and
     /// neither failure is visible in a build log.
     #[test]
     fn the_app_icon_decodes_out_of_the_ico() {
-        let (rgba, w, h) = icon_rgba().expect("no 32x32 RGBA frame in icon.ico");
-        assert_eq!((w, h), (32, 32));
-        assert_eq!(rgba.len(), 32 * 32 * 4);
-        assert!(rgba.chunks(4).any(|px| px[3] > 0), "every pixel is transparent");
+        for px in [32, 48] {
+            let (rgba, w, h) = frame_rgba(px).unwrap_or_else(|| panic!("no {px}px RGBA frame"));
+            assert_eq!((w, h), (px as u32, px as u32));
+            assert_eq!(rgba.len(), (px as usize).pow(2) * 4);
+            assert!(rgba.chunks(4).any(|p| p[3] > 0), "every pixel is transparent");
+        }
+    }
+
+    /// The recolor has to hit the plate and only the plate: a rule that also
+    /// caught the robot would flip the mark's own color with the theme.
+    #[test]
+    fn the_light_plate_inverts_the_backdrop_but_not_the_robot() {
+        let (dark, ..) = logo_rgba(32, false).unwrap();
+        let (light, ..) = logo_rgba(32, true).unwrap();
+        let count = |rgba: &[u8], want: [u8; 3]| {
+            rgba.chunks_exact(4).filter(|p| p[3] == 255 && p[..3] == want).count()
+        };
+        // (20, 20, 20) is the plate, (255, 78, 62) the robot's body.
+        let plate = count(&dark, [20, 20, 20]);
+        assert!(plate > 100, "asset changed: no dark plate to recolor");
+        assert_eq!(count(&light, [235, 235, 235]), plate, "plate was not inverted");
+        assert_eq!(count(&light, [255, 78, 62]), count(&dark, [255, 78, 62]), "robot changed");
     }
 
     /// The guard is only useful if it leaves a way out. Settings must open with
@@ -918,7 +1092,6 @@ mod tests {
             Screen::Teams,
             Screen::Workflows,
             Screen::Plans,
-            Screen::Chat,
             Screen::Assistant,
         ]
         {

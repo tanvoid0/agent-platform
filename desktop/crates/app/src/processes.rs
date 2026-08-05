@@ -73,7 +73,7 @@ pub struct State {
     pub lineage: crate::graph::Lineage,
     pub viewport: crate::graph::Viewport,
     pub error: Option<String>,
-    pub notice: Option<String>,
+    pub notice: crate::domain::Toast,
     pub busy: bool,
     /// One chat thread per scope (`"<run id>"`, or `"<run id>:<uuid>"` while a
     /// subagent is inspected), so switching runs does not mix conversations.
@@ -102,7 +102,7 @@ impl Default for State {
             lineage: crate::graph::Lineage::All,
             viewport: crate::graph::Viewport::default(),
             error: None,
-            notice: None,
+            notice: Default::default(),
             busy: false,
             chats: std::collections::HashMap::new(),
             chat_open: false,
@@ -484,7 +484,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Created(Ok(id)) => {
             state.composer.submitting = false;
             state.composer.goal.clear();
-            state.notice = Some(format!("Started run #{id}."));
+            state.notice.set(format!("Started run #{id}."));
             update(state, client, Message::Select(id))
         }
         Message::Created(Err(e)) => {
@@ -633,7 +633,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::ActionDone(result) => {
             state.busy = false;
             match result {
-                Ok(msg) => state.notice = Some(msg),
+                Ok(msg) => state.notice.set(msg),
                 Err(e) => state.error = Some(e),
             }
             match state.selected {
@@ -642,7 +642,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             }
         }
         Message::DismissNotice => {
-            state.notice = None;
+            state.notice.clear();
             state.error = None;
             Task::none()
         }

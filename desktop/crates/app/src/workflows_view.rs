@@ -20,13 +20,6 @@ pub fn view(state: &State) -> Element<'_, Message> {
             Some(ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss)),
         ));
     }
-    if let Some(notice) = &state.notice {
-        blocks.push(ui::alert(
-            Tone::Success,
-            notice.clone(),
-            Some(ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss)),
-        ));
-    }
 
     if let Some(editor) = &state.editor {
         blocks.push(editor_card(state, editor));

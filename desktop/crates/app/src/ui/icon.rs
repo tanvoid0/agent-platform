@@ -110,11 +110,6 @@ pub fn glyph<'a, M: 'a>(i: Icon) -> Element<'a, M> {
     i.glyph().size(SIZE).into()
 }
 
-/// Foreground-colored icon, for standalone use.
-pub fn icon<'a, M: 'a>(i: Icon) -> Element<'a, M> {
-    i.glyph().size(SIZE).style(theme::text_default).into()
-}
-
 /// `text-muted-foreground` icon — captions, list rows.
 pub fn icon_muted<'a, M: 'a>(i: Icon) -> Element<'a, M> {
     i.glyph().size(SIZE).style(theme::text_muted).into()

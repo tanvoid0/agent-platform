@@ -1,13 +1,15 @@
-//! E.V. — Extra-Vehicular Assistant, the onboard suit AI. Same stateless chat
-//! endpoint as `chat.rs`, plus a persona system prompt, an animated HUD, spoken
-//! replies, and the long-term memory in `memory.rs`.
+//! E.V. — Extra-Vehicular Assistant, the onboard suit AI and the app's one
+//! conversation surface. Stateless chat endpoint, a persona system prompt, the
+//! long-term memory in `memory.rs`, and — behind the voice-mode toggle — an
+//! animated HUD, a live mic and spoken replies. Voice mode off is plain chat:
+//! same thread, same tools, no HUD and no audio.
 //!
 //! Voice: Microsoft Edge neural TTS (AriaNeural over the free websocket
 //! endpoint — no key, needs internet) played through rodio; falls back to the
 //! platform's native engine (SAPI/WinRT, AVSpeech, speech-dispatcher) offline.
 
 use agent_platform_client::sse::ChatChunk;
-use agent_platform_client::types::{ChatCompletionBody, ChatMessage, ToolCall};
+use agent_platform_client::types::{ChatCompletionBody, ChatMessage, ProviderEntry, ToolCall};
 use agent_platform_client::Client;
 use iced::Task;
 use std::collections::VecDeque;
@@ -291,7 +293,16 @@ pub struct State {
     pub draft: String,
     pub sending: bool,
     pub error: Option<String>,
+    /// Voice mode: the HUD is on screen, the mic can be armed and replies are
+    /// spoken. Off is the same thread as plain text.
     pub voice: bool,
+    /// Provider/model override for this thread; empty = the server's default.
+    /// Persisted in `shell::Settings`, like every other screen preference.
+    pub provider: String,
+    pub model: String,
+    /// Providers the proxy knows, for the header dropdowns. Loaded on screen
+    /// entry; empty until then (the dropdowns just have nothing to offer).
+    pub catalog: Vec<ProviderEntry>,
     /// Long-term recall, refreshed by the app before every message. `None` when
     /// memory is off or empty — see `memory::Store::system_block`.
     pub memory: Option<String>,
@@ -382,6 +393,25 @@ pub struct State {
 impl State {
     pub fn new() -> Self {
         Self { voice: true, ..Self::default() }
+    }
+
+    /// The screen's thread, opened on the persisted provider/model pair.
+    pub fn with_defaults(provider: String, model: String) -> Self {
+        Self { provider, model, ..Self::new() }
+    }
+
+    pub fn provider_ids(&self) -> Vec<String> {
+        self.catalog.iter().map(|p| p.id.clone()).collect()
+    }
+
+    /// Models the chosen provider offers; every provider's models when no
+    /// provider is picked (the proxy resolves an alias to its provider).
+    pub fn model_options(&self) -> Vec<String> {
+        self.catalog
+            .iter()
+            .filter(|p| self.provider.is_empty() || p.id == self.provider)
+            .flat_map(|p| p.models.options.iter().cloned())
+            .collect()
     }
 
     /// Hands-free listening is on: the mic is open and E.V. decides when you
@@ -514,8 +544,8 @@ impl State {
         messages.extend(self.messages.iter().cloned());
         let body = ChatCompletionBody {
             messages,
-            model: None,
-            provider: None,
+            model: non_empty(&self.model),
+            provider: non_empty(&self.provider),
             temperature: None,
             max_tokens: None,
             // Past the round cap the tools disappear from the request, which
@@ -814,9 +844,28 @@ fn synthesize(text: &str) -> Result<Vec<u8>, String> {
     Ok(audio.audio_bytes)
 }
 
+fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Fetch the provider catalog for the header dropdowns.
+pub fn load_catalog(client: &Client) -> Task<Message> {
+    let client = client.clone();
+    Task::perform(
+        async move { client.llm_providers().await.map(|c| c.providers).map_err(|e| e.to_string()) },
+        Message::CatalogLoaded,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     DraftChanged(String),
+    ProviderChanged(String),
+    ModelChanged(String),
+    /// Back to the server's default provider and model.
+    UseDefaults,
+    CatalogLoaded(Result<Vec<ProviderEntry>, String>),
     Send,
     /// Toggle: first press starts the mic, second press stops and transcribes.
     Listen,
@@ -846,6 +895,30 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.draft = v;
             Task::none()
         }
+        Message::ProviderChanged(v) => {
+            // The picked model belongs to the old provider; keep it only if
+            // the new one also offers it.
+            state.provider = v;
+            if !state.model_options().iter().any(|m| m == &state.model) {
+                state.model.clear();
+            }
+            Task::none()
+        }
+        Message::ModelChanged(v) => {
+            state.model = v;
+            Task::none()
+        }
+        Message::UseDefaults => {
+            state.provider.clear();
+            state.model.clear();
+            Task::none()
+        }
+        Message::CatalogLoaded(Ok(providers)) => {
+            state.catalog = providers;
+            Task::none()
+        }
+        // The dropdowns just stay empty; chat itself still works on defaults.
+        Message::CatalogLoaded(Err(_)) => Task::none(),
         Message::Send => {
             let prompt = state.draft.trim().to_string();
             if prompt.is_empty() || state.sending {
@@ -1075,7 +1148,13 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::ToggleVoice => {
             state.voice = !state.voice;
             if !state.voice {
+                // Leaving voice mode closes the mic too — the HUD it was
+                // reported on is gone, and a live mic nobody can see is the one
+                // thing this screen must never do.
                 state.hush();
+                state.recorder = None;
+                state.capture = None;
+                state.onset = 0;
             }
             Task::none()
         }
@@ -1332,6 +1411,36 @@ mod tests {
         assert_eq!(s.messages[0].content, "Systems nominal.");
         // What reached the voice is the reply, not the deliberation.
         assert_eq!(s.speaking.as_deref(), Some("Systems nominal."));
+    }
+
+    #[test]
+    fn switching_provider_drops_a_model_it_does_not_offer() {
+        use agent_platform_client::types::ProviderModels;
+        let entry = |id: &str, model: &str| ProviderEntry {
+            id: id.into(),
+            label: id.into(),
+            configured: true,
+            local: false,
+            models: ProviderModels {
+                options: vec![model.into()],
+                selected_model: model.into(),
+                source: "discovery".into(),
+                warning: None,
+                fallback_note: None,
+            },
+        };
+        let mut s = State {
+            catalog: vec![entry("a", "a-model"), entry("b", "b-model")],
+            provider: "a".into(),
+            model: "a-model".into(),
+            ..State::new()
+        };
+        let _ = update(&mut s, &client(), Message::ProviderChanged("b".into()));
+        assert!(s.model.is_empty(), "a-model does not exist on provider b");
+
+        let _ = update(&mut s, &client(), Message::ModelChanged("b-model".into()));
+        let _ = update(&mut s, &client(), Message::UseDefaults);
+        assert!(s.provider.is_empty() && s.model.is_empty());
     }
 
     #[test]

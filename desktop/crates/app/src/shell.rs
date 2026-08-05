@@ -78,7 +78,7 @@ impl ThemeMode {
 /// OS dark-mode probe with a short TTL cache. `resolve()` runs on every render
 /// (60/s while the HUD animates) and `dark_light::detect()` hits the registry,
 /// so the raw call is cached; 2s still picks up an OS theme switch promptly.
-fn system_is_dark() -> bool {
+pub fn system_is_dark() -> bool {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
@@ -113,6 +113,11 @@ pub struct Settings {
     /// thread stops fitting.
     #[serde(default = "default_local_n_ctx")]
     pub local_n_ctx: u32,
+    /// Port for the OpenAI-compatible endpoint in front of that model, for the
+    /// Python server's own agents. 0 — the default — leaves it off; nothing
+    /// listens and the model only answers this app's chat.
+    #[serde(default)]
+    pub local_server_port: u16,
 }
 
 fn default_local_n_ctx() -> u32 {
@@ -129,6 +134,7 @@ impl Default for Settings {
             chat_model: String::new(),
             local_model_path: String::new(),
             local_n_ctx: default_local_n_ctx(),
+            local_server_port: 0,
         }
     }
 }

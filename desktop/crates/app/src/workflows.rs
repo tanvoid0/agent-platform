@@ -67,7 +67,7 @@ pub struct State {
     pub running: Option<i64>,
     pub busy: bool,
     pub error: Option<String>,
-    pub notice: Option<String>,
+    pub notice: crate::domain::Toast,
 }
 
 #[derive(Debug, Clone)]
@@ -214,7 +214,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                     // A failed run is bad news and must look like it; only a
                     // clean run goes in the green banner.
                     if run.status == "succeeded" {
-                        state.notice = Some(format!("Run #{} succeeded.", run.id));
+                        state.notice.set(format!("Run #{} succeeded.", run.id));
                     } else {
                         state.error = Some(format!(
                             "Run #{} failed — {}",
@@ -373,7 +373,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.busy = false;
             match result {
                 Ok(wf) => {
-                    state.notice = Some(format!("Saved \"{}\".", wf.name));
+                    state.notice.set(format!("Saved \"{}\".", wf.name));
                     state.editor = None;
                     refresh(client)
                 }
@@ -396,7 +396,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         }
         Message::Dismiss => {
             state.error = None;
-            state.notice = None;
+            state.notice.clear();
             Task::none()
         }
     }
