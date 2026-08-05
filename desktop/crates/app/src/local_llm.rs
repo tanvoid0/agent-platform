@@ -17,7 +17,7 @@
 //! roughly a fifth of the tok/s. Here the context is ours to set.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use agent_platform_client::sse::ChatChunk;
 use agent_platform_client::types::ChatCompletionBody;
@@ -28,6 +28,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 
 /// Every layer on the GPU. The spike measured 123 tok/s this way against 11 on
 /// CPU, so a partial offload is not worth offering as a setting yet.
@@ -135,10 +136,31 @@ fn sampler(body: &ChatCompletionBody) -> LlamaSampler {
     }
 }
 
-/// Generate on the calling (blocking) thread, handing every token to `emit`.
-/// Returns the error text for a `Failed` chunk; `Ok(())` means the reply ended
-/// on its own or hit the token cap.
-fn generate(body: &ChatCompletionBody, mut emit: impl FnMut(String)) -> Result<(), String> {
+/// How many leading tokens `new` shares with `cached`.
+///
+/// This is the whole KV-reuse trick: a chat template re-renders the entire
+/// thread every turn, so turn N's prompt is turn N-1's prompt plus the reply
+/// and the new question. The shared prefix is already in the cache.
+fn shared_prefix(cached: &[LlamaToken], new: &[LlamaToken]) -> usize {
+    cached.iter().zip(new).take_while(|(a, b)| a == b).count()
+}
+
+/// The context and what is currently in its KV cache. Lives on the engine
+/// thread and nowhere else — `LlamaContext` is not `Send`.
+struct Session<'a> {
+    ctx: llama_cpp_2::context::LlamaContext<'a>,
+    /// Tokens the cache holds, in order. Empty after a reset.
+    cached: Vec<LlamaToken>,
+}
+
+/// Generate on the engine thread, handing every token to `emit`. Returns the
+/// error text for a `Failed` chunk; `Ok(())` means the reply ended on its own
+/// or hit the token cap.
+fn generate(
+    session: &mut Session<'_>,
+    body: &ChatCompletionBody,
+    mut emit: impl FnMut(String),
+) -> Result<(), String> {
     let cfg = config().ok_or_else(|| "no local model configured".to_string())?;
     let model = model()?;
 
@@ -157,32 +179,34 @@ fn generate(body: &ChatCompletionBody, mut emit: impl FnMut(String)) -> Result<(
         ));
     }
 
-    let mut ctx = model
-        .new_context(
-            backend()?,
-            LlamaContextParams::default()
-                .with_n_ctx(std::num::NonZeroU32::new(cfg.n_ctx))
-                // llama.cpp defaults to 4 threads whatever the machine has.
-                .with_n_threads(threads())
-                .with_n_threads_batch(threads()),
-        )
-        .map_err(|e| format!("context: {e}"))?;
+    // Keep the shared prefix, drop the rest of the cache. One token short of the
+    // full prompt at most: the last one has to be decoded to produce logits, and
+    // a resend of an identical prompt would otherwise have nothing to sample
+    // from.
+    let reuse = shared_prefix(&session.cached, &tokens).min(tokens.len() - 1);
+    session
+        .ctx
+        .clear_kv_cache_seq(Some(0), Some(reuse as u32), None)
+        .map_err(|e| format!("trimming the kv cache: {e}"))?;
+    session.cached.truncate(reuse);
 
-    let mut batch = LlamaBatch::new(tokens.len().max(max_tokens as usize), 1);
-    let last = tokens.len() as i32 - 1;
-    for (i, token) in tokens.iter().enumerate() {
+    let fresh = &tokens[reuse..];
+    let mut batch = LlamaBatch::new(fresh.len().max(1), 1);
+    let last = fresh.len() as i32 - 1;
+    for (i, token) in fresh.iter().enumerate() {
         batch
-            .add(*token, i as i32, &[0], i as i32 == last)
+            .add(*token, (reuse + i) as i32, &[0], i as i32 == last)
             .map_err(|e| e.to_string())?;
     }
-    ctx.decode(&mut batch).map_err(|e| format!("prompt decode: {e}"))?;
+    session.ctx.decode(&mut batch).map_err(|e| format!("prompt decode: {e}"))?;
+    session.cached.extend_from_slice(fresh);
 
     let mut sampler = sampler(body);
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut pos = tokens.len() as i32;
 
     for _ in 0..max_tokens {
-        let token = sampler.sample(&ctx, -1);
+        let token = sampler.sample(&session.ctx, -1);
         if model.is_eog_token(token) {
             break;
         }
@@ -198,7 +222,10 @@ fn generate(body: &ChatCompletionBody, mut emit: impl FnMut(String)) -> Result<(
         batch.clear();
         batch.add(token, pos, &[0], true).map_err(|e| e.to_string())?;
         pos += 1;
-        ctx.decode(&mut batch).map_err(|e| format!("decode: {e}"))?;
+        session.ctx.decode(&mut batch).map_err(|e| format!("decode: {e}"))?;
+        // The generated token is in the cache too, and the next turn's prompt
+        // will contain it — that is what makes the reply itself reusable.
+        session.cached.push(token);
         if pos as u32 >= cfg.n_ctx {
             break;
         }
@@ -210,28 +237,93 @@ fn threads() -> i32 {
     std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(1) as i32)
 }
 
-/// The same chunk stream `sse::chat_stream` produces, generated here instead.
-///
-/// One turn at a time: the lock is held for the whole generation, so a second
-/// send waits rather than fighting for the GPU.
-// ponytail: one global generation lock; per-model contexts if two threads ever
-// need to answer at once.
-pub fn chat_stream(body: ChatCompletionBody) -> impl Stream<Item = ChatChunk> {
-    static BUSY: Mutex<()> = Mutex::new(());
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+/// One turn of work for the engine thread: what to answer, and where to put the
+/// tokens as they arrive.
+struct Job {
+    body: ChatCompletionBody,
+    out: tokio::sync::mpsc::UnboundedSender<ChatChunk>,
+}
 
-    tokio::task::spawn_blocking(move || {
-        let _turn = BUSY.lock().unwrap_or_else(|e| e.into_inner());
-        let emit_tx = tx.clone();
-        let result = generate(&body, |piece| {
-            let _ = emit_tx.send(ChatChunk::Delta(piece));
-        });
-        let _ = match result {
-            Ok(()) => tx.send(ChatChunk::Done),
-            Err(e) => tx.send(ChatChunk::Failed(e)),
-        };
+/// Hand a job to the engine thread, starting it if this is the first one.
+///
+/// The thread exists because [`Session`] cannot leave it: `LlamaContext` is not
+/// `Send`, and keeping one alive across turns is the whole point — a fresh
+/// context per turn would re-decode the entire conversation every time.
+/// Serialising turns is a side effect, and the right one: they would otherwise
+/// fight over the same GPU.
+// ponytail: a single engine thread, so one conversation at a time. A second
+// context (and a session per thread) if two ever need to answer at once.
+fn submit(job: Job) {
+    static ENGINE: OnceLock<std::sync::mpsc::Sender<Job>> = OnceLock::new();
+
+    let tx = ENGINE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("local-llm".into())
+            .spawn(move || engine_loop(&rx))
+            .expect("spawn the local-llm thread");
+        tx
     });
 
+    if let Err(e) = tx.send(job) {
+        // The thread only exits when the channel closes or the model failed to
+        // load, and it reports the latter itself; this is the former.
+        let _ = e.0.out.send(ChatChunk::Failed("the local model thread is gone".into()));
+    }
+}
+
+/// Load once, then answer jobs until the channel closes.
+fn engine_loop(rx: &std::sync::mpsc::Receiver<Job>) {
+    let session = (|| {
+        let cfg = config().ok_or_else(|| "no local model configured".to_string())?;
+        let ctx = model()?
+            .new_context(
+                backend()?,
+                LlamaContextParams::default()
+                    .with_n_ctx(std::num::NonZeroU32::new(cfg.n_ctx))
+                    // llama.cpp defaults to 4 threads whatever the machine has.
+                    .with_n_threads(threads())
+                    .with_n_threads_batch(threads()),
+            )
+            .map_err(|e| format!("context: {e}"))?;
+        Ok::<_, String>(Session { ctx, cached: Vec::new() })
+    })();
+
+    let mut session = match session {
+        Ok(s) => s,
+        // Loading is the expensive, failure-prone step. Report it to whoever
+        // asked rather than dying silently, then let each later job fail the
+        // same way through the closed channel.
+        Err(e) => {
+            for job in rx.iter() {
+                let _ = job.out.send(ChatChunk::Failed(e.clone()));
+            }
+            return;
+        }
+    };
+
+    for job in rx.iter() {
+        let out = job.out;
+        let result = generate(&mut session, &job.body, |piece| {
+            let _ = out.send(ChatChunk::Delta(piece));
+        });
+        let _ = match result {
+            Ok(()) => out.send(ChatChunk::Done),
+            Err(e) => {
+                // A failed turn leaves the cache in an unknown state; the next
+                // one starts from scratch rather than trusting it.
+                session.ctx.clear_kv_cache();
+                session.cached.clear();
+                out.send(ChatChunk::Failed(e))
+            }
+        };
+    }
+}
+
+/// The same chunk stream `sse::chat_stream` produces, generated here instead.
+pub fn chat_stream(body: ChatCompletionBody) -> impl Stream<Item = ChatChunk> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    submit(Job { body, out: tx });
     futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|c| (c, rx)) })
 }
 
@@ -260,6 +352,18 @@ mod tests {
         assert!(!cfg.model_path.is_file());
     }
 
+    #[test]
+    fn the_reusable_prefix_stops_at_the_first_difference() {
+        let t = |ids: &[i32]| ids.iter().map(|i| LlamaToken(*i)).collect::<Vec<_>>();
+        // Turn 2's prompt is turn 1's plus more — the whole point.
+        assert_eq!(shared_prefix(&t(&[1, 2, 3]), &t(&[1, 2, 3, 4, 5])), 3);
+        // An edited earlier turn invalidates everything after the edit.
+        assert_eq!(shared_prefix(&t(&[1, 2, 3]), &t(&[1, 9, 3])), 1);
+        // A cleared conversation shares nothing, and neither does a fresh cache.
+        assert_eq!(shared_prefix(&t(&[1, 2, 3]), &t(&[9])), 0);
+        assert_eq!(shared_prefix(&[], &t(&[1, 2])), 0);
+    }
+
     /// The only check that exercises llama.cpp itself. Ignored by default —
     /// it needs weights, which no CI has:
     ///
@@ -268,20 +372,73 @@ mod tests {
     /// ```
     #[test]
     #[ignore = "needs a GGUF via AGENT_PLATFORM_TEST_GGUF"]
-    fn it_generates_from_a_real_model() {
+    fn it_generates_from_a_real_model_and_reuses_the_cache() {
         let Ok(path) = std::env::var("AGENT_PLATFORM_TEST_GGUF") else { return };
         let cfg = Config { model_path: PathBuf::from(path), n_ctx: 2048 };
         assert!(cfg.model_path.is_file(), "AGENT_PLATFORM_TEST_GGUF is not a file");
-        CONFIG_OVERRIDE.set(cfg).expect("override set once");
+        CONFIG_OVERRIDE.set(cfg.clone()).expect("override set once");
 
-        let mut body = body(None);
-        body.messages = vec![ChatMessage::text("user", "Reply with the single word: pong")];
-        body.max_tokens = Some(16);
+        let ctx = model()
+            .expect("model")
+            .new_context(
+                backend().expect("backend"),
+                LlamaContextParams::default()
+                    .with_n_ctx(std::num::NonZeroU32::new(cfg.n_ctx))
+                    .with_n_threads(threads())
+                    .with_n_threads_batch(threads()),
+            )
+            .expect("context");
+        let mut session = Session { ctx, cached: Vec::new() };
+
+        let mut first = body(None);
+        first.messages = vec![ChatMessage::text("user", "Reply with the single word: pong")];
+        first.max_tokens = Some(16);
 
         let mut reply = String::new();
-        generate(&body, |piece| reply.push_str(&piece)).expect("generation");
+        generate(&mut session, &first, |piece| reply.push_str(&piece)).expect("first turn");
         assert!(!reply.trim().is_empty(), "model produced no tokens");
-        println!("reply: {reply}");
+        let after_first = session.cached.len();
+        println!("first reply: {reply}");
+
+        // Second turn: same thread plus the reply and one more question, which
+        // is exactly the shape the prefix reuse is for.
+        let mut second = body(None);
+        second.messages = vec![
+            ChatMessage::text("user", "Reply with the single word: pong"),
+            ChatMessage::text("assistant", reply.trim()),
+            ChatMessage::text("user", "Now reply with the single word: ping"),
+        ];
+        second.max_tokens = Some(16);
+
+        let tokens = model()
+            .expect("model")
+            .str_to_token(&prompt(model().unwrap(), &second), AddBos::Always)
+            .expect("tokenize");
+        let reuse = shared_prefix(&session.cached, &tokens);
+        assert!(reuse > 0, "second turn shared no prefix with the first ({after_first} cached)");
+
+        let mut reply2 = String::new();
+        generate(&mut session, &second, |piece| reply2.push_str(&piece)).expect("second turn");
+        assert!(!reply2.trim().is_empty());
+        println!("reused {reuse} of {} prompt tokens; second reply: {reply2}", tokens.len());
+
+        // The check that actually matters: reuse is an optimisation, so a warm
+        // cache must answer exactly what a cold one would. Greedy sampling makes
+        // that a strict equality.
+        let cold_ctx = model()
+            .unwrap()
+            .new_context(
+                backend().unwrap(),
+                LlamaContextParams::default()
+                    .with_n_ctx(std::num::NonZeroU32::new(cfg.n_ctx))
+                    .with_n_threads(threads())
+                    .with_n_threads_batch(threads()),
+            )
+            .expect("cold context");
+        let mut cold = Session { ctx: cold_ctx, cached: Vec::new() };
+        let mut cold_reply = String::new();
+        generate(&mut cold, &second, |piece| cold_reply.push_str(&piece)).expect("cold turn");
+        assert_eq!(reply2, cold_reply, "reusing the kv cache changed the answer");
     }
 
     #[test]

@@ -335,9 +335,19 @@ Verified with `--features cuda` against the GGUF Ollama already has: 106 unit
 tests green, and a model-backed test (`--ignored`, pointed at a real GGUF by
 `AGENT_PLATFORM_TEST_GGUF`) generates on the GPU end to end.
 
-Still open, in rough order: KV-cache reuse across turns (a fresh context per
-turn re-decodes the whole history), unload/VRAM policy, a settings UI, tool
-calls, and whether the Python side ever points at this instead of Ollama.
+**KV-cache reuse landed with it.** The engine is one owned thread — `LlamaContext`
+is not `Send`, and keeping one alive across turns is the point — holding a
+context plus the token list currently in its cache. A chat template re-renders
+the whole thread every turn, so turn N's prompt is turn N-1's prompt plus the
+reply and the new question: the shared prefix is already cached, everything past
+it is dropped with `clear_kv_cache_seq`, and only the tail is decoded. Measured
+on the two-turn test: 19 of 37 prompt tokens reused. The test that matters is
+the equivalence one — greedy sampling means a warm cache must produce the
+*identical* string a cold one does, and it does.
+
+Still open, in rough order: unload/VRAM policy, a settings UI (both knobs are
+`settings.json`-only today), tool calls, shipping the DLLs in the installer, and
+whether the Python side ever points at this instead of Ollama.
 
 ## What would reopen the full port
 
