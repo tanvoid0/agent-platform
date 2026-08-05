@@ -40,6 +40,20 @@ cargo build --release --features vulkan    # needs VULKAN_SDK set
 `vulkan` goes through a direct `llama-cpp-sys-2` dependency because `llama-cpp-2`
 forwards `cuda`/`metal`/`rocm`/`opencl` and not `vulkan`.
 
+### CUDA on Windows
+
+`winget install Nvidia.CUDA` (13.3 here). Three things bite, in order:
+
+- If a `cuda` build already failed once, `cargo clean --release -p llama-cpp-sys-2`
+  first — cmake caches the configure and skips it, then fails on a missing
+  `install.vcxproj`.
+- Export **`CUDA_PATH_V13_3`** as well as `CUDA_PATH` in any shell older than the
+  install. MSBuild's `CUDA 13.3.targets` reads the versioned one and errors with an
+  empty toolkit directory without it.
+- Put **`$CUDA_PATH\bin\x64`** on `PATH` to *run* the binary. CUDA 13 moved the
+  redistributables there and `bin` has no DLLs; miss it and the exe dies with
+  `0xC0000135` and no output.
+
 ## The Ollama baseline
 
 Match the context — Ollama defaults to the model's full trained context, which on an

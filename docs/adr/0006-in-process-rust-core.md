@@ -201,7 +201,7 @@ Deliberately dropped from the original spike: whether iced and axum share a toki
 runtime (answered — [finding 3](#3-iced-already-hosts-tokio-tasks)), and binary size
 as a decision input.
 
-### Results — 2026-08-05, partial
+### Results — 2026-08-05
 
 Harness: [`desktop/spike-llama`](../../desktop/spike-llama), excluded from the
 workspace so it never enters the app's build. `llama-cpp-2` 0.1.154. Model is the
@@ -215,13 +215,28 @@ toolchain, no `.cargo/config.toml` change. Clean build 40 s, binary 3.9 MB. [Fin
 2](#2-the-ggml-on-windows-risk-is-mostly-retired) holds for llama.cpp too, at least
 on CPU features.
 
-**Build: both accelerators are blocked on an SDK this machine does not have.**
+**Build: CUDA passes once the Toolkit is installed. Vulkan was never retried.**
 
 | Feature | Result |
 |---|---|
 | default (CPU) | builds, runs |
-| `cuda` | `CMake Error … CUDA Toolkit not found`. The driver is not enough; `nvcc` is required and the Toolkit is not installed |
-| `vulkan` | `Please install Vulkan SDK and ensure that VULKAN_SDK env variable is set` |
+| `cuda` | builds and runs on CUDA Toolkit 13.3 (`winget install Nvidia.CUDA`). 13m 46s clean build, 146 MB binary. Before the Toolkit: `CMake Error … CUDA Toolkit not found` — the driver is not enough, `nvcc` is required |
+| `vulkan` | untried; `Please install Vulkan SDK and ensure that VULKAN_SDK env variable is set`. CUDA answered the question, so the second SDK was not installed |
+
+Three Windows-specific snags, none of them llama.cpp's fault, all of them things a
+build script would have to handle if this ships:
+
+- **A failed CUDA configure leaves a poisoned cmake cache.** The first post-install
+  build reported `CMake project was already configured. Skipping configuration step.`
+  and then `MSBUILD : error MSB1009 … Switch: install.vcxproj`, because the cached
+  configure predated the Toolkit. `cargo clean --release -p llama-cpp-sys-2` fixes it.
+- **MSBuild's CUDA integration reads `CUDA_PATH_V13_3`, not `CUDA_PATH`.** With only
+  the latter set: `CUDA 13.3.targets(609,9): error : The CUDA Toolkit directory ''
+  does not exist`. The installer sets both machine-wide; a shell that predates the
+  install has to export both.
+- **CUDA 13 moved the redistributable DLLs to `bin\x64`.** `bin` itself holds no
+  `.dll` at all, so a `PATH` carrying only `bin` gets `0xC0000135` (DLL not found)
+  with no message. The exe's only CUDA import is `cublas64_13.dll`.
 
 Also worth recording: **`llama-cpp-2` does not forward a `vulkan` feature.** It
 forwards `cuda`, `metal`, `rocm`, `opencl` and stops. The feature does exist one
@@ -229,32 +244,48 @@ level down on `llama-cpp-sys-2`, so the spike reaches it by taking a direct
 dependency on the sys crate and letting feature unification do the rest. That works,
 but it means the Vulkan path is not on the binding's supported surface.
 
-**Measure: the accelerator is the entire result.**
+**Measure: the accelerator is the entire result, and on it the spike matches Ollama.**
 
 | Backend | Context | Placement | Eval tok/s |
 |---|---|---|---|
-| spike, CPU | 2048 | CPU | **11.4** |
-| Ollama, its own default | 131072 | 39% CPU / 61% GPU | **28.5** |
-| Ollama, `num_ctx` 2048 | 2048 | 100% GPU | **153.5** |
+| spike, CPU | 512 | CPU | 11.4 |
+| Ollama, its own default | 131072 | 39% CPU / 61% GPU | 28.5 |
+| **spike, CUDA, all layers** | **512** | **100% GPU** | **123.5** (123.5 / 124.9 / 123.5 / 124.0 / 121.4) |
+| **Ollama, `num_ctx` 2048** | **2048** | **100% GPU** | **112.7** (120.4 / 113.6 / 111.9 / 112.7) |
 
-CPU-only is 13× off the Ollama baseline, so it cannot be the shipped configuration
-and the CPU number is not a verdict on anything — the spike is not answerable until
-one of the two accelerator builds runs. **Kill criteria neither met nor cleared.**
+Medians of the runs in parentheses, back to back in one sitting. **Kill criteria
+cleared:** the CUDA feature builds on Windows, and tok/s is not below the Ollama
+baseline — it is ~10% above it.
 
-One finding that lands regardless of how that resolves: Ollama at *its own default*
+Two caveats on that 10%, because it is smaller than it reads:
+
+- **The Ollama row was re-measured, and the earlier 153.5 did not reproduce.** Same
+  command, same model, 100% GPU at `num_ctx` 2048 both times; today it runs 112–120.
+  Whatever moved (thermals, driver state, resident models) moved between sittings and
+  not between backends, so only the same-sitting numbers above are comparable. The
+  153.5 is left in this list as the outlier it turned out to be, not as a baseline.
+- **The two rows are not context-matched.** The spike sizes `n_ctx` to the prompt —
+  512 here — against Ollama's 2048. At these sizes the KV cache is a rounding error
+  next to the model, but the spike gets whatever small edge there is.
+
+The honest reading is **parity, not a win**: llama.cpp under our own control performs
+like llama.cpp under Ollama's, which is what it should do — both are the same engine
+on the same weights. The case for linking it in was never throughput. It is the
+control surface (VRAM policy, multi-model residency, KV reuse, GBNF) and not shipping
+a second application, and this spike says that control costs nothing in tok/s.
+
+One finding that stands independent of all of the above: Ollama at *its own default*
 does 28.5 tok/s on this hardware, because it sizes the KV cache for the model's full
 131k context, wants 23 GB, and spills 39% of the model to CPU. The same model at
-2048 context is 5.4× faster. That is the second requirement — VRAM policy — showing
-up as a measured 5× rather than as an argument, and it is available today by passing
+2048 context is ~4–5× faster. That is the second requirement — VRAM policy — showing
+up as a measurement rather than as an argument, and it is available today by passing
 `num_ctx` on the existing Ollama path.
 
-**Next:** install one SDK and rerun. CUDA is the like-for-like comparison, since
-CUDA is what Ollama uses here.
-
-```bash
-cd desktop/spike-llama
-cargo run --release --features cuda -- <path-to.gguf> 999
-```
+**Next:** the spike is answered and Phase 0 is closed. What it did *not* cover, and
+what the implementation has to face: the build matrix (this measured one accelerator
+on one machine — CUDA on Windows), model load time (~4.0 s per process start, versus
+an Ollama daemon that keeps the model resident), and whether unloading policy lives
+in the app or stays behind the `/api/v1/model-ops/ollama/*` shape.
 
 ## What would reopen the full port
 
