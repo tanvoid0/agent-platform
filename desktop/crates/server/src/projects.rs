@@ -106,7 +106,7 @@ struct ProjectOwner {
 ///
 /// 404 — never 401 — is the tenancy contract: a workspace token asking about
 /// another tenant's project must not learn that it exists.
-async fn assert_project_access(
+pub(crate) async fn assert_access(
     state: &AppState,
     principal: &Principal,
     project_id: i64,
@@ -271,7 +271,7 @@ async fn get_project(
     principal: Principal,
     Path(project_id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    assert_project_access(&state, &principal, project_id).await?;
+    assert_access(&state, &principal, project_id).await?;
     Ok(Json(load_project(&state, project_id).await?).into_response())
 }
 
@@ -282,7 +282,7 @@ async fn update_project(
     body: Option<Json<ProjectUpdate>>,
 ) -> Result<Response, ApiError> {
     let Json(req) = body.unwrap_or_default();
-    assert_project_access(&state, &principal, project_id).await?;
+    assert_access(&state, &principal, project_id).await?;
     load_project(&state, project_id).await?;
 
     // `null` and "absent" mean the same thing to the Python model (it checks
@@ -323,7 +323,7 @@ async fn delete_project(
     principal: Principal,
     Path(project_id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    assert_project_access(&state, &principal, project_id).await?;
+    assert_access(&state, &principal, project_id).await?;
     load_project(&state, project_id).await?;
 
     // One transaction: a deleted project that left processes pointing at it is
@@ -387,7 +387,7 @@ async fn get_workspace_state(
     principal: Principal,
     Path(project_id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    assert_project_access(&state, &principal, project_id).await?;
+    assert_access(&state, &principal, project_id).await?;
     let row: WorkspaceStateRow =
         sqlx::query_as("SELECT workspace_payload_json, updated_at FROM project WHERE id = ?")
             .bind(project_id)
@@ -411,7 +411,7 @@ async fn put_workspace_state(
     Path(project_id): Path<i64>,
     body: Option<Json<Value>>,
 ) -> Result<Response, ApiError> {
-    assert_project_access(&state, &principal, project_id).await?;
+    assert_access(&state, &principal, project_id).await?;
     load_project(&state, project_id).await?;
 
     let payload = body
@@ -479,7 +479,7 @@ async fn get_planning_context(
     principal: Principal,
     Path(project_id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    assert_project_access(&state, &principal, project_id).await?;
+    assert_access(&state, &principal, project_id).await?;
     Ok(Json(planning_context(&state, project_id).await?).into_response())
 }
 
@@ -489,7 +489,7 @@ async fn patch_planning_context(
     Path(project_id): Path<i64>,
     body: Option<Json<Value>>,
 ) -> Result<Response, ApiError> {
-    assert_project_access(&state, &principal, project_id).await?;
+    assert_access(&state, &principal, project_id).await?;
     planning_context(&state, project_id).await?; // 404s a missing project first
 
     let fields: Map<String, Value> = match body {

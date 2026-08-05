@@ -20,6 +20,14 @@ pub fn iso_string(at: NaiveDateTime) -> String {
     }
 }
 
+/// Nullable columns: `null` stays `null` rather than becoming an epoch.
+pub fn sql_time_opt<S: serde::Serializer>(raw: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    match raw {
+        Some(raw) => s.serialize_str(&iso_from_sql(raw)),
+        None => s.serialize_none(),
+    }
+}
+
 pub fn iso_value(at: NaiveDateTime) -> Value {
     Value::String(iso_string(at))
 }

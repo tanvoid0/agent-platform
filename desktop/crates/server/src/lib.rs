@@ -2,13 +2,15 @@
 //!
 //! Binds the public port, handles the domains that have been migrated, and
 //! reverse-proxies everything else to the Python server it spawns as a child.
-//! Migrated so far: auth, `/health`, `/`, projects, teams.
+//! Migrated so far: auth, `/health`, `/`, projects, teams, and todo CRUD
+//! (the agent-driven todo routes still belong to Python — see `todos`).
 
 pub mod auth;
 pub mod error;
 pub mod projects;
 pub mod proxy;
 pub mod teams;
+pub mod todos;
 pub mod upstream;
 pub mod wire;
 
@@ -102,6 +104,12 @@ impl AppState {
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(false)
+            // sqlx turns foreign keys ON per connection; SQLAlchemy leaves SQLite's
+            // default OFF. With them on, deleting a board that still has items is
+            // a 500 here and a 204 there — the schema has FKs the data does not
+            // honour. Matching Python is the contract; tightening this is a
+            // migration, not a port.
+            .foreign_keys(false)
             .busy_timeout(std::time::Duration::from_secs(30));
         Self {
             pool: SqlitePoolOptions::new().connect_lazy_with(opts),
@@ -145,6 +153,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", axum::routing::get(root))
         .merge(projects::routes())
         .merge(teams::routes())
+        .merge(todos::routes())
         .fallback(proxy::forward)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

@@ -114,7 +114,12 @@ def client(test_engine, monkeypatch):
             headers["Authorization"] = f"Bearer {key}"
         # The mocks are placeholders: a live server runs its own executor, so a
         # test that asserts on them is not a parity test and should fail here.
-        with httpx.Client(base_url=base_url, headers=headers, timeout=30.0) as c:
+        # TestClient follows redirects and a bare httpx.Client does not. Without
+        # this, FastAPI's trailing-slash 307 fails the test against Python while
+        # the Rust server — which answers both spellings — passes it.
+        with httpx.Client(
+            base_url=base_url, headers=headers, timeout=30.0, follow_redirects=True
+        ) as c:
             yield c, MagicMock(), MagicMock()
         return
 

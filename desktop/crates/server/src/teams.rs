@@ -196,13 +196,13 @@ fn graph_error(msg: &str) -> Value {
 // Colors
 // ---------------------------------------------------------------------------
 
-fn stable_palette_color(seed: &str) -> &'static str {
+pub(crate) fn stable_palette_color(seed: &str) -> &'static str {
     let digest = Sha256::digest(seed.as_bytes());
     let idx = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
     ROSTER_ACCENT_PALETTE[idx as usize % ROSTER_ACCENT_PALETTE.len()]
 }
 
-fn random_palette_color(avoid: &[String]) -> String {
+pub(crate) fn random_palette_color(avoid: &[String]) -> String {
     let blocked: Vec<String> = avoid.iter().map(|c| c.to_lowercase()).collect();
     let pool: Vec<&str> = ROSTER_ACCENT_PALETTE
         .iter()

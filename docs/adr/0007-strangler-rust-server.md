@@ -63,6 +63,17 @@ screen in `crates/app` stay untouched per migration.
    (WAL + `busy_timeout`), but a table written by both Python and Rust is where
    invariants diverge silently. A domain moves whole or not at all.
 
+   **Todos is a knowing exception, taken 2026-08-05.** Its CRUD is in Rust while
+   `items/{id}/agent/*`, `planning-form/submit` and `spawn-process` stay in
+   Python, because they run through the LLM proxy and the orchestrator. Those
+   Python routes write `todo_items` and `todo_item_events`, so that table now has
+   two writers. The call was Benson's: visible progress over waiting for
+   `llm_proxy`. What bounds the damage is that Rust writes one column per
+   statement and never a whole row, so a rename cannot clobber an agent's
+   `plan_json`; the reverse is still possible, because SQLAlchemy flushes whole
+   rows. The exception ends when `llm_proxy` moves. Nothing else gets this
+   treatment without the same explicit call.
+
    Two clarifications the projects slice forced. A route that only *reads*
    another domain's table is not part of this domain and stays proxied
    (`GET /projects/{id}/processes` serializes the process table, so it migrates
@@ -94,6 +105,11 @@ screen in `crates/app` stay untouched per migration.
    rows. Loud, which is the point. Those two behaviours (FK nullification on
    delete, the payload column) were then checked directly against the database.
 
+   The harness itself needed one fix, found while migrating todos: `httpx.Client`
+   does not follow redirects and `TestClient` does, so FastAPI's trailing-slash
+   `307` failed tests against Python that Rust — answering both spellings —
+   passed. A harness that flatters the new implementation is worse than none.
+
    The strongest evidence is cheaper than any of that, though: fetch the same
    route from Rust and from the Python child and compare the parsed bodies. The
    projects list came back deep-equal, which no test asserts and no reviewer
@@ -107,7 +123,7 @@ screen in `crates/app` stay untouched per migration.
 |---|--------|----------|
 | 1 | auth (`api_auth.py`, `api_tokens/`) | every other slice needs the principal; the proxy must reject before forwarding |
 | 2 | `/health`, `/` | zero coupling — the only two routes that depend on no Python-owned fact |
-| 3 | projects ✅, teams ✅, then todos, workflows | leaf tables, no LLM, ~1.5k LOC |
+| 3 | projects ✅, teams ✅, todo CRUD ✅ (split — see below), workflows | leaf tables, no LLM, ~1.5k LOC |
 | 4 | `llm_proxy/` | ~3k LOC; also where `local_llm.rs` moves so the cloud binary gets in-process inference |
 | 5 | processes / orchestrator / action_orchestrator | FastAPI `BackgroundTasks` + `asyncio.create_task` → tokio; needs a `startup_recovery` equivalent |
 | 6 | assistant, chat, coder | largest and highest-churn |
@@ -177,6 +193,11 @@ a 404.
   ephemeral address. The daemon passes `AGENT_PLATFORM_PUBLIC_HOST`/`_PORT` and
   `system_routes.py` prefers them, so the field keeps meaning "the address you
   reached us on". That is the one Python change this slice needed.
+- **Foreign keys are turned off on the Rust pool.** sqlx enables
+  `PRAGMA foreign_keys` per connection; SQLAlchemy leaves SQLite's default off.
+  The schema declares FKs the data does not honour, so with them on, deleting a
+  board that still has items was a 500 here and a 204 there — and the same for a
+  project that owns a board. Enforcing them is a data migration, not a port.
 - **Timestamps are read and written as text, not as `NaiveDateTime`.** Two
   separate diffs, both invisible to every test: the seeded team rows were written
   by aware-datetime code and carry `+00:00`, which Python renders with a trailing
