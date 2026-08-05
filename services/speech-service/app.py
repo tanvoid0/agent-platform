@@ -6,24 +6,41 @@ The agent-platform proxy routes the `speech` capability here when
 Kept out of the main app for the same reason as the image service: the platform
 brokers capabilities over HTTP and never imports a model runtime.
 
-Piper is driven through its CLI rather than its Python API, so a pip install
-(`pip install piper-tts`, which ships a `piper` console script) and a downloaded
-release binary both work with one code path.
+Piper runs in-process when `piper-tts` is importable, and through its CLI
+otherwise, so a pip install and a downloaded release binary both work. The
+in-process path exists for latency: loading a voice costs ~1.4 s against ~50 ms
+to synthesize a sentence, so a process per request meant every sentence of a
+streamed reply paid the load again and the voice never caught up with the text.
 """
 
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import wave
+from contextlib import asynccontextmanager, suppress
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-app = FastAPI(title="Speech service", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load the default voice before the first request rather than during it —
+    # that request is the one a listener notices as a gap.
+    with suppress(Exception):
+        load_voice(str(voice_path(DEFAULT_VOICE)))
+    yield
+
+
+app = FastAPI(title="Speech service", version="0.1.0", lifespan=lifespan)
 
 PIPER_BIN = os.environ.get("PIPER_BIN", "piper")
 VOICES_DIR = Path(os.environ.get("PIPER_VOICES_DIR", "voices"))
@@ -57,13 +74,54 @@ def voice_path(name: str) -> Path:
     return candidate
 
 
+@lru_cache(maxsize=4)
+def load_voice(path: str):
+    """The loaded voice for a `.onnx`, kept for the life of the process.
+
+    Raises `ImportError` when only the release binary is installed; the caller
+    falls back to the CLI.
+    """
+    from piper import PiperVoice
+
+    return PiperVoice.load(path)
+
+
+# ponytail: one global lock. A loaded voice is not documented as thread-safe and
+# FastAPI runs sync handlers on a threadpool, so concurrent callers serialize.
+# Synthesis is ~50 ms; go per-voice, or to multiple workers, if that queues.
+_synth_lock = threading.Lock()
+
+
+def synthesize(text: str, model: Path) -> bytes | None:
+    """WAV bytes from the in-process voice, or `None` when `piper-tts` is not
+    importable — a release-binary install has the CLI and nothing else."""
+    try:
+        voice = load_voice(str(model))
+    except ImportError:
+        return None
+    buf = io.BytesIO()
+    with _synth_lock, wave.open(buf, "wb") as wav:
+        voice.synthesize_wav(text, wav)
+    return buf.getvalue()
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
-    """Readiness: the binary is on PATH and at least one voice is installed."""
+    """Readiness: something can synthesize, and at least one voice is installed.
+
+    `engine` is worth reading when the voice sounds slow: `cli` reloads the
+    model on every request, `in-process` does not.
+    """
     voices = sorted(p.stem for p in VOICES_DIR.glob("*.onnx")) if VOICES_DIR.exists() else []
     binary = shutil.which(PIPER_BIN) or (PIPER_BIN if Path(PIPER_BIN).exists() else None)
+    engine = "cli" if binary else None
+    with suppress(ImportError):
+        import piper  # noqa: F401
+
+        engine = "in-process"
     return {
-        "status": "ok" if (binary and voices) else "unconfigured",
+        "status": "ok" if (engine and voices) else "unconfigured",
+        "engine": engine,
         "piper": binary,
         "voices": voices,
         "default_voice": DEFAULT_VOICE,
@@ -77,8 +135,12 @@ def speech(req: SpeechRequest) -> Response:
         raise HTTPException(status_code=400, detail="input is required")
     model = voice_path((req.voice or DEFAULT_VOICE).strip() or DEFAULT_VOICE)
 
-    # Piper streams raw PCM to stdout but only writes a real WAV header to a
-    # file, so it gets a temp file and we hand back the bytes.
+    if (audio := synthesize(text, model)) is not None:
+        return Response(content=audio, media_type=MEDIA_TYPE)
+
+    # Release-binary install: a process per request, model load included. Piper
+    # streams raw PCM to stdout but only writes a real WAV header to a file, so
+    # it gets a temp file and we hand back the bytes.
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "speech.wav"
         try:

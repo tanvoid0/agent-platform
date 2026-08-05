@@ -27,12 +27,18 @@ pip install -r requirements.txt
 Then install Piper itself, either way:
 
 ```bash
-pip install piper-tts          # ships a `piper` console script
+pip install piper-tts          # importable module, plus a `piper` console script
 ```
 
 or download a release binary from `github.com/rhasspy/piper/releases` (there are
 no wheels for every Python/OS combination — the binary is the fallback) and
 point `PIPER_BIN` at it.
+
+Prefer the pip install. When `piper` is importable the voice is loaded once and
+stays loaded (`engine: in-process` in `/health`); the binary path shells out per
+request, and loading the model costs ~1.4 s against ~50 ms to synthesize a
+sentence. Over a streamed reply that is the difference between the voice
+tracking the text and falling seconds behind it.
 
 Voices are separate downloads: `huggingface.co/rhasspy/piper-voices`. Each is a
 `<name>.onnx` plus a `<name>.onnx.json` alongside it. Drop both in `voices/`:
@@ -50,10 +56,10 @@ uvicorn app:app --host 127.0.0.1 --port 8123
 
 ```bash
 curl http://127.0.0.1:8123/health
-# {"status":"ok","piper":"...piper.exe","voices":["en_US-amy-medium"], ...}
+# {"status":"ok","engine":"in-process","voices":["en_US-amy-medium"], ...}
 ```
 
-`status` is `unconfigured` until both the binary and one voice are found.
+`status` is `unconfigured` until both an engine and one voice are found.
 
 ## Environment
 
