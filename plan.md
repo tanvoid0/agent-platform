@@ -179,9 +179,10 @@ Ordered by what unblocks what:
 
    Off by default, and the coupling is still real: with the endpoint configured,
    server-run agents on that provider fail when the app is closed. Loopback and
-   unauthenticated, the same boundary Ollama and LM Studio draw. Not covered:
-   `/v1/embeddings`, and a caller's `model` is ignored — whatever GGUF is
-   configured answers.
+   unauthenticated, the same boundary Ollama and LM Studio draw. `tools` go in
+   and `tool_calls` come back out (`finish_reason: tool_calls`), so a server-run
+   agent turn works, not just prose. Not covered: `/v1/embeddings`, and a
+   caller's `model` is ignored — whatever GGUF is configured answers.
 
 *The pre-desktop refactor checklist (`docs/refactor-handoff-followup.md`) is
 complete and the file is deleted: services extracted (`app/services/`),

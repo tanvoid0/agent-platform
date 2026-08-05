@@ -9,7 +9,9 @@
 //! ```
 //!
 //! Only what that provider actually calls is implemented: `GET /v1/models` for
-//! discovery and `POST /v1/chat/completions`, streaming or buffered. Bound to
+//! discovery and `POST /v1/chat/completions`, streaming or buffered, with
+//! `tools` in and `tool_calls` out — an agent turn is the reason the server
+//! would point here at all. Bound to
 //! loopback and unauthenticated, which is the same trust boundary Ollama and LM
 //! Studio draw — any process on this machine can already reach those.
 //!
@@ -22,7 +24,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 
-use agent_platform_client::sse::ChatChunk;
+use agent_platform_client::sse::{ChatChunk, ToolCallDelta};
 use agent_platform_client::types::{ChatCompletionBody, ChatMessage};
 
 /// Start the listener on a background thread. `Err` is a port that could not be
@@ -160,15 +162,17 @@ fn completions(out: &mut impl Write, raw: &[u8]) -> std::io::Result<()> {
 
     if !stream {
         let mut text = String::new();
+        let mut call = None;
         let mut failure = None;
         crate::local_llm::chat_blocking(body, |chunk| match chunk {
             ChatChunk::Delta(piece) => text.push_str(piece),
+            ChatChunk::ToolCall(d) => call = Some(d.clone()),
             ChatChunk::Failed(e) => failure = Some(e.clone()),
             _ => {}
         });
         return match failure {
             Some(e) => write_json(out, 500, &error_json(&e)),
-            None => write_json(out, 200, &completion_json(&id, &text)),
+            None => write_json(out, 200, &completion_json(&id, &text, call.as_ref())),
         };
     }
 
@@ -181,13 +185,18 @@ fn completions(out: &mut impl Write, raw: &[u8]) -> std::io::Result<()> {
     // so a failed turn ends the stream like a finished one; the proxy sees a
     // short reply, which is what every other SSE upstream does too.
     let mut broken = false;
+    let mut called = false;
     crate::local_llm::chat_blocking(body, |chunk| {
         if broken {
             return;
         }
         let frame = match chunk {
             ChatChunk::Delta(piece) => Some(chunk_json(&id, piece)),
-            ChatChunk::Done | ChatChunk::Failed(_) => Some(done_json(&id)),
+            ChatChunk::ToolCall(d) => {
+                called = true;
+                Some(tool_call_chunk_json(&id, d))
+            }
+            ChatChunk::Done | ChatChunk::Failed(_) => Some(done_json(&id, called)),
             _ => None,
         };
         if let Some(frame) = frame {
@@ -198,11 +207,41 @@ fn completions(out: &mut impl Write, raw: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn completion_json(model: &str, text: &str) -> String {
+fn completion_json(model: &str, text: &str, call: Option<&ToolCallDelta>) -> String {
+    // A turn is one or the other: [`crate::local_llm`] holds a recognised call
+    // back from the stream, so `text` is empty whenever `call` is set.
+    let (message, finish) = match call {
+        Some(d) => (
+            format!(r#"{{"role":"assistant","content":null,"tool_calls":[{}]}}"#, tool_call_json(d)),
+            "tool_calls",
+        ),
+        None => {
+            (format!(r#"{{"role":"assistant","content":{}}}"#, json_string(text)), "stop")
+        }
+    };
     format!(
-        r#"{{"id":"chatcmpl-local","object":"chat.completion","created":0,"model":{},"choices":[{{"index":0,"message":{{"role":"assistant","content":{}}},"finish_reason":"stop"}}]}}"#,
+        r#"{{"id":"chatcmpl-local","object":"chat.completion","created":0,"model":{},"choices":[{{"index":0,"message":{message},"finish_reason":"{finish}"}}]}}"#,
+        json_string(model)
+    )
+}
+
+/// One `tool_calls[i]`. The engine emits a whole call at once, so there is no
+/// partial fragment to stitch and `arguments` is already complete JSON.
+fn tool_call_json(d: &ToolCallDelta) -> String {
+    format!(
+        r#"{{"index":{},"id":{},"type":"function","function":{{"name":{},"arguments":{}}}}}"#,
+        d.index,
+        json_string(d.id.as_deref().unwrap_or("call_local")),
+        json_string(d.name.as_deref().unwrap_or_default()),
+        json_string(&d.arguments)
+    )
+}
+
+fn tool_call_chunk_json(model: &str, d: &ToolCallDelta) -> String {
+    format!(
+        r#"{{"id":"chatcmpl-local","object":"chat.completion.chunk","created":0,"model":{},"choices":[{{"index":0,"delta":{{"tool_calls":[{}]}},"finish_reason":null}}]}}"#,
         json_string(model),
-        json_string(text)
+        tool_call_json(d)
     )
 }
 
@@ -214,9 +253,10 @@ fn chunk_json(model: &str, piece: &str) -> String {
     )
 }
 
-fn done_json(model: &str) -> String {
+fn done_json(model: &str, called: bool) -> String {
+    let finish = if called { "tool_calls" } else { "stop" };
     format!(
-        r#"{{"id":"chatcmpl-local","object":"chat.completion.chunk","created":0,"model":{},"choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}]}}"#,
+        r#"{{"id":"chatcmpl-local","object":"chat.completion.chunk","created":0,"model":{},"choices":[{{"index":0,"delta":{{}},"finish_reason":"{finish}"}}]}}"#,
         json_string(model)
     )
 }
@@ -304,13 +344,52 @@ mod tests {
             v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()),
             Some("say \"hi\"\nthen stop")
         );
-        let full: serde_json::Value =
-            serde_json::from_str(&completion_json("m", "a\\b")).expect("valid JSON completion");
+        let full: serde_json::Value = serde_json::from_str(&completion_json("m", "a\\b", None))
+            .expect("valid JSON completion");
         assert_eq!(
             full.pointer("/choices/0/message/content").and_then(|c| c.as_str()),
             Some("a\\b")
         );
-        assert!(serde_json::from_str::<serde_json::Value>(&done_json("m")).is_ok());
+        assert!(serde_json::from_str::<serde_json::Value>(&done_json("m", false)).is_ok());
+    }
+
+    /// A tool turn is the point of pointing the server here, and OpenAI clients
+    /// read the call off `tool_calls` with `finish_reason: tool_calls` — not off
+    /// the content, where a JSON reply would look like prose.
+    #[test]
+    fn a_tool_call_leaves_as_tool_calls_not_as_content() {
+        let call = ToolCallDelta {
+            index: 0,
+            id: Some("call_local_1".into()),
+            name: Some("run_command".into()),
+            arguments: r#"{"command":"dir \"C:\\Program Files\""}"#.into(),
+        };
+
+        let v: serde_json::Value = serde_json::from_str(&completion_json("m", "", Some(&call)))
+            .expect("valid JSON completion");
+        let tc = v.pointer("/choices/0/message/tool_calls/0").expect("a call");
+        assert_eq!(tc["id"], "call_local_1");
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc.pointer("/function/name").unwrap(), "run_command");
+        // Arguments cross the wire as a JSON *string*, so the quotes and
+        // backslashes inside have to survive being escaped twice.
+        assert_eq!(
+            tc.pointer("/function/arguments").and_then(|a| a.as_str()),
+            Some(call.arguments.as_str())
+        );
+        assert!(v.pointer("/choices/0/message/content").is_some_and(|c| c.is_null()));
+        assert_eq!(v.pointer("/choices/0/finish_reason").unwrap(), "tool_calls");
+
+        let chunk: serde_json::Value =
+            serde_json::from_str(&tool_call_chunk_json("m", &call)).expect("valid JSON chunk");
+        assert_eq!(
+            chunk.pointer("/choices/0/delta/tool_calls/0/function/name").unwrap(),
+            "run_command"
+        );
+        // The stream says why it stopped, or the caller runs nothing.
+        let done: serde_json::Value =
+            serde_json::from_str(&done_json("m", true)).expect("valid JSON done");
+        assert_eq!(done.pointer("/choices/0/finish_reason").unwrap(), "tool_calls");
     }
 
     /// The whole path, over a real socket, with real weights: the endpoint is
