@@ -1,0 +1,27 @@
+[package]
+name = "spike-llama"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "ADR 0006 Phase 0 spike: does llama-cpp-2 build here, and how fast is it against Ollama"
+
+[dependencies]
+# No default features: `common` and `openmp` drag extra C targets in and this
+# only needs the model + context + sampler.
+llama-cpp-2 = { version = "0.1.154", default-features = false }
+# `token_to_piece` takes one of its decoders, so the version has to match the
+# one llama-cpp-2 pins.
+encoding_rs = "0.8.35"
+# Never called directly. It is here because the safe wrapper forwards `cuda` but
+# not `vulkan`, and a direct dependency lets the feature be turned on by
+# unification anyway.
+llama-cpp-sys-2 = { version = "0.1.154", default-features = false, optional = true }
+
+[features]
+# The accelerator half of the spike. Each needs its own SDK present, not just a
+# driver: `cuda` wants the CUDA Toolkit (nvcc), `vulkan` wants VULKAN_SDK set.
+cuda = ["llama-cpp-2/cuda"]
+vulkan = ["dep:llama-cpp-sys-2", "llama-cpp-sys-2/vulkan"]
+
+[profile.release]
+debug = false

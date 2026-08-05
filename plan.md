@@ -73,8 +73,10 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
 - **In-process inference** — [ADR 0006](docs/adr/0006-in-process-rust-core.md):
   link llama.cpp into the desktop binary instead of shelling out to Ollama. The
   full Rust port was reviewed and rejected; the server stays Python. Gated on a
-  spike: do CUDA/Vulkan feature flags build on Windows, and what is tok/s
-  against the current Ollama path.
+  spike, `desktop/spike-llama/`, now **half-answered**: `llama-cpp-2` builds on
+  CPU with the toolchain already in the tree, but CPU is 11 tok/s against
+  Ollama's 153 on the GPU, and both accelerator features need an SDK this
+  machine lacks (CUDA Toolkit, or Vulkan SDK). Install one and rerun.
 - **Project sub-groups** — `Project` is a flat folder (no `parent_id`/tags);
   nested groups if career workflows demand it.
 - **Document routing** — per-model native PDF/vision vs derived markdown

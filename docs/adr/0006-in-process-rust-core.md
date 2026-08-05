@@ -201,6 +201,61 @@ Deliberately dropped from the original spike: whether iced and axum share a toki
 runtime (answered — [finding 3](#3-iced-already-hosts-tokio-tasks)), and binary size
 as a decision input.
 
+### Results — 2026-08-05, partial
+
+Harness: [`desktop/spike-llama`](../../desktop/spike-llama), excluded from the
+workspace so it never enters the app's build. `llama-cpp-2` 0.1.154. Model is the
+GGUF Ollama already has on disk — `llama3.1:8b`, Q4\_K\_M — so both sides run the
+same weights. Greedy sampling, 256 tokens, same prompt. Machine: RTX 5080 (16 GB,
+driver 610.62), Windows 11.
+
+**Build: passes on CPU, and it was cheap.** `llama-cpp-2` compiles against the
+VS-bundled cmake and LLVM libclang the repo already points `whisper-rs` at — no new
+toolchain, no `.cargo/config.toml` change. Clean build 40 s, binary 3.9 MB. [Finding
+2](#2-the-ggml-on-windows-risk-is-mostly-retired) holds for llama.cpp too, at least
+on CPU features.
+
+**Build: both accelerators are blocked on an SDK this machine does not have.**
+
+| Feature | Result |
+|---|---|
+| default (CPU) | builds, runs |
+| `cuda` | `CMake Error … CUDA Toolkit not found`. The driver is not enough; `nvcc` is required and the Toolkit is not installed |
+| `vulkan` | `Please install Vulkan SDK and ensure that VULKAN_SDK env variable is set` |
+
+Also worth recording: **`llama-cpp-2` does not forward a `vulkan` feature.** It
+forwards `cuda`, `metal`, `rocm`, `opencl` and stops. The feature does exist one
+level down on `llama-cpp-sys-2`, so the spike reaches it by taking a direct
+dependency on the sys crate and letting feature unification do the rest. That works,
+but it means the Vulkan path is not on the binding's supported surface.
+
+**Measure: the accelerator is the entire result.**
+
+| Backend | Context | Placement | Eval tok/s |
+|---|---|---|---|
+| spike, CPU | 2048 | CPU | **11.4** |
+| Ollama, its own default | 131072 | 39% CPU / 61% GPU | **28.5** |
+| Ollama, `num_ctx` 2048 | 2048 | 100% GPU | **153.5** |
+
+CPU-only is 13× off the Ollama baseline, so it cannot be the shipped configuration
+and the CPU number is not a verdict on anything — the spike is not answerable until
+one of the two accelerator builds runs. **Kill criteria neither met nor cleared.**
+
+One finding that lands regardless of how that resolves: Ollama at *its own default*
+does 28.5 tok/s on this hardware, because it sizes the KV cache for the model's full
+131k context, wants 23 GB, and spills 39% of the model to CPU. The same model at
+2048 context is 5.4× faster. That is the second requirement — VRAM policy — showing
+up as a measured 5× rather than as an argument, and it is available today by passing
+`num_ctx` on the existing Ollama path.
+
+**Next:** install one SDK and rerun. CUDA is the like-for-like comparison, since
+CUDA is what Ollama uses here.
+
+```bash
+cd desktop/spike-llama
+cargo run --release --features cuda -- <path-to.gguf> 999
+```
+
 ## What would reopen the full port
 
 - Install-failure reports traceable to the bundled runtime that bundling cannot fix,
