@@ -9,6 +9,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agenda;
+mod agenda_view;
 mod assistant;
 mod assistant_view;
 mod chat;
@@ -60,6 +62,7 @@ pub enum Screen {
     Teams,
     Workflows,
     Plans,
+    Agenda,
     Assistant,
     Memory,
     Settings,
@@ -177,6 +180,7 @@ pub struct App {
     pub providers: providers::State,
     pub workflows: workflows::State,
     pub todos: todos::State,
+    pub agenda: agenda::State,
 }
 
 impl App {
@@ -259,6 +263,7 @@ pub enum Message {
     Providers(providers::Message),
     Workflows(workflows::Message),
     Todos(todos::Message),
+    Agenda(agenda::Message),
 }
 
 /// One frame of the app icon as RGBA, picked by its edge in pixels.
@@ -486,6 +491,7 @@ fn boot() -> (App, Task<Message>) {
         providers: providers::State::default(),
         workflows: workflows::State::default(),
         todos: todos::State::default(),
+        agenda: agenda::State::default(),
     };
     let task = if minimized { Task::none() } else { open_window() };
     let bootstrap = Task::batch([
@@ -536,6 +542,7 @@ fn enter_screen(app: &App) -> Task<Message> {
         }
         Screen::Workflows => Task::done(Message::Workflows(workflows::Message::Refresh)),
         Screen::Plans => Task::done(Message::Todos(todos::Message::Refresh)),
+        Screen::Agenda => Task::done(Message::Agenda(agenda::Message::Refresh)),
         // The dropdowns need the provider catalog once; chat itself works
         // without it, so a failed load costs nothing but empty pickers.
         Screen::Assistant if app.assistant.catalog.is_empty() => {
@@ -900,6 +907,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             providers::update(&mut app.providers, &app.client, msg).map(Message::Providers)
         }
         Message::Todos(msg) => todos::update(&mut app.todos, &app.client, msg).map(Message::Todos),
+        Message::Agenda(msg) => {
+            agenda::update(&mut app.agenda, &app.client, msg).map(Message::Agenda)
+        }
         Message::Workflows(msg) => {
             workflows::update(&mut app.workflows, &app.client, msg).map(Message::Workflows)
         }
@@ -1101,6 +1111,7 @@ mod tests {
             Screen::Teams,
             Screen::Workflows,
             Screen::Plans,
+            Screen::Agenda,
             Screen::Assistant,
         ]
         {

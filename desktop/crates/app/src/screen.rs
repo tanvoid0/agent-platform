@@ -20,6 +20,7 @@ const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
             (Screen::Teams, Icon::Users, "Teams"),
             (Screen::Workflows, Icon::Zap, "Workflows"),
             (Screen::Plans, Icon::ListChecks, "Plans"),
+            (Screen::Agenda, Icon::Clock, "Agenda"),
         ],
     ),
     // One entry, two tabs: see [`chat_view`].
@@ -46,6 +47,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .map(Message::Library),
         Screen::Workflows => crate::workflows_view::view(&app.workflows).map(Message::Workflows),
         Screen::Plans => crate::todos_view::view(&app.todos).map(Message::Todos),
+        Screen::Agenda => crate::agenda_view::view(&app.agenda).map(Message::Agenda),
         Screen::Assistant | Screen::Memory => chat_view(app),
     };
 

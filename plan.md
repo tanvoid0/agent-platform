@@ -66,10 +66,14 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
   OpenAI-shaped). Open: VAD auto-stop, streaming partials, wake word. Roadmap in
   `docs/ev-voice-roadmap.md`, setup in the service's own README.
 - **Assistant roadmap** — `docs/practical-assistant-roadmap.md`. Its phases are
-  server-complete, UI partly ported: todo boards **have** a native screen
-  (**Plans**, `todos.rs`/`todos_view.rs`); the assistant dashboard, agent drawer
-  and review banner do not (the desktop `assistant.rs` is the E.V. voice HUD, a
-  different thing).
+  server-complete; the UI is ported except the planning chat. Todo boards are
+  the **Plans** screen (`todos.rs`/`todos_view.rs`), and the assistant dashboard
+  plus its review banner are **Agenda** (`agenda.rs`/`agenda_view.rs`): one
+  project's assistant board by horizon, complete-from-the-card, and the
+  reviewer's suggestions applied or dismissed whole. Still open: the agent
+  drawer — the chat that *proposes* those actions (`/assistant/chat/*`, with
+  pending actions and `present_planning_form`). Note the desktop
+  `assistant.rs` is the E.V. voice HUD, a different thing.
 - **In-process inference** — [ADR 0006](docs/adr/0006-in-process-rust-core.md):
   link llama.cpp into the desktop binary instead of shelling out to Ollama. The
   full Rust port was reviewed and rejected; the server stays Python. The Phase 0

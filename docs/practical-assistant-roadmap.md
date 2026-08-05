@@ -16,8 +16,14 @@
 >   (`desktop/crates/app/src/todos.rs`, `todos_view.rs`, `Screen::Plans`) runs
 >   over the same `/api/v1/todos/*` API. Columns are statuses rather than
 >   categories, which differs from the web board described below.
-> - **Assistant dashboard, agent drawer, planning form blocks, review banner —
->   not ported.** Still open work. Note
+> - **Assistant dashboard + review banner — ported (2026-08-05).** The native
+>   **Agenda** screen (`desktop/crates/app/src/agenda.rs`, `agenda_view.rs`,
+>   `Screen::Agenda`) runs over `/api/v1/assistant/dashboard`,
+>   `/items/{id}/complete` and `/reviews/*`: project picker, day/week/month
+>   horizon, stats, overdue/habits/goals, and reviews applied or dismissed
+>   whole (per-action picking stays a chat job).
+> - **Agent drawer + planning form blocks — not ported.** Still open work:
+>   `/assistant/chat/*`, its pending actions, and `present_planning_form`. Note
 >   `desktop/crates/app/src/assistant.rs` is the E.V. voice HUD, a different
 >   thing that happens to share the name.
 

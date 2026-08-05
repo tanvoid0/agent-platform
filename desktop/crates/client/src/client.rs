@@ -402,6 +402,55 @@ impl Client {
             .map(|_| ())
     }
 
+    // -- Personal assistant ----------------------------------------------------
+
+    /// The assistant's board for one project, sliced by horizon (`day`, `week`,
+    /// `month`). The board is created on first read, server-side.
+    pub async fn assistant_dashboard(
+        &self,
+        project: i64,
+        horizon: &str,
+    ) -> Result<AssistantDashboard> {
+        self.get_json(&format!(
+            "/api/v1/assistant/dashboard?project_id={project}&horizon={}",
+            urlencode(horizon)
+        ))
+        .await
+    }
+
+    /// Log a completion. The item is addressed by bare id — the server resolves
+    /// the project itself — so no `project_id` goes on this one.
+    pub async fn assistant_complete_item(&self, item: i64) -> Result<TodoItem> {
+        self.post_json(&format!("/api/v1/assistant/items/{item}/complete"), &serde_json::json!({}))
+            .await
+    }
+
+    /// Runs the reviewer against the board — an LLM call, so it is slow.
+    pub async fn assistant_run_review(&self, project: i64) -> Result<AssistantReview> {
+        self.post_json(
+            &format!("/api/v1/assistant/reviews/run?project_id={project}"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn assistant_pending_reviews(&self, project: i64) -> Result<AssistantReviewsResponse> {
+        self.get_json(&format!("/api/v1/assistant/reviews/pending?project_id={project}"))
+            .await
+    }
+
+    /// Applies every action the review proposed; an empty body means "all of
+    /// them", which is the only thing this screen offers.
+    pub async fn assistant_apply_review(&self, review: i64) -> Result<Value> {
+        self.post_json(&format!("/api/v1/assistant/reviews/{review}/apply"), &serde_json::json!({}))
+            .await
+    }
+
+    pub async fn assistant_dismiss_review(&self, review: i64) -> Result<Value> {
+        self.post_json(&format!("/api/v1/assistant/reviews/{review}/dismiss"), &serde_json::json!({}))
+            .await
+    }
+
     // -- LLM providers ---------------------------------------------------------
 
     pub async fn llm_env(&self) -> Result<LlmEnv> {
@@ -479,5 +528,33 @@ mod tests {
     fn urlencode_path_segment() {
         assert_eq!(urlencode("my-model_1.0"), "my-model_1.0");
         assert_eq!(urlencode("a b/c"), "a%20b%2Fc");
+    }
+
+    /// Verbatim `DashboardOut`, dumped from the server's own pydantic model —
+    /// the assistant's items are the fat `ItemOut`, and [`TodoItem`] is a
+    /// subset of it. A field renamed server-side breaks here, not on screen.
+    #[test]
+    fn a_dashboard_payload_decodes() {
+        // `##` delimiters: the category color is `"#fff"`, which would close a
+        // plain `r#"…"#`.
+        let body = r##"{"project_id":1,"board_id":2,"horizon":"day","range_start":"x","range_end":"y","categories":[{"id":3,"board_id":2,"name":"c","color":"#fff","sort_order":0,"planner_profile_id":null,"created_at":"2026-08-05T21:44:25","updated_at":"2026-08-05T21:44:25"}],"items":[{"id":1,"board_id":2,"category_id":3,"title":"t","description":"d","status":"plan","priority":1,"tags":["a"],"plan":[],"metadata":{},"assigned_profile_id":null,"linked_process_id":null,"parent_item_id":null,"due_at":"2026-08-06T00:00:00","scheduled_at":null,"time_horizon":null,"item_kind":null,"recurrence":{},"completion":{},"created_at":"2026-08-05T21:44:25","updated_at":"2026-08-05T21:44:25"}],"subtasks_by_parent":{},"overdue":[],"habits_due":[],"goals":[],"stats":{"total_items":1,"done_count":0,"active_count":1,"overdue_count":1,"habits_due_count":0}}"##;
+        let d: AssistantDashboard = serde_json::from_str(body).unwrap();
+        assert_eq!(d.horizon, "day");
+        assert_eq!(d.items[0].title, "t");
+        assert_eq!(d.categories[0].name, "c");
+        assert_eq!(d.stats.overdue_count, 1);
+    }
+
+    /// `POST /reviews/run` keys the id as `review_id`; the pending list keys it
+    /// as `id`. One type reads both, so the banner works either way.
+    #[test]
+    fn a_review_decodes_under_both_id_names() {
+        let run = r#"{"review_id":5,"status":"pending","summary":"s","stats":{},"proposed_actions":[{"action_id":"a1","name":"create_item","parameters":{},"confidence":0.9,"reasoning":"why"}]}"#;
+        let pending = r#"{"reviews":[{"id":5,"status":"pending","summary":null,"stats":{},"proposed_actions":[],"created_at":"2026-08-05T21:44:25"}]}"#;
+        let run: AssistantReview = serde_json::from_str(run).unwrap();
+        assert_eq!(run.id, 5);
+        assert_eq!(run.proposed_actions[0].reasoning.as_deref(), Some("why"));
+        let list: AssistantReviewsResponse = serde_json::from_str(pending).unwrap();
+        assert_eq!(list.reviews[0].id, 5);
     }
 }

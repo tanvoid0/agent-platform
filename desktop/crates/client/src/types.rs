@@ -788,3 +788,58 @@ pub struct TodoItemPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category_id: Option<i64>,
 }
+
+// -- Personal assistant ------------------------------------------------------
+
+/// Horizons `GET /assistant/dashboard` groups by (`_horizon_range` server-side).
+pub const ASSISTANT_HORIZONS: [&str; 3] = ["day", "week", "month"];
+
+/// The assistant's own board for one project, sliced by horizon. Items are the
+/// same `ItemOut` the todo API returns, so [`TodoItem`] deserializes them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssistantDashboard {
+    pub project_id: i64,
+    pub board_id: i64,
+    pub horizon: String,
+    pub categories: Vec<TodoCategory>,
+    pub items: Vec<TodoItem>,
+    pub overdue: Vec<TodoItem>,
+    pub habits_due: Vec<TodoItem>,
+    pub goals: Vec<TodoItem>,
+    pub stats: AssistantStats,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AssistantStats {
+    pub total_items: i64,
+    pub done_count: i64,
+    pub active_count: i64,
+    pub overdue_count: i64,
+    pub habits_due_count: i64,
+}
+
+/// One action a review proposes; applied as a batch, not individually.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlannedAction {
+    pub action_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+}
+
+/// A pending review. `POST /reviews/run` returns the same fields under
+/// `review_id` rather than `id`, so both names deserialize.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssistantReview {
+    #[serde(alias = "review_id")]
+    pub id: i64,
+    pub status: String,
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub proposed_actions: Vec<PlannedAction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssistantReviewsResponse {
+    pub reviews: Vec<AssistantReview>,
+}
