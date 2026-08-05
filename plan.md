@@ -79,6 +79,11 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
   cleared. Implementation is the open work; its unknowns are the build matrix
   (one accelerator on one machine measured), the ~4 s per-process model load
   against Ollama's resident daemon, and where unload policy lives.
+  Related defect found while measuring: local chat routes to Ollama's
+  OpenAI-compat endpoint, which takes no `options`, so every reply loads at
+  131k context (23 GB, 39% spilled to CPU, ~4–5× slower). Not fixable from this
+  codebase — see the ADR's results section. Either the Ollama app's own context
+  setting changes, or the proxy moves to native `/api/chat`.
 - **Project sub-groups** — `Project` is a flat folder (no `parent_id`/tags);
   nested groups if career workflows demand it.
 - **Document routing** — per-model native PDF/vision vs derived markdown

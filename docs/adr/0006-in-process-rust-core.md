@@ -278,8 +278,24 @@ One finding that stands independent of all of the above: Ollama at *its own defa
 does 28.5 tok/s on this hardware, because it sizes the KV cache for the model's full
 131k context, wants 23 GB, and spills 39% of the model to CPU. The same model at
 2048 context is ~4–5× faster. That is the second requirement — VRAM policy — showing
-up as a measurement rather than as an argument, and it is available today by passing
-`num_ctx` on the existing Ollama path.
+up as a measurement rather than as an argument.
+
+**And on the path this app actually uses, that requirement is unreachable.** Traced
+2026-08-05 against Ollama 0.32.5: [`_upstream_urls`](../../app/llm_proxy/routes/llm.py)
+routes `ollama` to its **OpenAI-compatible** `/v1/chat/completions`, and that surface
+takes no `options`. Three things were tried and none of them work from our side:
+
+| Attempt | Result |
+|---|---|
+| `options.num_ctx` in the `/v1/chat/completions` body | silently ignored — model loads at 131072, 23 GB, 39% CPU |
+| Preload via native `/api/generate` at `num_ctx` 4096, then call the compat endpoint | preload lands (4096, 5.3 GB, 100% GPU), then the compat call **evicts and reloads** it at 131072 |
+| `OLLAMA_CONTEXT_LENGTH` in the environment | overridden. The Ollama **desktop app** writes its own `context_length` (262144 here) into `%LOCALAPPDATA%\Ollama\db.sqlite` and passes that to the server it spawns; the server log shows Ollama's own VRAM-derived default would have been 4096 |
+
+So every local chat this platform makes is paying the ~4–5× tax, and the only knobs
+are outside the codebase: a setting in someone else's GUI, or switching the proxy to
+Ollama's native `/api/chat` and translating request, response and SSE back to OpenAI
+shape. That is the second requirement stated as a defect rather than a preference —
+owning inference means owning `n_ctx`, and here we do not own it at all.
 
 **Next:** the spike is answered and Phase 0 is closed. What it did *not* cover, and
 what the implementation has to face: the build matrix (this measured one accelerator
