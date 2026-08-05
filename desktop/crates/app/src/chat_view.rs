@@ -90,11 +90,12 @@ pub fn panel<'a>(
             .into(),
         );
     }
-    // An empty transcript keeps its natural height whatever the caller asked
-    // for; only a real thread is worth reserving space for. The column fills
-    // only when the caller does, so a capped panel does not stretch its card.
+    // An empty transcript keeps its natural height inside a capped panel, so it
+    // does not stretch its card. A filling caller is the whole window, though —
+    // there shrinking floats the composer up into the middle of the page.
     let filled = matches!(height, Length::Fill);
-    let body_height = if state.messages.is_empty() { Length::Shrink } else { height };
+    let body_height =
+        if state.messages.is_empty() && !filled { Length::Shrink } else { height };
     blocks.push(container(transcript).height(body_height).into());
     blocks.push(composer);
     column(blocks)

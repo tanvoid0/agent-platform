@@ -148,7 +148,14 @@ pub fn dag_layout(
     }
     by_depth.sort_by_key(|(d, _)| *d);
 
+    // A depth band wider than this wraps onto further rows: a flat plan puts
+    // every task at depth 0, and one 23-wide row is a horizontal scroll with no
+    // shape to read. Rows are laid from a running cursor rather than the depth
+    // itself, so a wrapped band still sits entirely above the next depth.
+    const MAX_PER_ROW: usize = 6;
+
     let mut nodes = Vec::new();
+    let mut row = 0usize;
     for (depth, bucket) in &by_depth {
         for (i, sub) in bucket.iter().enumerate() {
             let column = by_task
@@ -158,12 +165,16 @@ pub fn dag_layout(
             nodes.push(GraphNode {
                 uuid: sub.client_uuid.clone(),
                 role: sub.role.clone(),
-                position: Point::new(i as f32 * COL_W, *depth as f32 * ROW_H),
+                position: Point::new(
+                    (i % MAX_PER_ROW) as f32 * COL_W,
+                    (row + i / MAX_PER_ROW) as f32 * ROW_H,
+                ),
                 column,
                 depth: *depth,
                 parent_hint: parent_hint(tasks, &sub.client_uuid),
             });
         }
+        row += bucket.len().div_ceil(MAX_PER_ROW).max(1);
     }
 
     let visible: Vec<&str> = nodes.iter().map(|n| n.uuid.as_str()).collect();
@@ -540,6 +551,22 @@ mod tests {
         assert_eq!(by["a"].position, Point::new(0.0, 0.0));
         assert_eq!(by["b"].position, Point::new(COL_W, 0.0));
         assert_eq!(by["c"].position, Point::new(0.0, ROW_H));
+    }
+
+    #[test]
+    fn a_wide_depth_wraps_and_still_sits_above_the_next_one() {
+        // Seven roots wrap onto a second row; the one child must clear both.
+        let names: Vec<String> = (0..7).map(|i| format!("r{i}")).collect();
+        let mut subs: Vec<_> = names.iter().map(|n| sub(n, &[])).collect();
+        subs.push(sub("kid", &["r0"]));
+        let mut tasks: Vec<_> = names.iter().map(|n| task(n, None, "completed")).collect();
+        tasks.push(task("kid", Some("r0"), "pending"));
+
+        let layout = dag_layout(&subs, &tasks, Lineage::All);
+        let by: HashMap<_, _> = layout.nodes.iter().map(|n| (n.uuid.as_str(), n)).collect();
+        assert_eq!(by["r5"].position, Point::new(5.0 * COL_W, 0.0), "last of row one");
+        assert_eq!(by["r6"].position, Point::new(0.0, ROW_H), "wraps back to x=0");
+        assert_eq!(by["kid"].position, Point::new(0.0, 2.0 * ROW_H), "clears the wrap");
     }
 
     #[test]

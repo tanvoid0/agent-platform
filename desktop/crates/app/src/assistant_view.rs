@@ -156,7 +156,7 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
                 iced::widget::Space::new().into()
             },
             if state.sending {
-                ui::badge("…", Tone::Warning)
+                ui::badge("thinking…", Tone::Info)
             } else {
                 ui::button_default(Icon::Send, "Send", Message::Send)
             },

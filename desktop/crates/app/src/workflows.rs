@@ -344,6 +344,9 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             Task::none()
         }
         Message::Save => {
+            if state.busy {
+                return Task::none(); // a save is already in flight
+            }
             let Some(editor) = &state.editor else { return Task::none() };
             let body = match editor_body(editor) {
                 Ok(body) => body,
