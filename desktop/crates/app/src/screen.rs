@@ -137,7 +137,16 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
     let (srv_label, srv_tone) = server_label(app.server_state());
 
     let mut blocks: Vec<Element<'_, Message>> = vec![
-        crate::assistant_view::hud(&app.assistant, Length::Fill).map(Message::Assistant),
+        // Takes the leftover height so the page does not end halfway down, but
+        // stops at a panel's worth: the canvas paints a fixed dark palette in
+        // either theme, and an unbounded one becomes a black slab across a
+        // light page.
+        // Big enough to be the landing page's headline, bounded on purpose: the
+        // canvas paints a fixed dark palette in either theme, so a HUD that took
+        // the window's leftover height became a black slab across a light page.
+        // Whatever is left below is ordinary background, and the page scrolls if
+        // the window is too short for the tiles.
+        crate::assistant_view::hud(&app.assistant, 420.0).map(Message::Assistant),
         ui::cluster(vec![
             ui::badge(mode_label, mode_tone),
             ui::badge(srv_label, srv_tone),
@@ -196,7 +205,7 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
         });
     }
 
-    ui::page_fixed(
+    ui::page(
         "Dashboard",
         Some(ui::muted("E.V. and the platform's vitals at a glance.")),
         None,
