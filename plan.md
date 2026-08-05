@@ -78,10 +78,8 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
   Ollama's 112.7 on the same weights, same sitting — parity, kill criteria
   cleared. First slice shipped the same day: the desktop's own chat answers
   in-process behind the `local-llm` feature (off by default; `cuda` implies
-  it), with `local_model_path`/`local_n_ctx` in `settings.json`. Open: KV reuse
-  across turns, unload/VRAM policy, a settings UI, tool calls, shipping the
-  llama/ggml DLLs in the installer, and whether the Python side ever points
-  here instead of at Ollama.
+  it), with `local_model_path`/`local_n_ctx` in `settings.json`, and KV-cache
+  reuse across turns landed after it. **Next steps are listed below.**
   Related defect found while measuring: local chat routes to Ollama's
   OpenAI-compat endpoint, which takes no `options`, so every reply loads at
   131k context (23 GB, 39% spilled to CPU, ~4–5× slower). Not fixable from this
@@ -91,6 +89,54 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
   nested groups if career workflows demand it.
 - **Document routing** — per-model native PDF/vision vs derived markdown
   (capability flags exist on providers).
+
+### In-process inference — next steps
+
+Where it stands: [`local_llm.rs`](desktop/crates/app/src/local_llm.rs) is the
+engine (one owned thread, model resident, KV prefix reused across turns),
+[`inference.rs`](desktop/crates/app/src/inference.rs) is the single dispatch
+point, and everything is behind the `local-llm` feature, off by default.
+
+Turn it on by hand for now — there is no UI:
+
+```jsonc
+// %APPDATA%\com.tanvoid0.agentplatform\settings.json
+"local_model_path": "E:\\...\\blobs\\sha256-<the gguf>",
+"local_n_ctx": 8192
+```
+
+```bash
+cd desktop && cargo run -p agent-platform-desktop --features cuda
+```
+
+Windows CUDA build needs `CUDA_PATH_V13_3` set (MSBuild reads the *versioned*
+variable) and `%CUDA_PATH%\bin\x64` on `PATH` at runtime, or the exe dies with a
+bare `0xC0000135`. The model-backed test is opt-in:
+
+```bash
+AGENT_PLATFORM_TEST_GGUF=<path.gguf> cargo test -p agent-platform-desktop --features cuda -- --ignored --nocapture
+```
+
+Ordered by what unblocks what:
+
+1. **Settings UI** for `local_model_path` (file picker) and `local_n_ctx`, plus
+   a badge saying which engine answered the last turn. Without it nobody
+   discovers the feature. Lands in the Settings screen, so it wants any
+   in-flight `screen.rs` / `main.rs` work committed first.
+2. **Unload / VRAM policy.** The model stays resident for the life of the
+   process. Needs an idle timeout (Ollama's `keep_alive` shape) and a way to
+   drop the model when a model-ops job wants the VRAM.
+3. **Installer ships the DLLs.** `local-llm` forces `dynamic-link` — two static
+   ggmls (whisper's and llama's) will not link — so a packaged build has to
+   carry `ggml*.dll`, `llama.dll`, `llama-common.dll` beside the exe.
+   `scripts/build_installer.py` + `desktop/installer/agent-platform.iss`. Only
+   blocks the first packaged `local-llm` build.
+4. **Tool calls.** `inference.rs` sends any turn carrying tools to the server,
+   so E.V.'s tool rounds never run locally. Wants GBNF-constrained output.
+5. **Point the Python side here**, if server-run agents should share the engine.
+   Deliberately out of scope so far: the desktop would have to expose the
+   `/api/v1/model-ops/ollama/*` shape and the server would start depending on
+   the app being open.
 
 *The pre-desktop refactor checklist (`docs/refactor-handoff-followup.md`) is
 complete and the file is deleted: services extracted (`app/services/`),
@@ -103,4 +149,5 @@ complete and the file is deleted: services extracted (`app/services/`),
 reality; stale references to `web/`, `/ui`, `/app`, the Jinja shell and the
 pixel office removed (pixel office permanently deferred with the web app).
 Second pass the same day: Plans screen and the Piper speech service marked
-shipped, ADR 0006 added to the backlog.*
+shipped, ADR 0006 added to the backlog. 2026-08-05: ADR 0006 spike closed and
+its first two slices shipped; "In-process inference — next steps" added.*
