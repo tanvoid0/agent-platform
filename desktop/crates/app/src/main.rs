@@ -874,6 +874,9 @@ fn subscription(app: &App) -> Subscription<Message> {
 }
 
 fn main() -> iced::Result {
+    // whisper.cpp/GGML log straight to stderr from C; the `set_print_*` params
+    // only cover segment output. No log backend feature is on, so this drops them.
+    whisper_rs::install_logging_hooks();
     iced::daemon(boot, update, view)
         .title(|_state: &App, _w| "Agent Platform".to_string())
         // System mode re-resolves on every render, so an OS light/dark switch
