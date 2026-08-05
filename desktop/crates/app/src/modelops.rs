@@ -28,6 +28,9 @@ pub struct State {
     pub uploading: bool,
     pub error: Option<String>,
     pub notice: Option<String>,
+    /// Whether the first refresh has completed, so empty-state copy is
+    /// only shown once we actually know the lists are empty.
+    pub loaded: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -127,21 +130,28 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 state.selected = projects.first().map(|p| p.name.clone());
             }
             state.projects = projects;
+            state.loaded = true;
             Task::none()
         }
         Message::OllamaLoaded(Ok(models)) => {
             state.ollama = models;
+            state.loaded = true;
             Task::none()
         }
         Message::RegistryLoaded(Ok(entries)) => {
             state.registry = entries;
+            state.loaded = true;
             Task::none()
         }
         // Ollama being absent is normal on a fresh install, so it must not
         // clobber the screen with an error banner.
-        Message::OllamaLoaded(Err(_)) => Task::none(),
+        Message::OllamaLoaded(Err(_)) => {
+            state.loaded = true;
+            Task::none()
+        }
         Message::ProjectsLoaded(Err(e)) | Message::RegistryLoaded(Err(e)) => {
             state.error = Some(e);
+            state.loaded = true;
             Task::none()
         }
 

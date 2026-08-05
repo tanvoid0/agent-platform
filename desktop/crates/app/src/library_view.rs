@@ -45,9 +45,11 @@ pub fn view(state: &State, kind: Kind) -> Element<'_, Message> {
         (None, Kind::Teams) => team_list(state),
     });
 
-    let actions = match state.draft {
-        None => Some(ui::button_default(Icon::Plus, new_label, new_msg)),
-        Some(_) => None,
+    let actions = match (&state.draft, state.busy) {
+        (Some(_), _) => None,
+        // A delete is in flight: the list has no other place to say so.
+        (None, true) => Some(ui::badge("working…", Tone::Info)),
+        (None, false) => Some(ui::button_default(Icon::Plus, new_label, new_msg)),
     };
     ui::page(title, Some(ui::muted(subtitle)), actions, ui::stack_lg(blocks))
 }
@@ -65,11 +67,13 @@ fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
 // ---------------------------------------------------------------------------
 
 fn project_list(state: &State) -> Element<'_, Message> {
-    if state.projects.is_empty() {
+    let Some(projects) = &state.projects else {
+        return ui::card(ui::empty_state_icon(Icon::Clock, "Loading…"));
+    };
+    if projects.is_empty() {
         return ui::card(ui::empty_state_icon(Icon::Folder, "No projects yet."));
     }
-    let rows: Vec<Element<'_, Message>> = state
-        .projects
+    let rows: Vec<Element<'_, Message>> = projects
         .iter()
         .map(|p| {
             ui::card(ui::cluster(vec![
@@ -105,20 +109,22 @@ fn team_presets<'a>() -> Element<'a, Message> {
     ui::section(
         "Start from a template",
         Some(ui::muted("Fills the editor — nothing is saved until you save it.")),
-        ui::cluster(cards),
+        ui::cluster(cards).align_y(iced::Alignment::Start),
     )
 }
 
 fn team_list(state: &State) -> Element<'_, Message> {
-    if state.teams.is_empty() {
+    let Some(teams) = &state.teams else {
+        return ui::card(ui::empty_state_icon(Icon::Clock, "Loading…"));
+    };
+    if teams.is_empty() {
         return ui::stack_lg(vec![
             ui::card(ui::empty_state_icon(Icon::Users, "No teams yet.")),
             team_presets(),
         ])
         .into();
     }
-    let rows: Vec<Element<'_, Message>> = state
-        .teams
+    let rows: Vec<Element<'_, Message>> = teams
         .iter()
         .map(|t| {
             ui::card(ui::cluster(vec![
@@ -128,6 +134,7 @@ fn team_list(state: &State) -> Element<'_, Message> {
                 ])
                 .into(),
                 ui::spacer(),
+                ui::caption(domain::relative_time(&t.updated_at).unwrap_or_default()),
                 ui::badge(ui::count(t.role_count as usize, "role", "roles"), Tone::Neutral),
                 ui::button_outline(Icon::Pencil, "Edit", Message::EditTeam(t.id)),
                 ui::button_destructive(Icon::Trash, "Delete", Message::DeleteTeam(t.id)),

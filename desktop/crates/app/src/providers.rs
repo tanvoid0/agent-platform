@@ -27,6 +27,9 @@ pub const ENDPOINT_FIELDS: [(&str, &str, &str); 3] = [
 pub struct State {
     pub env: Option<LlmEnv>,
     pub catalog: Vec<ProviderEntry>,
+    /// False until the first catalog fetch settles, so an in-flight load is not
+    /// rendered as "no providers exist".
+    pub catalog_loaded: bool,
     /// Edits not yet saved, keyed by env name. Absent = untouched.
     pub drafts: Vec<(String, String)>,
     pub default_provider: String,
@@ -145,9 +148,15 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         }
         Message::CatalogLoaded(Ok(providers)) => {
             state.catalog = providers;
+            state.catalog_loaded = true;
             Task::none()
         }
-        Message::EnvLoaded(Err(e)) | Message::CatalogLoaded(Err(e)) => {
+        Message::CatalogLoaded(Err(e)) => {
+            state.catalog_loaded = true;
+            state.error = Some(e);
+            Task::none()
+        }
+        Message::EnvLoaded(Err(e)) => {
             state.error = Some(e);
             Task::none()
         }

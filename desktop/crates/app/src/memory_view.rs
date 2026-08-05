@@ -104,7 +104,22 @@ pub fn view(store: &Store) -> Element<'_, crate::memory::Message> {
             )];
             // A red "Forget all" with nothing to forget is alarm without stakes.
             if !store.items.is_empty() {
-                actions.push(ui::button_destructive(Icon::Trash, "Forget all", Message::ForgetAll));
+                // Two-step: the first click only arms the button, since there is
+                // no undo for a wipe.
+                if store.confirm_forget {
+                    actions.push(ui::button_destructive(
+                        Icon::Trash,
+                        "Really forget all?",
+                        Message::ForgetAll,
+                    ));
+                    actions.push(ui::button_ghost(Icon::X, "Cancel", Message::CancelForget));
+                } else {
+                    actions.push(ui::button_destructive(
+                        Icon::Trash,
+                        "Forget all",
+                        Message::ForgetAll,
+                    ));
+                }
             }
             ui::cluster(actions).into()
         }),

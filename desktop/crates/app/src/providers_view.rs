@@ -48,7 +48,11 @@ fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
 
 fn catalog_card(state: &State) -> Element<'_, Message> {
     let list: Element<'_, Message> = if state.catalog.is_empty() {
-        ui::empty_state("No provider catalog yet.")
+        if state.catalog_loaded {
+            ui::empty_state("No provider catalog yet.")
+        } else {
+            ui::empty_state_icon(Icon::Clock, "Loading catalog…")
+        }
     } else {
         ui::stack(
             state

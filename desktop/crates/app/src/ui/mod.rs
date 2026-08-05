@@ -283,7 +283,12 @@ pub fn page<'a, M: 'a>(
     actions: Option<Element<'a, M>>,
     content: impl Into<Element<'a, M>>,
 ) -> Element<'a, M> {
-    page_fixed(title_text, description, actions, scrollable(content.into()).height(Length::Fill))
+    page_fixed(
+        title_text,
+        description,
+        actions,
+        scrollable(content.into()).spacing(space::SM).height(Length::Fill),
+    )
 }
 
 /// Same scaffold for screens that scroll their own body — a chat transcript

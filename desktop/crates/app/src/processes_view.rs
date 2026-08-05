@@ -133,15 +133,6 @@ fn truncate(s: &str, max: usize) -> String {
 // ---------------------------------------------------------------------------
 
 fn detail_pane<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
-    let Some(process) = state.selected_process() else {
-        return ui::page(
-            "Processes",
-            Some(ui::muted("Pick a run, or start a new one.")),
-            None,
-            ui::empty_state_icon(Icon::Activity, "Nothing selected."),
-        );
-    };
-
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
 
     if let Some(err) = &state.error {
@@ -150,6 +141,20 @@ fn detail_pane<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message>
     if let Some(notice) = &state.notice {
         blocks.push(dismissible(ui::alert(Tone::Info, notice.clone(), None)));
     }
+
+    let Some(process) = state.selected_process() else {
+        blocks.push(if state.selected.is_some() {
+            ui::empty_state_icon(Icon::Clock, "Loading run…")
+        } else {
+            ui::empty_state_icon(Icon::Activity, "Nothing selected.")
+        });
+        return ui::page(
+            "Processes",
+            Some(ui::muted("Pick a run, or start a new one.")),
+            None,
+            ui::stack_lg(blocks),
+        );
+    };
 
     blocks.push(summary_card(state, process));
     blocks.push(
@@ -198,7 +203,7 @@ fn actions_row<'a>(state: &'a State, process: &'a ProcessRecord) -> Element<'a, 
         buttons.push(ui::button_destructive(Icon::X, "Cancel", Message::Cancel));
     }
     if matches!(status, "failed" | "cancelled" | "completed") {
-        buttons.push(ui::button_secondary(Icon::Refresh, "Retry", Message::Retry));
+        buttons.push(ui::button_secondary(Icon::RotateCcw, "Retry", Message::Retry));
     }
     buttons.push(ui::button_outline(Icon::Refresh, "Sync", Message::Sync));
     buttons.push(ui::button_ghost(Icon::Download, "Export", Message::Export));
@@ -437,7 +442,11 @@ fn events_view(state: &State) -> Element<'_, Message> {
         .collect();
 
     let body: Element<'_, Message> = if matched.is_empty() {
-        ui::empty_state_icon(Icon::Scroll, "No events yet.")
+        if state.events.is_empty() {
+            ui::empty_state_icon(Icon::Scroll, "No events yet.")
+        } else {
+            ui::empty_state_icon(Icon::Search, "No events match this filter.")
+        }
     } else {
         // Newest last, tail-rendered: iced lays out every child.
         let tail = &matched[matched.len().saturating_sub(400)..];
@@ -452,7 +461,13 @@ fn events_view(state: &State) -> Element<'_, Message> {
                 .into()
             })
             .collect();
-        scrollable(ui::stack(rows)).height(400).anchor_bottom().into()
+        scrollable(ui::stack(rows)).spacing(space::SM).height(400).anchor_bottom().into()
+    };
+
+    let count = if filter.is_empty() {
+        ui::count(state.events.len(), "event", "events")
+    } else {
+        format!("{} of {}", matched.len(), ui::count(state.events.len(), "event", "events"))
     };
 
     let toolbar: Element<'_, Message> = ui::cluster(vec![
@@ -460,7 +475,7 @@ fn events_view(state: &State) -> Element<'_, Message> {
             .width(280)
             .into(),
         ui::spacer(),
-        ui::caption(ui::count(state.events.len(), "event", "events")),
+        ui::caption(count),
     ])
     .into();
 
@@ -534,7 +549,7 @@ fn inspector<'a>(state: &'a State, uuid: &'a str) -> Element<'a, Message> {
             buttons.insert(0, ui::button_default(Icon::Eye, "Review", Message::OpenReview(t.id)));
         }
         if row.column == BoardColumn::Failed {
-            buttons.insert(0, ui::button_secondary(Icon::Refresh, "Retry task", Message::RetryTask(t.id)));
+            buttons.insert(0, ui::button_secondary(Icon::RotateCcw, "Retry task", Message::RetryTask(t.id)));
         }
         ui::cluster(buttons).into()
     });

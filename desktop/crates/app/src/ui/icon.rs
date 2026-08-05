@@ -62,6 +62,7 @@ icons! {
 
     // actions
     Refresh => refresh_cw,
+    RotateCcw => rotate_ccw,
     Play => play,
     Stop => square,
     Pause => pause,

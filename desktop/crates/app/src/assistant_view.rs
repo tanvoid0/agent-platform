@@ -17,7 +17,7 @@ use iced::{mouse, Color, Element, Length, Point, Radians, Rectangle, Renderer, T
 /// The live HUD canvas alone, for embedding outside this screen (the
 /// Dashboard). Whoever shows it must also run the `assistant::Tick`
 /// subscription, or the canvas freezes.
-pub fn hud(state: &State, height: f32) -> Element<'_, Message> {
+pub fn hud(state: &State, height: impl Into<Length>) -> Element<'_, Message> {
     container(
         canvas_widget(Hud {
             phase: state.phase,
@@ -37,7 +37,7 @@ pub fn hud(state: &State, height: f32) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(height),
     )
-    .style(theme::code_block)
+    .style(theme::hud_backdrop)
     .width(Length::Fill)
     .into()
 }

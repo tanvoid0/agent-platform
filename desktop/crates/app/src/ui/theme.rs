@@ -195,13 +195,15 @@ pub enum Tone {
     Danger,
 }
 
-fn tone_color(t: &Tokens, tone: Tone) -> Color {
+pub(crate) fn tone_color(t: &Tokens, tone: Tone) -> Color {
     match tone {
         Tone::Neutral => t.muted_foreground,
         Tone::Info => t.info,
         Tone::Success => t.success,
         Tone::Warning => t.warning,
-        Tone::Danger => t.destructive,
+        // dark destructive is a button *background* token, unreadable as text
+        // on near-black; buttons keep using t.destructive directly.
+        Tone::Danger => if t.dark { hsl(0.0, 91.0, 71.0) } else { t.destructive },
     }
 }
 
@@ -301,6 +303,15 @@ pub fn code_block(theme: &Theme) -> container::Style {
         background: Some(Background::Color(t.muted)),
         border: Border { color: t.border, width: 1.0, radius: radius::MD.into() },
         ..container::Style::default()
+    }
+}
+
+/// Backdrop for the HUD canvas, which paints a fixed dark palette in either
+/// theme — a light backdrop would swallow its white/cyan strokes.
+pub fn hud_backdrop(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb(0.04, 0.05, 0.08))),
+        ..code_block(theme)
     }
 }
 

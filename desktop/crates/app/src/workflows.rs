@@ -54,8 +54,12 @@ impl Editor {
 #[derive(Default)]
 pub struct State {
     pub items: Vec<WorkflowInfo>,
+    /// False until the first list response lands, so the empty state can say
+    /// "loading" instead of "you have none".
+    pub loaded: bool,
     pub selected: Option<i64>,
     pub runs: Vec<WorkflowRunInfo>,
+    pub runs_loading: bool,
     /// Which run's per-step results are unfolded.
     pub expanded_run: Option<i64>,
     pub editor: Option<Editor>,
@@ -159,6 +163,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
     match message {
         Message::Refresh => refresh(client),
         Message::Loaded(Ok(items)) => {
+            state.loaded = true;
             // A selected workflow that no longer exists takes its runs with it.
             if state.selected.is_some_and(|id| !items.iter().any(|w| w.id == id)) {
                 state.selected = None;
@@ -171,14 +176,17 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             if state.selected == Some(id) {
                 state.selected = None;
                 state.runs.clear();
+                state.runs_loading = false;
                 return Task::none();
             }
             state.selected = Some(id);
             state.runs.clear();
+            state.runs_loading = true;
             state.expanded_run = None;
             load_runs(client, id)
         }
         Message::RunsLoaded(Ok(runs)) => {
+            state.runs_loading = false;
             state.runs = runs;
             Task::none()
         }
@@ -373,7 +381,13 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 }
             }
         }
-        Message::Loaded(Err(e)) | Message::RunsLoaded(Err(e)) => {
+        Message::Loaded(Err(e)) => {
+            state.loaded = true;
+            state.error = Some(e);
+            Task::none()
+        }
+        Message::RunsLoaded(Err(e)) => {
+            state.runs_loading = false;
             state.error = Some(e);
             Task::none()
         }

@@ -82,7 +82,11 @@ fn projects_card(state: &State) -> Element<'_, Message> {
             "Model projects",
             Some(ui::muted("Pick a project, choose stages, and run the pipeline.")),
             None,
-            ui::empty_state_icon(Icon::Cpu, "No model projects yet."),
+            if !state.loaded {
+                ui::empty_state_icon(Icon::Clock, "Loading…")
+            } else {
+                ui::empty_state_icon(Icon::Cpu, "No model projects yet.")
+            },
         );
     }
 
@@ -194,7 +198,11 @@ fn job_card<'a>(
 
 fn ollama_card(state: &State) -> Element<'_, Message> {
     let list: Element<'_, Message> = if state.ollama.is_empty() {
-        ui::empty_state_icon(Icon::Cpu, "No local models found (is Ollama running?).")
+        if !state.loaded {
+            ui::empty_state_icon(Icon::Clock, "Loading…")
+        } else {
+            ui::empty_state_icon(Icon::Cpu, "No local models found (is Ollama running?).")
+        }
     } else {
         ui::stack(
             state
@@ -221,7 +229,11 @@ fn ollama_card(state: &State) -> Element<'_, Message> {
                 container(ui::input("qwen2.5:7b", &state.pull_name, Message::PullNameChanged))
                     .width(220)
                     .into(),
-                ui::button_secondary(Icon::Download, "Pull", Message::PullModel),
+                if state.busy {
+                    ui::badge("pulling…", Tone::Info)
+                } else {
+                    ui::button_secondary(Icon::Download, "Pull", Message::PullModel)
+                },
             ])
             .into(),
         ),
@@ -231,7 +243,11 @@ fn ollama_card(state: &State) -> Element<'_, Message> {
 
 fn registry_card(state: &State) -> Element<'_, Message> {
     let list: Element<'_, Message> = if state.registry.is_empty() {
-        ui::empty_state_icon(Icon::Inbox, "Nothing registered yet.")
+        if !state.loaded {
+            ui::empty_state_icon(Icon::Clock, "Loading…")
+        } else {
+            ui::empty_state_icon(Icon::Inbox, "Nothing registered yet.")
+        }
     } else {
         ui::stack(
             state

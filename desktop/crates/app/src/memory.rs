@@ -85,6 +85,9 @@ pub struct Store {
     /// A harvest is in flight; the dashboard says so rather than looking idle
     /// while new facts are on their way.
     pub harvesting: bool,
+    /// "Forget all" is armed: the next click really wipes everything. Anything
+    /// else the user does disarms it.
+    pub confirm_forget: bool,
     /// What the last harvest just saved, surfaced as a banner in the chat it
     /// came from so the user can discard a wrong guess on the spot.
     pub notice: Option<Notice>,
@@ -118,6 +121,7 @@ impl Store {
             draft: String::new(),
             editing: None,
             harvesting: false,
+            confirm_forget: false,
             notice: None,
         }
     }
@@ -321,7 +325,10 @@ pub enum Message {
     CancelEdit,
     Delete(u64),
     ToggleEnabled,
+    /// Arms, then performs, the wipe — see the handler.
     ForgetAll,
+    /// Disarm "Forget all" without wiping anything.
+    CancelForget,
     DismissError,
     /// Close the "memory updated" banner, keeping the facts.
     NoticeKeep,
@@ -330,6 +337,11 @@ pub enum Message {
 }
 
 pub fn update(store: &mut Store, message: Message) -> Task<Message> {
+    // Doing anything else — searching, editing, navigating away — disarms the
+    // wipe, so a confirmation can never be left lying around to be hit later.
+    if !matches!(message, Message::ForgetAll) {
+        store.confirm_forget = false;
+    }
     match message {
         Message::Harvested(facts, source) => {
             store.harvesting = false;
@@ -407,12 +419,19 @@ pub fn update(store: &mut Store, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::ForgetAll => {
+            // First click only arms the button; the second one wipes.
+            if !store.confirm_forget {
+                store.confirm_forget = true;
+                return Task::none();
+            }
+            store.confirm_forget = false;
             store.items.clear();
             store.editing = None;
             store.notice = None;
             store.save();
             Task::none()
         }
+        Message::CancelForget => Task::none(),
         Message::DismissError => {
             store.error = None;
             Task::none()
@@ -504,6 +523,20 @@ mod tests {
             "a reused id would make the dashboard edit the wrong row"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forget_all_needs_a_second_click_and_anything_else_disarms_it() {
+        let mut s = store();
+        s.add("Prefers Rust.".into(), "Chat");
+        let _ = update(&mut s, Message::ForgetAll);
+        assert!(s.confirm_forget && s.items.len() == 1, "the first click only arms");
+        let _ = update(&mut s, Message::SearchChanged("r".into()));
+        assert!(!s.confirm_forget, "doing anything else disarms the wipe");
+
+        let _ = update(&mut s, Message::ForgetAll);
+        let _ = update(&mut s, Message::ForgetAll);
+        assert!(s.items.is_empty() && !s.confirm_forget);
     }
 
     #[test]

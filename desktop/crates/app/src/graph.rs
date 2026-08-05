@@ -412,7 +412,7 @@ where
         }
 
         for node in &self.layout.nodes {
-            let accent = tone_color(&t, node.column.tone());
+            let accent = theme::tone_color(&t, node.column.tone());
             let selected = self.selected.as_deref() == Some(node.uuid.as_str());
             let rect = Path::rounded_rectangle(
                 node.position,
@@ -453,16 +453,6 @@ where
         }
 
         vec![frame.into_geometry()]
-    }
-}
-
-fn tone_color(t: &theme::Tokens, tone: crate::ui::Tone) -> Color {
-    match tone {
-        crate::ui::Tone::Neutral => t.muted_foreground,
-        crate::ui::Tone::Info => t.info,
-        crate::ui::Tone::Success => t.success,
-        crate::ui::Tone::Warning => t.warning,
-        crate::ui::Tone::Danger => t.destructive,
     }
 }
 

@@ -23,7 +23,7 @@ const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
         ],
     ),
     // One entry, two tabs: see [`chat_view`].
-    ("ASSISTANTS", &[(Screen::Chat, Icon::Message, "Chat")]),
+    ("ASSISTANTS", &[(Screen::Chat, Icon::Message, "Assistants")]),
 ];
 
 /// The chat tab strip: the voiced assistant first (it is the headline act), the
@@ -137,7 +137,7 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
     let (srv_label, srv_tone) = server_label(app.server_state());
 
     let mut blocks: Vec<Element<'_, Message>> = vec![
-        crate::assistant_view::hud(&app.assistant, 224.0).map(Message::Assistant),
+        crate::assistant_view::hud(&app.assistant, Length::Fill).map(Message::Assistant),
         ui::cluster(vec![
             ui::badge(mode_label, mode_tone),
             ui::badge(srv_label, srv_tone),
@@ -150,30 +150,53 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
     let mut tiles = vec![ui::stat(
         Icon::Sparkles,
         "Memories",
-        app.memory.visible().len().to_string(),
+        app.memory.items.len().to_string(),
     )];
-    if let Some(status) = &app.status {
-        let ok = |r: &ReadinessReport| {
-            format!("{}/{}", r.checks.iter().filter(|c| c.ok).count(), r.checks.len())
-        };
-        tiles.extend([
-            ui::stat(Icon::Activity, "Active processes", status.processes.active.to_string()),
-            ui::stat(Icon::Scroll, "Total processes", status.processes.total.to_string()),
-            ui::stat(Icon::Clock, "Uptime", uptime(status.uptime_seconds)),
-            ui::stat(Icon::CheckCircle, "Readiness", ok(&status.readiness)),
-            ui::stat(Icon::Plug, "LLM proxy", ok(&status.llm_proxy)),
-        ]);
+    // The five server tiles are always pushed — as "—" until status lands — so the
+    // row keeps its shape instead of snapping from one full-width tile to six.
+    match &app.status {
+        Some(status) => {
+            let ok = |r: &ReadinessReport| {
+                format!("{}/{}", r.checks.iter().filter(|c| c.ok).count(), r.checks.len())
+            };
+            tiles.extend([
+                ui::stat(Icon::Activity, "Active processes", status.processes.active.to_string()),
+                ui::stat(Icon::Scroll, "Total processes", status.processes.total.to_string()),
+                ui::stat(Icon::Clock, "Uptime", uptime(status.uptime_seconds)),
+                ui::stat(Icon::CheckCircle, "Readiness", ok(&status.readiness)),
+                ui::stat(Icon::Plug, "LLM proxy", ok(&status.llm_proxy)),
+            ]);
+        }
+        None => tiles.extend([
+            ui::stat(Icon::Activity, "Active processes", "—"),
+            ui::stat(Icon::Scroll, "Total processes", "—"),
+            ui::stat(Icon::Clock, "Uptime", "—"),
+            ui::stat(Icon::CheckCircle, "Readiness", "—"),
+            ui::stat(Icon::Plug, "LLM proxy", "—"),
+        ]),
     }
     blocks.push(ui::cluster(tiles).into());
 
     if app.status.is_none() {
-        blocks.push(ui::empty_state_icon(
-            Icon::Clock,
-            "Platform stats appear as soon as the server answers.",
-        ));
+        // Say *why* there are no stats — a port conflict and a stopped server are
+        // not "any moment now".
+        blocks.push(match app.server_state() {
+            ServerState::Conflict => ui::empty_state_icon(
+                Icon::Alert,
+                "Another server owns the port — see Settings → Status.",
+            ),
+            ServerState::Unreachable => ui::empty_state_icon(
+                Icon::Alert,
+                "The server is not running — restart it or see Settings → Status.",
+            ),
+            _ => ui::empty_state_icon(
+                Icon::Clock,
+                "Platform stats appear as soon as the server answers.",
+            ),
+        });
     }
 
-    ui::page(
+    ui::page_fixed(
         "Dashboard",
         Some(ui::muted("E.V. and the platform's vitals at a glance.")),
         None,
@@ -511,7 +534,7 @@ fn status_view(app: &App) -> Element<'_, Message> {
             ui::cluster(vec![
                 ui::stat(Icon::Activity, "Active processes", status.processes.active.to_string()),
                 ui::stat(Icon::Scroll, "Total processes", status.processes.total.to_string()),
-                ui::stat(Icon::Clock, "Uptime", format!("{:.0}s", status.uptime_seconds)),
+                ui::stat(Icon::Clock, "Uptime", uptime(status.uptime_seconds)),
             ])
             .into(),
         );
@@ -646,7 +669,7 @@ fn checks_view(report: &ReadinessReport) -> Element<'_, Message> {
                         if check.ok { "ok" } else { "fail" },
                         if check.ok { Tone::Success } else { Tone::Danger },
                     ),
-                    ui::body(check.name.clone()),
+                    container(ui::body(check.name.clone())).width(180).into(),
                     ui::muted(check.detail.clone()),
                 ])
                 .into()

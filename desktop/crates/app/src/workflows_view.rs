@@ -32,7 +32,9 @@ pub fn view(state: &State) -> Element<'_, Message> {
         blocks.push(editor_card(state, editor));
     }
 
-    let list: Element<'_, Message> = if state.items.is_empty() {
+    let list: Element<'_, Message> = if !state.loaded {
+        ui::empty_state_icon(Icon::Clock, "Loading workflows…")
+    } else if state.items.is_empty() {
         ui::empty_state_icon(
             Icon::Zap,
             "No workflows yet. A workflow is a fixed list of HTTP or action steps \
@@ -159,10 +161,14 @@ fn workflow_card<'a>(state: &'a State, wf: &'a WorkflowInfo) -> Element<'a, Mess
     }
     lines.push(
         ui::cluster(vec![
-            ui::button_secondary(
-                Icon::Play,
+            // One run at a time server-side, so every card's button is dead
+            // while any workflow runs — look it, don't just act it.
+            ui::button_sized(
+                Some(Icon::Play),
                 if state.running == Some(wf.id) { "Running…" } else { "Run now" },
-                Message::RunNow(wf.id),
+                ui::ButtonVariant::Secondary,
+                ui::Size::Sm,
+                state.running.is_none().then_some(Message::RunNow(wf.id)),
             ),
             ui::button_ghost(
                 Icon::Scroll,
@@ -186,7 +192,11 @@ fn workflow_card<'a>(state: &'a State, wf: &'a WorkflowInfo) -> Element<'a, Mess
 
 fn runs_view(state: &State) -> Element<'_, Message> {
     if state.runs.is_empty() {
-        return ui::empty_state_icon(Icon::Inbox, "No runs yet. Press \"Run now\" to try it.");
+        return if state.runs_loading {
+            ui::empty_state_icon(Icon::Clock, "Loading runs…")
+        } else {
+            ui::empty_state_icon(Icon::Inbox, "No runs yet. Press \"Run now\" to try it.")
+        };
     }
     ui::stack(state.runs.iter().map(|run| run_row(state, run)).collect()).into()
 }

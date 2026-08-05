@@ -245,8 +245,9 @@ pub const TEAM_PRESETS: &[Preset] = &[
 
 #[derive(Default)]
 pub struct State {
-    pub projects: Vec<ProjectSummary>,
-    pub teams: Vec<TeamTemplateSummary>,
+    /// `None` until the first fetch lands — an empty list means empty.
+    pub projects: Option<Vec<ProjectSummary>>,
+    pub teams: Option<Vec<TeamTemplateSummary>>,
     /// Full team detail for the open editor; the list only carries summaries.
     pub team_detail: Option<TeamTemplateDetail>,
     pub draft: Option<Draft>,
@@ -297,6 +298,8 @@ pub enum Message {
     SaveTeam,
     DeleteProject(i64),
     DeleteTeam(i64),
+    DeleteProjectConfirmed(i64),
+    DeleteTeamConfirmed(i64),
     Done(Result<String, String>),
     DismissNotice,
 }
@@ -333,15 +336,40 @@ fn edit_role(state: &mut State, id: &str, f: impl FnOnce(&mut RosterRole)) {
     }
 }
 
+/// Yes/No dialog, then `confirmed` — mirrors the close prompt in `main.rs`.
+fn confirm(what: &str, confirmed: Message) -> Task<Message> {
+    let dialog = rfd::AsyncMessageDialog::new()
+        .set_title("Agent Platform")
+        .set_description(format!("Delete this {what}? This cannot be undone."))
+        .set_buttons(rfd::MessageButtons::YesNo);
+    Task::future(async move { dialog.show().await == rfd::MessageDialogResult::Yes }).then(
+        move |yes| if yes { Task::done(confirmed.clone()) } else { Task::none() },
+    )
+}
+
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
+        // A save or delete is already in flight; ignore repeat clicks.
+        _ if state.busy
+            && matches!(
+                message,
+                Message::SaveProject
+                    | Message::SaveTeam
+                    | Message::DeleteProject(_)
+                    | Message::DeleteTeam(_)
+                    | Message::DeleteProjectConfirmed(_)
+                    | Message::DeleteTeamConfirmed(_)
+            ) =>
+        {
+            Task::none()
+        }
         Message::Refresh => refresh(client),
         Message::ProjectsLoaded(Ok(p)) => {
-            state.projects = p;
+            state.projects = Some(p);
             Task::none()
         }
         Message::TeamsLoaded(Ok(t)) => {
-            state.teams = t;
+            state.teams = Some(t);
             Task::none()
         }
         Message::TeamDetailLoaded(Ok(detail)) => {
@@ -364,7 +392,8 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         }
         Message::EditProject(id) => {
             state.team_detail = None;
-            state.draft = state.projects.iter().find(|p| p.id == id).map(Draft::from_project);
+            state.draft =
+                state.projects.iter().flatten().find(|p| p.id == id).map(Draft::from_project);
             Task::none()
         }
         Message::NewTeam => {
@@ -517,7 +546,9 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 Message::Done,
             )
         }
-        Message::DeleteProject(id) => {
+        Message::DeleteProject(id) => confirm("project", Message::DeleteProjectConfirmed(id)),
+        Message::DeleteTeam(id) => confirm("team", Message::DeleteTeamConfirmed(id)),
+        Message::DeleteProjectConfirmed(id) => {
             state.busy = true;
             let client = client.clone();
             Task::perform(
@@ -525,7 +556,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 Message::Done,
             )
         }
-        Message::DeleteTeam(id) => {
+        Message::DeleteTeamConfirmed(id) => {
             state.busy = true;
             let client = client.clone();
             Task::perform(
