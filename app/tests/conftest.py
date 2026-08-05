@@ -1,7 +1,18 @@
-"""Shared fixtures: in-memory DB (via engine patch) + DAGExecutor mock."""
+"""Shared fixtures: in-memory DB (via engine patch) + DAGExecutor mock.
 
+Set ``AGENT_PLATFORM_TEST_BASE_URL`` to run a test file against a *running*
+server over HTTP instead of in-process — the parity harness for ADR 0007, where
+a domain migrates to Rust only once its own test file passes against both. Add
+``AGENT_PLATFORM_TEST_KEY`` when that server has a master key. Only tests that
+assert on HTTP behaviour can run this way; anything that reaches for the mocked
+``DAGExecutor`` or monkeypatches server internals is testing Python objects, not
+the contract, and will fail loudly rather than silently prove nothing.
+"""
+
+import os
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
@@ -95,6 +106,18 @@ def test_engine(monkeypatch):
 
 @pytest.fixture
 def client(test_engine, monkeypatch):
+    base_url = (os.getenv("AGENT_PLATFORM_TEST_BASE_URL") or "").strip()
+    if base_url:
+        headers = {}
+        key = (os.getenv("AGENT_PLATFORM_TEST_KEY") or "").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        # The mocks are placeholders: a live server runs its own executor, so a
+        # test that asserts on them is not a parity test and should fail here.
+        with httpx.Client(base_url=base_url, headers=headers, timeout=30.0) as c:
+            yield c, MagicMock(), MagicMock()
+        return
+
     mock_cls = MagicMock()
     mock_inst = MagicMock()
     mock_inst.plan = AsyncMock()

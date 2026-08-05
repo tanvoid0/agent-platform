@@ -376,11 +376,11 @@ fn boot() -> (App, Task<Message>) {
         .unwrap_or(settings.port);
 
     let log = std::sync::Arc::new(std::sync::Mutex::new(shell::LogRing::new()));
-    let (python, script) = shell::resolve_server().unwrap_or_else(|| {
-        log.lock().unwrap().push(
-            "[shell] no bundled server payload and no repo checkout found".to_string(),
-        );
-        (Default::default(), Default::default())
+    let daemon = shell::resolve_server().unwrap_or_else(|| {
+        log.lock()
+            .unwrap()
+            .push("[shell] agent-platformd is missing from the install directory".to_string());
+        Default::default()
     });
 
     let key = shell::load_or_create_key(&app_dir).unwrap_or_else(|e| {
@@ -400,8 +400,7 @@ fn boot() -> (App, Task<Message>) {
     let mut sh = Shell {
         server: None,
         log,
-        python,
-        script,
+        daemon,
         port,
         key: key.clone(),
         data_dir: app_dir.clone(),

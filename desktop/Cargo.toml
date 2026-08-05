@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/client", "crates/app"]
+members = ["crates/client", "crates/app", "crates/server"]
 # Throwaway ADR 0006 spike. Excluded so a plain `cargo build` here never drags
 # llama.cpp — or a CUDA toolchain — into the app's build.
 exclude = ["spike-llama"]

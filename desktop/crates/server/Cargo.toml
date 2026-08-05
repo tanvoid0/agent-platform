@@ -1,0 +1,39 @@
+[package]
+name = "agent-platform-server"
+version = "0.1.0"
+edition = "2021"
+description = "Rust API server for agent-platform: migrated domains plus a reverse proxy to the Python server (ADR 0007)"
+
+[[bin]]
+name = "agent-platformd"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "signal"] }
+# `stream` is what keeps SSE responses unbuffered through the proxy. No gzip
+# feature on purpose: decompressing here would invalidate the headers we copy.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sha2 = "0.10"
+subtle = "2"
+futures = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+# Job object with kill-on-close: the only thing that reaps the Python child when
+# this process is terminated rather than shut down. See upstream.rs.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    # The extended limit struct is gated behind Threading; CreateJobObjectW takes
+    # a SECURITY_ATTRIBUTES pointer, so it is gated behind Security.
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

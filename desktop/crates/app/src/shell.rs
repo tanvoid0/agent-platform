@@ -1,7 +1,9 @@
 //! Server sidecar management, ported from the Tauri shell (`desktop/src-tauri/src/lib.rs`).
 //!
-//! The server is the unmodified Python app; everything desktop-specific (loopback
-//! bind, per-install key, per-user data dirs, fixed port) is passed as environment.
+//! The child is `agent-platformd` (ADR 0007), which binds our port and spawns the
+//! Python server itself on an ephemeral one. Everything desktop-specific (loopback
+//! bind, per-install key, per-user data dirs, fixed port) is still passed as
+//! environment — the daemon forwards it to Python unchanged.
 //! Differences from the Tauri version: the port is fixed (Ollama-style background
 //! server — external clients need a stable address) and there is no CORS env at
 //! all (a native client has no origin).
@@ -25,9 +27,9 @@ pub const APP_DIR: &str = "com.tanvoid0.agentplatform";
 const LOG_CAPACITY: usize = 4000;
 
 #[cfg(windows)]
-const RUNTIME_PYTHON: &str = "python.exe";
+const DAEMON_EXE: &str = "agent-platformd.exe";
 #[cfg(not(windows))]
-const RUNTIME_PYTHON: &str = "bin/python3";
+const DAEMON_EXE: &str = "agent-platformd";
 
 /// Appearance preference. `System` follows the OS setting, re-read on each poll
 /// so a mid-session OS switch is picked up without a restart.
@@ -196,8 +198,8 @@ impl LogRing {
 pub struct Shell {
     pub server: Option<Child>,
     pub log: Arc<Mutex<LogRing>>,
-    pub python: PathBuf,
-    pub script: PathBuf,
+    /// `agent-platformd`, which owns the Python process from here on.
+    pub daemon: PathBuf,
     pub port: u16,
     pub key: String,
     pub data_dir: PathBuf,
@@ -231,6 +233,14 @@ impl Shell {
                 if let Some(err) = child.stderr.take() {
                     drain_into_log(self.log.clone(), err);
                 }
+                #[cfg(windows)]
+                if !job::adopt(&child) {
+                    self.log_line(
+                        "[shell] warning: the server was not adopted into our job object; \
+                         a crash of this app will leave it running"
+                            .to_string(),
+                    );
+                }
                 self.server = Some(child);
             }
             Err(e) => self.log_line(format!("[shell] could not start the server: {e}")),
@@ -263,17 +273,12 @@ impl Shell {
     fn spawn(&self) -> std::io::Result<Child> {
         std::fs::create_dir_all(&self.data_dir)?;
         let port = self.port;
-        let mut cmd = Command::new(&self.python);
-        cmd.arg(&self.script)
-            .arg("--skip-build")
-            .arg("--no-browser")
-            .arg("--exit-with-parent")
-            .env("AGENT_PLATFORM_HOST", "127.0.0.1")
+        let mut cmd = Command::new(&self.daemon);
+        // No args: the daemon knows how to find and start Python (and sets that
+        // process's own bind port and LLM_ORCHESTRATOR_BASE_URL from this).
+        cmd.env("AGENT_PLATFORM_HOST", "127.0.0.1")
             .env("AGENT_PLATFORM_PORT", port.to_string())
             .env("AGENT_PLATFORM_MASTER_KEY", &self.key)
-            // Chat, agents, coder and assistant reach the embedded LLM proxy over
-            // HTTP; the default base assumes :18410 which may not be our port.
-            .env("LLM_ORCHESTRATOR_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
             .env("AGENT_PLATFORM_ENV", "development")
             .env("AGENT_PLATFORM_DB_PATH", self.data_dir.join("agent_platform.db"))
             .env("AGENT_PLATFORM_WORKSPACE_ROOT", self.data_dir.join("workspaces"))
@@ -320,35 +325,61 @@ pub fn load_or_create_key(dir: &Path) -> std::io::Result<String> {
     Ok(key)
 }
 
-/// Locate the Python runtime and entrypoint: repo checkout first in debug builds
-/// (so editing the server takes effect), bundled payload next to the exe otherwise.
-pub fn resolve_server() -> Option<(PathBuf, PathBuf)> {
-    if cfg!(debug_assertions) {
-        if let Some(found) = repo_server() {
-            return Some(found);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(root) = exe.parent().map(|p| p.join("server")) {
-            let python = root.join("runtime").join(RUNTIME_PYTHON);
-            let script = root.join("scripts").join("start.py");
-            if python.is_file() && script.is_file() {
-                return Some((python, script));
-            }
-        }
-    }
-    repo_server()
+/// The server binary, which always sits beside ours — `target/<profile>` in a dev
+/// build, the install dir otherwise. Finding Python is its problem now, not ours.
+pub fn resolve_server() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let daemon = exe.parent()?.join(DAEMON_EXE);
+    daemon.is_file().then_some(daemon)
 }
 
-fn repo_server() -> Option<(PathBuf, PathBuf)> {
-    // crates/app -> crates -> desktop -> repo root
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?.parent()?;
-    let script = repo.join("scripts").join("start.py");
-    if !script.is_file() {
-        return None;
+/// Ties children to this process at the OS level, so a crash cannot leave a
+/// server holding the port and the database. Mirrors the same trick in
+/// `crates/server/src/upstream.rs`, which the daemon applies to Python.
+#[cfg(windows)]
+mod job {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// Never closed on purpose: the OS closing it when we exit is the whole
+    /// mechanism. Stored as `usize` because a raw HANDLE is not `Send`/`Sync`.
+    static JOB: OnceLock<usize> = OnceLock::new();
+
+    pub fn adopt(child: &Child) -> bool {
+        let handle = *JOB.get_or_init(|| unsafe { create() } as usize);
+        handle != 0
+            && unsafe {
+                AssignProcessToJobObject(handle as HANDLE, child.as_raw_handle() as HANDLE) != 0
+            }
     }
-    let python = if cfg!(windows) { "python" } else { "python3" };
-    Some((PathBuf::from(python), script))
+
+    unsafe fn create() -> HANDLE {
+        let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if handle.is_null() {
+            return std::ptr::null_mut();
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            handle,
+            JobObjectExtendedLimitInformation,
+            std::ptr::addr_of!(info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0;
+        if ok {
+            handle
+        } else {
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Drains a child pipe into the ring on its own thread. Not optional: a child

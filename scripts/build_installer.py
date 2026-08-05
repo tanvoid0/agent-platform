@@ -116,7 +116,9 @@ def main() -> None:
             "Install Inno Setup from https://jrsoftware.org/isinfo.php and re-run."
         )
 
-    build = ["cargo", "build", "--release", "-p", "agent-platform-desktop"]
+    # The app spawns agent-platformd (ADR 0007) from its own directory, so both
+    # binaries have to be built and both have to be packaged.
+    build = ["cargo", "build", "--release", "-p", "agent-platform-desktop", "-p", "agent-platform-server"]
     features = os.environ.get("AGENT_PLATFORM_FEATURES", "").strip()
     if features:
         build += ["--features", features]

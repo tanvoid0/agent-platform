@@ -7,12 +7,14 @@
 ;
 ; Expects, relative to this .iss file's SourceDir (desktop\):
 ;   target\release\agent-platform.exe   the compiled app (icon already embedded)
+;   target\release\agent-platformd.exe  the API server the app spawns (ADR 0007)
 ;   target\release\*.dll                llama.cpp + ggml, only in a local-llm build
 ;   payload\                            Python runtime + server (scripts/bundle_server.py)
 ;   crates\app\icon.ico                 app icon, reused for the installer/shortcuts
 ;
-; payload\ is installed as {app}\server\ — shell.rs's resolve_server() looks for
-; the bundled runtime at <exe dir>\server\runtime and <exe dir>\server\scripts.
+; payload\ is installed as {app}\server\ — agent-platformd looks for the bundled
+; runtime at <exe dir>\server\runtime and <exe dir>\server\scripts, and the app
+; looks for agent-platformd beside itself.
 
 #define MyAppName "Agent Platform"
 #define MyAppVersion "0.2.0"
@@ -45,6 +47,8 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 
 [Files]
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; Without this the app starts, finds no server binary, and serves nothing.
+Source: "..\target\release\agent-platformd.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; The `local-llm` feature forces llama.cpp to build as DLLs (two static ggmls
 ; will not link), and cargo drops them beside the exe. A default build has none,
 ; hence skipifsourcedoesntexist — the exe then never looks for them.

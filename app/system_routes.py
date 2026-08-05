@@ -73,9 +73,18 @@ def system_status(session: Session = Depends(get_session)) -> dict[str, Any]:
         "uptime_seconds": round(time.time() - _STARTED_AT, 1),
         "python": sys.version.split()[0],
         "platform": platform.platform(),
+        # The address callers use, which is not our bind address when something
+        # fronts us: `agent-platformd` (ADR 0007) binds the public port and gives
+        # this process an ephemeral one, then passes the public pair back here.
         "listening_on": {
-            "host": os.getenv("AGENT_PLATFORM_HOST") or "127.0.0.1",
-            "port": int(os.getenv("AGENT_PLATFORM_PORT") or 18410),
+            "host": os.getenv("AGENT_PLATFORM_PUBLIC_HOST")
+            or os.getenv("AGENT_PLATFORM_HOST")
+            or "127.0.0.1",
+            "port": int(
+                os.getenv("AGENT_PLATFORM_PUBLIC_PORT")
+                or os.getenv("AGENT_PLATFORM_PORT")
+                or 18410
+            ),
         },
         "auth_required": bool((os.getenv("AGENT_PLATFORM_MASTER_KEY") or "").strip()),
         "readiness": {"ok": app_code == 200, **app_ready},
