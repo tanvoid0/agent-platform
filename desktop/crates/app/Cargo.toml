@@ -32,6 +32,24 @@ iced_fonts = { version = "0.3.0", features = ["lucide", "advanced_text"] }
 # Decodes the frames inside icon.ico for the window and tray icons. Already in
 # the tree via iced's svg backend, so this costs no extra build.
 png = "0.17"
+# ADR 0006: llama.cpp in-process. Optional because the feature adds a C++ build
+# (and a CUDA Toolkit for the `cuda` build) that nothing else in this crate
+# needs. `encoding_rs` is llama-cpp-2's own decoder type, so its version has to
+# match the one llama-cpp-2 pins.
+llama-cpp-2 = { version = "0.1.154", default-features = false, optional = true }
+encoding_rs = { version = "0.8.35", optional = true }
+
+[features]
+default = []
+# `dynamic-link` is not optional here: whisper-rs-sys already links its own copy
+# of ggml statically, and two static ggmls in one binary is hundreds of
+# LNK2005s. Building llama.cpp as DLLs keeps the duplicate symbols out of the
+# link — at the cost of shipping those DLLs beside the exe.
+local-llm = ["dep:llama-cpp-2", "dep:encoding_rs", "llama-cpp-2/dynamic-link"]
+# Accelerator for the above. CPU-only was measured at 11 tok/s against 123 on
+# the GPU, so a shipped build wants one of these, and each needs its own SDK
+# installed — see desktop/spike-llama/README.md.
+cuda = ["local-llm", "llama-cpp-2/cuda"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }

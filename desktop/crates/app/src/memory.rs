@@ -16,7 +16,7 @@
 //! The store is a plain JSON file next to `settings.json`, so a user can read,
 //! back up or delete their memories without the app's help.
 
-use agent_platform_client::sse::{self, ChatChunk};
+use agent_platform_client::sse::ChatChunk;
 use agent_platform_client::types::{ChatCompletionBody, ChatMessage};
 use agent_platform_client::Client;
 use futures::StreamExt;
@@ -235,7 +235,7 @@ impl Store {
         let client = client.clone();
         Task::perform(
             async move {
-                let reply = sse::chat_stream(client, body)
+                let reply = crate::inference::chat_stream(client, body)
                     .fold(String::new(), |mut acc, chunk| async move {
                         if let ChatChunk::Delta(text) = chunk {
                             acc.push_str(&text);

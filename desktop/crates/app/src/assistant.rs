@@ -6,7 +6,7 @@
 //! endpoint — no key, needs internet) played through rodio; falls back to the
 //! platform's native engine (SAPI/WinRT, AVSpeech, speech-dispatcher) offline.
 
-use agent_platform_client::sse::{self, ChatChunk};
+use agent_platform_client::sse::ChatChunk;
 use agent_platform_client::types::{ChatCompletionBody, ChatMessage, ToolCall};
 use agent_platform_client::Client;
 use iced::Task;
@@ -525,7 +525,7 @@ impl State {
         };
         Task::batch([
             iced::widget::operation::snap_to_end(transcript_id()),
-            Task::run(sse::chat_stream(client.clone(), body), Message::Chunk),
+            Task::run(crate::inference::chat_stream(client.clone(), body), Message::Chunk),
         ])
     }
 

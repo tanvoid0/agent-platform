@@ -303,6 +303,42 @@ on one machine — CUDA on Windows), model load time (~4.0 s per process start, 
 an Ollama daemon that keeps the model resident), and whether unloading policy lives
 in the app or stays behind the `/api/v1/model-ops/ollama/*` shape.
 
+## Implementation — first slice, 2026-08-05
+
+The UI's own chat answers in-process; everything else is unchanged. Behind the
+`local-llm` cargo feature, **off by default**, so a normal `cargo build` still
+compiles no C++ and needs no CUDA Toolkit. `cuda` implies it.
+
+- [`local_llm.rs`](../../desktop/crates/app/src/local_llm.rs) — backend, model
+  and generation, emitting the same `ChatChunk`s the server's SSE relay does.
+  The model stays loaded across turns (a reload is ~4 s); a fresh context is
+  built per turn, and one global lock means one generation at a time.
+- [`inference.rs`](../../desktop/crates/app/src/inference.rs) — the one place
+  that chooses. Tool calls, an explicit provider and an explicit model all go to
+  the server; without the feature it is a passthrough.
+- `Settings::local_model_path` picks the GGUF (empty = off) and
+  `Settings::local_n_ctx` sizes the KV cache — the knob the Ollama path denies
+  us. No UI for either yet: this slice is the engine, not the settings screen.
+
+**The one real surprise: two ggmls do not link.** `whisper-rs-sys` (already in
+this binary for STT) statically links its own copy of ggml, and so does
+`llama-cpp-sys-2` — MSVC answers with hundreds of `LNK2005 … already defined in
+libwhisper_rs_sys` and then `LNK1169`. The fix is `llama-cpp-2/dynamic-link`,
+which builds llama.cpp and ggml as DLLs instead, so the feature pulls it in
+unconditionally. That moves the problem to runtime: the DLLs live in the sys
+crate's `OUT_DIR` where nothing can find them, so
+[build.rs](../../desktop/crates/app/build.rs) copies them beside the binaries.
+**The installer does not ship them yet** — packaging a `local-llm` build has to
+add `ggml*.dll`, `llama.dll` and `llama-common.dll`.
+
+Verified with `--features cuda` against the GGUF Ollama already has: 106 unit
+tests green, and a model-backed test (`--ignored`, pointed at a real GGUF by
+`AGENT_PLATFORM_TEST_GGUF`) generates on the GPU end to end.
+
+Still open, in rough order: KV-cache reuse across turns (a fresh context per
+turn re-decodes the whole history), unload/VRAM policy, a settings UI, tool
+calls, and whether the Python side ever points at this instead of Ollama.
+
 ## What would reopen the full port
 
 - Install-failure reports traceable to the bundled runtime that bundling cannot fix,

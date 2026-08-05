@@ -76,9 +76,12 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
   spike (`desktop/spike-llama/`) is **answered and closed**: with CUDA Toolkit
   13.3 installed, `llama-cpp-2` builds on Windows and runs 123.5 tok/s against
   Ollama's 112.7 on the same weights, same sitting — parity, kill criteria
-  cleared. Implementation is the open work; its unknowns are the build matrix
-  (one accelerator on one machine measured), the ~4 s per-process model load
-  against Ollama's resident daemon, and where unload policy lives.
+  cleared. First slice shipped the same day: the desktop's own chat answers
+  in-process behind the `local-llm` feature (off by default; `cuda` implies
+  it), with `local_model_path`/`local_n_ctx` in `settings.json`. Open: KV reuse
+  across turns, unload/VRAM policy, a settings UI, tool calls, shipping the
+  llama/ggml DLLs in the installer, and whether the Python side ever points
+  here instead of at Ollama.
   Related defect found while measuring: local chat routes to Ollama's
   OpenAI-compat endpoint, which takes no `options`, so every reply loads at
   131k context (23 GB, 39% spilled to CPU, ~4–5× slower). Not fixable from this

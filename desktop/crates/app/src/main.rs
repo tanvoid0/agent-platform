@@ -16,7 +16,10 @@ mod chat_view;
 mod domain;
 mod graph;
 mod history;
+mod inference;
 mod library;
+#[cfg(feature = "local-llm")]
+mod local_llm;
 mod library_view;
 mod memory;
 mod memory_view;

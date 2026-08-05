@@ -1,7 +1,7 @@
 //! Chat against the platform's LLM proxy. One thread, kept in memory — the
 //! server's chat endpoint is stateless, so the whole history is sent each turn.
 
-use agent_platform_client::sse::{self, ChatChunk};
+use agent_platform_client::sse::ChatChunk;
 use agent_platform_client::types::{ChatCompletionBody, ChatMessage, ProviderEntry};
 use agent_platform_client::Client;
 use iced::Task;
@@ -235,7 +235,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             };
             Task::batch([
                 iced::widget::operation::snap_to_end(state.scroll_id()),
-                Task::run(sse::chat_stream(client.clone(), body), Message::Chunk),
+                Task::run(crate::inference::chat_stream(client.clone(), body), Message::Chunk),
             ])
         }
         Message::Chunk(ChatChunk::Delta(text)) => {

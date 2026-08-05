@@ -103,6 +103,20 @@ pub struct Settings {
     /// Empty = the server's default.
     pub chat_provider: String,
     pub chat_model: String,
+    /// GGUF to answer chat with in-process (ADR 0006). Empty — the default —
+    /// sends every turn to the server, as before. Only read when the binary was
+    /// built with the `local-llm` feature.
+    #[serde(default)]
+    pub local_model_path: String,
+    /// KV-cache context for that model. The knob the Ollama path does not
+    /// expose: too large and the cache spills to CPU, too small and a long
+    /// thread stops fitting.
+    #[serde(default = "default_local_n_ctx")]
+    pub local_n_ctx: u32,
+}
+
+fn default_local_n_ctx() -> u32 {
+    8192
 }
 
 impl Default for Settings {
@@ -113,6 +127,8 @@ impl Default for Settings {
             theme: ThemeMode::default(),
             chat_provider: String::new(),
             chat_model: String::new(),
+            local_model_path: String::new(),
+            local_n_ctx: default_local_n_ctx(),
         }
     }
 }
