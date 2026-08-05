@@ -1,9 +1,15 @@
 # ADR 0001 (Accepted): Agent platform — orchestration, observation, and boundaries
 
-**Status:** Accepted  
-**Date:** 2026-04-10  
+**Status:** Accepted — server decisions all still hold  
+**Date:** 2026-04-10 (status re-checked 2026-08-04)  
 **Deciders:** (fill when decided)  
 **Tags:** multi-agent, HITL, Ollama, OpenAI-compatible proxy, reliability
+
+> **Client references are historical.** "React Flow UI" below meant the `web/` app, deleted by
+> [ADR 0005](./0005-native-iced-desktop-headless-server.md); the client is now native iced. This
+> changes nothing here — every decision in this ADR is about server authority, and the HTTP-first
+> and SSE-as-a-hint rules bind the new client exactly as they bound the old one. Implementation
+> status is tracked in [reliability-invariants.md](../reliability-invariants.md).
 
 ---
 
@@ -127,7 +133,7 @@ This is a **default** you can accept, revise, or reject after research. It is co
 
 6. **Reliability:** Timeouts on planning/subagents; global run timeout; explicit cancel endpoint; terminal states.
 
-7. **Security posture (v1):** Subagents are **prompt-only** unless tools are explicitly enabled later under **ADR 0002 (tools)** with allowlists and budgets.
+7. **Security posture (v1):** Subagents are **prompt-only** unless tools are explicitly enabled later under a dedicated **tools ADR** with allowlists and budgets. (This originally read "ADR 0002 (tools)"; number 0002 went to the UI stack instead, and the tools ADR was never written — `app/tools_policy.py` carries the policy today.)
 
 ---
 
@@ -188,8 +194,10 @@ Use this as a reading list; reorder by your risk tolerance.
 
 - **Product brainstorm / roadmap** in the repo (e.g. `.cursor/plans/`) — product intent; **this ADR** is architecture.
 - **Embedded LLM proxy** (`app/llm_proxy/`) — transport and provider routing only; agent logic stays in Agent Platform routes and the DAG executor.
-- **[ADR 0002](./0002-ui-stack-react-typescript-vite.md)** — web shell (React+TS+Vite, TanStack Query, @xyflow/react).
-- **[ADR 0003](./0003-future-3d-simulation-boundary.md)** — optional lazy-loaded 3D module; authority stays server-side.
+- **[ADR 0002](./0002-ui-stack-react-typescript-vite.md)** — web shell (React+TS+Vite, TanStack Query, @xyflow/react). **Superseded by [ADR 0005](./0005-native-iced-desktop-headless-server.md)**; the current client is native iced.
+- **[ADR 0003](./0003-future-3d-simulation-boundary.md)** — optional 3D module; authority stays server-side. Boundary holds, bundle-splitting mechanism superseded.
+- **[ADR 0004](./0004-desktop-shell-tauri-python-sidecar.md)** / **[ADR 0005](./0005-native-iced-desktop-headless-server.md)** — desktop shell: server owned as a child process, native UI.
+- **[ADR 0006](./0006-in-process-rust-core.md)** — inference moves in-process; the server stays Python.
 - **Tools / MCP** — `app/tools_policy.py` today; a dedicated ADR when executable tools ship beyond prompts.
 
 ---

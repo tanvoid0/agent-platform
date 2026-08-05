@@ -1,12 +1,12 @@
-# Web API Contract Coverage
+# API Contract Coverage
 
-This document defines the web-facing API responses that must remain compatible for the in-repo UI and other thin clients.
+This document defines the API responses that must remain compatible for the native desktop client and other thin clients. (Written when the consumer was the in-repo `web/` UI; that UI is deleted, the contracts are not — `desktop/crates/client/` consumes the same shapes, and `scripts/sync_contract_enums.py` turns server-side enum drift into a Rust compile error.)
 
 The contract suite is the pytest `contract` marker. `pnpm smoke` runs that suite through `python scripts/smoke_workflow.py`, so CI can fail fast on response-shape drift.
 
 ## Selected endpoints
 
-These routes were chosen because a shape change here would break the current UI flow quickly and visibly:
+These routes were chosen because a shape change here would break a client flow quickly and visibly:
 
 1. `GET /api/v1/llm/ui-catalog`
 2. `GET /v1/catalog`

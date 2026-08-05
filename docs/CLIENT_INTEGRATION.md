@@ -1,6 +1,6 @@
 # Client Integration Guide
 
-End-to-end setup for an external microservice or Flow UI deployment talking to Agent Platform.
+End-to-end setup for an external microservice or third-party client talking to Agent Platform.
 
 ## 1. Obtain credentials
 

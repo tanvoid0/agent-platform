@@ -1,14 +1,22 @@
-# Agent workspace routes (canonical)
+# Agent workspace routes — historical
 
-> **All paths are under `/api/v1`.** The bare-root mirror (`/processes`, `/teams`, …) was removed with the browser UI; paths written without the prefix below are relative to it.
+> **Superseded 2026-08-04. Nothing serves these routes.** They were the browser
+> routes of the `web/` Flow UI, deleted by the native-desktop migration
+> ([ADR 0005](./adr/0005-native-iced-desktop-headless-server.md)). The server now
+> exposes only `/api/v1/*`, `/v1/*`, `/tokens`, `/docs`, `/health` and `/ready` —
+> there is no `/app/*`, no `/flow/*`, and no `/flow/* → /app/*` redirect.
+>
+> Kept as a map from the old routes to the native screens that replaced them, for
+> anyone reading commits or issues written before the migration.
 
-| Route | Purpose | Backend |
+| Old browser route | Purpose | Replaced by |
 |-------|---------|---------|
-| `/app/` | Redirect to active project workspace or project list | — |
-| `/app/projects/:projectId` | Agentic AI workspace (3D, kanban, inspector) for one project | `GET/PATCH /projects/{id}`, project-scoped state |
-| `/app/projects` | Projects list / CRUD | `GET/POST/PATCH/DELETE /projects` |
-| `/app/teams` | Team templates | `GET/POST/PATCH/DELETE /teams` |
-| `/app/finance`, `/app/finance/project` | Finance demo | Optional |
-| `/app/settings/*` | Settings | LLM proxy / env |
+| `/app/` | Redirect to active project workspace or project list | `Screen::Dashboard` |
+| `/app/projects/:projectId` | Agentic AI workspace (3D, kanban, inspector) for one project | `Screen::Processes` (`processes.rs`). The 3D/pixel office was dropped, not ported — see [native-desktop-migration.md](./native-desktop-migration.md). |
+| `/app/projects` | Projects list / CRUD | `Screen::Projects` (`library.rs`) |
+| `/app/teams` | Team templates | `Screen::Teams` (`library.rs`) |
+| `/app/finance`, `/app/finance/project` | Finance demo | Dropped, not ported |
+| `/app/settings/*` | Settings | `Screen::Settings` (`screen.rs`) |
 
-Legacy bookmarks under `/flow/*` redirect to `/app/*` (308).
+The API operations these screens called are unchanged and still documented in
+[delegation-ui-api-matrix.md](./delegation-ui-api-matrix.md).

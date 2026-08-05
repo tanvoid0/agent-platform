@@ -5,13 +5,21 @@
 > ([ADR 0005](./adr/0005-native-iced-desktop-headless-server.md)). The server
 > halves survive and are live — `app/todos/`, `app/assistant/`,
 > `/api/v1/assistant/*`, planner profiles, board templates, action orchestrator.
-> The UI halves are gone: the desktop app has **no todos/kanban or assistant
-> dashboard screen** (`desktop/crates/app/src/assistant.rs` is the E.V. voice
-> HUD, a different thing). So "Done" in the status table means *server done, UI
-> unported*. Any `.tsx` path, `/app/…` route, or `cd web && pnpm run test` below
-> refers to deleted files. Porting these screens to iced is open work; treat the
-> phase tables as a spec of server behaviour to build against, not a record of
-> shipped UI.
+> So "Done" in the status table means *server done*, and any `.tsx` path,
+> `/app/…` route, or `cd web && pnpm run test` below refers to deleted files.
+> Treat the phase tables as a spec of server behaviour, not a record of shipped
+> UI.
+>
+> **Port status of the UI halves, as of 2026-08-04:**
+>
+> - **Todo boards / kanban — ported.** The native **Plans** screen
+>   (`desktop/crates/app/src/todos.rs`, `todos_view.rs`, `Screen::Plans`) runs
+>   over the same `/api/v1/todos/*` API. Columns are statuses rather than
+>   categories, which differs from the web board described below.
+> - **Assistant dashboard, agent drawer, planning form blocks, review banner —
+>   not ported.** Still open work. Note
+>   `desktop/crates/app/src/assistant.rs` is the E.V. voice HUD, a different
+>   thing that happens to share the name.
 
 Handoff for evolving **agent-platform** from a simulation-first orchestration demo into a **practical daily planning assistant**: personal planning, nutrition, fitness, travel, shopping, mentorship, coding help, and calendar organisation — without breaking existing process/team/simulation flows.
 

@@ -1,6 +1,8 @@
-# Screens → agent-platform API
+# Client operations → agent-platform API
 
 > **All paths are under `/api/v1`.** The bare-root mirror (`/processes`, `/teams`, …) was removed with the browser UI; paths written without the prefix below are relative to it.
+>
+> Written for the Flow UI, which was consolidated into `web/` and then deleted by the native-desktop migration ([ADR 0005](./adr/0005-native-iced-desktop-headless-server.md)). **The table below is still current** — these are the API operations any client uses, and the native app in `desktop/crates/client/` calls the same ones.
 
 | Operation | HTTP | Notes |
 |-----------|------|--------|
@@ -18,4 +20,4 @@
 
 **Live updates:** Process and project state use **SSE + REST** on Agent Platform (no separate WebSocket project channel).
 
-**Status:** The Flow UI uses Agent Platform for projects, teams, processes, finance-style rollups from in-browser usage ledgers, and `POST /api/v1/chat` for server-backed (embedded LLM proxy) chat. Full graph/approve flows remain available via `/ui`, `/docs`, or API clients; use `GET /processes` directly when you need a raw process list.
+**Status:** The server ships no browser UI beyond the `/tokens` dashboard — there is no `/ui` mount. Graph and approve flows live in the native desktop app; anything else reaches them through `/docs` (OpenAPI) or a direct API client. Use `GET /processes` when you need a raw process list.

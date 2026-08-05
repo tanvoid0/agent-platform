@@ -1,8 +1,19 @@
 # ADR 0003: Future optional 3D simulation — module boundary and authority
 
-**Status:** Accepted (boundary); implementation **not** required for v1  
-**Date:** 2026-04-11  
+**Status:** Boundary **still holds**; mechanism **superseded** by [ADR 0005](0005-native-iced-desktop-headless-server.md)  
+**Date:** 2026-04-11 (status revised 2026-08-04)  
 **Tags:** 3D, R3F, Three.js, Babylon, simulation, lazy-loading, pixel-art, canvas-2d
+
+> **Revision, 2026-08-04.** The *authority* half of this ADR is unchanged and load-bearing: a
+> simulation view is a renderer of server state and never an owner of run state. The
+> *mechanism* half is dead — dynamic `import()`, bundle splitting, `main.tsx`, and every
+> `web/src/features/…` path below refer to the React/Vite app deleted by ADR 0005. The pixel
+> office described in the addendum was dropped with it and was not reimplemented in
+> `iced::canvas`; see [native-desktop-migration.md](../native-desktop-migration.md).
+>
+> If spatial visualization is ever revived, it lands in the native app and this ADR needs a
+> successor stating the iced-side boundary. The rule to carry forward: whatever draws it reads
+> `GET /processes/{id}`, and writes go through the same REST actions every other screen uses.
 
 ## Context
 

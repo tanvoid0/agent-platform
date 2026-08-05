@@ -47,18 +47,22 @@ Defaults are `SPEECH_DEFAULT_MODEL=tts-1` and `SPEECH_DEFAULT_VOICE=alloy`
      (ElevenLabs' `xi-api-key`) needs a gateway in front, or a row of its own
      in `speech_backends.py`.
 
-2. **Self-hosted open source** (no per-use cost, build-it-yourself appeal)
+2. **Self-hosted open source** (no per-use cost, build-it-yourself appeal) — **built**
    - **Piper** — fast CPU ONNX, real-time on modest hardware, decent quality.
-     Easiest self-host.
+     Easiest self-host. **This is what was built:** `services/speech-service/`
+     exposes the OpenAI `/v1/audio/speech` shape over Piper; point
+     `SPEECH_API_BASE` at it and the capability router resolves `speech_local`.
+     Setup, voice downloads and the three env vars that all matter are in
+     [its README](../services/speech-service/README.md) — that file is the
+     authority, not this one. Kept out of `app/` on purpose: the platform brokers
+     capabilities over HTTP and never imports a model runtime.
    - **Kokoro-82M** — small model, near-provider quality, ONNX ports exist.
-     Current best quality/size ratio.
+     Current best quality/size ratio. Swapping to it means pointing
+     `SPEECH_API_BASE` at a different server; platform and desktop do not change.
    - **F5-TTS / XTTS-v2** — voice cloning (give E.V. a custom voice), GPU
      preferred, slower.
-   - Integration path: run one of them behind an OpenAI-shaped server and set
-     `SPEECH_API_BASE` — no desktop or proxy change. Serving the model in-process
-     from the sidecar is the other option, and costs a heavy Python dependency
-     in the packaged payload. This is the recommended route for a self-built
-     voice.
+   - The rejected alternative: serving the model in-process from the sidecar,
+     which costs a heavy Python dependency in the packaged payload.
 
 3. **Latency polish (applies to any backend)**
    - ~~Split reply into sentences, synthesize per sentence, queue chunks into
@@ -70,7 +74,10 @@ Defaults are `SPEECH_DEFAULT_MODEL=tts-1` and `SPEECH_DEFAULT_VOICE=alloy`
 
 1. Current: local whisper `base.en` push-to-talk (done).
 2. **Bigger/faster models** — `small.en` for accuracy, or GPU features of
-   whisper-rs (vulkan/cuda) if transcription feels slow.
+   whisper-rs (vulkan/cuda) if transcription feels slow. Note whisper-rs is
+   pulled on default (CPU) features today, so those flags are untested here —
+   the same unknown [ADR 0006](adr/0006-in-process-rust-core.md) puts in front of
+   its llama.cpp spike. Whichever gets built first answers it for both.
 3. **Auto-stop (VAD)** — detect end-of-speech instead of a second click
    (whisper.cpp ships a VAD; energy-threshold is the cheap version).
 4. **Streaming partials** — show words as they're recognized (whisper.cpp

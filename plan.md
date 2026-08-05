@@ -61,12 +61,20 @@ uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410
 - **UX polish pass** — drive the app, audit each screen against the `ui/` kit;
   newer screens (workflows, providers, memory, history sidebar) landed fast.
 - **E.V. voice** — `POST /v1/audio/speech` proxies whatever `SPEECH_API_BASE`
-  points at (Piper/Kokoro or a hosted provider, keyed by `SPEECH_API_KEY`) and
-  the desktop tries it before its own engines. Open: pick and stand up a
-  self-hosted model. Roadmap in `docs/ev-voice-roadmap.md`.
+  points at and the desktop tries it before its own engines. The self-hosted
+  model is picked and stood up: `services/speech-service/` (Piper, CPU ONNX,
+  OpenAI-shaped). Open: VAD auto-stop, streaming partials, wake word. Roadmap in
+  `docs/ev-voice-roadmap.md`, setup in the service's own README.
 - **Assistant roadmap** — `docs/practical-assistant-roadmap.md`. Its phases are
-  server-complete but UI-unported: todo boards and the assistant dashboard have
-  no native screen (the desktop `assistant.rs` is the E.V. voice HUD).
+  server-complete, UI partly ported: todo boards **have** a native screen
+  (**Plans**, `todos.rs`/`todos_view.rs`); the assistant dashboard, agent drawer
+  and review banner do not (the desktop `assistant.rs` is the E.V. voice HUD, a
+  different thing).
+- **In-process inference** — [ADR 0006](docs/adr/0006-in-process-rust-core.md):
+  link llama.cpp into the desktop binary instead of shelling out to Ollama. The
+  full Rust port was reviewed and rejected; the server stays Python. Gated on a
+  spike: do CUDA/Vulkan feature flags build on Windows, and what is tok/s
+  against the current Ollama path.
 - **Project sub-groups** — `Project` is a flat folder (no `parent_id`/tags);
   nested groups if career workflows demand it.
 - **Document routing** — per-model native PDF/vision vs derived markdown
@@ -81,4 +89,6 @@ complete and the file is deleted: services extracted (`app/services/`),
 
 *Refreshed: 2026-08-04 — rewritten for the native-desktop / headless-API
 reality; stale references to `web/`, `/ui`, `/app`, the Jinja shell and the
-pixel office removed (pixel office permanently deferred with the web app).*
+pixel office removed (pixel office permanently deferred with the web app).
+Second pass the same day: Plans screen and the Piper speech service marked
+shipped, ADR 0006 added to the backlog.*

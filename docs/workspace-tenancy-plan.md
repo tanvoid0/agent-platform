@@ -1,5 +1,16 @@
 # Workspace Tenancy — Implementation Plan
 
+> **Landed.** Shipped and covered by `app/tests/test_workspace_tenancy.py` and
+> `test_workspace_service.py`. Kept as the design record; for how the system
+> behaves now, read [API_WORKSPACE_SCOPING.md](./API_WORKSPACE_SCOPING.md) and
+> [CLIENT_INTEGRATION.md](./CLIENT_INTEGRATION.md) instead — those are the
+> client-facing docs Step 8 below required, and they are current.
+>
+> "Flow UI" throughout means *one external client holding one workspace token*.
+> That specific UI was deleted by [ADR 0005](./adr/0005-native-iced-desktop-headless-server.md);
+> the tenancy model it motivated is unchanged and now serves the native desktop
+> app and any external microservice on the same terms.
+
 ## Goal
 
 Introduce a **Workspace** tenant that sits above `Project`, so independent

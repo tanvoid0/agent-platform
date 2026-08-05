@@ -15,7 +15,7 @@ Workspace  (tenant — one token = one workspace)
 | Credential | Scope | Use case |
 |------------|-------|----------|
 | `AGENT_PLATFORM_MASTER_KEY` | All workspaces | Admin, dashboard, token minting |
-| Workspace API token (`agp_…`) | One workspace | External microservices, Flow UI |
+| Workspace API token (`agp_…`) | One workspace | External microservices, the native desktop app |
 
 Mint workspace tokens at **`POST /api/v1/workspaces/{workspace_id}/api-tokens/`** (master key only).  
 Resolve the caller's workspace with **`GET /api/v1/me/workspace`** (workspace token only).
