@@ -222,6 +222,8 @@ pub enum Message {
     CloseConfirmed,
     MinimizeToTray,
     CloseCancelled,
+    /// Esc while a modal is up; routed to whichever modal is open.
+    EscapePressed,
     /// A toast's time is up (or its close button was pressed).
     NoticeExpired,
     WindowClosed(window::Id),
@@ -595,6 +597,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::CloseCancelled => {
             app.close_prompt = None;
             Task::none()
+        }
+        Message::EscapePressed => {
+            if app.close_prompt.is_some() {
+                app.close_prompt = None;
+                Task::none()
+            } else {
+                update(
+                    app,
+                    Message::Library(library::Message::CancelConfirm),
+                )
+            }
         }
         Message::CloseConfirmed => {
             app.close_prompt = None;
@@ -996,9 +1009,10 @@ fn subscription(app: &App) -> Subscription<Message> {
             })
         }));
     }
-    // Esc dismisses the in-app modals, as the OS dialogs they replaced did.
-    let escape = |msg: Message| {
-        iced::keyboard::listen().filter_map(move |event| {
+    // Esc dismisses the in-app modals, as the OS dialogs they replaced did. The
+    // filter_map closure has to stay non-capturing, so update() picks the modal.
+    if app.close_prompt.is_some() || app.library.confirm.is_some() {
+        subs.push(iced::keyboard::listen().filter_map(|event| {
             matches!(
                 event,
                 iced::keyboard::Event::KeyPressed {
@@ -1006,13 +1020,8 @@ fn subscription(app: &App) -> Subscription<Message> {
                     ..
                 }
             )
-            .then(|| msg.clone())
-        })
-    };
-    if app.close_prompt.is_some() {
-        subs.push(escape(Message::CloseCancelled));
-    } else if app.library.confirm.is_some() {
-        subs.push(escape(Message::Library(library::Message::CancelConfirm)));
+            .then_some(Message::EscapePressed)
+        }));
     }
     Subscription::batch(subs)
 }
