@@ -27,6 +27,9 @@ skills-lock.json
 
 # Desktop shell
 desktop/target/
+# MSVC leaves object files where it was invoked — cargo's own output is under
+# target/, so anything named *.obj out here is a stray.
+*.obj
 desktop/payload/*
 !desktop/payload/.gitkeep
 
