@@ -10,6 +10,7 @@ from chat_usage import LlmStepUsageOut, LlmUsageOut, merge_llm_usages
 from action_orchestrator.models import Action
 from action_orchestrator.schemas import PlannedAction
 from llm_client import call_llm, call_llm_tool_proposals
+from llm_text import looks_like_machine_output, strip_code_fences
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +190,55 @@ def tool_calls_to_planned_actions(
     return planned
 
 
+def _decision_from_json(response: str) -> dict[str, Any] | None:
+    """A model that answers the tool-call prompt with one JSON object instead of
+    calling a tool.
+
+    Without this the object matches neither `<reasoning>` nor `Thought:`, so the
+    thought falls back to `response[:200]` — a ```json fence truncated
+    mid-sentence — and that string is what the review banner and the assistant's
+    own chat turn then show the user. Its `actions` are lost in the same step.
+    """
+    try:
+        data = json.loads(strip_code_fences(response))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    thought = data.get("reasoning") or data.get("thought")
+    actions: list[PlannedAction] = []
+    for a in data.get("actions") or []:
+        if not isinstance(a, dict):
+            continue
+        # `action_id` only, never the display name: unlike the tool-call path
+        # these are not checked against the action set, so a guessed id would
+        # travel as a real proposal.
+        action_id = str(a.get("action_id") or "").strip()
+        if not action_id:
+            continue
+        params = a.get("parameters")
+        actions.append(
+            PlannedAction(
+                action_id=action_id,
+                name=str(a.get("name") or action_id),
+                parameters=params if isinstance(params, dict) else {},
+                confidence=float(a.get("confidence") or 0.9),
+                reasoning=a.get("reasoning"),
+            )
+        )
+    return {
+        "thought": str(thought).strip() if thought else None,
+        "actions": actions,
+    }
+
+
 def parse_decision_response(response: str) -> dict[str, Any]:
     """Parse the LLM response for actions and reasoning."""
+    structured = _decision_from_json(response)
+    if structured and (structured["thought"] or structured["actions"]):
+        return structured
+
     thought = None
     actions: list[PlannedAction] = []
 
@@ -234,7 +282,12 @@ def parse_decision_response(response: str) -> dict[str, Any]:
     if not actions:
         actions = parse_actions_from_text(response)
 
-    return {"thought": thought or response[:200], "actions": actions}
+    # The last resort is the head of the raw response, which is fine when the
+    # model wrote prose and unusable when it wrote a data structure this parser
+    # could not read: callers put this string in front of the user as the
+    # assistant's own words. Better to have no thought than a broken-looking one.
+    fallback = "" if looks_like_machine_output(response) else (response or "").strip()
+    return {"thought": thought or fallback[:200] or None, "actions": actions}
 
 
 def parse_actions_from_text(text: str) -> list[PlannedAction]:

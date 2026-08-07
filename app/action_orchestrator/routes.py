@@ -51,6 +51,14 @@ from time_utils import utc_now_naive
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["action-orchestrator"])
 
+# Handlers must not be named after anything imported above them. `get_session`
+# (the route) shadowed `database.get_session` (the dependency) for every route
+# declared after it, so `/sessions/{id}/steps`, `/results`, `/complete` and
+# `/history` were served a *session response dict* where they expected a DB
+# session and 500'd, and `/decide` demanded a `session_id` query parameter that
+# is not part of its contract. Found by cross-rendering this domain against the
+# Rust port; the route below is `get_session_detail` for that reason.
+
 
 def action_client_scope(
     client_hdr: str | None = Depends(agent_platform_client_header),
@@ -363,7 +371,7 @@ def create_session(
 
 
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
-def get_session(
+def get_session_detail(
     session_id: int,
     session: Session = Depends(get_session),
     client_hdr: str | None = Depends(action_client_scope),

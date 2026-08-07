@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any
 
 from pydantic import BaseModel
 
 from llm_client import call_llm
+from llm_text import strip_code_fences
 from workflows.schemas import WorkflowStep, validate_steps
 
 logger = logging.getLogger(__name__)
@@ -65,13 +65,9 @@ class AssistResponse(BaseModel):
     steps: list[WorkflowStep] | None = None
 
 
-def _strip_fences(text: str) -> str:
-    # Reasoning models (deepseek-r1, qwen3, …) may prefix the JSON with an
-    # inline <think>…</think> block; it is deliberation, not answer.
-    text = re.sub(r"^\s*<think>.*?</think>", "", text, flags=re.DOTALL)
-    text = text.strip()
-    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
-    return match.group(1) if match else text
+# Kept as a local name because this module's tests address it; the rules moved
+# to `llm_text` once the action orchestrator needed the same two.
+_strip_fences = strip_code_fences
 
 
 def parse_assist_reply(content: str) -> AssistResponse:
