@@ -1,0 +1,84 @@
+# The repo's only automated check. Nothing ran the 490-odd tests before this;
+# `cd desktop && cargo test` was a thing you had to remember.
+#
+# Two jobs, because the workspace does not build in one place:
+#
+# - `server` is the deployable artifact (Dockerfile, the cloud target of
+#   ADR 0007). It has no GUI or audio dependencies, so it builds on Linux and
+#   that is what the image is built from — the platform worth gating on.
+# - `desktop` is iced + whisper.cpp + WebView2 and ships on Windows only, so it
+#   is checked there. cmake and LLVM are both preinstalled on `windows-latest`;
+#   `LIBCLANG_PATH` is not exported by default and bindgen needs it.
+#
+# `cargo build` runs alongside `cargo test` on purpose: dev-dependencies unify
+# features back into the lib, so a test run alone can pass on a lib whose own
+# feature list is missing something it uses. That is in the runbook and it is
+# the exact failure this catches.
+name: CI
+
+on:
+  push:
+    branches: [main, rust-server-migration]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI failure should name the panic, not a pointer.
+  RUST_BACKTRACE: 1
+
+jobs:
+  server:
+    name: server (linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - run: cargo build -p agent-platform-server
+      - run: cargo test -p agent-platform-server -p agent-platform-client
+      # Warnings are not failures yet: this repo has never been gated and
+      # turning `-D warnings` on in the same commit that adds CI would make the
+      # first run red for reasons unrelated to the change under review. Tighten
+      # once the backlog it prints is empty.
+      - run: cargo clippy -p agent-platform-server -p agent-platform-client --all-targets
+
+  desktop:
+    name: desktop (windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      # whisper-rs builds whisper.cpp through bindgen; without this it fails
+      # with "Unable to find libclang" rather than anything about whisper.
+      # Hardcoded rather than read from an env var: the runner image installs
+      # LLVM here and does not export a variable pointing at it.
+      - run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+        shell: pwsh
+      # The default feature set: `local-llm`/`cuda` need a CUDA toolkit no
+      # hosted runner has, and the app ships with them off.
+      - run: cargo build -p agent-platform-desktop
+      - run: cargo test -p agent-platform-desktop
+
+  hygiene:
+    name: repo hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python scripts/check_repo_hygiene.py

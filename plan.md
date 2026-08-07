@@ -213,6 +213,67 @@ SQLite-only and refuses to start with `DATABASE_URL` set.
   nested groups if career workflows demand it.
 - **Document routing** — per-model native PDF/vision vs derived markdown
   (capability flags exist on providers).
+- **Deployment hardening** — the gap between "runs on this machine" and
+  "survives a container restart". Four landed 2026-08-08 (below); the rest are
+  listed there and none is started.
+
+### Deployment hardening — 2026-08-08
+
+A production-readiness pass over `agent-platformd`. The code was in good shape;
+what was missing was everything that only matters once the process is not being
+babysat by a developer.
+
+**Landed:**
+
+1. **CI, for the first time** — `.github/workflows/ci.yml`. 490-odd tests
+   existed and nothing ran them. Two build jobs because the workspace does not
+   build in one place: the server (the deployable artifact, no GUI or audio
+   deps) on Linux, the desktop app on Windows with `LIBCLANG_PATH` set for
+   whisper's bindgen. `cargo build` runs beside `cargo test` for the reason the
+   runbook already gives — dev-dependencies unify features back into the lib.
+   Clippy runs without `-D warnings`: gating a never-gated repo in the same
+   commit that adds the gate makes the first run red for unrelated reasons.
+2. **SIGTERM is handled** — `serve` listened for Ctrl-C only, so `docker stop`,
+   `systemctl stop` and a pod eviction were all ignored until the SIGKILL that
+   follows. Every in-flight SSE stream, DAG executor step and model-build stage
+   died mid-write. `shutdown_signal()` selects over both on unix; Windows has
+   no SIGTERM and `ctrl_c` already covers its console events.
+3. **An exposed bind with no master key is refused at startup** — auth being
+   fully open when `AGENT_PLATFORM_MASTER_KEY` is unset is a *loopback*
+   convenience, and `AGENT_PLATFORM_HOST` is an environment variable. The two
+   together published every route, with nothing in the startup output saying
+   so. `AGENT_PLATFORM_ALLOW_OPEN=1` is the deliberate override.
+   `is_loopback` treats anything it does not recognise as exposed.
+4. **`/health` touches the database** — it answered `ok` from the fact that the
+   handler ran, so a server whose SQLite file was deleted, locked or out of
+   disk reported healthy while 500ing every other route. Now `SELECT 1` and a
+   503 on failure. It runs on `pool`, not `any`, because `pool` carries
+   `busy_timeout(30s)`: the desktop's adopt-or-spawn check reads a non-200 as
+   "dead", and an instant `SQLITE_BUSY` would have it start a second server
+   against the same file.
+
+**Not done, in the order worth doing:**
+
+- **No inbound limits.** No request timeout, no body cap past axum's 2 MB
+  extractor default, no global concurrency cap (only `chat` has one, via
+  `AGENT_PLATFORM_CHAT_MAX_CONCURRENT`). `tower-http` is already a dependency —
+  its `timeout` and `limit` features are the whole fix.
+- **`schema.sql` creates but does not migrate** — see `db::ensure_schema`. The
+  first column change needs `sqlx::migrate!` (sqlx is already in the tree) or a
+  `schema_version` table. The thirty historical Alembic revisions are not worth
+  carrying: every database in existence is at head.
+- **`openapi.json` drifts silently** — see the note on `lib.rs::openapi`.
+- **The parity tax outlived its counterparty.** The Python server is deleted,
+  but the crate still declines foreign keys ("matching Python is the
+  contract"), carries `preserve_order` + `tiktoken-rs` for token-count parity,
+  keeps two hand-rolled `json.dumps` renderers (`workflow_engine::PythonJson`
+  and `todos::EnsureAscii` — the duplication is flagged in `dag_schema.rs`) and
+  shapes errors like pydantic's. Each is now deletion, not maintenance.
+- **`AppState.pool` + `AppState.any`** — finishing the `sqlx::Any` conversion
+  deletes a field and lets `Config::from_env` stop refusing `DATABASE_URL`.
+- **Rate limiting is per-token and in-process**; the master key is unlimited and
+  `state.windows` is never pruned.
+- **No backup or vacuum story** for the SQLite file.
 
 ### Rust server migration — **closed 2026-08-07**
 

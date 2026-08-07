@@ -37,7 +37,9 @@ cd desktop && cargo run -p agent-platform-desktop      # the app (spawns agent-p
 cd desktop && cargo run -p agent-platform-server       # the server alone
 ```
 
-There is no CI. Nothing runs these but us — run them before claiming a change works.
+`.github/workflows/ci.yml` runs all three on push and PR — the server and
+hygiene on Linux, the desktop app on Windows. Run them locally anyway before
+claiming a change works; CI is the backstop, not the loop.
 
 ## Rules
 

@@ -286,6 +286,31 @@ async fn llm_proxy_routes_authenticate_per_route() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// `/health` is the desktop's liveness probe and a container's readiness check,
+/// and it used to answer `ok` from the fact that the handler ran at all. A
+/// server whose database it cannot open answers every *other* route with a 500,
+/// so reporting `ok` there is the one failure this endpoint exists to catch.
+#[tokio::test]
+async fn health_fails_when_the_database_cannot_be_opened() {
+    let db = temp_db_path();
+    seed_db(&db).await;
+    let origin = start_server(&db, None).await;
+    let (status, body) = get(&origin, "/health", None).await;
+    assert_eq!(status, 200, "{body}");
+
+    // A path under a directory that does not exist: `mode=rwc` creates a file,
+    // it does not create the directory above it.
+    let unopenable = temp_db_path().join("no-such-dir").join("agent_platform.db");
+    let origin = start_server(&unopenable, None).await;
+    let (status, body) = get(&origin, "/health", None).await;
+    assert_eq!(status, 503, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["detail"], "database unavailable");
+
+    let _ = std::fs::remove_file(&db);
+}
+
 #[tokio::test]
 async fn no_master_key_leaves_auth_open() {
     // The Python server's dev convenience: unset master key means no auth at all.

@@ -101,7 +101,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use serde_json::json;
@@ -137,18 +137,47 @@ impl Config {
                 .into());
         }
 
+        let host = env_opt("AGENT_PLATFORM_HOST").unwrap_or_else(|| "127.0.0.1".into());
+        let master_key = env_opt("AGENT_PLATFORM_MASTER_KEY");
+
+        // Open auth is a *loopback* convenience. Off the loopback it is an open
+        // server, and nothing about the startup output said so.
+        if master_key.is_none() && !is_loopback(&host) && env_opt("AGENT_PLATFORM_ALLOW_OPEN").is_none() {
+            return Err(format!(
+                "AGENT_PLATFORM_HOST={host} binds beyond the loopback with no \
+                 AGENT_PLATFORM_MASTER_KEY set, which serves every route to anyone who can \
+                 reach the port. Set a master key, or set AGENT_PLATFORM_ALLOW_OPEN=1 if that \
+                 is deliberate."
+            )
+            .into());
+        }
+
         Ok(Self {
-            host: env_opt("AGENT_PLATFORM_HOST").unwrap_or_else(|| "127.0.0.1".into()),
+            host,
             port: env_opt("AGENT_PLATFORM_PORT")
                 .map(|s| s.parse::<u16>())
                 .transpose()?
                 .unwrap_or(18410),
-            master_key: env_opt("AGENT_PLATFORM_MASTER_KEY"),
+            master_key,
             db_path: env_opt("AGENT_PLATFORM_DB_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("data/agent_platform.db")),
         })
     }
+}
+
+/// Whether a bind host is reachable only from this machine.
+///
+/// String-matched rather than parsed, because the two forms that are not
+/// addresses at all (`localhost`, and the empty host some launchers pass) have
+/// to pass too. Anything unrecognised is treated as exposed: guessing wrong in
+/// that direction refuses a startup, guessing wrong the other way opens a server.
+fn is_loopback(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.is_empty() || h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 pub fn env_opt(name: &str) -> Option<String> {
@@ -238,9 +267,40 @@ impl AppState {
 ///
 /// This used to answer from the Python child's liveness, and could report
 /// `down` for a daemon that was itself perfectly healthy. There is no child any
-/// more: if this handler runs at all, the server is up.
-async fn health() -> Response {
-    Json(json!({"status": "ok", "service": "agent-platform"})).into_response()
+/// more — but "this handler runs" is not the same as "this server can answer",
+/// because every route past `/health` needs the database. A process whose
+/// SQLite file has been deleted, locked or filled the disk kept reporting `ok`
+/// here and 500ing everywhere else, which is the one failure a liveness probe
+/// exists to catch. So it touches the database.
+///
+/// The query is `SELECT 1` on the pool, not a table read: it proves a
+/// connection can be opened, which is what fails, without depending on any
+/// schema this check would then have to be kept in step with.
+///
+/// It runs on `pool` rather than `any` because `pool` is the one carrying
+/// `busy_timeout(30s)`. The desktop polls this endpoint to decide whether to
+/// adopt a running server or start its own, and a `SQLITE_BUSY` returned
+/// immediately would read as "that server is dead" and spawn a second one
+/// against the same file.
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+    match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.pool).await {
+        Ok(_) => Json(json!({"status": "ok", "service": "agent-platform"})).into_response(),
+        Err(e) => {
+            logd!("health check could not reach the database: {e}");
+            // 503, so a container orchestrator and the desktop's
+            // attach-if-running check both read it as "not ready" rather than
+            // as a healthy server that happens to fail every request.
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "error",
+                    "service": "agent-platform",
+                    "detail": "database unavailable",
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// What the proxy fallback became. Shaped like every other error this server
@@ -388,10 +448,60 @@ pub async fn serve(cfg: Config) -> Result<(), BoxError> {
     logd!("listening on http://{addr}");
 
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
 
     Ok(())
+}
+
+/// Resolves on the first shutdown request the platform can send.
+///
+/// **SIGTERM is the one that matters and was missing.** `docker stop`,
+/// `systemctl stop` and a Kubernetes pod eviction all send SIGTERM and then
+/// SIGKILL after a grace period; a server listening only for Ctrl-C ignored the
+/// polite one and was killed by the second, dropping every in-flight SSE
+/// stream, DAG executor step and model-build stage mid-write. Ctrl-C stays
+/// because that is how a developer stops it in a terminal.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // A failure to install the handler must not become a server that
+        // cannot be stopped: fall back to Ctrl-C alone.
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                logd!("could not listen for SIGTERM, Ctrl-C only: {e}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    // Windows: `ctrl_c` covers Ctrl-C, Ctrl-Break and the console close button.
+    // A `taskkill /F` is not catchable by anything, here or in Python.
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+
+    logd!("shutdown signal received; draining in-flight requests");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard in [`Config::from_env`] turns on this predicate, and getting it
+    /// wrong in the permissive direction publishes an unauthenticated server.
+    #[test]
+    fn only_loopback_hosts_read_as_loopback() {
+        for host in ["127.0.0.1", "127.9.9.9", "localhost", "LOCALHOST", "::1", "[::1]", " 127.0.0.1 ", ""] {
+            assert!(is_loopback(host), "{host:?} is loopback");
+        }
+        for host in ["0.0.0.0", "192.168.1.10", "::", "[::]", "example.com", "10.0.0.1"] {
+            assert!(!is_loopback(host), "{host:?} is not loopback");
+        }
+    }
 }
