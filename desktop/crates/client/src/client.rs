@@ -10,8 +10,11 @@ use serde_json::Value;
 pub enum Error {
     /// Transport-level failure (connect, timeout, body read).
     Http(reqwest::Error),
-    /// Non-2xx response; message extracted from the `{"detail": ...}` body when present.
-    Api { status: u16, message: String, body: Option<Value> },
+    /// Non-2xx response; message extracted from the `{"detail": ...}` body when
+    /// present. `trace` is the `x-request-id` the response carried (see
+    /// `desktop/crates/server/src/request_id.rs`) — both servers log every
+    /// request under it, so it is what the Logs screen's trace filter needs.
+    Api { status: u16, message: String, body: Option<Value>, trace: Option<String> },
     /// 2xx response whose body did not match the expected shape.
     Decode { message: String },
 }
@@ -19,8 +22,30 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // These strings are shown to the user verbatim — every screen's
+            // error banner is `e.to_string()`. reqwest's own Display for a
+            // refused connection is "error sending request for url (…)", which
+            // says nothing about the one thing that happened: the server is not
+            // up. The rest keep reqwest's wording, which is specific enough.
+            Error::Http(e) if e.is_timeout() => {
+                write!(f, "The server did not answer in time")
+            }
+            Error::Http(e) if e.is_connect() => match e.url() {
+                Some(url) => {
+                    write!(f, "Cannot reach the server at {}", url.origin().ascii_serialization())
+                }
+                None => write!(f, "Cannot reach the server"),
+            },
             Error::Http(e) => write!(f, "{e}"),
-            Error::Api { status, message, .. } => write!(f, "HTTP {status}: {message}"),
+            Error::Api { status, message, trace, .. } => {
+                write!(f, "HTTP {status}: {message}")?;
+                if let Some(id) = trace {
+                    // `ui::alert_error_traced` parses this suffix back off to
+                    // offer a "View logs" button — keep the two in sync.
+                    write!(f, " · trace {id}")?;
+                }
+                Ok(())
+            }
             Error::Decode { message } => write!(f, "decode error: {message}"),
         }
     }
@@ -35,6 +60,12 @@ impl From<reqwest::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The `x-request-id` a response carried — both servers set it on every
+/// response, matched or proxied, per `request_id.rs`.
+fn trace_id(resp: &reqwest::Response) -> Option<String> {
+    resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()).map(str::to_string)
+}
 
 pub(crate) fn detail_message(body: &Value) -> String {
     match body.get("detail") {
@@ -90,13 +121,14 @@ impl Client {
 
     async fn handle<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
         let status = resp.status();
+        let trace = trace_id(&resp);
         let text = resp.text().await?;
         if !status.is_success() {
             let body: Option<Value> = serde_json::from_str(&text).ok();
             let message = body.as_ref().map(detail_message).unwrap_or_else(|| {
                 if text.is_empty() { "Request failed".to_string() } else { text.clone() }
             });
-            return Err(Error::Api { status: status.as_u16(), message, body });
+            return Err(Error::Api { status: status.as_u16(), message, body, trace });
         }
         let text = if text.is_empty() { "{}" } else { &text };
         serde_json::from_str(text).map_err(|e| Error::Decode { message: e.to_string() })
@@ -282,6 +314,13 @@ impl Client {
         Self::handle(resp).await
     }
 
+    /// The server's own OpenAPI document — the whole REST surface, including the
+    /// routes `agent-platformd` answers itself: Python still declares them, and
+    /// the daemon proxies this path to it.
+    pub async fn openapi(&self) -> Result<Value> {
+        self.get_json("/openapi.json").await
+    }
+
     // -- Model-ops ------------------------------------------------------------
 
     pub async fn model_projects(&self) -> Result<ModelProjectsResponse> {
@@ -358,11 +397,12 @@ impl Client {
             .send()
             .await?;
         let status = resp.status();
+        let trace = trace_id(&resp);
         if !status.is_success() {
             let text = resp.text().await?;
             let body: Option<Value> = serde_json::from_str(&text).ok();
             let message = body.as_ref().map(detail_message).unwrap_or(text);
-            return Err(Error::Api { status: status.as_u16(), message, body });
+            return Err(Error::Api { status: status.as_u16(), message, body, trace });
         }
         Ok(resp.bytes().await?.to_vec())
     }
@@ -400,6 +440,52 @@ impl Client {
         self.delete_json::<serde::de::IgnoredAny>(&format!("/api/v1/todos/items/{id}"))
             .await
             .map(|_| ())
+    }
+
+    // -- Coder agent -----------------------------------------------------------
+
+    /// Open a coder session. The id is needed *before* the first turn streams:
+    /// answering a delegated tool call is addressed by `(thread_id, call_id)`,
+    /// and the id would otherwise only arrive with the turn that already needs it.
+    pub async fn create_coder_thread(
+        &self,
+        workspace_root: &str,
+    ) -> Result<CoderThreadCreateOut> {
+        self.post_json(
+            "/api/v1/coder/chat/threads",
+            &serde_json::json!({ "workspace_root": workspace_root }),
+        )
+        .await
+    }
+
+    pub async fn coder_threads(&self) -> Result<CoderThreadsListOut> {
+        self.get_json("/api/v1/coder/chat/threads").await
+    }
+
+    /// One thread with its full history, for reopening a past session.
+    pub async fn coder_thread(&self, id: i64) -> Result<CoderThreadOut> {
+        self.get_json(&format!("/api/v1/coder/chat/thread?thread_id={id}")).await
+    }
+
+    pub async fn delete_coder_thread(&self, id: i64) -> Result<()> {
+        self.delete_json::<serde::de::IgnoredAny>(&format!("/api/v1/coder/chat/thread/{id}"))
+            .await
+            .map(|_| ())
+    }
+
+    /// Hand back what a delegated tool call produced on this machine. The agent
+    /// turn is parked on this until it lands.
+    pub async fn coder_tool_result(&self, thread_id: i64, call_id: &str, result: &str) -> Result<()> {
+        self.post_json::<serde::de::IgnoredAny>(
+            "/api/v1/coder/chat/tool-result",
+            &serde_json::json!({
+                "thread_id": thread_id,
+                "call_id": call_id,
+                "result": result,
+            }),
+        )
+        .await
+        .map(|_| ())
     }
 
     // -- Personal assistant ----------------------------------------------------
@@ -449,6 +535,76 @@ impl Client {
     pub async fn assistant_dismiss_review(&self, review: i64) -> Result<Value> {
         self.post_json(&format!("/api/v1/assistant/reviews/{review}/dismiss"), &serde_json::json!({}))
             .await
+    }
+
+    // -- Personal assistant: the planning chat ---------------------------------
+
+    pub async fn assistant_threads(&self, project: i64) -> Result<AssistantThreadsResponse> {
+        self.get_json(&format!("/api/v1/assistant/chat/threads?project_id={project}")).await
+    }
+
+    /// A fresh thread. Without this, `assistant_thread(project, None)` opens the
+    /// most recently touched one — there is no "send into a new thread" flag.
+    pub async fn assistant_new_thread(&self, project: i64) -> Result<AssistantThreadCreated> {
+        self.post_json(
+            &format!("/api/v1/assistant/chat/threads?project_id={project}"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// `None` opens the most recently updated thread, creating one if the project
+    /// has never been chatted to.
+    pub async fn assistant_thread(
+        &self,
+        project: i64,
+        thread: Option<i64>,
+    ) -> Result<AssistantChatThread> {
+        let mut path = format!("/api/v1/assistant/chat/thread?project_id={project}");
+        if let Some(id) = thread {
+            path.push_str(&format!("&thread_id={id}"));
+        }
+        self.get_json(&path).await
+    }
+
+    /// One LLM turn: routes to a domain profile, plans board actions, replies.
+    /// Slow — minutes on a local model.
+    pub async fn assistant_chat_send(
+        &self,
+        project: i64,
+        body: &AssistantChatSend,
+    ) -> Result<AssistantChatThread> {
+        self.post_json(&format!("/api/v1/assistant/chat/send?project_id={project}"), body).await
+    }
+
+    /// Drops everything after `message_index` and regenerates from that user turn.
+    pub async fn assistant_chat_retry(
+        &self,
+        project: i64,
+        body: &AssistantChatRetry,
+    ) -> Result<AssistantChatThread> {
+        self.post_json(&format!("/api/v1/assistant/chat/retry?project_id={project}"), body).await
+    }
+
+    /// Saves the answers (to the domain profile, or as a chat turn for a
+    /// clarifying form) and continues the conversation from them.
+    pub async fn assistant_submit_form(
+        &self,
+        project: i64,
+        body: &AssistantFormSubmit,
+    ) -> Result<AssistantChatThread> {
+        self.post_json(&format!("/api/v1/assistant/chat/submit-form?project_id={project}"), body)
+            .await
+    }
+
+    /// Applies proposed actions to the assistant's board. An empty `actions`
+    /// dismisses the proposal instead.
+    pub async fn assistant_apply_actions(
+        &self,
+        project: i64,
+        body: &AssistantApplyBody,
+    ) -> Result<AssistantApplyResult> {
+        self.post_json(&format!("/api/v1/assistant/chat/apply?project_id={project}"), body).await
     }
 
     // -- LLM providers ---------------------------------------------------------
@@ -522,6 +678,26 @@ mod tests {
             "a; b"
         );
         assert_eq!(detail_message(&serde_json::json!({})), "Request failed");
+    }
+
+    /// Every screen renders `Error::to_string()` straight into its banner, so
+    /// this string is user copy. A dead port is the case the user actually hits
+    /// (the app races the daemon's startup), and reqwest's own wording for it —
+    /// "error sending request for url (…)" — describes the library, not the
+    /// problem.
+    #[tokio::test]
+    async fn a_refused_connection_reads_as_a_server_that_is_not_up() {
+        // Port 1 is privileged and unbound: connect fails without a timeout wait.
+        let err = Client::new("http://127.0.0.1:1", "k")
+            .projects()
+            .await
+            .expect_err("nothing is listening on port 1");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Cannot reach the server at http://127.0.0.1:1"),
+            "unhelpful transport error reached the user: {message}"
+        );
+        assert!(!message.contains("error sending request"));
     }
 
     #[test]

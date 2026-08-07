@@ -61,6 +61,15 @@ pub fn backoff(attempt: u32) -> Duration {
 /// payloads of every complete (blank-line-terminated) frame; leftover bytes
 /// stay in `buf`. Keep-alive comment lines are dropped.
 pub fn drain_frames(buf: &mut String) -> Vec<String> {
+    drain_named_frames(buf).into_iter().map(|(_, data)| data).collect()
+}
+
+/// The same drain, keeping each payload's `event:` name — empty for the
+/// data-only frames the process and chat routes emit. The coder route is the
+/// one that names its events (`tool_call`, `approval_required`, …), and the
+/// name is the whole meaning there: the payloads are otherwise
+/// indistinguishable JSON objects.
+pub fn drain_named_frames(buf: &mut String) -> Vec<(String, String)> {
     let mut out = Vec::new();
     // Normalize CRLF so frame splitting only deals with \n\n.
     while let Some(pos) = buf.find("\r\n") {
@@ -69,9 +78,16 @@ pub fn drain_frames(buf: &mut String) -> Vec<String> {
     while let Some(pos) = buf.find("\n\n") {
         let frame: String = buf[..pos].to_string();
         buf.drain(..pos + 2);
+        // The name leads its frame, so one pass collecting it first keeps the
+        // payload loop below in order.
+        let name = frame
+            .lines()
+            .find_map(|l| l.strip_prefix("event:"))
+            .map(|n| n.trim().to_string())
+            .unwrap_or_default();
         for line in frame.lines() {
             if let Some(data) = line.strip_prefix("data:") {
-                out.push(data.strip_prefix(' ').unwrap_or(data).to_string());
+                out.push((name.clone(), data.strip_prefix(' ').unwrap_or(data).to_string()));
             }
             // lines starting with ':' are keep-alives; anything else is ignored
         }
@@ -455,6 +471,153 @@ impl StreamState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Coder agent
+// ---------------------------------------------------------------------------
+
+/// One event from the coder agent's SSE routes (`app/coder/routes.py`).
+///
+/// Unlike [`chat_stream`] these are *named* frames carrying whole messages: the
+/// coder loop buffers each LLM step before emitting it, so there are no token
+/// deltas to accumulate. Events the app has no use for (`heartbeat`, `title`,
+/// `context_usage`) are dropped rather than modelled.
+#[derive(Debug, Clone)]
+pub enum CoderEvent {
+    /// A complete assistant turn. Two can arrive per round: the reasoning the
+    /// model wrote before deciding to call a tool, then the final answer.
+    Assistant(String),
+    /// The tool-free plan the model wrote before the loop started, when the turn
+    /// asked for one. Persisted server-side as a plain assistant message, so a
+    /// reopened session renders it as one — this event exists only so the live
+    /// stream can tell it apart from an answer.
+    Plan(String),
+    /// The agent has issued a call and — under `delegate_tools` — is now blocked
+    /// waiting for this machine to run it and POST the result back. Answering it
+    /// is not optional: the server gives up after 300s.
+    ToolCall { call_id: String, name: String, arguments: serde_json::Value },
+    /// What the call returned, as the model will see it.
+    ToolResult { name: String, content: String },
+    /// A `run_command` call paused for a human decision. The turn is over until
+    /// `/coder/chat/approve` resumes it — no further events arrive on this
+    /// stream.
+    ApprovalRequired { call_id: String, name: String, arguments: serde_json::Value },
+    Failed(String),
+    Done,
+}
+
+fn coder_event(name: &str, payload: &str) -> Option<CoderEvent> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let str_at = |k: &str| v.get(k).and_then(|s| s.as_str()).unwrap_or_default().to_string();
+    let args = || v.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+    match name {
+        "assistant" => Some(CoderEvent::Assistant(str_at("content"))),
+        "plan" => Some(CoderEvent::Plan(str_at("content"))),
+        "tool_call" => Some(CoderEvent::ToolCall {
+            call_id: str_at("call_id"),
+            name: str_at("name"),
+            arguments: args(),
+        }),
+        "tool_result" => {
+            Some(CoderEvent::ToolResult { name: str_at("name"), content: str_at("content") })
+        }
+        "approval_required" => Some(CoderEvent::ApprovalRequired {
+            call_id: str_at("call_id"),
+            name: str_at("name"),
+            arguments: args(),
+        }),
+        "error" => Some(CoderEvent::Failed(detail_message(&v))),
+        "done" => Some(CoderEvent::Done),
+        _ => None,
+    }
+}
+
+/// Stream one of the coder agent's SSE routes — `/coder/chat/stream`,
+/// `/chat/retry` or `/chat/approve`, which differ only in their request body.
+///
+/// Never reconnects, for [`chat_stream`]'s reason: an agent turn is not
+/// resumable, and a silent retry would re-run every tool call in it.
+pub fn coder_stream(
+    client: Client,
+    path: &'static str,
+    body: serde_json::Value,
+) -> impl Stream<Item = CoderEvent> {
+    futures::stream::unfold(CoderState::Start(client, path, Box::new(body)), |st| async move {
+        match st {
+            CoderState::Start(client, path, body) => {
+                let url = client.url(path);
+                let resp = client
+                    .authed(
+                        client
+                            .http()
+                            .post(url)
+                            .header("Accept", "text/event-stream")
+                            // What puts the tools on this machine: the server
+                            // picks `DesktopDelegatedExecutor` off this header
+                            // (see `coder/desktop_executor.py`).
+                            .header("X-Agent-Platform-Client", "portal-desktop")
+                            .json(&*body),
+                    )
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        let conn =
+                            CurrentConn { stream: Box::pin(r.bytes_stream()), buf: String::new() };
+                        Some((None, CoderState::Reading(Box::new(conn), Default::default())))
+                    }
+                    Ok(r) => {
+                        let status = r.status().as_u16();
+                        let text = r.text().await.unwrap_or_default();
+                        let msg = serde_json::from_str::<serde_json::Value>(&text)
+                            .map(|v| detail_message(&v))
+                            .unwrap_or(text);
+                        Some((
+                            Some(CoderEvent::Failed(format!("HTTP {status}: {msg}"))),
+                            CoderState::End,
+                        ))
+                    }
+                    Err(e) => Some((Some(CoderEvent::Failed(e.to_string())), CoderState::End)),
+                }
+            }
+            CoderState::Reading(mut conn, mut pending) => {
+                if let Some(item) = pending.pop_front() {
+                    let done = matches!(item, CoderEvent::Done | CoderEvent::Failed(_));
+                    let next =
+                        if done { CoderState::End } else { CoderState::Reading(conn, pending) };
+                    return Some((Some(item), next));
+                }
+                match conn.stream.next().await {
+                    Some(Ok(chunk)) => {
+                        conn.buf.push_str(&String::from_utf8_lossy(&chunk));
+                        for (name, payload) in drain_named_frames(&mut conn.buf) {
+                            if let Some(ev) = coder_event(&name, &payload) {
+                                pending.push_back(ev);
+                            }
+                        }
+                        Some((None, CoderState::Reading(conn, pending)))
+                    }
+                    Some(Err(e)) => Some((Some(CoderEvent::Failed(e.to_string())), CoderState::End)),
+                    // The body closed without `done`. An approval pause looks
+                    // exactly like this from here, so end the stream quietly
+                    // rather than reporting a failure the user cannot act on.
+                    None => {
+                        pending.push_back(CoderEvent::Done);
+                        Some((None, CoderState::Reading(conn, pending)))
+                    }
+                }
+            }
+            CoderState::End => None,
+        }
+    })
+    .filter_map(|item| async move { item })
+}
+
+enum CoderState {
+    Start(Client, &'static str, Box<serde_json::Value>),
+    Reading(Box<CurrentConn>, std::collections::VecDeque<CoderEvent>),
+    End,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +628,42 @@ mod tests {
         let frames = drain_frames(&mut buf);
         assert_eq!(frames, vec!["{\"a\":1}"]);
         assert_eq!(buf, "data: partial");
+    }
+
+    #[test]
+    fn named_frames_keep_their_event_and_hold_a_split_one_back() {
+        let mut buf = "event: tool_call\ndata: {\"name\":\"read_file\"}\n\nevent: don".to_string();
+        let frames = drain_named_frames(&mut buf);
+        assert_eq!(frames, vec![("tool_call".to_string(), "{\"name\":\"read_file\"}".to_string())]);
+        assert_eq!(buf, "event: don", "a half-arrived frame waits for the rest");
+        // Data-only frames (processes, chat) still parse, with an empty name.
+        let mut buf = "data: {\"a\":1}\n\n".to_string();
+        assert_eq!(drain_named_frames(&mut buf)[0].0, "");
+    }
+
+    #[test]
+    fn a_tool_call_carries_what_the_desktop_needs_to_answer_it() {
+        let ev = coder_event(
+            "tool_call",
+            r#"{"call_id":"c1","name":"read_file","arguments":{"path":"src/a.rs"}}"#,
+        )
+        .unwrap();
+        match ev {
+            CoderEvent::ToolCall { call_id, name, arguments } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(name, "read_file");
+                assert_eq!(arguments["path"], "src/a.rs");
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+        // Events with no desktop meaning are dropped rather than surfaced as
+        // empty assistant turns.
+        assert!(coder_event("heartbeat", r#"{"elapsed":1}"#).is_none());
+        assert!(coder_event("assistant", "not json").is_none());
+        assert!(matches!(
+            coder_event("error", r#"{"detail":"boom"}"#),
+            Some(CoderEvent::Failed(m)) if m == "boom"
+        ));
     }
 
     #[test]

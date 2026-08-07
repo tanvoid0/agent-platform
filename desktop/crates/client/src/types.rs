@@ -630,6 +630,51 @@ pub struct EnvSaveResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Coder agent (mirrors app/coder/schemas.py)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoderThreadCreateOut {
+    pub thread_id: i64,
+    pub title: String,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoderThreadSummary {
+    pub id: i64,
+    pub title: String,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub message_count: i64,
+    #[serde(default)]
+    pub preview: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoderThreadsListOut {
+    pub threads: Vec<CoderThreadSummary>,
+}
+
+/// One thread with its whole history. `messages` stays `Value`: it is the raw
+/// OpenAI-shaped log (user / assistant-with-`tool_calls` / tool), and the
+/// desktop rebuilds its transcript from it rather than the server inventing a
+/// second shape for the same thing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoderThreadOut {
+    pub thread_id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<Value>,
+}
+
+// ---------------------------------------------------------------------------
 // Workflows (mirrors app/workflows/schemas.py)
 // ---------------------------------------------------------------------------
 
@@ -818,13 +863,24 @@ pub struct AssistantStats {
     pub habits_due_count: i64,
 }
 
-/// One action a review proposes; applied as a batch, not individually.
-#[derive(Debug, Clone, Deserialize)]
+/// One action the assistant proposes. `parameters` is carried opaquely because
+/// applying an action means handing the server back the *same* object it sent —
+/// seventeen action ids with seventeen parameter shapes, none of which this
+/// client has any reason to understand.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PlannedAction {
     pub action_id: String,
     pub name: String,
     #[serde(default)]
+    pub parameters: Value,
+    #[serde(default = "one")]
+    pub confidence: f64,
+    #[serde(default)]
     pub reasoning: Option<String>,
+}
+
+fn one() -> f64 {
+    1.0
 }
 
 /// A pending review. `POST /reviews/run` returns the same fields under
@@ -842,4 +898,168 @@ pub struct AssistantReview {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssistantReviewsResponse {
     pub reviews: Vec<AssistantReview>,
+}
+
+// -- Personal assistant: the planning chat -----------------------------------
+
+/// A thread in the sidebar picker. `preview` is the last thing *the user* said,
+/// which is what makes one thread tellable from another.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssistantThreadSummary {
+    pub id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub message_count: i64,
+    #[serde(default)]
+    pub preview: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssistantThreadsResponse {
+    #[serde(default)]
+    pub threads: Vec<AssistantThreadSummary>,
+}
+
+/// `POST /assistant/chat/threads` — the only route that answers with a bare id
+/// rather than a thread body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssistantThreadCreated {
+    pub thread_id: i64,
+}
+
+/// One stored turn. `proposed_actions` is the snapshot of what the assistant
+/// offered *at that point in the thread*, and `proposal_status` says what became
+/// of it (`pending`, `approved`, `dismissed`, `superseded`) — so a reopened
+/// thread shows a decision that was already taken as taken.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssistantChatMessage {
+    pub role: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub proposed_actions: Vec<PlannedAction>,
+    #[serde(default)]
+    pub proposal_status: Option<String>,
+}
+
+/// One control in a planning form. `kind` is one of `boolean`, `single_select`,
+/// `multi_select`, `text`, `textarea` — anything else renders as text, because a
+/// field the client cannot draw must still be answerable.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanningFormField {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    #[serde(default, rename = "helpText")]
+    pub help_text: Option<String>,
+    /// Prefilled from the stored profile, so a re-asked field is not re-typed.
+    #[serde(default)]
+    pub default: Option<Value>,
+}
+
+/// The intake or clarifying form an action asked for. `purpose == "clarifying"`
+/// means the answers go back as a chat turn; anything else saves to the domain
+/// profile first.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanningForm {
+    #[serde(default)]
+    pub purpose: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub fields: Vec<PlanningFormField>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ContextUsage {
+    #[serde(default)]
+    pub context_window: i64,
+    #[serde(default)]
+    pub total_estimated: i64,
+    #[serde(default)]
+    pub percent_used: f64,
+}
+
+/// One type for five routes. `GET /chat/thread`, `POST /chat/send`, `/retry` and
+/// `/submit-form` all answer with a thread and differ only in which extras they
+/// carry, so every field that is not universal defaults.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AssistantChatThread {
+    #[serde(default)]
+    pub thread_id: Option<i64>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<AssistantChatMessage>,
+    #[serde(default)]
+    pub pending_actions: Vec<PlannedAction>,
+    #[serde(default)]
+    pub pending_form: Option<PlanningForm>,
+    #[serde(default)]
+    pub context_usage: Option<ContextUsage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AssistantChatSend {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AssistantChatRetry {
+    pub thread_id: i64,
+    pub message_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AssistantFormSubmit {
+    pub domain: String,
+    pub answers: HashMap<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<i64>,
+    pub auto_continue: bool,
+}
+
+/// Applying an empty action list is how a proposal is *dismissed* — the server
+/// resolves the thread's pending snapshot either way.
+#[derive(Debug, Clone, Serialize)]
+pub struct AssistantApplyBody {
+    pub actions: Vec<PlannedAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<i64>,
+    pub auto_continue: bool,
+}
+
+/// What the board did. Read even though the thread is refetched right after:
+/// the auto-continue turn that would have narrated this is allowed to fail, and
+/// then this is the only record the user gets.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AssistantApplyResult {
+    #[serde(default)]
+    pub applied: Vec<String>,
+    #[serde(default)]
+    pub skipped: Vec<String>,
+    #[serde(default)]
+    pub guidance: Vec<String>,
+    /// The turn the assistant took *about* the apply. Present means the summary
+    /// is already in the transcript and does not need repeating; the body itself
+    /// is not read, because the thread is refetched anyway.
+    #[serde(default)]
+    pub continuation: Option<Value>,
 }
