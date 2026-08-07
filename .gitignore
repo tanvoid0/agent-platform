@@ -35,3 +35,9 @@ desktop/payload/*
 
 # Piper voice models (60 MB+ each; download per README)
 services/speech-service/voices/
+
+# SQLite's WAL sidecars. The .db beside them is tracked on purpose; these two
+# are regenerated whenever anything opens it, so they only ever show up as noise
+# in `git status` after a test run.
+*.db-wal
+*.db-shm

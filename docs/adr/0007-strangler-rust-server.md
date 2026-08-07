@@ -63,18 +63,20 @@ screen in `crates/app` stay untouched per migration.
    (WAL + `busy_timeout`), but a table written by both Python and Rust is where
    invariants diverge silently. A domain moves whole or not at all.
 
-   **Todos is a knowing exception, taken 2026-08-05.** Its CRUD is in Rust while
-   `items/{id}/agent/*`, `planning-form/submit` and `spawn-process` stay in
-   Python, because they run through the LLM proxy and the orchestrator. Those
-   Python routes write `todo_items` and `todo_item_events`, so that table now has
-   two writers. The call was Benson's: visible progress over waiting for
-   `llm_proxy`. Workflows is split the same way — `run` (the engine) and
-   `assist` (the LLM) stay in Python, and Rust reads `workflow_runs` without
-   writing it except on delete. What bounds the damage is that Rust writes one column per
-   statement and never a whole row, so a rename cannot clobber an agent's
-   `plan_json`; the reverse is still possible, because SQLAlchemy flushes whole
-   rows. The exception ends when `llm_proxy` moves. Nothing else gets this
-   treatment without the same explicit call.
+   **Todos was a knowing exception, taken 2026-08-05 and closed 2026-08-06.** Its
+   CRUD went to Rust while `items/{id}/agent/*`, `planning-form/submit` and
+   `spawn-process` stayed in Python, because they run through the LLM proxy and
+   the orchestrator — so `todo_items` had two writers. The call was Benson's:
+   visible progress over waiting for `llm_proxy`. What bounded the damage is that
+   Rust writes one column per statement and never a whole row, so a rename cannot
+   clobber an agent's `plan_json`; the reverse was possible, because SQLAlchemy
+   flushes whole rows.
+
+   The exception lasted one day. Workflows, todos and processes are all whole,
+   and `todo_items` has a single writer again. The rule stands unamended:
+   nothing else gets this treatment without the same explicit call, and the thing
+   that made it survivable — one column per statement — is now house style rather
+   than a concession.
 
    Two clarifications the projects slice forced. A route that only *reads*
    another domain's table is not part of this domain and stays proxied
@@ -125,9 +127,9 @@ screen in `crates/app` stay untouched per migration.
 |---|--------|----------|
 | 1 | auth (`api_auth.py`, `api_tokens/`) | every other slice needs the principal; the proxy must reject before forwarding |
 | 2 | `/health`, `/` | zero coupling — the only two routes that depend on no Python-owned fact |
-| 3 | projects ✅, teams ✅, todo CRUD ✅, workflow CRUD ✅ (the last two split — see below) | leaf tables, no LLM, ~1.5k LOC |
-| 4 | `llm_proxy/` | ~3k LOC; also where `local_llm.rs` moves so the cloud binary gets in-process inference |
-| 5 | processes / orchestrator / action_orchestrator | FastAPI `BackgroundTasks` + `asyncio.create_task` → tokio; needs a `startup_recovery` equivalent |
+| 3 | projects ✅, teams ✅, todos ✅, workflows ✅ — all whole | leaf tables, no LLM, ~1.5k LOC |
+| 4 | `llm_proxy/` ✅ | ~3k LOC; also where `local_llm.rs` moves so the cloud binary gets in-process inference |
+| 5 | processes / orchestrator / action_orchestrator ✅ | `BackgroundTasks` + `asyncio.create_task` became four fire-and-forget `tokio::spawn`s; `startup_recovery` has its equivalent and the child runs with `AGENT_PLATFORM_RESUME_ON_STARTUP=0` |
 | 6 | assistant, chat, coder | largest and highest-churn |
 | 7 | `system_routes` | an aggregator, so it can only be last — see below |
 
@@ -184,6 +186,21 @@ a 404.
 - The in-memory rate limiter is per-process, so it now counts in two places. Both
   count every request, so the effective limit is unchanged, but both must be
   restarted together to reset a window.
+- **API-token usage counters have two writers until coder *and playground* land.**
+  `record_api_token_usage` is a read-modify-write, and the Rust DAG executor now
+  increments `api_tokens` / `api_token_usage_daily` while six Python routes still
+  do — `/coder/chat/{send,stream,retry,approve}` and
+  `/playground/chat/{send,stream}`. Rust uses `SET x = x + 1`; Python's
+  read-then-write is the half that can lose an increment. Only a project-scoped
+  token is exposed — master-key callers short-circuit on `token_id is None`.
+  **The assistant is not a writer**: its call site passes a literal `None` and
+  returns without touching a row. Both facts came from scoping, not a bug report,
+  and the second means playground has to be scheduled — the ordering in `plan.md`
+  never named it.
+- **`assistant_domain_profiles` has had two writers since `agent/apply` landed**,
+  which the todos slice did not record at the time: `merge_profile` in Python and
+  `todos.rs::merge_domain_profile` in Rust, both read-modify-write. It closes with
+  the assistant slice.
 - `last_used_at` is written by whichever process terminates the request. For proxied
   routes that stays Python.
 - **Postgres is not supported by the Rust server yet.** Slice 1 is SQLite-only
@@ -197,8 +214,24 @@ a 404.
   reached us on". That is the one Python change this slice needed.
 - **A proxied route inside a migrated prefix has to be declared.**
   `POST /workflows/assist` matches `/workflows/{workflow_id}`, so leaving it out
-  gave a `405` instead of falling through to Python. Routing a path explicitly at
-  `proxy::forward` is how a route stays with Python inside a prefix Rust owns.
+  gave a `405` instead of falling through to Python — it was declared at
+  `proxy::forward` until it migrated in its own right. Routing a path explicitly
+  is how a route stays with Python inside a prefix Rust owns; `spawn-process` is
+  the one still doing it.
+- **The `/v1` cutover, taken 2026-08-06.** The daemon starts its child with
+  `LLM_ORCHESTRATOR_BASE_URL` pointing back at the public origin and
+  `AGENT_PLATFORM_V1_ROUTER=0`, so the nine proxy routes have exactly one
+  implementation and every internal caller — planner, subagents, coder,
+  assistant, `tool_handlers` — reaches it through Rust. Python keeps the package
+  imported (eight modules use `llm_proxy.core` in process) and keeps serving
+  `/v1` when it runs standalone, which is what leaves the five pytest files that
+  exercise those routes working. The cost is one loopback hop per internal call
+  and a shared fate: a Rust `/v1` regression now takes the orchestrator with it.
+- **Handlers inside the daemon do not take that hop.** `llm::complete_internal`
+  is the `/v1/chat/completions` code path without the socket, and it is what
+  `workflows/assist` and `todos agent/chat` call. Its errors carry the status the
+  public route would have answered with, so a handler can map them exactly as its
+  Python counterpart mapped an HTTP response.
 - **Path params reject like FastAPI, via `error::PathId`.** axum answers
   `/todos/items/abc` with a plain-text `400`; FastAPI answers `422` with the
   validation envelope naming the parameter. Every migrated route with an id was
