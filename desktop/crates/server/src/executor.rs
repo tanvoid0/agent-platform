@@ -38,7 +38,7 @@
 //!
 //! - **`record_api_token_usage` writes `SET x = x + 1`** where Python does a
 //!   read-modify-write. Rust's is the safe one; Python's is not, and
-//!   `assistant/`, `coder/` and `playground/` still call it from that side until
+//!   `assistant/`, `coder/` and `playground/` still called it from that side until
 //!   step 4 — so the lost-update window this step opens is theirs, not ours.
 //! - **Error text.** Python's `LLM*Error` messages come from `llm_client.py`'s
 //!   HTTP layer, which is not ported; `llm::complete_internal` carries its own.
@@ -819,13 +819,14 @@ async fn append_event(
 ///
 /// Python reads the row, mutates the object and commits — a lost update whenever
 /// two writers overlap. Rust's increment is atomic, which does **not** rescue
-/// the pair: `assistant/`, `coder/` and `playground/` still call the Python one
-/// with the same token until step 4, so a project-scoped token driving both at
-/// once can still lose Python's side of a concurrent bump. That window closes
-/// when those three move, not here.
+/// the pair — while Python could still reach it. **That window is closed as of
+/// 2026-08-07**: coder moved to Rust, playground was deleted rather than ported,
+/// and the assistant's call site passes a literal `None`. The four remaining
+/// Python importers all sit behind routes Rust now owns, so nothing on that side
+/// increments these rows any more.
 ///
 /// Master-key callers have no `token_id` and are not tracked at all.
-async fn record_api_token_usage(
+pub(crate) async fn record_api_token_usage(
     state: &AppState,
     token_id: Option<i64>,
     tokens: i64,

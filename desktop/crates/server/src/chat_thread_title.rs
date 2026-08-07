@@ -1,27 +1,28 @@
 //! Parallel smart-title generation for chat threads. Port of the non-SSE half of
 //! `app/chat_thread_title.py`.
 //!
-//! **Addition, not a deletion.** `chat_thread_title.py` keeps three importers
-//! (`assistant/services/assistant_chat.py`, `coder/service.py`,
-//! `playground/service.py`), so it stays in Python whatever moves here. This
-//! file lands before either half of step 4 because all three of those domains
-//! need it and none of it touches SQL.
+//! **Addition, not a deletion.** `chat_thread_title.py` keeps two importers
+//! (`assistant/services/assistant_chat.py` and `coder/service.py`), so it stays
+//! in Python whatever moves here. This file landed before either half of step 4
+//! because both of those domains need it and none of it touches SQL.
 //!
 //! # What is deliberately not here
 //!
-//! **`merge_title_sse_events` (`chat_thread_title.py:137-199`) is not ported.**
-//! It is coder- and playground-only — the assistant has no streaming route at
-//! all — and it is the one function in the module with real machinery
-//! (two workers, a queue, cancellation on drop). It belongs in the coder commit,
-//! next to the SSE framing it interleaves into, not here where it would sit
-//! uncalled. Its non-SSE dependencies are all in this file:
+//! **`merge_title_sse_events` (`chat_thread_title.py:137-199`) is not ported,
+//! and the coder commit found it never needs to be.** Its queue and two workers
+//! exist to interleave one late frame into a stream; a
+//! `tokio::sync::mpsc::UnboundedSender` cloned to the title task *is* that
+//! merge, and "keep waiting for the title after the source closes" falls out of
+//! the channel closing when the last sender drops. See
+//! `coder::spawn_title_worker`. Its non-SSE dependencies are all in
+//! this file:
 //! [`await_smart_title`] is the same resolve-or-fall-back it does inline, and
 //! `format_sse_event` is one `format!`.
 //!
 //! **Persistence is the caller's.** Python's `await_smart_title` also runs
-//! `persist_thread_title`, which writes whichever of `assistant_chat_threads`,
-//! `coder_chat_threads` or `playground_chat_threads` the caller owns — three
-//! different tables, so there is nothing shared to port. [`await_smart_title`]
+//! `persist_thread_title`, which writes whichever of `assistant_chat_threads`
+//! or `coder_chat_threads` the caller owns — different tables, so there is
+//! nothing shared to port. [`await_smart_title`]
 //! returns the resolved title and the caller keeps Python's guard: write the row
 //! only when `thread.title.unwrap_or("") != final`, touching `updated_at` with
 //! it.

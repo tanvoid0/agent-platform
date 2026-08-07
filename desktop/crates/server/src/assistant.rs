@@ -1438,7 +1438,7 @@ async fn reviews_run(
 
     let goal = "Review the user's progress and propose plan adjustments. Focus on overdue items, \
                 habit consistency, and sustainable next steps.";
-    let (planned, thought, _usage) = decide_actions(&state, goal, &context, &actions, &llm_model).await;
+    let (planned, thought, _usage) = decide_actions(&state, goal, &context, &actions, &[], &llm_model).await;
 
     let now = sql_now();
     let summary = thought.unwrap_or_else(|| "Progress review complete.".to_string());
@@ -2643,7 +2643,7 @@ async fn generate_assistant_turn(
         );
 
         let (planned, decided_thought, decide_steps) =
-            decide_actions(state, message, &turn_context, &actions, &llm_model).await;
+            decide_actions(state, message, &turn_context, &actions, &[], &llm_model).await;
         usage_steps.extend(decide_steps);
         thought = decided_thought;
 

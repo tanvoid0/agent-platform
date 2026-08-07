@@ -9,7 +9,9 @@ name = "agent-platformd"
 path = "src/main.rs"
 
 [dependencies]
-axum = "0.8"
+# `multipart` for the two model-ops upload routes; nothing else in the crate
+# takes a file.
+axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "signal"] }
 # `stream` is what keeps SSE responses unbuffered through the proxy. No gzip
 # feature on purpose: decompressing here would invalidate the headers we copy.

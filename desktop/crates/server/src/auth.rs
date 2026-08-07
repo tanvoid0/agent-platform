@@ -153,6 +153,7 @@ struct TokenRow {
     held_reason: Option<String>,
     rate_limit_per_minute: Option<i64>,
     expires_at: Option<NaiveDateTime>,
+    last_used_at: Option<NaiveDateTime>,
 }
 
 /// Guards exactly the prefix `app/main.py` mounts with `_api_deps`. `/v1/*` (the
@@ -202,7 +203,7 @@ pub async fn resolve(state: &AppState, authorization: Option<&str>) -> Result<Pr
 async fn resolve_workspace_token(state: &AppState, raw: &str) -> Result<Principal, AuthError> {
     let row: Option<TokenRow> = sqlx::query_as(
         "SELECT id, workspace_id, prefix, scopes_json, status, held_reason, \
-                rate_limit_per_minute, expires_at \
+                rate_limit_per_minute, expires_at, last_used_at \
          FROM api_tokens WHERE token_hash = ?",
     )
     .bind(hash_token(raw))
@@ -256,15 +257,48 @@ async fn resolve_workspace_token(state: &AppState, raw: &str) -> Result<Principa
 
     check_and_increment(state, row.id, row.rate_limit_per_minute).map_err(|e| e.with_prefix(prefix))?;
 
-    // ponytail: `last_used_at` is not written here. While the proxy is in front of
-    // Python, Python terminates every request and writes it. The first migrated
-    // domain has to add the same 60s-throttled update or the column goes stale.
+    touch_last_used(state, row.id, row.last_used_at).await;
 
     Ok(Principal {
         workspace_id: Some(row.workspace_id),
         token_id: Some(row.id),
         scopes: serde_json::from_str(&row.scopes_json).unwrap_or_default(),
     })
+}
+
+/// `_LAST_USED_THROTTLE_SECONDS`. One write per token per minute, not per
+/// request — the column exists to answer "is anyone still using this?", and
+/// that question does not need second resolution.
+const LAST_USED_THROTTLE_SECONDS: i64 = 60;
+
+/// `auth.py`'s throttled `last_used_at` update.
+///
+/// **This was missing until `api_tokens` moved, and it was a real defect, not a
+/// cosmetic one.** Rust never wrote the column and Python only writes it for
+/// requests that reach Python — so once a domain migrated, a token whose
+/// traffic Rust answers stopped advancing it entirely. A coder-only or
+/// processes-only token read as never used in `GET /api-tokens`, which is
+/// exactly the signal an operator revokes on.
+///
+/// A failure here is logged and swallowed: this is bookkeeping on the auth path,
+/// and failing a valid caller's request over it would be the worse bug.
+async fn touch_last_used(state: &AppState, token_id: i64, last_used_at: Option<NaiveDateTime>) {
+    let now = Utc::now().naive_utc();
+    let due = match last_used_at {
+        None => true,
+        Some(at) => (now - at).num_seconds() > LAST_USED_THROTTLE_SECONDS,
+    };
+    if !due {
+        return;
+    }
+    let result = sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE id = ?")
+        .bind(crate::wire::sql_string(now))
+        .bind(token_id)
+        .execute(&state.pool)
+        .await;
+    if let Err(e) = result {
+        eprintln!("[agent-platformd] last_used_at update failed for token {token_id}: {e}");
+    }
 }
 
 /// Fixed-window counter, same shape as `app/api_tokens/rate_limiter.py`.

@@ -2960,6 +2960,9 @@ async fn agent_step(
         &req.goal,
         &context,
         &actions,
+        // `agent/step` passes no history — the prompt's "previous actions"
+        // block belongs to the session routes.
+        &[],
         &llm_model,
     )
     .await;

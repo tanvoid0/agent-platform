@@ -196,7 +196,7 @@ fn assert_client_access(proc: &ProcessOut, headers: &HeaderMap) -> Result<(), Ap
 }
 
 /// `api_auth.agent_platform_client_header`: trimmed, blank is absent, 256 chars.
-fn client_header(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn client_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get(CLIENT_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -692,7 +692,7 @@ struct TemplateRow {
 }
 
 /// `client_scope.require_client_id_enabled`.
-fn require_client_id_enabled() -> bool {
+pub(crate) fn require_client_id_enabled() -> bool {
     matches!(
         std::env::var("AGENT_PLATFORM_REQUIRE_CLIENT_ID")
             .unwrap_or_default()
@@ -704,7 +704,7 @@ fn require_client_id_enabled() -> bool {
 }
 
 /// `client_scope.merged_client_id` — the first non-blank of header, then body.
-fn merged_client_id(header: Option<&str>, body: Option<&str>) -> Option<String> {
+pub(crate) fn merged_client_id(header: Option<&str>, body: Option<&str>) -> Option<String> {
     header
         .into_iter()
         .chain(body)

@@ -1,16 +1,16 @@
 //! Token usage shapes shared by every chat domain. Port of `app/chat_usage.py`.
 //!
-//! **Addition, not a deletion.** `chat_usage.py` keeps five importers
+//! **Addition, not a deletion.** `chat_usage.py` keeps four importers
 //! (`action_orchestrator/engine.py`, `assistant/{routes,schemas}.py`,
-//! `assistant/services/assistant_chat.py`, `coder/{routes,schemas,service}.py`,
-//! `playground/{routes,schemas,service}.py`), so it stays in Python whatever
-//! moves here. This file exists because *all three* of coder, assistant and
-//! playground need it, and it is the only part of step 4 that touches no SQL.
+//! `assistant/services/assistant_chat.py`, `coder/{routes,schemas,service}.py`),
+//! so it stays in Python whatever moves here. This file exists because both
+//! coder and assistant need it, and it is the only part of step 4 that touches
+//! no SQL.
 //!
 //! **These are wire shapes.** [`ContextUsageOut`] is a response body field on
-//! `GET /coder/chat/context-usage`, `GET /assistant/chat/context-usage`,
-//! `GET /playground/chat/context-usage` and on every thread/send payload from
-//! those three domains; [`LlmUsageOut`] rides along on the send payloads. Field
+//! `GET /coder/chat/context-usage` and `GET /assistant/chat/context-usage`, and
+//! on every thread/send payload from both; [`LlmUsageOut`] rides along on the
+//! send payloads. Field
 //! order and names are contract — the structs below are in pydantic's
 //! declaration order and nothing here is `skip_serializing_if`, because pydantic
 //! emits `"label": null` rather than omitting it.
@@ -205,7 +205,7 @@ fn round1(value: f64) -> f64 {
 /// The keyword-only arguments of `estimate_context_usage`. A struct because Rust
 /// has no keyword defaults and every caller fills a different three or four of
 /// the eight: coder passes system/tools/conversation, assistant adds
-/// `injected_context`, playground passes system/conversation. The other four
+/// `injected_context`. The other four
 /// have no caller in either language today but are part of the wire shape.
 #[derive(Default)]
 pub struct ContextInputs<'a> {

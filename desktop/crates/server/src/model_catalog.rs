@@ -63,6 +63,19 @@ impl CatalogCache {
         });
     }
 
+    /// Refresh the Ollama half now, not at the next tick — what `model_ops`
+    /// calls after a pull, copy, create or delete has changed what is installed.
+    /// A failed fetch leaves the previous list alone, same as the loop above.
+    pub async fn refresh_ollama_now(&self, http: &reqwest::Client) {
+        let tags = fetch_ollama_tags(http, QUICK_TIMEOUT).await;
+        if tags.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        inner.ollama_tags = tags;
+        inner.ollama_updated_at = Some(Instant::now());
+    }
+
     pub fn ollama_tags(&self) -> Vec<String> {
         self.read().ollama_tags.clone()
     }
@@ -282,7 +295,7 @@ pub async fn coerce_local_model_if_needed(
         let want = model.trim();
         if ids.iter().any(|id| id == want) {
             if env_flag("LM_STUDIO_TRY_LOAD_MODEL", true)
-                && env_flag("LM_STUDIO_PRELOAD_MATCHED_MODEL", false)
+                && env_flag("LM_STUDIO_PRELOAD_MATCHED_MODEL", true)
             {
                 lm_studio_load_model(http, &base, want).await;
             }

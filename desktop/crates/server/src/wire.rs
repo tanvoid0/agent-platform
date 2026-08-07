@@ -164,3 +164,191 @@ fn plural(n: usize) -> &'static str {
         "s"
     }
 }
+
+// ---------------------------------------------------------------------------
+// Body fields, the way pydantic's lax mode reads them
+// ---------------------------------------------------------------------------
+
+const STRING_TYPE_MSG: &str = "Input should be a valid string";
+
+/// A required `str`. An explicit `null` is a **type** failure, not a missing one.
+pub fn required_str(errors: &mut Vec<Value>, body: &Value, field: &str) -> String {
+    match body.get(field) {
+        None => {
+            errors.push(ApiError::field_error(field, "missing", "Field required"));
+            String::new()
+        }
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => {
+            errors.push(ApiError::field_error(field, "string_type", STRING_TYPE_MSG));
+            String::new()
+        }
+    }
+}
+
+/// A `str` with a default. **`null` is rejected**: the field is not `Optional`,
+/// so an explicit null fails where an absent key takes the default.
+pub fn defaulted_str(errors: &mut Vec<Value>, body: &Value, field: &str, default: &str) -> String {
+    match body.get(field) {
+        None => default.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => {
+            errors.push(ApiError::field_error(field, "string_type", STRING_TYPE_MSG));
+            String::new()
+        }
+    }
+}
+
+/// `str | None`, where a null really is allowed.
+pub fn optional_str(errors: &mut Vec<Value>, body: &Value, field: &str) -> Option<String> {
+    match body.get(field) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            errors.push(ApiError::field_error(field, "string_type", STRING_TYPE_MSG));
+            None
+        }
+    }
+}
+
+/// `bool` with a `False` default, coerced the way pydantic's lax mode coerces:
+/// `"yes"`, `"on"`, `"1"` and friends are booleans, and `0`/`1` (int *or*
+/// float) are booleans. Everything else splits between "wrong type" and "right
+/// type, unreadable value" exactly as pydantic splits it — a divergence a
+/// cross-render caught, since a Rust `bool` parser answers 422 where Python
+/// answers 200.
+pub fn lax_bool(errors: &mut Vec<Value>, body: &Value, field: &str) -> bool {
+    const TRUE: [&str; 6] = ["1", "true", "t", "yes", "y", "on"];
+    const FALSE: [&str; 6] = ["0", "false", "f", "no", "n", "off"];
+    let unreadable = |errors: &mut Vec<Value>| {
+        errors.push(ApiError::field_error(
+            field,
+            "bool_parsing",
+            "Input should be a valid boolean, unable to interpret input",
+        ));
+        false
+    };
+    let wrong_type = |errors: &mut Vec<Value>| {
+        errors.push(ApiError::field_error(field, "bool_type", "Input should be a valid boolean"));
+        false
+    };
+
+    match body.get(field) {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => {
+            let lowered = s.trim().to_ascii_lowercase();
+            if TRUE.contains(&lowered.as_str()) {
+                true
+            } else if FALSE.contains(&lowered.as_str()) {
+                false
+            } else {
+                unreadable(errors)
+            }
+        }
+        Some(Value::Number(n)) => match n.as_f64() {
+            Some(v) if v == 0.0 => false,
+            Some(v) if v == 1.0 => true,
+            // An integer that is neither is readable-but-wrong; a fractional
+            // one is not a boolean at all.
+            _ if n.is_i64() || n.is_u64() => unreadable(errors),
+            _ => wrong_type(errors),
+        },
+        Some(_) => wrong_type(errors),
+    }
+}
+
+/// `int | None`, coerced from a float or a numeric string the way pydantic does.
+pub fn lax_int(errors: &mut Vec<Value>, body: &Value, field: &str) -> Option<i64> {
+    match body.get(field) {
+        None | Some(Value::Null) => None,
+        Some(value) => lax_int_value(errors, field, value),
+    }
+}
+
+/// The coercion itself, for a value already pulled out of the body.
+pub fn lax_int_value(errors: &mut Vec<Value>, field: &str, value: &Value) -> Option<i64> {
+    let from_float = |errors: &mut Vec<Value>, v: f64| {
+        if v.fract() == 0.0 {
+            Some(v as i64)
+        } else {
+            errors.push(ApiError::field_error(
+                field,
+                "int_from_float",
+                "Input should be a valid integer, got a number with a fractional part",
+            ));
+            None
+        }
+    };
+
+    match value {
+        Value::Bool(b) => Some(i64::from(*b)),
+        Value::Number(n) => match n.as_i64() {
+            Some(v) => Some(v),
+            None => from_float(errors, n.as_f64().unwrap_or(f64::NAN)),
+        },
+        Value::String(s) => {
+            let raw = s.trim();
+            if let Ok(v) = raw.parse::<i64>() {
+                Some(v)
+            } else if let Ok(v) = raw.parse::<f64>() {
+                from_float(errors, v)
+            } else {
+                errors.push(ApiError::field_error(
+                    field,
+                    "int_parsing",
+                    "Input should be a valid integer, unable to parse string as an integer",
+                ));
+                None
+            }
+        }
+        _ => {
+            errors.push(ApiError::field_error(field, "int_type", "Input should be a valid integer"));
+            None
+        }
+    }
+}
+
+/// A JSON object body, read from raw bytes rather than through `Json<T>`.
+///
+/// `Option<Json<T>>` rejects an empty body carrying `Content-Type:
+/// application/json` — which is what an argument-less `POST` from most clients
+/// looks like — with a **plain-text 400**, where FastAPI answers the 422
+/// envelope. Reading `Bytes` and parsing here is also what gets `json_invalid`
+/// and `model_attributes_type` right. Lives here rather than in one domain
+/// because every domain that takes a body needs the same three answers.
+pub fn parse_body(raw: &axum::body::Bytes) -> Result<Value, ApiError> {
+    if raw.is_empty() {
+        return Err(ApiError::validation(vec![serde_json::json!({
+            "type": "missing", "loc": ["body"], "msg": "Field required",
+        })]));
+    }
+    match serde_json::from_slice::<Value>(raw) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(ApiError::validation(vec![serde_json::json!({
+            "type": "model_attributes_type",
+            "loc": ["body"],
+            "msg": "Input should be a valid dictionary or object to extract fields from",
+        })])),
+        Err(e) => Err(ApiError::validation(vec![serde_json::json!({
+            "type": "json_invalid",
+            "loc": ["body", json_error_offset(raw, &e)],
+            "msg": "JSON decode error",
+        })])),
+    }
+}
+
+/// `json.JSONDecodeError.pos` — the 0-based **byte** offset of the offending
+/// character, where serde reports a 1-based line and column.
+///
+/// ponytail: exact on a single-line body, which is every body a client actually
+/// sends; a multi-line one is reconstructed by counting the preceding lines,
+/// which assumes single-byte newlines.
+fn json_error_offset(raw: &axum::body::Bytes, e: &serde_json::Error) -> usize {
+    let (line, column) = (e.line(), e.column());
+    if line <= 1 {
+        return column.saturating_sub(1);
+    }
+    raw.split(|b| *b == b'\n').take(line - 1).map(|l| l.len() + 1).sum::<usize>()
+        + column.saturating_sub(1)
+}

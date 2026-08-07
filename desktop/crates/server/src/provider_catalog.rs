@@ -10,9 +10,9 @@
 //! built-in default — so the screen always has something to show and each row
 //! says which of those it is (`source`) and whether the backend was reachable.
 //!
-//! The admin surface's *other* catalog shape (`build_provider_catalog`, used by
-//! `/api/v1/llm-proxy/ui/*`) stays with Python; it is a different body for a
-//! different screen, and nothing here needs it.
+//! The admin surface's *other* catalog shape — `build_provider_catalog`, behind
+//! `/api/v1/llm-proxy/ui/*` — is [`build_admin`] further down: a different body
+//! for a different screen, over the same discovery.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -26,8 +26,8 @@ use crate::llm_config::{
     aimlapi_api_key, aimlapi_openai_base, anthropic_api_key, anthropic_openai_base,
     anthropic_version_header, default_model_for_provider, first_configured_provider,
     gemini_api_key, is_supported_provider, load_config_yaml, lm_studio_api_base, modality_map,
-    ollama_api_base, provider_configured, provider_ids, provider_label, read_ui_fallbacks,
-    Registry,
+    ollama_api_base, provider_configured, provider_ids, provider_label, read_env_file,
+    read_ui_fallbacks, Registry,
 };
 use crate::model_capabilities::{provider_default_capabilities, resolve_model_capabilities};
 use crate::model_catalog::{fetch_lm_studio_models, fetch_lm_studio_native_keys, fetch_openai_model_ids};
@@ -255,7 +255,57 @@ async fn ollama_entries(http: &reqwest::Client) -> (Vec<Value>, bool) {
 
 /// Model ids from a provider that is not Ollama, or `None` when it did not answer.
 async fn discovered_models(http: &reqwest::Client, provider: &str) -> Option<Vec<String>> {
-    let ids = match provider {
+    discovered_with_source(http, provider).await.0
+}
+
+/// Ollama's tag names alone. `_fetch_ollama_models`, which — unlike the `/v1`
+/// catalog's [`ollama_entries`] — does not ping `/api/version` first, so an
+/// unreachable backend and an empty library are the same answer here.
+async fn ollama_tag_names(http: &reqwest::Client) -> Vec<String> {
+    let base = ollama_api_base();
+    if base.is_empty() {
+        return Vec::new();
+    }
+    let Ok(response) = send_with_retry("provider_catalog_ollama", false, || {
+        http.get(format!("{}/api/tags", base.trim_end_matches('/'))).timeout(CATALOG_TIMEOUT)
+    })
+    .await
+    else {
+        return Vec::new();
+    };
+    if !response.is_ok() {
+        return Vec::new();
+    }
+    response
+        .json()
+        .as_ref()
+        .and_then(|v| v.get("models"))
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|item| item.get("name").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `_fetch_provider_models` — the ids, plus the name of the discovery that
+/// produced them.
+///
+/// The source is reported **even when the fetch came back empty**, because that
+/// is what Python returns and what the admin catalog's `source` field then
+/// shows for a configured provider whose list is unavailable and which has no
+/// aliases, no UI fallbacks and no default model to fall back to.
+async fn discovered_with_source(
+    http: &reqwest::Client,
+    provider: &str,
+) -> (Option<Vec<String>>, Option<&'static str>) {
+    let (ids, source): (Vec<String>, Option<&'static str>) = match provider {
+        "ollama" => (ollama_tag_names(http).await, Some("ollama_tags")),
         "lm_studio" => {
             // Both URLs are the same host and port, so probing together costs one
             // spare local request when LM Studio is up and halves the stall when
@@ -265,13 +315,26 @@ async fn discovered_models(http: &reqwest::Client, provider: &str) -> Option<Vec
                 fetch_lm_studio_models(http, CATALOG_TIMEOUT),
                 fetch_lm_studio_native_keys(http, &base, CATALOG_TIMEOUT)
             );
-            if openai.is_empty() { native } else { openai }
+            if !openai.is_empty() {
+                (openai, Some("lm_studio_models"))
+            } else if !native.is_empty() {
+                (native, Some("lm_studio_native_models"))
+            } else {
+                (Vec::new(), None)
+            }
         }
         "aimlapi" if provider_configured("aimlapi") => {
             let url = format!("{}/models", aimlapi_openai_base());
             let headers = vec![("Authorization".into(), format!("Bearer {}", aimlapi_api_key()))];
-            fetch_openai_model_ids(http, &url, &headers, "provider_catalog_aimlapi", CLOUD_TIMEOUT)
-                .await
+            let ids = fetch_openai_model_ids(
+                http,
+                &url,
+                &headers,
+                "provider_catalog_aimlapi",
+                CLOUD_TIMEOUT,
+            )
+            .await;
+            (ids, Some("upstream_models"))
         }
         "anthropic" if provider_configured("anthropic") => {
             let url = format!("{}/models", anthropic_openai_base());
@@ -279,19 +342,20 @@ async fn discovered_models(http: &reqwest::Client, provider: &str) -> Option<Vec
                 ("x-api-key".into(), anthropic_api_key()),
                 ("anthropic-version".into(), anthropic_version_header()),
             ];
-            fetch_openai_model_ids(
+            let ids = fetch_openai_model_ids(
                 http,
                 &url,
                 &headers,
                 "provider_catalog_anthropic",
                 CLOUD_TIMEOUT,
             )
-            .await
+            .await;
+            (ids, Some("upstream_models"))
         }
-        "gemini" => gemini_models(http).await,
-        _ => Vec::new(),
+        "gemini" => (gemini_models(http).await, Some("upstream_models")),
+        _ => (Vec::new(), None),
     };
-    (!ids.is_empty()).then_some(dedupe(ids))
+    ((!ids.is_empty()).then(|| dedupe(ids)), source)
 }
 
 /// Gemini's native list, which prefixes ids with `models/` and includes
@@ -450,6 +514,154 @@ pub async fn build(http: &reqwest::Client, options: CatalogOptions) -> Value {
     }
 
     json!({ "object": "catalog", "resolved_defaults": defaults, "providers": providers })
+}
+
+// ---------------------------------------------------------------------------
+// The admin shape
+// ---------------------------------------------------------------------------
+
+/// What an operator has actually *saved*, as opposed to what the proxy would
+/// resolve — `get_persisted_defaults`. The dotenv file only; the process
+/// environment is deliberately not consulted, because this is the pair the
+/// config screen renders back into its own fields.
+pub fn persisted_defaults() -> Value {
+    let data = load_config_yaml();
+    let (config_provider, config_model) = defaults_from_config(&data);
+    let env = read_env_file();
+    let from_env =
+        env.get("DEFAULT_PROVIDER").map(|v| v.trim().to_ascii_lowercase()).unwrap_or_default();
+    let mut provider = if from_env.is_empty() { config_provider.clone() } else { from_env };
+    if !is_supported_provider(&provider) {
+        provider = String::new();
+    }
+    let mut model = env.get("DEFAULT_MODEL").map(|v| v.trim().to_string()).unwrap_or_default();
+    if model.is_empty() && provider == config_provider {
+        model = config_model;
+    }
+    json!({ "provider": provider, "model": model })
+}
+
+/// `build_provider_catalog` — the admin/config surface's registry.
+///
+/// A different body from [`build`] for a different screen: one flat model list
+/// per provider with the *reason* it is that list (`source`), plus the two
+/// notes the config UI shows when a backend did not answer. Providers are
+/// probed together, and only the configured ones are probed at all — serially,
+/// one unreachable backend added its whole retry budget to every other row's
+/// wait, and the caller renders nothing until this returns.
+pub async fn build_admin(http: &reqwest::Client) -> Value {
+    let aliases_by_provider = aliases_by_provider();
+    let defaults = resolved_defaults();
+    let default_provider = defaults["provider"].as_str().unwrap_or("").to_string();
+    let default_model = defaults["model"].as_str().unwrap_or("").trim().to_string();
+
+    let ids = provider_ids(Registry::Chat);
+    let configured_by_provider: Vec<bool> = ids.iter().map(|p| provider_configured(p)).collect();
+    // Every fetcher swallows its own transport errors, so no single provider can
+    // fail the join.
+    let probed: Vec<(Option<Vec<String>>, Option<&'static str>)> = futures::future::join_all(
+        ids.iter().zip(&configured_by_provider).map(|(provider, configured)| async move {
+            if *configured {
+                discovered_with_source(http, provider).await
+            } else {
+                (None, None)
+            }
+        }),
+    )
+    .await;
+
+    let mut providers = Vec::new();
+    for ((provider, configured), (discovered, source)) in
+        ids.iter().zip(&configured_by_provider).zip(probed)
+    {
+        let configured = *configured;
+        let aliases = aliases_by_provider.get(*provider).cloned().unwrap_or_default();
+        let mut model_source = source.map(str::to_string);
+        let mut warning: Option<&str> = None;
+        let mut fallback_note: Option<&str> = None;
+
+        let discovered_any = discovered.as_ref().is_some_and(|ids| !ids.is_empty());
+        let mut models: Vec<String> = discovered.unwrap_or_default();
+        if models.is_empty() && !aliases.is_empty() {
+            models = aliases.clone();
+            model_source = Some("config_aliases".into());
+            fallback_note = Some("Provider catalog unavailable; using config.yaml aliases.");
+        }
+        if models.is_empty() {
+            models = fallback_models(provider, &aliases);
+            if !models.is_empty() {
+                model_source = Some("ui_fallback_models".into());
+                fallback_note =
+                    Some("Provider catalog unavailable; using configured UI fallback models.");
+            }
+        }
+        let default_model_for_row = default_model_for_provider(provider);
+        if models.is_empty() && !default_model_for_row.is_empty() {
+            models = vec![default_model_for_row.to_string()];
+            model_source = Some("provider_default".into());
+            fallback_note = Some("Provider catalog unavailable; using the provider default model.");
+        }
+        if configured && !discovered_any && fallback_note.is_none() {
+            warning =
+                Some("Provider did not return a model catalog; fallback values are being used.");
+        }
+        let model_source = model_source.unwrap_or_else(|| "unavailable".into());
+
+        let mut selected = default_model_for_row.to_string();
+        if default_provider == *provider && !default_model.is_empty() {
+            selected = default_model.clone();
+        } else if let Some(first) = models.first() {
+            selected = first.clone();
+        }
+        let mut options = vec![selected.clone()];
+        options.extend(models);
+
+        providers.push(json!({
+            "id": provider,
+            "label": provider_label(provider),
+            "configured": configured,
+            "local": matches!(*provider, "ollama" | "lm_studio"),
+            "capabilities": provider_capabilities(provider),
+            "models": {
+                "options": dedupe(options),
+                "selected_model": selected,
+                "default_model": selected,
+                "source": model_source,
+                "warning": warning,
+                "fallback_note": fallback_note,
+            },
+        }));
+    }
+
+    json!({
+        "persisted_defaults": persisted_defaults(),
+        "resolved_defaults": defaults,
+        "providers": providers,
+    })
+}
+
+/// One row of [`build_admin`], addressed by provider id **or by any model alias
+/// declared under it** — `get_provider_catalog_entry`.
+pub async fn admin_entry(http: &reqwest::Client, provider_or_alias: &str) -> Result<Value, ApiError> {
+    let token = provider_or_alias.trim();
+    let provider_id = if is_supported_provider(token) {
+        token.to_ascii_lowercase()
+    } else {
+        aliases_by_provider()
+            .into_iter()
+            .find(|(_, values)| values.iter().any(|v| v == token))
+            .map(|(provider, _)| provider)
+            .unwrap_or_default()
+    };
+    if provider_id.is_empty() {
+        return Err(ApiError::not_found("Unknown provider"));
+    }
+    let catalog = build_admin(http).await;
+    catalog["providers"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == json!(provider_id)))
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("Unknown provider"))
 }
 
 /// The catalog's provider filter. Its rejection message names `anthropic`, which

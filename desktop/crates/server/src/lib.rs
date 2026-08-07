@@ -7,17 +7,32 @@
 //! processes (`processes.rs` + `executor.rs` + `dag_schema.rs`), and the
 //! embedded LLM proxy's whole `/v1` surface (`llm.rs` and its
 //! `llm_config`/`byok`/`model_catalog`/`model_capabilities`/`provider_catalog`/
-//! `upstream_http` satellites). Partial: assistant (`assistant.rs` +
-//! `assistant_turn.rs` + `clarifying_form.rs` — reads, the profile write, and
-//! chat's context-usage/thread/send; the rest still proxied) and `chat.rs`
-//! (`POST /api/v1/chat` alone). Untouched: coder, playground, `system_routes`,
-//! the workspace/document stack. `plan.md`'s "Rust server migration" section
+//! `upstream_http` satellites), assistant (`assistant.rs` + `assistant_turn.rs`
+//! + `clarifying_form.rs`; only `POST /chat/threads` is left proxied, by
+//! choice) and coder (`coder.rs` + `coder_loop.rs` + `coder_tools.rs` — all ten
+//! routes, agent loop and delegated tool park included), the `action_orchestrator`
+//! routes (`/action-sets`, `/sessions`, `/decide` — the same module as the engine)
+//! and the LLM-proxy admin surface (`llm_admin.rs`; only `POST /config-yaml` is
+//! proxied, for its `jsonschema` error text). Partial: `chat.rs`
+//! (`POST /api/v1/chat` alone), `api_tokens.rs` (the workspace token CRUD;
+//! `auth.rs` writes `last_used_at` again as of that port), `model_ops.rs`
+//! (Ollama, projects and the registry; the four pipeline-job routes stay with
+//! Python, which owns the runner) and the workspace stack (`workspaces.rs` —
+//! all six tenant routes including the archive cascade — plus
+//! `workspace_files.rs`, where `POST /upload` and `GET /file` on a `.pdf` stay
+//! proxied for PyMuPDF). **No router is wholly Python any more**; what is
+//! proxied is six deliberate request shapes, `system_routes` among them.
+//! Playground was deleted rather than ported.
+//! `plan.md`'s "Rust server migration" section
 //! is the live source of truth for exactly which routes, kept current there
 //! rather than duplicated here — this comment is the map, not the manifest.
 
 pub mod action_orchestrator;
+pub mod api_tokens;
 pub mod assistant;
 pub mod coder;
+pub mod coder_loop;
+pub mod coder_tools;
 pub mod assistant_turn;
 pub mod auth;
 pub mod byok;
@@ -32,9 +47,11 @@ pub mod dotenv;
 pub mod error;
 pub mod executor;
 pub mod llm;
+pub mod llm_admin;
 pub mod llm_config;
 pub mod model_capabilities;
 pub mod model_catalog;
+pub mod model_ops;
 pub mod processes;
 pub mod projects;
 pub mod provider_catalog;
@@ -48,6 +65,8 @@ pub mod workflow_engine;
 pub mod usage;
 pub mod wire;
 pub mod workflows;
+pub mod workspace_files;
+pub mod workspaces;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -136,6 +155,12 @@ pub struct AppState {
     /// ponytail: in-process like the Python one; both count every request so the
     /// effective limit is unchanged. Needs a shared store if this ever runs N-up.
     pub windows: Mutex<HashMap<i64, (u64, u32)>>,
+    /// Coder turns parked on a delegated tool call, keyed by
+    /// `(thread_id, call_id)` — `coder/desktop_executor.py`'s module-level
+    /// `_pending` dict. **This is process memory**: `/chat/tool-result` must be
+    /// served by the same process that served `/chat/stream`, which is why the
+    /// coder loop routes moved in one commit. See [`coder_tools`].
+    pub coder_pending: Mutex<coder_tools::PendingMap>,
     /// Local model lists, refreshed in the background so `/v1/health` never waits
     /// on a backend. Empty until `serve` starts the refresh loop, which is what a
     /// test harness gets — and what Python reports for its own first 30 seconds.
@@ -170,6 +195,7 @@ impl AppState {
             upstream,
             http: reqwest::Client::new(),
             windows: Mutex::new(HashMap::new()),
+            coder_pending: Mutex::new(HashMap::new()),
             catalog: Arc::new(model_catalog::CatalogCache::default()),
         }
     }
@@ -205,15 +231,21 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", axum::routing::get(health))
         .route("/", axum::routing::get(root))
+        .merge(action_orchestrator::routes())
+        .merge(api_tokens::routes())
         .merge(assistant::routes())
         .merge(coder::routes())
         .merge(chat::routes())
         .merge(llm::routes())
+        .merge(llm_admin::routes())
+        .merge(model_ops::routes())
         .merge(processes::routes())
         .merge(projects::routes())
         .merge(teams::routes())
         .merge(todos::routes())
         .merge(workflows::routes())
+        .merge(workspace_files::routes())
+        .merge(workspaces::routes())
         .fallback(proxy::forward)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

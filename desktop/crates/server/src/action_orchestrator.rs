@@ -29,13 +29,23 @@
 //! Usage accounting is dropped: `decide_actions` returns an `LlmUsageOut` that
 //! `agent_bridge.agent_step` immediately discards (`planned, thought, _`).
 
+use std::sync::Arc;
+
+use axum::body::Bytes;
+use axum::extract::{RawQuery, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::FromRow;
 
 use crate::chat_usage::{coerce_int, LlmStepUsageOut};
 use crate::dag_schema::sanitize_llm_model_alias;
-use crate::error::ApiError;
+use crate::auth::Principal;
+use crate::error::{ApiError, PathId};
+use crate::wire::{defaulted_str, lax_bool, optional_str, parse_body, required_str, sql_now};
 use crate::todos::py_repr;
 use crate::AppState;
 
@@ -134,7 +144,7 @@ You can call multiple tools if needed to accomplish complex goals."
 ///
 /// The context is `json.dumps(..., indent=2)` here — **not** the `str(dict)`
 /// `agent/chat` interpolates — so this one is genuinely JSON.
-fn build_user_message(goal: &str, context: &Map<String, Value>) -> String {
+fn build_user_message(goal: &str, context: &Map<String, Value>, history: &[Value]) -> String {
     let mut parts = vec![format!("Goal: {goal}")];
 
     if !context.is_empty() {
@@ -165,6 +175,24 @@ fn build_user_message(goal: &str, context: &Map<String, Value>) -> String {
         }
     }
 
+    // Only the session routes pass this: what the client already ran, and what
+    // came back. A failed action is named as failed rather than summarised.
+    if !history.is_empty() {
+        parts.push("\nPrevious actions and results:".to_string());
+        for entry in history {
+            let action_id = entry.get("action_id").map_or("unknown".to_string(), py_display);
+            match entry.get("error").filter(|v| py_truthy(v)) {
+                Some(error) => parts.push(format!("- {action_id}: FAILED - {}", py_display(error))),
+                None => {
+                    let result = entry.get("result").cloned().unwrap_or_else(|| json!({}));
+                    let rendered = json_dumps_indent2(&result);
+                    let truncated: String = rendered.chars().take(200).collect();
+                    parts.push(format!("- {action_id}: {truncated}"));
+                }
+            }
+        }
+    }
+
     parts.join("\n\n")
 }
 
@@ -185,6 +213,7 @@ pub(crate) async fn decide_actions(
     goal: &str,
     context: &Map<String, Value>,
     actions: &[ActionRow],
+    history: &[Value],
     llm_model: &str,
 ) -> (Vec<PlannedAction>, Option<String>, Vec<LlmStepUsageOut>) {
     if actions.is_empty() {
@@ -198,7 +227,7 @@ pub(crate) async fn decide_actions(
     let tools = build_action_tools(actions);
     let messages = vec![
         json!({"role": "system", "content": build_system_message()}),
-        json!({"role": "user", "content": build_user_message(goal, context)}),
+        json!({"role": "user", "content": build_user_message(goal, context, history)}),
     ];
 
     match decide(state, &messages, tools, actions, llm_model).await {
@@ -702,7 +731,7 @@ pub(crate) fn py_truthy(value: &Value) -> bool {
 }
 
 /// Python's `str()`: a string is itself, everything else is its `repr`.
-fn py_display(value: &Value) -> String {
+pub(crate) fn py_display(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => py_repr(other),
@@ -758,6 +787,1232 @@ fn ensure_ascii(text: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+pub fn routes() -> Router<Arc<AppState>> {
+    const BASE: &str = "/api/v1";
+    Router::new()
+        .route(&format!("{BASE}/action-sets"), get(list_sets).post(create_set))
+        .route(
+            &format!("{BASE}/action-sets/{{set_id}}"),
+            get(get_set).put(update_set).delete(delete_set),
+        )
+        .route(
+            &format!("{BASE}/action-sets/{{set_id}}/actions"),
+            get(list_set_actions).post(add_action),
+        )
+        .route(
+            &format!("{BASE}/action-sets/{{set_id}}/actions/{{action_id}}"),
+            get(get_action_detail).put(update_action_detail).delete(delete_action_endpoint),
+        )
+        .route(&format!("{BASE}/sessions"), post(create_session))
+        .route(&format!("{BASE}/sessions/{{session_id}}"), get(get_session))
+        .route(&format!("{BASE}/sessions/{{session_id}}/steps"), post(request_step))
+        .route(&format!("{BASE}/sessions/{{session_id}}/results"), post(submit_result))
+        .route(&format!("{BASE}/sessions/{{session_id}}/complete"), post(complete_session))
+        .route(&format!("{BASE}/sessions/{{session_id}}/history"), get(get_session_history))
+        .route(&format!("{BASE}/decide"), post(decide_route))
+}
+
+/// `action_client_scope`. `client_id` is the only tenant column these tables
+/// have, and the header that fills it is caller-supplied — so a workspace token
+/// gets a namespace derived from its own workspace and never gets to name
+/// another tenant's. The master key keeps the header behaviour, so a
+/// single-tenant deployment can still partition by hand.
+fn client_scope(principal: &Principal, headers: &HeaderMap) -> Option<String> {
+    match principal.workspace_id {
+        Some(workspace_id) => Some(format!("ws:{workspace_id}")),
+        None => crate::processes::client_header(headers),
+    }
+}
+
+/// `_check_client_access`. An unowned row is public; an owned one needs the
+/// caller to name the same namespace.
+fn client_access(row_client_id: Option<&str>, scope: Option<&str>) -> bool {
+    match row_client_id.filter(|id| !id.is_empty()) {
+        None => true,
+        Some(owner) => scope.is_some_and(|scope| owner == scope.trim()),
+    }
+}
+
+fn access_denied() -> ApiError {
+    ApiError::new(StatusCode::FORBIDDEN, "Access denied")
+}
+
+#[derive(FromRow)]
+struct ActionSetRow {
+    id: i64,
+    client_id: Option<String>,
+    name: String,
+    description: Option<String>,
+    metadata_json: Option<String>,
+}
+
+/// Every action column, for the CRUD routes — the engine's [`ActionRow`] carries
+/// only the four the prompt needs.
+#[derive(FromRow)]
+struct ActionFullRow {
+    id: i64,
+    action_id: String,
+    name: String,
+    description: String,
+    parameters_json: String,
+    execution_mode: String,
+    endpoint: Option<String>,
+}
+
+const ACTION_COLUMNS: &str =
+    "id, action_id, name, description, parameters_json, execution_mode, endpoint";
+
+impl ActionFullRow {
+    /// `registry.action_to_dict`, which is also exactly `ActionResponse`.
+    fn to_out(&self) -> Value {
+        json!({
+            "id": self.id,
+            "action_id": self.action_id,
+            "name": self.name,
+            "description": self.description,
+            "parameters": decode_object(&self.parameters_json),
+            "execution_mode": self.execution_mode,
+            "endpoint": self.endpoint,
+        })
+    }
+}
+
+/// `json.loads` behind a `try/except JSONDecodeError` returning `{}` — and a
+/// stored scalar (`5`, `null`) is returned *as it is* by Python, since only a
+/// decode failure is caught. That distinction is visible in a response body.
+fn decode_object(raw: &str) -> Value {
+    serde_json::from_str::<Value>(raw).unwrap_or_else(|_| json!({}))
+}
+
+fn decode_object_opt(raw: Option<&str>) -> Value {
+    match raw.filter(|s| !s.is_empty()) {
+        None => json!({}),
+        Some(raw) => decode_object(raw),
+    }
+}
+
+async fn load_set(state: &AppState, set_id: i64) -> Result<ActionSetRow, ApiError> {
+    sqlx::query_as(
+        "SELECT id, client_id, name, description, metadata_json FROM action_sets WHERE id = ?",
+    )
+    .bind(set_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("Action set not found"))
+}
+
+async fn load_actions(state: &AppState, set_id: i64) -> Result<Vec<ActionFullRow>, ApiError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {ACTION_COLUMNS} FROM actions WHERE set_id = ?"
+    ))
+    .bind(set_id)
+    .fetch_all(&state.pool)
+    .await?)
+}
+
+/// `registry.action_set_to_dict`, which `ActionSetResponse` then renders — so
+/// `client_id` and the timestamps are dropped on the way out.
+fn set_to_out(row: &ActionSetRow, actions: &[ActionFullRow]) -> Value {
+    json!({
+        "id": row.id,
+        "name": row.name,
+        "description": row.description,
+        "metadata": decode_object_opt(row.metadata_json.as_deref()),
+        "actions": actions.iter().map(ActionFullRow::to_out).collect::<Vec<_>>(),
+    })
+}
+
+// --- Action sets -----------------------------------------------------------
+
+async fn create_set(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let body = parse_body(&raw)?;
+
+    let mut errors = Vec::new();
+    let name = required_str(&mut errors, &body, "name");
+    let description = optional_str(&mut errors, &body, "description");
+    let metadata = object_field(&mut errors, &body, "metadata");
+    let actions = parse_action_creates(&mut errors, body.get("actions"));
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+
+    let effective = crate::processes::merged_client_id(scope.as_deref(), None);
+    if crate::processes::require_client_id_enabled() && effective.is_none() {
+        return Err(ApiError::bad_request("client_id is required"));
+    }
+
+    let now = sql_now();
+    let set_id: i64 = sqlx::query_scalar(
+        "INSERT INTO action_sets (client_id, name, description, metadata_json, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(&effective)
+    .bind(&name)
+    .bind(&description)
+    // `set_metadata`: an empty mapping is stored as NULL, not as `{}`.
+    .bind(metadata.as_ref().filter(|m| !m.is_empty()).map(|m| Value::Object(m.clone()).to_string()))
+    .bind(&now)
+    .bind(&now)
+    .fetch_one(&state.pool)
+    .await?;
+
+    for action in &actions {
+        insert_action(&state, set_id, action, &now).await?;
+    }
+
+    let row = load_set(&state, set_id).await?;
+    let actions = load_actions(&state, set_id).await?;
+    Ok(Json(set_to_out(&row, &actions)).into_response())
+}
+
+async fn list_sets(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let limit = int_query(query.as_deref(), "limit", 50)?;
+    let effective = crate::processes::merged_client_id(scope.as_deref(), None);
+
+    // `list_action_sets`: an unowned set is shared, so it is listed for every
+    // caller rather than only for the one that owns nothing.
+    let rows: Vec<ActionSetRow> = match &effective {
+        Some(client_id) => sqlx::query_as(
+            "SELECT id, client_id, name, description, metadata_json FROM action_sets \
+             WHERE client_id = ? OR client_id IS NULL ORDER BY id DESC LIMIT ?",
+        )
+        .bind(client_id)
+        .bind(limit),
+        None => sqlx::query_as(
+            "SELECT id, client_id, name, description, metadata_json FROM action_sets \
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit),
+    }
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        if !client_access(row.client_id.as_deref(), scope.as_deref()) {
+            continue;
+        }
+        let actions = load_actions(&state, row.id).await?;
+        out.push(set_to_out(&row, &actions));
+    }
+    Ok(Json(json!({ "action_sets": out })).into_response())
+}
+
+/// The set, or the 404/403 pair every route in this domain opens with.
+async fn require_set(
+    state: &AppState,
+    set_id: i64,
+    scope: Option<&str>,
+) -> Result<ActionSetRow, ApiError> {
+    let row = load_set(state, set_id).await?;
+    if !client_access(row.client_id.as_deref(), scope) {
+        return Err(access_denied());
+    }
+    Ok(row)
+}
+
+async fn get_set(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(set_id): PathId<i64>,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let row = require_set(&state, set_id, scope.as_deref()).await?;
+    let actions = load_actions(&state, set_id).await?;
+    Ok(Json(set_to_out(&row, &actions)).into_response())
+}
+
+async fn update_set(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(set_id): PathId<i64>,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let body = parse_body(&raw)?;
+
+    let mut errors = Vec::new();
+    let name = optional_str(&mut errors, &body, "name");
+    let description = optional_str(&mut errors, &body, "description");
+    let metadata = object_field_opt(&mut errors, &body, "metadata");
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+
+    require_set(&state, set_id, scope.as_deref()).await?;
+
+    // `is not None` per field, so a key the caller omitted keeps its column —
+    // and `updated_at` is not touched, because SQLModel has no `onupdate` here.
+    if let Some(name) = name {
+        sqlx::query("UPDATE action_sets SET name = ? WHERE id = ?")
+            .bind(name)
+            .bind(set_id)
+            .execute(&state.pool)
+            .await?;
+    }
+    if let Some(description) = description {
+        sqlx::query("UPDATE action_sets SET description = ? WHERE id = ?")
+            .bind(description)
+            .bind(set_id)
+            .execute(&state.pool)
+            .await?;
+    }
+    if let Some(metadata) = metadata {
+        sqlx::query("UPDATE action_sets SET metadata_json = ? WHERE id = ?")
+            .bind(
+                (!metadata.is_empty()).then(|| Value::Object(metadata).to_string()),
+            )
+            .bind(set_id)
+            .execute(&state.pool)
+            .await?;
+    }
+
+    let row = load_set(&state, set_id).await?;
+    let actions = load_actions(&state, set_id).await?;
+    Ok(Json(set_to_out(&row, &actions)).into_response())
+}
+
+async fn delete_set(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(set_id): PathId<i64>,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    require_set(&state, set_id, scope.as_deref()).await?;
+    sqlx::query("DELETE FROM actions WHERE set_id = ?")
+        .bind(set_id)
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("DELETE FROM action_sets WHERE id = ?")
+        .bind(set_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(Json(json!({ "success": true })).into_response())
+}
+
+// --- Actions ---------------------------------------------------------------
+
+/// `ActionCreate`, which is also the element type of `ActionSetCreate.actions`.
+struct ActionCreate {
+    action_id: String,
+    name: String,
+    description: String,
+    parameters: Option<Map<String, Value>>,
+    execution_mode: String,
+    endpoint: Option<String>,
+}
+
+async fn insert_action(
+    state: &AppState,
+    set_id: i64,
+    action: &ActionCreate,
+    now: &str,
+) -> Result<i64, ApiError> {
+    Ok(sqlx::query_scalar(
+        "INSERT INTO actions \
+         (set_id, action_id, name, description, parameters_json, execution_mode, endpoint, \
+          created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(set_id)
+    .bind(&action.action_id)
+    .bind(&action.name)
+    .bind(&action.description)
+    .bind(parameters_json(action.parameters.as_ref()))
+    .bind(&action.execution_mode)
+    .bind(&action.endpoint)
+    .bind(now)
+    .bind(now)
+    .fetch_one(&state.pool)
+    .await?)
+}
+
+/// `set_parameters`: a falsy mapping is stored as the literal `"{}"`.
+fn parameters_json(parameters: Option<&Map<String, Value>>) -> String {
+    match parameters.filter(|p| !p.is_empty()) {
+        Some(p) => Value::Object(p.clone()).to_string(),
+        None => "{}".to_string(),
+    }
+}
+
+async fn add_action(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(set_id): PathId<i64>,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let body = parse_body(&raw)?;
+    let mut errors = Vec::new();
+    let action = parse_action_create(&mut errors, &body, &[]);
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+    let action = action.expect("no errors means a body");
+
+    require_set(&state, set_id, scope.as_deref()).await?;
+
+    let duplicate: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM actions WHERE set_id = ? AND action_id = ?")
+            .bind(set_id)
+            .bind(&action.action_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    if duplicate.is_some() {
+        return Err(ApiError::bad_request(format!(
+            "Action with action_id '{}' already exists in this set",
+            action.action_id
+        )));
+    }
+
+    let id = insert_action(&state, set_id, &action, &sql_now()).await?;
+    let row = require_action_by_row_id(&state, id).await?;
+    Ok(Json(row.to_out()).into_response())
+}
+
+async fn require_action_by_row_id(state: &AppState, id: i64) -> Result<ActionFullRow, ApiError> {
+    sqlx::query_as(&format!("SELECT {ACTION_COLUMNS} FROM actions WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Action not found"))
+}
+
+async fn require_action(
+    state: &AppState,
+    set_id: i64,
+    action_id: &str,
+) -> Result<ActionFullRow, ApiError> {
+    sqlx::query_as(&format!(
+        "SELECT {ACTION_COLUMNS} FROM actions WHERE set_id = ? AND action_id = ?"
+    ))
+    .bind(set_id)
+    .bind(action_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("Action not found"))
+}
+
+async fn list_set_actions(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(set_id): PathId<i64>,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    require_set(&state, set_id, scope.as_deref()).await?;
+    let actions = load_actions(&state, set_id).await?;
+    Ok(Json(json!({
+        "actions": actions.iter().map(ActionFullRow::to_out).collect::<Vec<_>>(),
+    }))
+    .into_response())
+}
+
+async fn get_action_detail(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId((set_id, action_id)): PathId<(i64, String)>,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    require_set(&state, set_id, scope.as_deref()).await?;
+    let action = require_action(&state, set_id, &action_id).await?;
+    Ok(Json(action.to_out()).into_response())
+}
+
+async fn update_action_detail(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId((set_id, action_id)): PathId<(i64, String)>,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let body = parse_body(&raw)?;
+    let mut errors = Vec::new();
+    let name = optional_str(&mut errors, &body, "name");
+    let description = optional_str(&mut errors, &body, "description");
+    let parameters = object_field_opt(&mut errors, &body, "parameters");
+    let execution_mode = optional_str(&mut errors, &body, "execution_mode");
+    let endpoint = optional_str(&mut errors, &body, "endpoint");
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+
+    require_set(&state, set_id, scope.as_deref()).await?;
+    let action = require_action(&state, set_id, &action_id).await?;
+
+    if let Some(name) = name {
+        sqlx::query("UPDATE actions SET name = ? WHERE id = ?")
+            .bind(name)
+            .bind(action.id)
+            .execute(&state.pool)
+            .await?;
+    }
+    if let Some(description) = description {
+        sqlx::query("UPDATE actions SET description = ? WHERE id = ?")
+            .bind(description)
+            .bind(action.id)
+            .execute(&state.pool)
+            .await?;
+    }
+    if let Some(parameters) = parameters {
+        sqlx::query("UPDATE actions SET parameters_json = ? WHERE id = ?")
+            .bind(parameters_json(Some(&parameters)))
+            .bind(action.id)
+            .execute(&state.pool)
+            .await?;
+    }
+    if let Some(execution_mode) = execution_mode {
+        sqlx::query("UPDATE actions SET execution_mode = ? WHERE id = ?")
+            .bind(execution_mode)
+            .bind(action.id)
+            .execute(&state.pool)
+            .await?;
+    }
+    if let Some(endpoint) = endpoint {
+        sqlx::query("UPDATE actions SET endpoint = ? WHERE id = ?")
+            .bind(endpoint)
+            .bind(action.id)
+            .execute(&state.pool)
+            .await?;
+    }
+
+    let row = require_action_by_row_id(&state, action.id).await?;
+    Ok(Json(row.to_out()).into_response())
+}
+
+async fn delete_action_endpoint(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId((set_id, action_id)): PathId<(i64, String)>,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    require_set(&state, set_id, scope.as_deref()).await?;
+    let action = require_action(&state, set_id, &action_id).await?;
+    sqlx::query("DELETE FROM actions WHERE id = ?")
+        .bind(action.id)
+        .execute(&state.pool)
+        .await?;
+    Ok(Json(json!({ "success": true })).into_response())
+}
+
+// --- Sessions --------------------------------------------------------------
+
+#[derive(FromRow)]
+struct SessionRow {
+    id: i64,
+    client_id: Option<String>,
+    action_set_id: i64,
+    goal: String,
+    context_json: Option<String>,
+    status: String,
+    current_step: i64,
+    max_steps: i64,
+    execution_mode: String,
+}
+
+const SESSION_COLUMNS: &str = "id, client_id, action_set_id, goal, context_json, status, \
+     current_step, max_steps, execution_mode";
+
+impl SessionRow {
+    fn to_out(&self) -> Value {
+        json!({
+            "id": self.id,
+            "action_set_id": self.action_set_id,
+            "goal": self.goal,
+            "context": decode_object_opt(self.context_json.as_deref()),
+            "status": self.status,
+            "current_step": self.current_step,
+            "max_steps": self.max_steps,
+            "execution_mode": self.execution_mode,
+        })
+    }
+
+    fn context(&self) -> Map<String, Value> {
+        match decode_object_opt(self.context_json.as_deref()) {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        }
+    }
+}
+
+async fn require_session(
+    state: &AppState,
+    session_id: i64,
+    scope: Option<&str>,
+) -> Result<SessionRow, ApiError> {
+    let row: SessionRow = sqlx::query_as(&format!(
+        "SELECT {SESSION_COLUMNS} FROM action_sessions WHERE id = ?"
+    ))
+    .bind(session_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("Session not found"))?;
+    if !client_access(row.client_id.as_deref(), scope) {
+        return Err(access_denied());
+    }
+    Ok(row)
+}
+
+async fn create_session(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let body = parse_body(&raw)?;
+
+    let mut errors = Vec::new();
+    let action_set_id = required_int(&mut errors, &body, "action_set_id");
+    let goal = required_str(&mut errors, &body, "goal");
+    let context = object_field(&mut errors, &body, "context");
+    let execution_mode = defaulted_str(&mut errors, &body, "execution_mode", "client");
+    let max_steps = bounded_int(&mut errors, &body, "max_steps", 10, 1, 50);
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+
+    let effective = crate::processes::merged_client_id(scope.as_deref(), None);
+    if crate::processes::require_client_id_enabled() && effective.is_none() {
+        return Err(ApiError::bad_request("client_id is required"));
+    }
+
+    require_set(&state, action_set_id, scope.as_deref()).await?;
+    if load_actions(&state, action_set_id).await?.is_empty() {
+        return Err(ApiError::bad_request("Action set has no actions"));
+    }
+
+    let context = context.unwrap_or_default();
+    let now = sql_now();
+    let session_id: i64 = sqlx::query_scalar(
+        "INSERT INTO action_sessions \
+         (client_id, action_set_id, goal, context_json, status, current_step, max_steps, \
+          execution_mode, created_at, updated_at, completed_at) \
+         VALUES (?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, NULL) RETURNING id",
+    )
+    .bind(&effective)
+    .bind(action_set_id)
+    .bind(&goal)
+    .bind((!context.is_empty()).then(|| Value::Object(context).to_string()))
+    .bind(max_steps)
+    .bind(&execution_mode)
+    .bind(&now)
+    .bind(&now)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let row = require_session(&state, session_id, scope.as_deref()).await?;
+    Ok(Json(row.to_out()).into_response())
+}
+
+async fn get_session(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(session_id): PathId<i64>,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let row = require_session(&state, session_id, scope.as_deref()).await?;
+    Ok(Json(row.to_out()).into_response())
+}
+
+#[derive(FromRow)]
+struct StepRow {
+    step_number: i64,
+    thought: Option<String>,
+    actions_json: String,
+    status: String,
+}
+
+/// `StepResponse`, whose `actions` go back through `PlannedAction` — so a stored
+/// action that is missing a field or carries an extra one is *not* echoed
+/// verbatim.
+fn step_response(
+    session_id: i64,
+    step_number: i64,
+    thought: Option<&str>,
+    actions: &[PlannedAction],
+    status: &str,
+    execution_mode: &str,
+    is_final: bool,
+) -> Value {
+    json!({
+        "session_id": session_id,
+        "step_number": step_number,
+        "thought": thought,
+        "actions": actions,
+        "status": status,
+        "execution_mode": execution_mode,
+        "is_final": is_final,
+    })
+}
+
+async fn request_step(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(session_id): PathId<i64>,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let body = parse_body(&raw)?;
+    let mut errors = Vec::new();
+    let step_context = object_field(&mut errors, &body, "context");
+    // Parsed and discarded, exactly as Python does with it.
+    let _require_confirmation = lax_bool(&mut errors, &body, "require_confirmation");
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+
+    let session = require_session(&state, session_id, scope.as_deref()).await?;
+    if session.status != "active" && session.status != "paused" {
+        return Err(ApiError::bad_request(format!(
+            "Session is {}, cannot request new steps",
+            session.status
+        )));
+    }
+
+    if session.current_step >= session.max_steps {
+        complete(&state, session_id).await?;
+        return Ok(Json(step_response(
+            session_id,
+            session.current_step,
+            Some("Maximum steps reached"),
+            &[],
+            "completed",
+            &session.execution_mode,
+            true,
+        ))
+        .into_response());
+    }
+
+    let actions = list_actions(&state, session.action_set_id).await?;
+
+    // History is one entry per *executed* action: the step's planned actions
+    // joined to whichever result was submitted for the same step and id.
+    let steps: Vec<StepRow> = sqlx::query_as(
+        "SELECT step_number, thought, actions_json, status FROM session_steps \
+         WHERE session_id = ? ORDER BY step_number",
+    )
+    .bind(session_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut history = Vec::new();
+    for step in &steps {
+        for planned in decode_array(&step.actions_json) {
+            let action_id = planned.get("action_id").cloned().unwrap_or(Value::Null);
+            let result: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT result_json, error FROM session_results \
+                 WHERE session_id = ? AND step_number = ? AND action_id = ?",
+            )
+            .bind(session_id)
+            .bind(step.step_number)
+            // `SessionResult.action_id` is a string column and the planned
+            // action's id may be anything JSON allows; a non-string simply
+            // matches nothing, which is what SQLAlchemy does with it too.
+            .bind(action_id.as_str().unwrap_or_default())
+            .fetch_optional(&state.pool)
+            .await?;
+            if let Some((result_json, error)) = result {
+                history.push(json!({
+                    "action_id": action_id,
+                    "result": result_json
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                        .unwrap_or(Value::Null),
+                    "error": error,
+                }));
+            }
+        }
+    }
+
+    let mut merged = session.context();
+    merged.extend(step_context.unwrap_or_default());
+
+    let (planned, thought, _usage) =
+        decide_actions(&state, &session.goal, &merged, &actions, &history, "").await;
+
+    if planned.is_empty() {
+        complete(&state, session_id).await?;
+        let thought = thought.filter(|t| !t.is_empty());
+        return Ok(Json(step_response(
+            session_id,
+            session.current_step,
+            Some(thought.as_deref().unwrap_or("No further actions needed")),
+            &[],
+            "completed",
+            &session.execution_mode,
+            true,
+        ))
+        .into_response());
+    }
+
+    let step_number = session.current_step + 1;
+    sqlx::query("UPDATE action_sessions SET current_step = ?, status = 'awaiting_execution' WHERE id = ?")
+        .bind(step_number)
+        .bind(session_id)
+        .execute(&state.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO session_steps \
+         (session_id, step_number, thought, actions_json, status, created_at, executed_at) \
+         VALUES (?, ?, ?, ?, 'pending', ?, NULL)",
+    )
+    .bind(session_id)
+    .bind(step_number)
+    .bind(&thought)
+    .bind(serde_json::to_string(&planned).unwrap_or_else(|_| "[]".into()))
+    .bind(sql_now())
+    .execute(&state.pool)
+    .await?;
+
+    Ok(Json(step_response(
+        session_id,
+        step_number,
+        thought.as_deref(),
+        &planned,
+        "awaiting_execution",
+        &session.execution_mode,
+        false,
+    ))
+    .into_response())
+}
+
+async fn complete(state: &AppState, session_id: i64) -> Result<(), ApiError> {
+    sqlx::query("UPDATE action_sessions SET status = 'completed', completed_at = ? WHERE id = ?")
+        .bind(sql_now())
+        .bind(session_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(())
+}
+
+fn decode_array(raw: &str) -> Vec<Value> {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Array(items)) => items,
+        // `get_actions` only catches a decode error, so a stored scalar raises
+        // on iteration in Python — but no writer here can produce one.
+        _ => Vec::new(),
+    }
+}
+
+async fn submit_result(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(session_id): PathId<i64>,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let body = parse_body(&raw)?;
+    let mut errors = Vec::new();
+    let step_number = required_int(&mut errors, &body, "step_number");
+    let action_id = required_str(&mut errors, &body, "action_id");
+    let result = object_field(&mut errors, &body, "result");
+    let error = optional_str(&mut errors, &body, "error");
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+
+    let session = require_session(&state, session_id, scope.as_deref()).await?;
+
+    let step: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM session_steps WHERE session_id = ? AND step_number = ?",
+    )
+    .bind(session_id)
+    .bind(step_number)
+    .fetch_optional(&state.pool)
+    .await?;
+    let step_id = step.ok_or_else(|| ApiError::not_found("Step not found"))?;
+
+    let failed = error.as_ref().is_some_and(|e| !e.is_empty());
+    let result = result.unwrap_or_default();
+    sqlx::query(
+        "INSERT INTO session_results \
+         (session_id, step_number, action_id, result_json, error, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(session_id)
+    .bind(step_number)
+    .bind(&action_id)
+    .bind((!result.is_empty()).then(|| Value::Object(result).to_string()))
+    .bind(&error)
+    .bind(sql_now())
+    .execute(&state.pool)
+    .await?;
+
+    sqlx::query("UPDATE session_steps SET status = ?, executed_at = ? WHERE id = ?")
+        .bind(if failed { "failed" } else { "executed" })
+        .bind(sql_now())
+        .bind(step_id)
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("UPDATE action_sessions SET status = 'active' WHERE id = ?")
+        .bind(session_id)
+        .execute(&state.pool)
+        .await?;
+
+    Ok(Json(json!({
+        "session_id": session_id,
+        "step_number": step_number,
+        "action_id": action_id,
+        "status": if failed { "failed" } else { "success" },
+        "next_step_available": session.current_step < session.max_steps,
+    }))
+    .into_response())
+}
+
+async fn complete_session(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(session_id): PathId<i64>,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    // The body is `CompleteSessionRequest | None`, so **no body at all** is
+    // valid here — unlike every other route in this domain.
+    let summary = if raw.is_empty() {
+        None
+    } else {
+        let body = parse_body(&raw)?;
+        let mut errors = Vec::new();
+        let summary = optional_str(&mut errors, &body, "summary");
+        if !errors.is_empty() {
+            return Err(ApiError::validation(errors));
+        }
+        summary
+    };
+
+    require_session(&state, session_id, scope.as_deref()).await?;
+    complete(&state, session_id).await?;
+    Ok(Json(json!({ "session_id": session_id, "status": "completed", "summary": summary }))
+        .into_response())
+}
+
+async fn get_session_history(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(session_id): PathId<i64>,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let session = require_session(&state, session_id, scope.as_deref()).await?;
+
+    let steps: Vec<StepRow> = sqlx::query_as(
+        "SELECT step_number, thought, actions_json, status FROM session_steps \
+         WHERE session_id = ? ORDER BY step_number",
+    )
+    .bind(session_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut steps_out = Vec::new();
+    for step in &steps {
+        // `PlannedAction(**a)` — a stored action that does not satisfy the model
+        // raises a 500 there, which is not worth reproducing; an unparseable
+        // entry is dropped instead, and only this server writes these rows.
+        let planned: Vec<PlannedAction> = decode_array(&step.actions_json)
+            .into_iter()
+            .filter_map(|a| serde_json::from_value(a).ok())
+            .collect();
+        steps_out.push(step_response(
+            session_id,
+            step.step_number,
+            step.thought.as_deref(),
+            &planned,
+            &step.status,
+            &session.execution_mode,
+            false,
+        ));
+    }
+
+    let results: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT step_number, action_id, error FROM session_results WHERE session_id = ?",
+    )
+    .bind(session_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let results_out: Vec<Value> = results
+        .iter()
+        .map(|(step_number, action_id, error)| {
+            json!({
+                "session_id": session_id,
+                "step_number": step_number,
+                "action_id": action_id,
+                "status": if error.as_ref().is_some_and(|e| !e.is_empty()) { "failed" } else { "success" },
+                "next_step_available": false,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "session": session.to_out(),
+        "steps": steps_out,
+        "results": results_out,
+    }))
+    .into_response())
+}
+
+async fn decide_route(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let body = parse_body(&raw)?;
+    let mut errors = Vec::new();
+    let action_set_id = required_int(&mut errors, &body, "action_set_id");
+    let goal = required_str(&mut errors, &body, "goal");
+    let context = object_field(&mut errors, &body, "context");
+    let execution_mode = defaulted_str(&mut errors, &body, "execution_mode", "client");
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+
+    require_set(&state, action_set_id, scope.as_deref()).await?;
+    let actions = list_actions(&state, action_set_id).await?;
+    if actions.is_empty() {
+        return Err(ApiError::bad_request("Action set has no actions"));
+    }
+
+    let (planned, thought, _usage) = decide_actions(
+        &state,
+        &goal,
+        &context.unwrap_or_default(),
+        &actions,
+        &[],
+        "",
+    )
+    .await;
+
+    Ok(Json(json!({
+        "thought": thought,
+        "actions": planned,
+        "execution_mode": execution_mode,
+    }))
+    .into_response())
+}
+
+// --- Body fields -----------------------------------------------------------
+
+fn required_int(errors: &mut Vec<Value>, body: &Value, field: &str) -> i64 {
+    match body.get(field) {
+        None => {
+            errors.push(ApiError::field_error(field, "missing", "Field required"));
+            0
+        }
+        Some(value) => crate::wire::lax_int_value(errors, field, value).unwrap_or_default(),
+    }
+}
+
+/// `int` with `ge`/`le` and a default — one failure for the type, another for
+/// the bound, never both.
+fn bounded_int(
+    errors: &mut Vec<Value>,
+    body: &Value,
+    field: &str,
+    default: i64,
+    min: i64,
+    max: i64,
+) -> i64 {
+    let Some(value) = body.get(field) else { return default };
+    let Some(parsed) = crate::wire::lax_int_value(errors, field, value) else { return default };
+    if parsed < min {
+        errors.push(ApiError::field_error(
+            field,
+            "greater_than_equal",
+            &format!("Input should be greater than or equal to {min}"),
+        ));
+    } else if parsed > max {
+        errors.push(ApiError::field_error(
+            field,
+            "less_than_equal",
+            &format!("Input should be less than or equal to {max}"),
+        ));
+    }
+    parsed
+}
+
+/// A `dict` field with `default_factory=dict`, so an absent key is `{}` and an
+/// explicit `null` is a type failure.
+fn object_field(errors: &mut Vec<Value>, body: &Value, field: &str) -> Option<Map<String, Value>> {
+    match body.get(field) {
+        None => Some(Map::new()),
+        Some(Value::Object(map)) => Some(map.clone()),
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                field,
+                "dict_type",
+                "Input should be a valid dictionary",
+            ));
+            None
+        }
+    }
+}
+
+/// A `dict | None` field: absent and null both mean "leave it alone".
+fn object_field_opt(
+    errors: &mut Vec<Value>,
+    body: &Value,
+    field: &str,
+) -> Option<Map<String, Value>> {
+    match body.get(field) {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(map)) => Some(map.clone()),
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                field,
+                "dict_type",
+                "Input should be a valid dictionary",
+            ));
+            None
+        }
+    }
+}
+
+/// `?limit=` as FastAPI reads a plain `int` query parameter.
+fn int_query(query: Option<&str>, name: &str, default: i64) -> Result<i64, ApiError> {
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        if key == name {
+            return value.trim().parse::<i64>().map_err(|_| {
+                ApiError::validation(vec![json!({
+                    "type": "int_parsing",
+                    "loc": ["query", name],
+                    "msg": "Input should be a valid integer, unable to parse string as an integer",
+                })])
+            });
+        }
+    }
+    Ok(default)
+}
+
+fn parse_action_creates(errors: &mut Vec<Value>, value: Option<&Value>) -> Vec<ActionCreate> {
+    let Some(value) = value else { return Vec::new() };
+    let Some(items) = value.as_array() else {
+        errors.push(ApiError::field_error("actions", "list_type", "Input should be a valid list"));
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        // The index is an **integer** in `loc`, not a string.
+        let prefix = vec![Value::from("actions"), Value::from(index)];
+        if !item.is_object() {
+            errors.push(json!({
+                "type": "model_attributes_type",
+                "loc": loc_with(&prefix, &[]),
+                "msg": "Input should be a valid dictionary or object to extract fields from",
+            }));
+            continue;
+        }
+        if let Some(action) = parse_action_create(errors, item, &prefix) {
+            out.push(action);
+        }
+    }
+    out
+}
+
+fn loc_with(prefix: &[Value], tail: &[&str]) -> Vec<Value> {
+    let mut loc = vec![Value::from("body")];
+    loc.extend(prefix.iter().cloned());
+    loc.extend(tail.iter().map(|s| Value::from(*s)));
+    loc
+}
+
+/// One `ActionCreate`, nested under `prefix` when it came from a list.
+fn parse_action_create(
+    errors: &mut Vec<Value>,
+    body: &Value,
+    prefix: &[Value],
+) -> Option<ActionCreate> {
+    let before = errors.len();
+    let mut string_field = |field: &str, required: bool| -> String {
+        match body.get(field) {
+            None => {
+                if required {
+                    errors.push(json!({
+                        "type": "missing",
+                        "loc": loc_with(prefix, &[field]),
+                        "msg": "Field required",
+                    }));
+                }
+                String::new()
+            }
+            Some(Value::String(s)) => s.clone(),
+            Some(_) => {
+                errors.push(json!({
+                    "type": "string_type",
+                    "loc": loc_with(prefix, &[field]),
+                    "msg": "Input should be a valid string",
+                }));
+                String::new()
+            }
+        }
+    };
+
+    let action_id = string_field("action_id", true);
+    let name = string_field("name", true);
+    let description = string_field("description", true);
+    let execution_mode = match body.get("execution_mode") {
+        None => "client".to_string(),
+        _ => string_field("execution_mode", false),
+    };
+    let endpoint = match body.get("endpoint") {
+        None | Some(Value::Null) => None,
+        _ => Some(string_field("endpoint", false)),
+    };
+
+    let parameters = match body.get("parameters") {
+        None => Some(Map::new()),
+        Some(Value::Object(map)) => Some(map.clone()),
+        Some(_) => {
+            errors.push(json!({
+                "type": "dict_type",
+                "loc": loc_with(prefix, &["parameters"]),
+                "msg": "Input should be a valid dictionary",
+            }));
+            None
+        }
+    };
+
+    if errors.len() != before {
+        return None;
+    }
+    Some(ActionCreate {
+        action_id,
+        name,
+        description,
+        parameters,
+        execution_mode,
+        endpoint,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -935,10 +2190,10 @@ mod tests {
     fn the_user_message_carries_the_goal_then_the_context() {
         let context: Map<String, Value> = json!({"item": {"id": 1}}).as_object().unwrap().clone();
         assert_eq!(
-            build_user_message("Plan it", &context),
+            build_user_message("Plan it", &context, &[]),
             "Goal: Plan it\n\nContext: {\n  \"item\": {\n    \"id\": 1\n  }\n}"
         );
-        assert_eq!(build_user_message("Plan it", &Map::new()), "Goal: Plan it");
+        assert_eq!(build_user_message("Plan it", &Map::new(), &[]), "Goal: Plan it");
     }
 
     #[test]
@@ -947,7 +2202,7 @@ mod tests {
             (0..15).map(|i| json!({"role": "user", "content": format!("m{i}")})).collect();
         let context: Map<String, Value> =
             json!({"conversation_history": turns}).as_object().unwrap().clone();
-        let message = build_user_message("g", &context);
+        let message = build_user_message("g", &context, &[]);
         // The excluded key leaves an empty context object behind, which Python
         // still renders.
         assert!(message.contains("Context: {}"), "{message}");

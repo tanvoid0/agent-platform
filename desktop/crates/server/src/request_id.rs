@@ -12,11 +12,19 @@
 //! Handlers never see it. `ApiError` and `AuthError` build their bodies inside
 //! the handler's task, which is why a task-local reaches them without threading
 //! an extractor through every signature.
+//!
+//! [`middleware`] also emits one JSON log line per request, in the same shape
+//! as `app/observability.py`'s `JsonLogFormatter` — the Logs screen's parser
+//! and its trace-id filter treat both servers' output as one stream, so a
+//! request served by *this* half must log the same fields Python does or a
+//! trace id from a migrated domain filters to nothing.
 
 use axum::extract::Request;
 use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
+use serde_json::json;
+use std::time::Instant;
 
 pub const HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
@@ -39,15 +47,69 @@ pub async fn middleware(mut req: Request, next: Next) -> Response {
         .map(str::to_owned)
         .unwrap_or_else(uuid_v4);
 
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let started = Instant::now();
+
     // Only fails if a caller sent bytes that cannot round-trip a header value,
     // in which case the generated id is used for our half and Python makes its own.
-    if let Ok(value) = HeaderValue::from_str(&id) {
+    let response = if let Ok(value) = HeaderValue::from_str(&id) {
         req.headers_mut().insert(HEADER, value.clone());
-        let mut response = REQUEST_ID.scope(id, next.run(req)).await;
+        let mut response = REQUEST_ID.scope(id.clone(), next.run(req)).await;
         response.headers_mut().insert(HEADER, value);
-        return response;
-    }
-    next.run(req).await
+        response
+    } else {
+        next.run(req).await
+    };
+
+    log_request(&id, &method, &path, response.status().as_u16(), started.elapsed());
+    response
+}
+
+fn log_request(request_id: &str, method: &str, path: &str, status: u16, elapsed: std::time::Duration) {
+    let line = json!({
+        "timestamp": chrono_now(),
+        "level": "INFO",
+        "logger": "agent_platform.request",
+        "message": "request completed",
+        "request_id": request_id,
+        "event": "request.completed",
+        "method": method,
+        "path": path,
+        "route": path,
+        "status_code": status,
+        "duration_ms": elapsed.as_millis(),
+    });
+    println!("{line}");
+}
+
+/// RFC3339 with the same shape `datetime.isoformat()` produces
+/// (`…+00:00`, not `…Z`), so `logs.rs`'s `clock()` splits it identically.
+fn chrono_now() -> String {
+    let now = std::time::SystemTime::now();
+    let unix = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = unix.as_secs();
+    let micros = unix.subsec_micros();
+    let days = secs / 86_400;
+    let time_of_day = secs % 86_400;
+    let (h, m, s) = (time_of_day / 3600, (time_of_day % 3600) / 60, time_of_day % 60);
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{micros:06}+00:00")
+}
+
+/// Howard Hinnant's `civil_from_days`: days-since-epoch → (year, month, day),
+/// proleptic Gregorian. No `chrono` dependency for one timestamp format.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// A v4 uuid in the shape `str(uuid.uuid4())` produces.
