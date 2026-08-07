@@ -216,7 +216,7 @@ proxy byte-for-byte:
 | `POST /api/v1/chat` + the shared chat helpers | `chat.rs`, `chat_usage.rs`, `chat_thread_title.rs` | `/llm/ready`, `/chat/resolved-defaults`, `/llm/ui-catalog` — proxied on purpose, pending a delete-or-port call |
 | Request correlation id on every response and error | `request_id.rs` | — |
 
-**Assistant: 18 of 20 routes now Rust** (`assistant.rs` +
+**Assistant: 19 of 20 routes now Rust — the domain is whole** (`assistant.rs` +
 [`assistant_turn.rs`](desktop/crates/server/src/assistant_turn.rs) +
 [`clarifying_form.rs`](desktop/crates/server/src/clarifying_form.rs),
 2026-08-06/07) — `GET dashboard`, `GET goals`, `GET`/`POST chat/threads` (POST
@@ -224,12 +224,12 @@ proxied), `GET chat/context-usage`, `GET chat/thread`, `POST chat/send`,
 `GET`/`PATCH profile/{domain}`, `GET profile`, `GET profile/forms`,
 `POST chat/apply`, `POST reviews/run`, `GET reviews/pending`,
 `POST reviews/{id}/apply`, `POST reviews/{id}/dismiss`,
-`POST items/{id}/complete`, `POST chat/retry`, `POST chat/submit-form`.
-**Still Python: 2 assistant routes** — `/reset`, and `POST chat/threads`,
-which is proxied on purpose (it shares a path with the `GET` Rust owns and
-is declared to `proxy::forward` explicitly) — plus
+`POST items/{id}/complete`, `POST chat/retry`, `POST chat/submit-form`,
+`POST reset`. **Only `POST chat/threads` is left with Python, and by choice
+not by blocker** — it shares a path with the `GET` Rust owns, so it is
+declared to `proxy::forward` explicitly. **Still entirely Python:**
 coder (10), playground (6), `system_routes`, and the
-workspace/document stack.** That is step 4 onward.
+workspace/document stack.** That is what remains of step 4 onward.
 
 **How a domain is proven.** Point the existing pytest file at a running server
 and compare failure sets, then cross-render the same rows through both servers
@@ -327,13 +327,15 @@ Ordered by what unblocks what:
    and coder holds the first in-process state shared between two HTTP requests,
    which fixes its granularity at five-routes-or-nothing.
 
-   **Done:** the tokenizer decision (below), `POST /api/v1/chat` (`chat.rs`), and
-   the shared helpers `chat_usage.rs` + `chat_thread_title.rs` that both halves
-   and playground need. **Held:** the three dead Flow-UI GETs, pending a call that
-   is not the migration's. **Next, in order:** the assistant's reads, then its
-   profile route (which closes the `assistant_domain_profiles` two-writer), then
-   threads + the LLM turns, then apply/reviews (which closes `todo_items`), then
-   `/assistant/reset`. The coder commit is separate and atomic.
+   **Done:** the tokenizer decision (below), `POST /api/v1/chat` (`chat.rs`), the
+   shared helpers `chat_usage.rs` + `chat_thread_title.rs` that both halves
+   and playground need, and — as of 2026-08-07 — **the whole assistant half**:
+   the reads, the profile route (closing the `assistant_domain_profiles`
+   two-writer), threads + the LLM turns, apply/reviews (closing `todo_items`),
+   `chat/retry` + `chat/submit-form`, and `/assistant/reset`. **Held:** the three
+   dead Flow-UI GETs, pending a call that is not the migration's, and
+   `POST /chat/threads`, proxied by choice. **Next: coder** — separate and
+   atomic, and now the only thing left in this step.
 4½. **playground** — 699 LOC, mounted at `main.py:105`, called by **nothing** in
    `desktop/crates/`, and the reason the token counters do not close at the end of
    step 4 as this list used to claim. `playground/service.py` is a strict subset
@@ -577,8 +579,9 @@ none — no split. Porting `spawn-process` removes the last writer of `todo_item
 writer of `todo_items` outright, as this note first claimed.
 `assistant/services/board_action_apply.py:14` imports `create_item` and
 `update_item` from `todos.services.board_service` and calls them from three
-assistant routes, and `/assistant/reset` deletes rows outright. That table has a
-Python writer until step 4's sub-step 7.
+assistant routes, and `/assistant/reset` deletes rows outright. Those closed in
+step 4's sub-step 7 and sub-step 9 respectively — the apply routes first, then
+reset — so `todo_items` had a Python writer until 2026-08-07.
 
 ##### The concurrency
 
@@ -1434,8 +1437,8 @@ missing-`item_id` skip, an item-not-on-this-board skip, and
 all correct. Not yet cross-rendered against a live Python server the way
 steps 1-3 were; `cargo test`'s 161 pre-existing cases still pass unchanged.
 
-**(8) `chat/retry` + `chat/submit-form` — shipped** (2026-08-07), leaving
-`/assistant/reset` as the only Python assistant route. Both are thin over
+**(8) `chat/retry` + `chat/submit-form` — shipped** (2026-08-07), which left
+`/assistant/reset` as the last one (sub-step 9, below). Both are thin over
 machinery sub-step 6 already built (`generate_assistant_turn`,
 `send_chat_message`, `resolve_thread`, `persist_thread`,
 `extract_pending_form`, `actions_without_forms`,
@@ -1471,6 +1474,45 @@ then submitted, exercising every rendering rule in one call (field-id label
 lookup, the underscore fallback for an unmatched id, `True` → `Yes`, `[]` →
 `(none)`) — and `retry`'s three refusals (out-of-range, negative, unknown
 thread) plus a successful regenerate-from-index-0.
+
+**(9) `POST /assistant/reset` — shipped** (2026-08-07). **The assistant
+domain is whole**; only `POST /chat/threads` still proxies, by choice.
+
+This is the route the list kept putting last because its ordered cascade is
+the only place a wrong FK order corrupts, so it is worth writing down what
+that order actually is: null the project's pointers first (Python flushes
+before deleting for exactly this reason — the FK from
+`project.assistant_board_id` would otherwise block the board delete), then
+chat threads, then reviews, then the board purge — item **events** first
+(they are *not* cascaded on item delete), then items, then categories, then
+the board row.
+
+Two things the port does differently in shape but not in effect. The
+row-by-row cascade is five `DELETE`s, with items split into two passes —
+`parent_item_id IS NOT NULL` then the rest — which is Python's
+`sorted(..., key=lambda i: (i.parent_item_id is None, i.id or 0))` as a
+`WHERE`. That split is on *has a parent* and nothing finer, so a grandchild
+shares a pass with its parent; matching Python beat topologically sorting,
+and it is latent there identically. And the deletes run in one
+`state.pool` transaction (the `executor.rs` precedent) while the project
+`UPDATE` sits outside it, because `project` is the one table already on the
+Postgres-aware `state.any` pool and a transaction cannot span both while
+that migration is mid-flight — noted at the function rather than papered
+over.
+
+**Cross-rendered properly, which this route earns.** Both servers reset the
+same seeded shape (assistant board, a parent item, a subtask, an item event,
+a review, a chat thread, a domain profile, plus an *unrelated* second board)
+on the same database: identical response bodies
+(`{"project_id":1,"board_id":2,"thread_id":1}` — including SQLite reusing
+the rowids, which both sides do), a byte-identical `confirm=false` 400, and
+identical resulting table state row for row. The invariants that matter all
+held on both: **domain profiles survive** (the documented one), the
+unrelated board and its categories are untouched, and the new board's
+`created_at` proves it was genuinely purged and rebuilt rather than left in
+place. `last_todo_board_id` was then driven through both of its branches —
+cleared when it pointed at the assistant board, kept when it pointed at
+another.
 
 **What proves it: less than half.** 14 of `test_assistant_api.py`'s 28 patch
 `decide_actions` or `_chat_only` in process — that is the entire LLM-touching
@@ -2192,10 +2234,11 @@ crate-wide now, with a test guarding it) and `KNOWN_TOOLS` had drifted behind
 `TOOL_SPECS`, so leaked `search` and `repo_map` calls were being dropped while
 their markup was stripped from the answer.
 
-**Resume at:** step 4's sub-steps 7 and 8 both shipped 2026-08-07 — apply/
-reviews (closing `todo_items`' last Python writer), then `chat/retry` +
-`chat/submit-form`. **The assistant is one route from whole:**
-`/assistant/reset`, whose ordered cascade delete is the only place a wrong FK
-order corrupts and which has no caller (`POST chat/threads` is the other
-Python one, but it is proxied by choice, not by blocker). After that,
-coder — separate, atomic, and the largest single diff left in the migration.*
+**Resume at: coder.** Step 4's assistant half finished 2026-08-07 — sub-step
+7 (apply/reviews, closing `todo_items`' last Python writer), sub-step 8
+(`chat/retry` + `chat/submit-form`) and sub-step 9 (`/reset`, cross-rendered
+against Python on the same database). **The assistant domain is whole**; only
+`POST /chat/threads` proxies, and by choice. What is left of the migration is
+coder — separate, atomic, and the largest single diff in it — then playground
+(step 4½, which is worth deleting rather than porting: no caller) and
+`system_routes` (step 5, the fan-in that can only move last).*

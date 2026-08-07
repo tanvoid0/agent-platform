@@ -1,10 +1,15 @@
 //! Assistant reads, ported from `app/assistant/routes.py` + services.
 //!
-//! **Scope: reads, `PATCH /profile/{domain}`, `POST /chat/send` (sub-steps
-//! 4-6), `chat/apply` + `reviews/run`/`apply`/`dismiss` +
-//! `items/{id}/complete` (sub-step 7), and `chat/retry` + `chat/submit-form`
-//! (sub-step 8)** — ADR 0007 step 4's ordered list in `plan.md`.
-//! `/assistant/reset` is the one route still proxied.
+//! **Scope: the whole assistant domain bar one route** — ADR 0007 step 4's
+//! ordered list in `plan.md`, sub-steps 4 through 9: the reads,
+//! `PATCH /profile/{domain}`, `POST /chat/send`, `chat/apply` +
+//! `reviews/run`/`apply`/`dismiss` + `items/{id}/complete`, `chat/retry` +
+//! `chat/submit-form`, and `POST /reset`.
+//!
+//! `POST /chat/threads` is the one path still handed to Python, and by choice
+//! rather than by blocker: it shares its path with the `GET` this module owns,
+//! so it is declared to `proxy::forward` explicitly (leaving it to the
+//! router's fallback would answer 405 instead of falling through).
 //!
 //! `chat/apply` and `reviews/{id}/apply` both close through
 //! [`apply_board_actions`], the board-scoped twin of `todos.rs`'s per-item
@@ -84,6 +89,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/v1/assistant/profile/{domain}",
             get(get_domain_profile).patch(patch_domain_profile),
         )
+        .route("/api/v1/assistant/reset", post(assistant_reset))
         .route("/api/v1/assistant/chat/apply", post(chat_apply))
         .route("/api/v1/assistant/chat/retry", post(chat_retry))
         .route("/api/v1/assistant/chat/submit-form", post(chat_submit_form))
@@ -1800,6 +1806,151 @@ async fn chat_submit_form(
     )
     .await?;
     Ok(Json(data).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// POST /assistant/reset — `assistant_reset.py`
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct AssistantResetRequest {
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `_purge_todo_board`, as four statements instead of a row-by-row cascade.
+///
+/// **Order is the whole point of this function.** SQLite runs with
+/// `PRAGMA foreign_keys = OFF` on both servers (see `db.rs`), so nothing here
+/// is enforced today — but the schema declares these keys, Postgres will
+/// enforce them, and this is the one route where getting the order wrong
+/// corrupts rather than errors. Dependents first: events (which are *not*
+/// cascaded on item delete), then items, then categories, then the board.
+///
+/// Items go in two passes because `todo_items.parent_item_id` is
+/// self-referential — subtasks before top-level items. That is Python's
+/// `sorted(items, key=lambda i: (i.parent_item_id is None, i.id or 0))`
+/// reproduced as a `WHERE`: it splits on *has a parent* and nothing finer, so
+/// a grandchild is in the same pass as its parent. Matching that rather than
+/// topologically sorting keeps the two servers identical; it is latent in
+/// Python the same way.
+async fn purge_todo_board(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    board_id: i64,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "DELETE FROM todo_item_events WHERE item_id IN \
+         (SELECT id FROM todo_items WHERE board_id = ?)",
+    )
+    .bind(board_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM todo_items WHERE board_id = ? AND parent_item_id IS NOT NULL")
+        .bind(board_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM todo_items WHERE board_id = ?")
+        .bind(board_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM todo_categories WHERE board_id = ?")
+        .bind(board_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM todo_boards WHERE id = ?")
+        .bind(board_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// `reset_assistant_workspace`: drop the project's assistant board (items,
+/// their events, categories), every assistant chat thread and every review,
+/// then hand back a fresh board and thread.
+///
+/// **Domain profiles survive on purpose** — `assistant_domain_profiles` is not
+/// touched here, matching Python's docstring; those are cleared from the
+/// profile page instead.
+///
+/// The deletes run in one transaction, which Python gets from doing the whole
+/// thing in a single session. The project-pointer `UPDATE` is *outside* it,
+/// because `project` is the one table already converted to the Postgres-aware
+/// `state.any` pool and a transaction cannot span both pools while that
+/// migration is mid-flight. Python nulls the pointer and flushes before
+/// deleting for the same reason it matters here: the FK from
+/// `project.assistant_board_id` would otherwise block the board delete.
+async fn assistant_reset(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Query(q): Query<ProjectIdQuery>,
+    body: Option<Json<AssistantResetRequest>>,
+) -> Result<Response, ApiError> {
+    let project_id = require_project(&state, &principal, q.project_id).await?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    if !req.confirm {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Confirmation required: send confirm=true to reset the assistant workspace",
+        ));
+    }
+
+    #[derive(FromRow)]
+    struct ProjectPointers {
+        assistant_board_id: Option<i64>,
+        last_todo_board_id: Option<i64>,
+    }
+    let pointers: Option<ProjectPointers> = sqlx::query_as(&db::sql(
+        "SELECT assistant_board_id, last_todo_board_id FROM project WHERE id = ?",
+        state.backend,
+    ))
+    .bind(project_id)
+    .fetch_optional(&state.any)
+    .await?;
+    let Some(pointers) = pointers else {
+        return Err(ApiError::not_found("Project not found"));
+    };
+    let board_id = pointers.assistant_board_id;
+
+    // `last_todo_board_id` is cleared only when it pointed at the board being
+    // deleted; an unrelated board the user was last on survives the reset.
+    let clear_last = board_id.is_some() && pointers.last_todo_board_id == board_id;
+    let now = sql_now();
+    let sql = if clear_last {
+        "UPDATE project SET assistant_board_id = NULL, last_todo_board_id = NULL, \
+         planning_prefs_json = NULL, updated_at = ? WHERE id = ?"
+    } else {
+        "UPDATE project SET assistant_board_id = NULL, planning_prefs_json = NULL, \
+         updated_at = ? WHERE id = ?"
+    };
+    sqlx::query(&db::sql(sql, state.backend))
+        .bind(&now)
+        .bind(project_id)
+        .execute(&state.any)
+        .await?;
+
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("DELETE FROM assistant_chat_threads WHERE project_id = ?")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM assistant_reviews WHERE project_id = ?")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(board_id) = board_id {
+        purge_todo_board(&mut tx, board_id).await?;
+    }
+    tx.commit().await?;
+
+    let new_board_id = ensure_assistant_board(&state, project_id).await?;
+    let thread = create_thread_row(&state, project_id, Some("New chat")).await?;
+
+    Ok(Json(json!({
+        "project_id": project_id,
+        "board_id": new_board_id,
+        "thread_id": thread.id,
+    }))
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------
