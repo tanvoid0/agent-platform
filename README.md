@@ -8,7 +8,7 @@ Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-co
 - **Tokens:** `http://127.0.0.1:18410/tokens` — issue and revoke workspace API tokens
 - **Everything else** — runs, teams, projects, providers, model ops — lives in the desktop app
 
-Provider catalog behavior is normalized across `/api/v1/llm/ui-catalog`, `/api/v1/llm-proxy/ui/providers`, and `/api/v1/llm-proxy/test/model-options`: each provider exposes the same capability shape (`streaming`, `tools`, `json_mode`, `model_discovery`). When a provider cannot list models live, the server falls back in order to provider aliases from `config.yaml`, then `orchestrator_ui.yaml` `fallback_models`, then the provider default model.
+Provider catalog behavior is normalized across `/api/v1/llm-proxy/ui/providers` and `/api/v1/llm-proxy/test/model-options`: each provider exposes the same capability shape (`streaming`, `tools`, `json_mode`, `model_discovery`). When a provider cannot list models live, the server falls back in order to provider aliases from `config.yaml`, then `orchestrator_ui.yaml` `fallback_models`, then the provider default model.
 
 ### BYOK (bring-your-own-key)
 

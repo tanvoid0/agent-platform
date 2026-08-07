@@ -142,58 +142,22 @@ def test_chat_completions_proxies_upstream(client, monkeypatch):
     assert data["choices"][0]["message"]["content"] == "hi"
 
 
-def test_chat_resolved_defaults_returns_provider_model(client):
-    c, _mock_cls, _mock_inst = client
-    r = c.get("/api/v1/chat/resolved-defaults", headers=_api_auth_headers())
-    assert r.status_code == 200
-    j = r.json()
-    assert "provider" in j and "model" in j
-    assert j["provider"] in ("ollama", "lm_studio", "gemini", "aimlapi")
-    assert isinstance(j["model"], str)
-
-
 def test_llm_proxy_env_provider_switch_applies_without_restart(client, monkeypatch, tmp_path):
     c, _mock_cls, _mock_inst = client
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
     env_path = tmp_path / ".env"
     env_path.write_text("DEFAULT_PROVIDER=lm_studio\n", encoding="utf-8")
 
-    r_before = c.get("/api/v1/chat/resolved-defaults", headers=_api_auth_headers())
+    r_before = c.get("/api/v1/llm-proxy/ui/providers", headers=_api_auth_headers())
     assert r_before.status_code == 200
-    assert r_before.json()["provider"] == "lm_studio"
+    assert r_before.json()["resolved_defaults"]["provider"] == "lm_studio"
 
     r_set = c.post("/api/v1/llm-proxy/env", json={"DEFAULT_PROVIDER": "ollama"}, headers=_api_auth_headers())
     assert r_set.status_code == 200
 
-    r_after = c.get("/api/v1/chat/resolved-defaults", headers=_api_auth_headers())
+    r_after = c.get("/api/v1/llm-proxy/ui/providers", headers=_api_auth_headers())
     assert r_after.status_code == 200
-    assert r_after.json()["provider"] == "ollama"
-
-
-def test_llm_ui_catalog_returns_providers_and_media(client):
-    c, _mock_cls, _mock_inst = client
-    r = c.get("/api/v1/llm/ui-catalog")
-    assert r.status_code == 200
-    j = r.json()
-    assert "resolved_defaults" in j
-    assert "providers" in j
-    providers = j["providers"]
-    assert len(providers) == 5
-    assert [p["id"] for p in providers] == ["ollama", "lm_studio", "aimlapi", "anthropic", "gemini"]
-    for p in providers:
-        assert "configured" in p
-        assert "reachable" in p
-        assert "capabilities" in p
-        assert "streaming" in p["capabilities"]
-        assert "tools" in p["capabilities"]
-        assert "json_mode" in p["capabilities"]
-        assert "model_discovery" in p["capabilities"]
-        assert "models" in p
-        assert "chat" in p
-        assert "default_model" in p["chat"]
-        assert isinstance(p["chat"]["options"], list)
-    gm = j["gemini_media"]
-    assert "image" in gm and "music" in gm and "video" in gm
+    assert r_after.json()["resolved_defaults"]["provider"] == "ollama"
 
 
 def test_llm_proxy_provider_catalog_uses_saved_defaults_and_local_order(client, monkeypatch, tmp_path):
@@ -284,41 +248,6 @@ def test_llm_proxy_provider_catalog_falls_back_when_listing_unavailable(client, 
     assert fallback_payload["provider"] == "anthropic"
     assert fallback_payload["source"] == "ui_fallback_models"
     assert fallback_payload["models"] == ["claude-sonnet-4-20250514"]
-
-
-def test_llm_ready_proxies_upstream(client, monkeypatch):
-    c, _mock_cls, _mock_inst = client
-    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "test-orch-key")
-    auth = {"Authorization": "Bearer test-orch-key"}
-
-    class FakeResp:
-        status_code = 200
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def get(self, url, headers=None):
-            assert "/v1/health/readiness" in url
-            assert headers and "Bearer test-orch-key" in headers.get("Authorization", "")
-            return FakeResp()
-
-    monkeypatch.setattr("chat_routes.httpx.AsyncClient", lambda *a, **k: FakeClient())
-
-    r = c.get("/api/v1/llm/ready", headers=auth)
-    assert r.status_code == 200
-    assert r.json() == {"ok": True}
-
-
-def test_llm_ready_requires_proxy_key(client, monkeypatch):
-    c, _mock_cls, _mock_inst = client
-    monkeypatch.delenv("AGENT_PLATFORM_MASTER_KEY", raising=False)
-
-    r = c.get("/api/v1/llm/ready")
-    assert r.status_code == 503
 
 
 def test_chat_requires_proxy_key(client, monkeypatch):

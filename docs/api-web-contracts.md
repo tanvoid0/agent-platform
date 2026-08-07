@@ -8,21 +8,19 @@ The contract suite is the pytest `contract` marker. `pnpm smoke` runs that suite
 
 These routes were chosen because a shape change here would break a client flow quickly and visibly:
 
-1. `GET /api/v1/llm/ui-catalog`
-2. `GET /v1/catalog`
-3. `POST /api/v1/chat`
-4. `GET /api/v1/chat/resolved-defaults`
-5. `GET /api/v1/teams/`
-6. `POST /api/v1/teams/`
-7. `POST /api/v1/processes`
-8. `GET /api/v1/todos/boards`
-9. `GET /api/v1/todos/boards/{id}`
-10. `GET /api/v1/workspaces/`, `GET /api/v1/me/workspace`, and workspace-scoped `GET /api/v1/projects/`
-11. `GET /api/v1/model-ops/projects`
-12. `POST /api/v1/model-ops/jobs`
-13. `GET /api/v1/model-ops/jobs/{id}`
-14. `GET /api/v1/model-ops/registry`
-15. `GET /api/v1/model-ops/ollama/models`
+1. `GET /v1/catalog`
+2. `POST /api/v1/chat`
+3. `GET /api/v1/teams/`
+4. `POST /api/v1/teams/`
+5. `POST /api/v1/processes`
+6. `GET /api/v1/todos/boards`
+7. `GET /api/v1/todos/boards/{id}`
+8. `GET /api/v1/workspaces/`, `GET /api/v1/me/workspace`, and workspace-scoped `GET /api/v1/projects/`
+9. `GET /api/v1/model-ops/projects`
+10. `POST /api/v1/model-ops/jobs`
+11. `GET /api/v1/model-ops/jobs/{id}`
+12. `GET /api/v1/model-ops/registry`
+13. `GET /api/v1/model-ops/ollama/models`
 
 ## Compatibility expectations
 

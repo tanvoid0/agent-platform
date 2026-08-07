@@ -40,13 +40,6 @@ def _chat_max_concurrent_requests() -> int:
 _llm_semaphore = asyncio.Semaphore(_chat_max_concurrent_requests())
 
 
-def _chat_resolved_defaults() -> dict[str, str]:
-    """Same provider/model as the embedded OpenAI proxy for unqualified requests (config + env)."""
-    from llm_proxy.routes.llm import get_resolved_proxy_defaults
-
-    return get_resolved_proxy_defaults()
-
-
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completions body for the Flow UI and other clients."""
 
@@ -69,63 +62,6 @@ class ChatCompletionRequest(BaseModel):
         if not isinstance(v, list) or len(v) == 0:
             raise ValueError("messages must be a non-empty list")
         return v
-
-
-def _llm_proxy_origin() -> str:
-    base = llm_proxy_base_url_v1().rstrip("/")
-    return base.rsplit("/v1", 1)[0]
-
-
-@router.get("/llm/ready")
-async def llm_ready():
-    """
-    Lightweight probe: server GETs /v1/health/readiness on the embedded LLM proxy.
-
-    Do not use GET /v1/models here: that handler may call Ollama and LM Studio (multi-second),
-    while the Flow UI times out browser fetches to this route (~4.5s) and showed LLM offline
-    even when chat and agents worked.
-    """
-    key = llm_proxy_master_key()
-    if not key:
-        raise HTTPException(
-            status_code=503,
-            detail="AGENT_PLATFORM_MASTER_KEY is not set.",
-        )
-    origin = _llm_proxy_origin()
-    headers = {"Authorization": f"Bearer {key}"}
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.get(f"{origin}/v1/health/readiness", headers=headers)
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}") from e
-    if r.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM proxy returned HTTP {r.status_code}",
-        )
-    return {"ok": True}
-
-
-@router.get("/chat/resolved-defaults")
-async def chat_resolved_defaults():
-    """
-    Effective LLM provider for this Agent Platform process (matches embedded proxy defaults).
-
-    Used by the Flow UI so the client does not need Vite flags to mirror server routing.
-    """
-    d = _chat_resolved_defaults()
-    return {"provider": d["provider"], "model": d["model"]}
-
-
-@router.get("/llm/ui-catalog")
-async def llm_ui_catalog():
-    """
-    Provider activation, reachability probes, chat model lists (from embedded proxy),
-    and Gemini media defaults for Flow settings and pickers.
-    """
-    from llm_ui_catalog import build_llm_ui_catalog_response
-
-    return await build_llm_ui_catalog_response()
 
 
 async def _stream_completion(url: str, headers: dict[str, str], payload: dict[str, Any]):

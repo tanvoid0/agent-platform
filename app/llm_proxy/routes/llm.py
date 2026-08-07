@@ -185,13 +185,6 @@ def _effective_defaults() -> tuple[str, str]:
     return p, m
 
 
-def get_resolved_proxy_defaults() -> dict[str, str]:
-    """Provider + model the embedded proxy would use for an unqualified request (for Settings UI)."""
-    from llm_proxy.services.provider_catalog import get_resolved_defaults
-
-    return get_resolved_defaults()
-
-
 @dataclass(frozen=True)
 class _LiveModelSource:
     provider_id: str
