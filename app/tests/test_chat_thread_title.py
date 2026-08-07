@@ -19,7 +19,9 @@ from chat_thread_title import (
     persist_thread_title,
     start_smart_title_task,
 )
-from playground.models import PlaygroundChatThread
+# Any of the three thread tables would do — this module is table-agnostic and
+# only needs a row with `title`, `updated_at` and `set_messages`.
+from coder.models import CoderChatThread
 
 
 def _run(coro):
@@ -106,7 +108,7 @@ def test_start_smart_title_task_respects_env(monkeypatch):
 
 def test_persist_thread_title(test_engine):
     with Session(test_engine) as session:
-        row = PlaygroundChatThread(title="New chat")
+        row = CoderChatThread(title="New chat")
         row.set_messages([])
         session.add(row)
         session.commit()
@@ -120,7 +122,7 @@ def test_await_smart_title_uses_smart_result(test_engine, monkeypatch):
 
     async def _test():
         with Session(test_engine) as session:
-            row = PlaygroundChatThread(title="Fallback")
+            row = CoderChatThread(title="Fallback")
             row.set_messages([])
             session.add(row)
             session.commit()
@@ -140,7 +142,7 @@ def test_await_smart_title_uses_smart_result(test_engine, monkeypatch):
 def test_await_smart_title_keeps_fallback_when_task_none(test_engine):
     async def _test():
         with Session(test_engine) as session:
-            row = PlaygroundChatThread(title="New chat")
+            row = CoderChatThread(title="New chat")
             row.set_messages([])
             session.add(row)
             session.commit()
@@ -181,7 +183,7 @@ def test_merge_title_sse_events_emits_title(test_engine, monkeypatch):
             return "Smart greeting"
 
         with Session(test_engine) as session:
-            row = PlaygroundChatThread(title="New chat")
+            row = CoderChatThread(title="New chat")
             row.set_messages([])
             session.add(row)
             session.commit()

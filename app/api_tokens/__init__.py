@@ -8,7 +8,7 @@ AVAILABLE_SCOPES: list[dict[str, str]] = [
     {"scope": "process:write", "description": "Create, start, and mutate processes"},
     {"scope": "todos:read", "description": "Read todo boards and items"},
     {"scope": "todos:write", "description": "Create and update todo boards and items"},
-    {"scope": "chat:write", "description": "Send messages to chat / coder / playground"},
+    {"scope": "chat:write", "description": "Send messages to chat and the coder agent"},
     {"scope": "model:read", "description": "Read model-ops projects, jobs, registry, and Ollama models"},
     {"scope": "model:write", "description": "Create/train models, run build jobs, and manage Ollama lifecycle"},
 ]

@@ -74,12 +74,16 @@ def workspace_info(
     in Explorer / Finder / a terminal on the machine where the API stores files (often the server).
     """
     _require_project(session, project_id, principal)
-    n = normalize_relative_path(path)
-    if n.startswith("processes/"):
-        seg = n.split("/", 2)
-        if len(seg) >= 2 and seg[1].isdigit():
-            _require_process_for_project(session, project_id, int(seg[1]))
+    # Inside the `try`: `normalize_relative_path` raises `WorkspaceError` for a
+    # path containing `..`, and out here that escaped unhandled — a 500 where
+    # every other route in this file answers 400. Found by cross-rendering this
+    # domain against the Rust port.
     try:
+        n = normalize_relative_path(path)
+        if n.startswith("processes/"):
+            seg = n.split("/", 2)
+            if len(seg) >= 2 and seg[1].isdigit():
+                _require_process_for_project(session, project_id, int(seg[1]))
         p = ensure_dir_path(project_id, path)
         return {
             "absolute_path": str(p),

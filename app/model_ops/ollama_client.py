@@ -29,7 +29,11 @@ async def list_models() -> dict[str, Any]:
 async def show_model(name: str) -> dict[str, Any]:
     r = await post_with_retry(
         f"{_base()}/api/show",
-        json={"name": name},
+        # `json_body`, not `json`: `post_with_retry` is `UpstreamClient.post`,
+        # whose keyword is `json_body`. Calling it with `json=` was a TypeError,
+        # i.e. a 500 on every show and every delete — found by cross-rendering
+        # this domain against the Rust port.
+        json_body={"name": name},
         timeout=30.0,
         context="model_ops_show",
     )
@@ -41,7 +45,7 @@ async def show_model(name: str) -> dict[str, Any]:
 async def delete_model(name: str) -> None:
     r = await post_with_retry(
         f"{_base()}/api/delete",
-        json={"name": name},
+        json_body={"name": name},
         timeout=60.0,
         context="model_ops_delete",
     )

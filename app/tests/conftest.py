@@ -21,7 +21,6 @@ from sqlmodel import create_engine
 import models  # noqa: F401 — register tables on SQLModel.metadata
 import todos.models  # noqa: F401 — todo board tables
 import assistant.models  # noqa: F401 — assistant tables
-import playground.models  # noqa: F401 — playground chat tables
 import coder.models  # noqa: F401 — coder agent chat tables
 import model_ops.models  # noqa: F401 — model build/train tables
 import workflows.models  # noqa: F401 — workflow automation tables
