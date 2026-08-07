@@ -282,6 +282,42 @@ async fn root() -> Response {
         .into_response()
 }
 
+/// `AGENT_PLATFORM_CORS_ORIGINS` — comma-separated origins allowed to call this
+/// server from a browser. Unset means no CORS layer at all, which is what a
+/// loopback-only install wants: same-origin and server-to-server callers never
+/// send `Origin`, so the layer would only ever be overhead.
+///
+/// Origins are explicit on purpose — no wildcard. `Access-Control-Allow-Origin: *`
+/// plus a `Bearer agp_…` token is how a token leaks to whatever page the user
+/// has open. An unparseable entry is dropped with a log line rather than
+/// failing startup, because a typo in one origin should not take the server down.
+fn cors_layer() -> Option<tower_http::cors::CorsLayer> {
+    let raw = env_opt("AGENT_PLATFORM_CORS_ORIGINS")?;
+    let origins: Vec<axum::http::HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.parse() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                logd!("[cors] ignoring unparseable origin {s:?}");
+                None
+            }
+        })
+        .collect();
+    if origins.is_empty() {
+        logd!("[cors] AGENT_PLATFORM_CORS_ORIGINS held no usable origin; CORS off");
+        return None;
+    }
+    logd!("[cors] allowing {} origin(s)", origins.len());
+    Some(
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any),
+    )
+}
+
 /// The whole surface. There is no fallback any more — an unknown path is a 404
 /// from [`not_found`], where it used to be forwarded to Python.
 ///
@@ -289,7 +325,7 @@ async fn root() -> Response {
 /// `app/main.py` guarded with `_api_deps`, and putting it here keeps that one
 /// decision in one place rather than on forty route declarations.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", axum::routing::get(health))
         .route("/", axum::routing::get(root))
         .route("/openapi.json", axum::routing::get(openapi))
@@ -316,7 +352,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         // Outermost, so an auth rejection carries a correlation id too.
         .layer(axum::middleware::from_fn(request_id::middleware))
-        .with_state(state)
+        .with_state(state);
+
+    // Outside both: a preflight `OPTIONS` carries no `Authorization` header, so
+    // it has to be answered before `require_token` sees it and 401s.
+    match cors_layer() {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
 }
 
 pub async fn serve(cfg: Config) -> Result<(), BoxError> {

@@ -57,6 +57,9 @@ bytes = "1"
 regex = "1"
 pdf-extract = "0.12"
 async-stream = "0.3.6"
+# CORS only. Hand-rolling preflight is where people quietly get `Vary` wrong and
+# poison a shared cache; this is the crate axum's own examples use.
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 
 [target.'cfg(windows)'.dependencies]
 # Job object with kill-on-close: the only thing that reaps the Python child when

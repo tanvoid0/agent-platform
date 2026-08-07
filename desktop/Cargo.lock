@@ -113,6 +113,7 @@ dependencies = [
  "subtle",
  "tiktoken-rs",
  "tokio",
+ "tower-http",
  "url",
  "windows-sys 0.59.0",
 ]

@@ -2,6 +2,52 @@
 
 End-to-end setup for an external microservice or third-party client talking to Agent Platform.
 
+## 0. Expose the server (only if the client is not on this machine)
+
+`agent-platformd` binds `127.0.0.1:18410` and serves the whole API itself — there
+is no Python server and no separate gateway. A client on the same box needs
+nothing from this section.
+
+```bash
+AGENT_PLATFORM_HOST=0.0.0.0 \
+AGENT_PLATFORM_MASTER_KEY=<key> \
+AGENT_PLATFORM_CORS_ORIGINS=https://yourapp.example \
+  agent-platformd
+```
+
+- **`AGENT_PLATFORM_HOST`** — bind address. Default `127.0.0.1`.
+- **`AGENT_PLATFORM_MASTER_KEY`** — **required** before binding beyond loopback.
+  With no master key set, auth is fully open; that is a deliberate local-dev
+  convenience (`desktop/crates/server/src/auth.rs`) and it becomes an open
+  database the moment the port is reachable.
+- **`AGENT_PLATFORM_CORS_ORIGINS`** — comma-separated origins, only needed for
+  callers that are *browsers*. Server-to-server clients never send `Origin`.
+  Unset means no CORS layer at all. There is no wildcard, on purpose: a `*` here
+  plus a `Bearer agp_…` token is how a token leaks to whatever page the user has
+  open.
+
+### TLS
+
+The server speaks plain HTTP, so bearer tokens cross the wire in clear. Put a
+reverse proxy in front rather than terminating TLS in the process — it is the
+smaller moving part and it handles certificate renewal:
+
+```caddy
+api.yourdomain.example {
+    reverse_proxy 127.0.0.1:18410
+}
+```
+
+With a proxy in front, keep the bind on `127.0.0.1` — only the proxy needs to
+reach it. `AGENT_PLATFORM_PUBLIC_HOST` / `AGENT_PLATFORM_PUBLIC_PORT` tell
+`GET /api/v1/system/status` what to report as the reachable address when it differs
+from the bind.
+
+Buffering note: several routes stream (SSE) — the process run stream, model-ops
+job stream, chat completions. A proxy that buffers responses turns those into a
+single delayed blob. Caddy's `reverse_proxy` streams by default; nginx needs
+`proxy_buffering off;`.
+
 ## 1. Obtain credentials
 
 **Admin (one-time):** set `AGENT_PLATFORM_MASTER_KEY` on the server and in your local `.env`.
@@ -106,7 +152,9 @@ with httpx.Client(base_url=BASE, headers=H, timeout=60) as c:
 
 - [API_WORKSPACE_SCOPING.md](./API_WORKSPACE_SCOPING.md) — isolation rules and endpoint reference
 - [model-ops-api.md](./model-ops-api.md) — build/train custom Ollama models (LoRA pipeline)
-- `/docs` — OpenAPI reference
+- `/openapi.json` — OpenAPI reference. (It was `/docs`, FastAPI's Swagger page,
+  which went with the Python server. The document is now checked in and
+  hand-maintained, so treat a surprising entry as possible drift.)
 - `scripts/external_microservice_example.py` — runnable orchestration sample
 - `scripts/model_ops_client_example.py` — runnable model build sample
 
