@@ -10,7 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 agent-platform-client = { path = "../client" }
+bytemuck = { version = "1", features = ["derive"] }
 iced = { version = "0.14", features = ["tokio", "canvas", "markdown", "svg", "image", "advanced"] }
+# A real terminal emulator, not a parser of our own: alacritty_terminal's state
+# machine (ANSI, scrollback, alt screen, mouse modes) behind an iced 0.14 canvas
+# widget. The PTY is ConPTY on Windows.
+iced_term = "0.8"
 tray-icon = "0.24"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "process"] }
 futures = "0.3"
@@ -52,9 +57,19 @@ local-llm = ["dep:llama-cpp-2", "dep:encoding_rs", "llama-cpp-2/dynamic-link"]
 cuda = ["local-llm", "llama-cpp-2/cuda"]
 
 [dev-dependencies]
+# Validates the orb's WGSL in a test; a shader typo is otherwise a panic on
+# the landing page, where it is far more expensive to find.
+naga = { version = "27", features = ["wgsl-in"] }
 tokio = { version = "1", features = ["macros"] }
 
 [target.'cfg(windows)'.dependencies]
+# The Coder preview pane: a WebView2 surface parented into our own window. iced
+# has no web engine and never will, so the page is a child window drawn over the
+# strip the layout reserves for it — see src/coder_browser.rs. Windows-only
+# because that parenting is per-platform, and this app ships on Windows.
+wry = "0.55"
+# The handle wry needs, at the version iced_runtime already exposes.
+raw-window-handle = "0.6"
 # Job object with kill-on-close, so a crash cannot orphan the server. See shell.rs.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

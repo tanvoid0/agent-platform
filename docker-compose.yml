@@ -2,7 +2,7 @@
 #
 #   pnpm docker:up
 #
-# API: http://127.0.0.1:18410/api/v1  |  Docs: http://127.0.0.1:18410/docs
+# API: http://127.0.0.1:18410/api/v1  |  OpenAPI: http://127.0.0.1:18410/openapi.json
 
 services:
   server:
@@ -20,15 +20,8 @@ services:
       PROXY_PUBLIC_URL: http://127.0.0.1:18410
       LLM_ORCHESTRATOR_BASE_URL: http://127.0.0.1:18410/v1
       AGENT_PLATFORM_DAG_MAX_CONCURRENT_TASKS: ${AGENT_PLATFORM_DAG_MAX_CONCURRENT_TASKS:-12}
-      UV_THREADPOOL_SIZE: ${UV_THREADPOOL_SIZE:-16}
-      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-16}
-      OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-16}
-      MKL_NUM_THREADS: ${MKL_NUM_THREADS:-16}
-      NUMEXPR_NUM_THREADS: ${NUMEXPR_NUM_THREADS:-16}
       AGENT_PLATFORM_ORCHESTRATOR_DOCKER_FIX: "0"
       AGENT_PLATFORM_LOCAL_LLM_DOCKER_FIX: "1"
-      AGENT_PLATFORM_UVICORN_WORKERS: ${AGENT_PLATFORM_UVICORN_WORKERS:-1}
-      AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS: ${AGENT_PLATFORM_UVICORN_KEEPALIVE_SECONDS:-30}
       # BYOK: extra allowlisted upstream hosts for client X-BYOK-Base-Url (canonical
       # provider hosts are always allowed). Provider keys still come from .env.
       BYOK_ALLOWED_HOSTS: ${BYOK_ALLOWED_HOSTS:-}
@@ -38,18 +31,10 @@ services:
       - .env
     volumes:
       - agent_platform_data:/app/data
-      - ./app:/app
-    develop:
-      watch:
-        - action: sync+restart
-          path: ./app
-          target: /app
-          ignore:
-            - __pycache__/
-            - .pytest_cache/
-            - "*.pyc"
-        - action: rebuild
-          path: ./app/requirements.txt
+    # No source bind-mount and no `develop.watch`: those synced `./app` into the
+    # container so an edit restarted uvicorn in place. A Rust server has to be
+    # compiled, so an edit means `docker compose up --build` — or, far faster,
+    # `cargo run -p agent-platform-server` on the host.
     restart: unless-stopped
 
 volumes:

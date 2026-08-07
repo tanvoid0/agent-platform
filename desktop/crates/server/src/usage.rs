@@ -50,8 +50,8 @@ pub(crate) fn encoder() -> Option<&'static tiktoken_rs::CoreBPE> {
                 "p50k_edit" => tiktoken_rs::p50k_edit().ok(),
                 "r50k_base" => tiktoken_rs::r50k_base().ok(),
                 other => {
-                    eprintln!(
-                        "[agent-platformd] unknown AGENT_PLATFORM_TOKEN_ENCODING {other:?}; \
+                    logd!(
+                        "unknown AGENT_PLATFORM_TOKEN_ENCODING {other:?}; \
                          falling back to the character heuristic"
                     );
                     None

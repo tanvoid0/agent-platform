@@ -155,7 +155,7 @@ impl IntoResponse for ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
-        eprintln!("[agent-platformd] database error: {e}");
+        logd!("database error: {e}");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "An unexpected error occurred.")
     }
 }

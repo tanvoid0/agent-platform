@@ -7,16 +7,12 @@
 //! live coupling `plan.md` flagged — Python owned the writes to the two files
 //! Rust reads.
 //!
-//! Two things stay with Python, both deliberately:
+//! `POST /config-yaml` was the last route here left with Python, for its
+//! `jsonschema` error text; [`crate::config_schema`] reproduces that wording so
+//! it lands here too, and the divergence that remains is documented there.
 //!
-//! - **`POST /config-yaml`.** Its 400 body is `jsonschema`'s own
-//!   `ValidationError.message`, produced by a Draft 2020-12 validator against a
-//!   schema file found by a three-candidate path search. A Rust validator would
-//!   answer a *different sentence* for the same bad config, which is a redesign
-//!   rather than a port — so the POST is handed to [`proxy::forward`] on the
-//!   same path the GET is served from. Registering only the GET would answer
-//!   405 where Python answers 400/200, which is the trap this migration has hit
-//!   four times.
+//! One thing is worth restating, because it looks like an oversight:
+//!
 //! - **`ORCHESTRATOR_INTERNAL_URL`'s default.** The self-calls below go to
 //!   `http://127.0.0.1:18410` unless that variable says otherwise, exactly as
 //!   Python's module constant does — *not* to whichever port this process
@@ -49,7 +45,7 @@ use crate::upstream_http::{classify_with_context, open_stream, send_with_retry, 
 use crate::wire::{
     check_len, defaulted_str, lax_bool, lax_int, optional_str, parse_body, required_str,
 };
-use crate::{env_opt, proxy, AppState};
+use crate::{env_opt, AppState};
 
 const MASTER_KEY_ENV: &str = "AGENT_PLATFORM_MASTER_KEY";
 
@@ -76,8 +72,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(&format!("{BASE}/snippet"), get(snippet))
         .route(&format!("{BASE}/env"), get(get_env).post(post_env))
-        // GET here, POST to Python — see the module note.
-        .route(&format!("{BASE}/config-yaml"), get(get_config_yaml).post(proxy::forward))
+        .route(&format!("{BASE}/config-yaml"), get(get_config_yaml).post(post_config_yaml))
         .route(&format!("{BASE}/health-proxy"), get(health_proxy))
         .route(&format!("{BASE}/health-readiness"), get(health_readiness))
         .route(&format!("{BASE}/ui/providers"), get(ui_providers))
@@ -174,7 +169,7 @@ fn read_text_universal(raw: &str) -> String {
 }
 
 fn io_error(e: std::io::Error) -> ApiError {
-    eprintln!("[agent-platformd] llm-proxy config write failed: {e}");
+    logd!("llm-proxy config write failed: {e}");
     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "An unexpected error occurred.")
 }
 
@@ -300,6 +295,68 @@ async fn get_config_yaml(principal: Principal) -> Result<Response, ApiError> {
     }
     let content = std::fs::read_to_string(&path).map_err(io_error)?;
     Ok(Json(json!({ "content": read_text_universal(&content) })).into_response())
+}
+
+/// `api_post_yaml`. Three failure modes, all 400: unparseable YAML, a root that
+/// is not a mapping, and a document the schema rejects.
+///
+/// The file is written **verbatim** — `body.content`, not a re-serialization of
+/// the parsed tree. Comments and formatting in an operator's config survive a
+/// round trip through this route, which they would not if it saved the parse.
+async fn post_config_yaml(principal: Principal, body: Bytes) -> Result<Response, ApiError> {
+    require_master_key(&principal)?;
+    let body = parse_body(&body)?;
+
+    let content = match body.get("content") {
+        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+        Some(Value::String(_)) => {
+            return Err(ApiError::validation(vec![ApiError::field_error(
+                "content",
+                "string_too_short",
+                "String should have at least 1 character",
+            )]))
+        }
+        None | Some(Value::Null) => {
+            return Err(ApiError::validation(vec![ApiError::field_error(
+                "content",
+                "missing",
+                "Field required",
+            )]))
+        }
+        Some(_) => {
+            return Err(ApiError::validation(vec![ApiError::field_error(
+                "content",
+                "string_type",
+                "Input should be a valid string",
+            )]))
+        }
+    };
+
+    // `yaml.safe_load` returning `None` for an empty document is `parsed = {}`,
+    // not a rejection — saving a config.yaml back to empty is allowed.
+    let parsed: Value = serde_yaml::from_str(&content)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, &format!("Invalid YAML: {e}")))?;
+    let parsed = if parsed.is_null() { json!({}) } else { parsed };
+
+    if !parsed.is_object() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "config root must be a mapping"));
+    }
+    if let Err(message) = crate::config_schema::validate(&parsed) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, &format!("Config schema: {message}")));
+    }
+
+    let path = config_yaml_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io_error)?;
+    }
+    std::fs::write(&path, content.as_bytes()).map_err(io_error)?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "Saved config.yaml. Restart the Agent Platform process if your deployment \
+                    caches YAML.",
+    }))
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------

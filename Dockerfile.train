@@ -1,5 +1,18 @@
-# GPU training image — extends backend with torch + model_ops train deps.
-FROM agent-platform:latest AS base
+# GPU training image — the model-ops build worker, with torch.
+#
+# It used to be `FROM agent-platform:latest`, extending the API image with
+# training deps, because that image was a Python one and the pipeline ran inside
+# the server process. Neither is true now: the API image carries no interpreter
+# at all, and the pipeline is a subprocess the server spawns. So this is its own
+# Python image, and the only thing it contains is `worker/`.
+#
+#   docker build -f Dockerfile.train -t agent-platform-train:latest .
+#
+# Point the server at it with MODEL_OPS_PYTHON (and MODEL_OPS_WORKER_PATH),
+# sharing MODEL_OPS_DATA_DIR — the worker communicates by files and stdout, so
+# the two containers need the data volume in common and nothing else.
+
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -7,12 +20,16 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY app/model_ops/requirements-train.txt /tmp/requirements-train.txt
-RUN pip install --no-cache-dir -r /tmp/requirements-train.txt \
+COPY worker/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
     && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128 || \
        pip install --no-cache-dir torch
 
-ENV MODEL_OPS_GPU_SUBPROCESS=0
+COPY worker/ /app/worker/
+
+ENV PYTHONPATH=/app/worker \
+    PYTHONUNBUFFERED=1 \
+    MODEL_OPS_WORKER_PATH=/app/worker
 
 ENTRYPOINT []
 CMD ["sleep", "infinity"]

@@ -69,6 +69,9 @@ impl State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// "View logs" on a traced error banner — intercepted in `main::update`
+    /// before it reaches here, so this arm exists only to satisfy exhaustiveness.
+    TraceLogs(String),
     Refresh,
     ProjectsLoaded(Result<Vec<ModelProject>, String>),
     OllamaLoaded(Result<Vec<OllamaModelSummary>, String>),
@@ -124,8 +127,10 @@ pub fn refresh(client: &Client) -> Task<Message> {
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
+        Message::TraceLogs(_) => Task::none(),
         Message::Refresh => refresh(client),
         Message::ProjectsLoaded(Ok(projects)) => {
+            state.error = None;
             if state.selected.is_none() {
                 state.selected = projects.first().map(|p| p.name.clone());
             }
@@ -134,11 +139,13 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             Task::none()
         }
         Message::OllamaLoaded(Ok(models)) => {
+            state.error = None;
             state.ollama = models;
             state.loaded = true;
             Task::none()
         }
         Message::RegistryLoaded(Ok(entries)) => {
+            state.error = None;
             state.registry = entries;
             state.loaded = true;
             Task::none()
@@ -292,7 +299,11 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             let finished = became_terminal(previous.as_deref(), &job.status);
             if finished {
                 let label = job.project_name.clone().unwrap_or_else(|| job.job_type.clone());
-                crate::notify::job_finished(&format!("Build job #{}", job.id), &label, &job.status);
+                crate::notify::away(
+                    "modelops",
+                    &format!("Build job #{}", job.id),
+                    &format!("{label}: {}", job.status),
+                );
             }
             state.job = Some(*job);
             // A finished job changes the registry and Ollama lists.

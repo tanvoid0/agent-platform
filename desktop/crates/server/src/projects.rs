@@ -27,7 +27,7 @@ use sqlx::FromRow;
 use crate::auth::Principal;
 use crate::db;
 use crate::error::{ApiError, PathId};
-use crate::wire::{iso_from_sql, sql_now, sql_time};
+use crate::wire::{iso_from_sql, parse_body, sql_now, sql_time};
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -222,10 +222,24 @@ async fn list_projects(
 async fn create_project(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    body: Option<Json<ProjectCreate>>,
+    // Raw bytes, not `Option<Json<ProjectCreate>>`: axum's `Json` extractor
+    // only yields `None` for a body-less request with no `Content-Type` at
+    // all — an empty body sent *with* `application/json` (an argument-less
+    // POST from most clients) fails to parse and axum answers its own
+    // plain-text 400 before this handler runs.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    let Json(req) = body.ok_or_else(|| {
-        ApiError::validation(vec![ApiError::field_error("name", "missing", "Field required")])
+    if body.is_empty() {
+        return Err(ApiError::validation(vec![ApiError::field_error(
+            "name", "missing", "Field required",
+        )]));
+    }
+    let req: ProjectCreate = serde_json::from_value(parse_body(&body)?).map_err(|e| {
+        ApiError::validation(vec![ApiError::field_error_at(
+            &["body"],
+            "model_attributes_type",
+            &e.to_string(),
+        )])
     })?;
     validate(req.name.as_deref(), req.description.as_deref(), req.color.as_deref(), true)?;
 
@@ -279,9 +293,21 @@ async fn update_project(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId(project_id): PathId<i64>,
-    body: Option<Json<ProjectUpdate>>,
+    // Raw bytes — see `create_project`'s comment. An empty body still means
+    // "no changes", same as the old `unwrap_or_default()`.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    let Json(req) = body.unwrap_or_default();
+    let req: ProjectUpdate = if body.is_empty() {
+        ProjectUpdate::default()
+    } else {
+        serde_json::from_value(parse_body(&body)?).map_err(|e| {
+            ApiError::validation(vec![ApiError::field_error_at(
+                &["body"],
+                "model_attributes_type",
+                &e.to_string(),
+            )])
+        })?
+    };
     assert_access(&state, &principal, project_id).await?;
     load_project(&state, project_id).await?;
 
@@ -409,13 +435,15 @@ async fn put_workspace_state(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId(project_id): PathId<i64>,
-    body: Option<Json<Value>>,
+    // Raw bytes, not `Option<Json<Value>>` — see `create_project`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     assert_access(&state, &principal, project_id).await?;
     load_project(&state, project_id).await?;
 
-    let payload = body
-        .and_then(|Json(v)| v.get("payload").cloned())
+    let payload = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("payload").cloned())
         .unwrap_or_else(|| json!({}));
     let now = sql_now();
     sqlx::query(&db::sql("UPDATE project SET workspace_payload_json = ?, updated_at = ? WHERE id = ?", state.backend))
@@ -487,13 +515,14 @@ async fn patch_planning_context(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId(project_id): PathId<i64>,
-    body: Option<Json<Value>>,
+    // Raw bytes, not `Option<Json<Value>>` — see `create_project`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     assert_access(&state, &principal, project_id).await?;
     planning_context(&state, project_id).await?; // 404s a missing project first
 
-    let fields: Map<String, Value> = match body {
-        Some(Json(Value::Object(map))) => map,
+    let fields: Map<String, Value> = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(map)) => map,
         _ => Map::new(),
     };
 

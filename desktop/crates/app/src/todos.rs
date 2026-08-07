@@ -48,6 +48,9 @@ pub fn shifted(status: &str, delta: i32) -> Option<&'static str> {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// "View logs" on a traced error banner — intercepted in `main::update`
+    /// before it reaches here, so this arm exists only to satisfy exhaustiveness.
+    TraceLogs(String),
     Refresh,
     BoardsLoaded(Result<Vec<TodoBoardSummary>, String>),
     BoardLoaded(Result<Box<TodoBoardDetail>, String>),
@@ -88,11 +91,13 @@ fn load_board(client: &Client, id: i64) -> Task<Message> {
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
+        Message::TraceLogs(_) => Task::none(),
         Message::Refresh => match state.selected {
             Some(id) => Task::batch([refresh(client), load_board(client, id)]),
             None => refresh(client),
         },
         Message::BoardsLoaded(Ok(boards)) => {
+            state.error = None;
             // Open the first board on a cold start, so the screen is never an
             // empty pane next to a populated list.
             let first = boards.first().map(|b| b.id);
@@ -113,6 +118,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             }
         }
         Message::BoardLoaded(Ok(board)) => {
+            state.error = None;
             state.selected = Some(board.id);
             state.board = Some(*board);
             Task::none()

@@ -5,7 +5,7 @@
 
 pub mod client;
 pub mod dag;
-pub mod enums_gen;
+pub mod enums;
 pub mod sse;
 pub mod types;
 

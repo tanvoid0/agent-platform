@@ -276,6 +276,9 @@ impl State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// "View logs" on a traced error banner — intercepted in `main::update`
+    /// before it reaches here, so this arm exists only to satisfy exhaustiveness.
+    TraceLogs(String),
     Refresh,
     ProjectsLoaded(Result<Vec<ProjectSummary>, String>),
     TeamsLoaded(Result<Vec<TeamTemplateSummary>, String>),
@@ -347,6 +350,7 @@ fn edit_role(state: &mut State, id: &str, f: impl FnOnce(&mut RosterRole)) {
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
+        Message::TraceLogs(_) => Task::none(),
         // A save or delete is already in flight; ignore repeat clicks.
         _ if state.busy
             && matches!(
@@ -363,14 +367,17 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         }
         Message::Refresh => refresh(client),
         Message::ProjectsLoaded(Ok(p)) => {
+            state.error = None;
             state.projects = Some(p);
             Task::none()
         }
         Message::TeamsLoaded(Ok(t)) => {
+            state.error = None;
             state.teams = Some(t);
             Task::none()
         }
         Message::TeamDetailLoaded(Ok(detail)) => {
+            state.error = None;
             state.draft = Some(Draft::from_team(&detail));
             state.team_detail = Some(*detail);
             state.viewport = crate::graph::Viewport::default();

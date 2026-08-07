@@ -1,5 +1,12 @@
 # Practical Multi-Agent Assistant — Phased Roadmap
 
+> **Paths in this document predate the Rust migration.** The FastAPI server
+> (`app/`) was deleted on 2026-08-07 — every route it describes is now served by
+> `agent-platformd` (`desktop/crates/server/src/`), byte-identically except for the
+> four changes listed in `plan.md`'s migration section. The behaviour here still
+> holds; the file references do not. See [ADR 0007](adr/0007-strangler-rust-server.md).
+
+
 > **Stale below this line (2026-08-04).** Every phase was implemented against
 > the `web/` React app, which the native-desktop migration deleted
 > ([ADR 0005](./adr/0005-native-iced-desktop-headless-server.md)). The server

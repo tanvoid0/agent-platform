@@ -2,10 +2,10 @@
 //! `ui` kit — no raw widget styling here.
 
 use crate::ui::{self, space, Icon, Tone};
-use crate::{App, Message, Screen, ServerState, SettingsTab};
+use crate::{App, HudStyle, Message, Screen, ServerState, SettingsTab, ThemeMode};
 use agent_platform_client::types::ReadinessReport;
 use iced::widget::{column, container, row, scrollable, Column};
-use iced::{Element, Length};
+use iced::{Element, Length, Padding};
 
 /// The sidebar: two short groups of things you *work in*. Everything you
 /// configure or inspect is one entry below them, on its own tabbed page — so
@@ -21,6 +21,7 @@ const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
             (Screen::Workflows, Icon::Zap, "Workflows"),
             (Screen::Plans, Icon::ListChecks, "Plans"),
             (Screen::Agenda, Icon::Clock, "Agenda"),
+            (Screen::Coder, Icon::Cpu, "Coder"),
         ],
     ),
     // One entry, two tabs: see [`chat_view`].
@@ -36,6 +37,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let content = match app.screen {
         Screen::Dashboard => dashboard_view(app),
         Screen::Settings => settings_view(app),
+        Screen::Logs => logs_view(app),
         _ if !app.view_available() => blocked_view(app, screen_title(app.screen)),
         Screen::Processes => crate::processes_view::view(&app.processes, &app.settings.theme.resolve())
             .map(Message::Processes),
@@ -47,7 +49,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .map(Message::Library),
         Screen::Workflows => crate::workflows_view::view(&app.workflows).map(Message::Workflows),
         Screen::Plans => crate::todos_view::view(&app.todos).map(Message::Todos),
-        Screen::Agenda => crate::agenda_view::view(&app.agenda).map(Message::Agenda),
+        Screen::Agenda => crate::agenda_view::view(&app.agenda, &app.settings.theme.resolve())
+            .map(Message::Agenda),
+        Screen::Coder => {
+            crate::coder_view::view(&app.coder, &app.settings.theme.resolve()).map(Message::Coder)
+        }
         Screen::Assistant | Screen::Memory => chat_view(app),
     };
 
@@ -75,9 +81,23 @@ pub fn view(app: &App) -> Element<'_, Message> {
             "Close Agent Platform?",
             "The server keeps running in the tray unless you close the app.",
             vec![
-                ui::button_ghost(Icon::X, "Cancel", Message::CloseCancelled),
+                // Cancel and Close have no icon that adds meaning to the word,
+                // so they are label-only; "Minimize to tray" keeps its monitor.
+                ui::button_sized(
+                    None,
+                    "Cancel",
+                    ui::ButtonVariant::Ghost,
+                    ui::Size::Sm,
+                    Some(Message::CloseCancelled),
+                ),
                 ui::button_secondary(Icon::Monitor, "Minimize to tray", Message::MinimizeToTray),
-                ui::button_destructive(Icon::Stop, "Close", Message::CloseConfirmed),
+                ui::button_sized(
+                    None,
+                    "Close",
+                    ui::ButtonVariant::Destructive,
+                    ui::Size::Sm,
+                    Some(Message::CloseConfirmed),
+                ),
             ],
         ),
         460.0,
@@ -134,19 +154,30 @@ fn sidebar(app: &App) -> Element<'_, Message> {
             ui::separator(),
             // Settings sits with the window controls, not in the groups above:
             // it is where you go to change the app, not to use it. It never
-            // locks — Status and Logs live inside it.
-            ui::nav_item(
-                Icon::Settings,
-                "Settings",
-                app.screen == Screen::Settings,
-                Message::Nav(Screen::Settings),
-            ),
+            // locks — Status and Logs live inside it. Icon-only like its two
+            // neighbors, so the row reads as one utility strip; each gets a
+            // tooltip since none of the three carry a visible label.
             ui::cluster(vec![
-                ui::icon_button(
-                    app.settings.theme.icon(),
-                    Message::SetTheme(app.settings.theme.next()),
+                ui::nav_icon_button(
+                    Icon::Settings,
+                    "Settings",
+                    app.screen == Screen::Settings,
+                    Message::Nav(Screen::Settings),
                 ),
-                ui::icon_button(Icon::Refresh, Message::RestartApp),
+                ui::nav_icon_button(
+                    Icon::Scroll,
+                    "Logs",
+                    app.screen == Screen::Logs,
+                    Message::Nav(Screen::Logs),
+                ),
+                ui::tooltip(
+                    ui::icon_button(
+                        app.settings.theme.icon(),
+                        Message::SetTheme(app.settings.theme.next()),
+                    ),
+                    "Toggle theme",
+                ),
+                ui::tooltip(ui::icon_button(Icon::Refresh, Message::RestartApp), "Restart app"),
             ])
             .width(Length::Fill),
         ]
@@ -187,7 +218,8 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
         // the window's leftover height became a black slab across a light page.
         // Whatever is left below is ordinary background, and the page scrolls if
         // the window is too short for the tiles.
-        crate::assistant_view::hud(&app.assistant, 420.0).map(Message::Assistant),
+        crate::assistant_view::hud(&app.assistant, 420.0, app.settings.hud_style, &app.settings.theme.resolve())
+            .map(Message::Assistant),
         ui::cluster(vec![
             ui::badge(mode_label, mode_tone),
             ui::badge(srv_label, srv_tone),
@@ -287,8 +319,12 @@ fn settings_view(app: &App) -> Element<'_, Message> {
             SettingsTab::ModelOps => {
                 crate::modelops_view::view(&app.modelops).map(Message::ModelOps)
             }
+            SettingsTab::Appearance => appearance_view(app),
             SettingsTab::Status => status_view(app),
-            SettingsTab::Logs => logs_view(app),
+            SettingsTab::Api => {
+                crate::apidocs_view::view(&app.apidocs, &app.shell.origin(), &app.shell.key)
+                    .map(Message::ApiDocs)
+            }
         }
     };
 
@@ -318,8 +354,12 @@ fn chat_view(app: &App) -> Element<'_, Message> {
         _ => with_history(
             app,
             crate::assistant::NAME,
-            crate::assistant_view::view(&app.assistant, &app.settings.theme.resolve())
-                .map(Message::Assistant),
+            crate::assistant_view::view(
+                &app.assistant,
+                &app.settings.theme.resolve(),
+                app.settings.hud_style,
+            )
+            .map(Message::Assistant),
         ),
     };
     match memory_notice(app) {
@@ -498,7 +538,7 @@ fn blocked_view<'a>(app: &'a App, title: &'a str) -> Element<'a, Message> {
     let mut actions = vec![ui::button_secondary(
         Icon::Scroll,
         "Open logs",
-        Message::NavSettings(SettingsTab::Logs),
+        Message::Nav(Screen::Logs),
     )];
     if !app.shell.attached {
         actions.push(ui::button_outline(
@@ -531,6 +571,9 @@ fn screen_title(screen: Screen) -> &'static str {
     if screen == Screen::Settings {
         return "Settings";
     }
+    if screen == Screen::Logs {
+        return "Logs";
+    }
     if screen.is_chat() {
         return CHAT_TABS.iter().find(|(s, _)| *s == screen).map(|(_, l)| *l).unwrap_or("Chat");
     }
@@ -541,6 +584,69 @@ fn screen_title(screen: Screen) -> &'static str {
         .unwrap_or("Agent Platform")
 }
 
+
+// ---------------------------------------------------------------------------
+// Appearance
+// ---------------------------------------------------------------------------
+
+/// Theme, E.V.'s animation and its speaking pace. The canvas below is the real
+/// one, ticking on the real mic — picking between two still thumbnails would
+/// tell you nothing about animations whose whole point is how they move.
+fn appearance_view(app: &App) -> Element<'_, Message> {
+    let style = app.settings.hud_style;
+    let rate = app.settings.voice_rate;
+    ui::page(
+        "Appearance",
+        Some(ui::muted("How the app and E.V. look and sound.")),
+        None,
+        ui::stack_lg(vec![
+            ui::card_with_header(
+                "Theme",
+                Some(ui::muted("System follows the OS and switches with it.")),
+                None,
+                ui::segmented([
+                    ("System", app.settings.theme == ThemeMode::System, Message::SetTheme(ThemeMode::System)),
+                    ("Light", app.settings.theme == ThemeMode::Light, Message::SetTheme(ThemeMode::Light)),
+                    ("Dark", app.settings.theme == ThemeMode::Dark, Message::SetTheme(ThemeMode::Dark)),
+                ]),
+            ),
+            ui::card_with_header(
+                "E.V. animation",
+                Some(ui::muted(match style {
+                    HudStyle::Bubble => "A soft orb drawn on the GPU — the smoothest of the three.",
+                    HudStyle::BubbleCanvas => {
+                        "The same orb without the GPU. Pick this if Bubble renders blank."
+                    }
+                    HudStyle::Suit => "The full suit HUD: spectrum web, reticle and telemetry.",
+                })),
+                None,
+                ui::stack(vec![
+                    ui::segmented(
+                        HudStyle::ALL.map(|s| (s.label(), style == s, Message::SetHudStyle(s))),
+                    ),
+                    crate::assistant_view::hud(&app.assistant, 260.0, style, &app.settings.theme.resolve())
+                        .map(Message::Assistant),
+                    ui::caption("Both are driven by the live mic — talk to see them move."),
+                ]),
+            ),
+            ui::card_with_header(
+                "Voice speed",
+                Some(ui::muted("How fast E.V. reads a reply aloud, in voice mode.")),
+                None,
+                ui::stack(vec![
+                    ui::segmented(crate::assistant::VOICE_RATES.map(|(label, r)| {
+                        (label, rate == r, Message::SetVoiceRate(r))
+                    })),
+                    ui::caption(
+                        "E.V. reads while the answer is still being written, so it also \
+                         eases off when the model falls behind and picks the pace back up \
+                         when text is waiting.",
+                    ),
+                ]),
+            ),
+        ]),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Status
@@ -631,7 +737,7 @@ fn server_card(app: &App) -> Element<'_, Message> {
     ];
     if let Some(status) = &app.status {
         rows.push(ui::field("Environment", ui::body(status.env.clone())));
-        rows.push(ui::field("Python", ui::body(status.python.clone())));
+        rows.push(ui::field("Version", ui::body(status.server.clone())));
         rows.push(ui::field("Platform", ui::muted(status.platform.clone())));
     }
     if let Some(err) = &app.status_error {
@@ -640,7 +746,7 @@ fn server_card(app: &App) -> Element<'_, Message> {
 
     ui::card_with_header(
         "Server",
-        Some(ui::muted("The Python API process this app owns.")),
+        Some(ui::muted("The API process this app owns.")),
         actions,
         ui::stack(rows),
     )
@@ -834,7 +940,8 @@ fn path_field<'a>(label: &'a str, value: Option<&str>) -> Element<'a, Message> {
 // ---------------------------------------------------------------------------
 
 fn logs_view(app: &App) -> Element<'_, Message> {
-    let toolbar = ui::cluster(vec![
+    let selected = app.logs.selected.len();
+    let mut toolbar = vec![
         container(ui::input_icon(Icon::Search, "Filter lines…", &app.logs.filter, Message::LogFilterChanged))
             .width(320)
             .into(),
@@ -843,20 +950,36 @@ fn logs_view(app: &App) -> Element<'_, Message> {
             if app.logs.paused { "Resume" } else { "Pause" },
             Message::ToggleLogsPaused,
         ),
-        ui::button_ghost(Icon::Trash, "Clear", Message::ClearLogs),
-        ui::spacer(),
-        ui::badge(
-            if app.shell.attached { "server log" } else { "process output" },
-            Tone::Neutral,
+        // Copy is the primary action here — a log line is something you paste
+        // into an issue, not something you read once.
+        ui::button_default(
+            Icon::Copy,
+            if selected > 0 { "Copy selected" } else { "Copy shown" },
+            Message::CopyLogs,
         ),
-    ]);
+    ];
+    if selected > 0 {
+        toolbar.push(ui::badge(ui::count(selected, "line selected", "lines selected"), Tone::Info));
+        toolbar.push(ui::button_ghost(Icon::XCircle, "Deselect", Message::ClearLogSelection));
+    } else {
+        toolbar.push(ui::button_ghost(Icon::ListChecks, "Select all", Message::SelectAllLogs));
+    }
+    toolbar.push(ui::button_ghost(Icon::Trash, "Clear", Message::ClearLogs));
+    toolbar.push(ui::spacer());
+    toolbar.push(ui::badge(
+        if app.shell.attached { "server log" } else { "process output" },
+        Tone::Neutral,
+    ));
+    let toolbar = ui::cluster(toolbar);
 
     let filter = app.logs.filter.to_lowercase();
-    let matched: Vec<&String> = app
+    let matched: Vec<(u64, &String)> = app
         .logs
         .lines
         .iter()
-        .filter(|l| filter.is_empty() || l.to_lowercase().contains(&filter))
+        .enumerate()
+        .filter(|(_, l)| filter.is_empty() || l.to_lowercase().contains(&filter))
+        .map(|(i, l)| (app.logs.base + i as u64, l))
         .collect();
     // Only the tail is rendered: iced lays out every child, and the ring holds
     // thousands of lines.
@@ -876,8 +999,12 @@ fn logs_view(app: &App) -> Element<'_, Message> {
                 app.logs.dropped
             )));
         }
-        for line in tail {
-            lines = lines.push(ui::mono((*line).clone()));
+        for (id, line) in tail {
+            lines = lines.push(ui::list_item_compact(
+                log_entry(line),
+                app.logs.selected.contains(id),
+                Message::ToggleLogLine(*id),
+            ));
         }
         scrollable(lines).height(Length::Fill).anchor_bottom().into()
     };
@@ -888,9 +1015,73 @@ fn logs_view(app: &App) -> Element<'_, Message> {
     ui::page_fixed(
         "Logs",
         Some(ui::muted(
-            "Server output, including startup and migrations — visible before the API answers.",
+            "Server output, including startup and migrations — visible before the API answers.              Click lines to select them, then copy.",
         )),
         None,
         column![toolbar, ui::code(body)].spacing(space::MD).height(Length::Fill),
     )
+}
+
+/// Column widths for a log row: level pill, clock, source. The message takes
+/// what is left, and a line's extra fields hang under it at [`FIELD_INDENT`].
+const LEVEL_W: f32 = 62.0;
+const TIME_W: f32 = 74.0;
+const SOURCE_W: f32 = 140.0;
+const FIELD_INDENT: f32 = LEVEL_W + TIME_W + SOURCE_W + 3.0 * space::XS;
+
+/// One line as columns — level pill, clock, source, message — with whatever
+/// structured fields it carried on a second, muted row.
+///
+/// ponytail: parsed per frame rather than at ingest, because only the rendered
+/// tail (500 lines) pays for it. Parse into `LogsState` if the frame time shows.
+fn log_entry<'a>(line: &str) -> Element<'a, Message> {
+    let entry = crate::logs::parse(line);
+    let head = row![
+        container(match entry.level {
+            Some(level) => ui::badge_icon(level_icon(level), level.label(), level_tone(level)),
+            None => ui::caption(""),
+        })
+        .width(LEVEL_W),
+        container(ui::caption(entry.time.unwrap_or_default())).width(TIME_W),
+        container(match entry.source {
+            Some(source) => ui::badge(source, Tone::Neutral),
+            None => ui::caption(""),
+        })
+        .width(SOURCE_W),
+        match entry.level {
+            Some(level @ (crate::logs::Level::Error | crate::logs::Level::Warn)) => {
+                ui::mono_toned(entry.message, level_tone(level))
+            }
+            _ => ui::mono(entry.message),
+        },
+    ]
+    .spacing(space::XS)
+    .align_y(iced::Alignment::Center);
+
+    if entry.fields.is_empty() {
+        return head.into();
+    }
+    let fields =
+        entry.fields.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("    ");
+    column![head, container(ui::caption(fields)).padding(Padding::default().left(FIELD_INDENT))]
+        .spacing(2)
+        .into()
+}
+
+fn level_icon(level: crate::logs::Level) -> Icon {
+    match level {
+        crate::logs::Level::Error => Icon::XCircle,
+        crate::logs::Level::Warn => Icon::Alert,
+        _ => Icon::Info,
+    }
+}
+
+/// INFO and DEBUG stay neutral: nearly every line is one, and a page of colored
+/// pills hides the two that matter.
+fn level_tone(level: crate::logs::Level) -> Tone {
+    match level {
+        crate::logs::Level::Error => Tone::Danger,
+        crate::logs::Level::Warn => Tone::Warning,
+        _ => Tone::Neutral,
+    }
 }

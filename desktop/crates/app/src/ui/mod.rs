@@ -66,6 +66,18 @@ pub fn toned<'a, M: 'a>(content: impl text::IntoFragment<'a>, tone: Tone) -> Ele
     text(content).size(font::SM).style(theme::text_tone(tone)).into()
 }
 
+/// [`mono`], colored by `tone` — an error or warning log line's message, so
+/// the two rows worth stopping for read differently from the wall of neutral
+/// ones around them, not just their level pill.
+pub fn mono_toned<'a, M: 'a>(content: impl text::IntoFragment<'a>, tone: Tone) -> Element<'a, M> {
+    text(content)
+        .size(font::XS)
+        .width(Length::Fill)
+        .font(iced::Font::MONOSPACE)
+        .style(theme::text_tone(tone))
+        .into()
+}
+
 // ---------------------------------------------------------------------------
 // Button (shadcn variants + sizes)
 // ---------------------------------------------------------------------------
@@ -159,6 +171,56 @@ pub fn icon_button<'a, M: 'a + Clone>(glyph: Icon, on_press: M) -> Element<'a, M
         .into()
 }
 
+/// shadcn `Tooltip`: a small label that appears above `content` on hover.
+/// Wrap any icon-only control that has no visible label with this.
+pub fn tooltip<'a, M: 'a>(content: Element<'a, M>, label: &'a str) -> Element<'a, M> {
+    iced::widget::tooltip(
+        content,
+        container(text(label).size(font::XS)).padding(Padding::from([4.0, 8.0])).style(theme::tooltip),
+        iced::widget::tooltip::Position::Top,
+    )
+    .gap(6)
+    .into()
+}
+
+/// Icon-only nav control (no label): same selected/hover styling as
+/// [`nav_item`], sized like [`icon_button`]. Used where the icon alone is
+/// self-explanatory, e.g. Settings sitting next to the theme/refresh icons.
+pub fn nav_icon_button<'a, M: 'a + Clone>(
+    glyph: Icon,
+    label: &'a str,
+    selected: bool,
+    on_press: M,
+) -> Element<'a, M> {
+    let btn = button(container(icon::glyph(glyph)).center(Length::Fill))
+        .width(28)
+        .height(28)
+        .padding(0)
+        .style(theme::nav_item(selected))
+        .on_press(on_press);
+    tooltip(btn.into(), label)
+}
+
+/// shadcn `Toggle` — stays highlighted while its state is on, so a switch
+/// (Files pane open, Plan step on) reads as state rather than as a one-shot
+/// action the way [`button_ghost`] does.
+pub fn toggle<'a, M: 'a + Clone>(
+    glyph: Icon,
+    label: &'a str,
+    selected: bool,
+    on_press: M,
+) -> Element<'a, M> {
+    button(
+        row![icon::glyph(glyph), text(label).size(font::SM)]
+            .spacing(space::XS + 2.0)
+            .align_y(iced::Alignment::Center),
+    )
+    .padding(Size::Sm.padding())
+    .style(theme::nav_item(selected))
+    .on_press(on_press)
+    .into()
+}
+
 /// `<Button variant="destructive">`
 pub fn button_destructive<'a, M: 'a + Clone>(
     glyph: Icon,
@@ -231,6 +293,25 @@ pub fn segmented<'a, M: 'a + Clone>(
         .padding(2.0)
         .style(theme::code_block)
         .into()
+}
+
+/// [`segmented`] for a set where more than one option can be on, and which
+/// therefore has no fixed width. It wraps: five equipment options in a 460px
+/// pane are one clipped line otherwise, and the clipped one is unpickable.
+pub fn chips<'a, M: 'a + Clone>(
+    options: impl IntoIterator<Item = (&'a str, bool, M)>,
+) -> Element<'a, M> {
+    let children: Vec<Element<'a, M>> = options
+        .into_iter()
+        .map(|(label, selected, msg)| {
+            button(text(label).size(font::XS))
+                .padding(Padding::from([4.0, 10.0]))
+                .style(theme::nav_item(selected))
+                .on_press(msg)
+                .into()
+        })
+        .collect();
+    Row::with_children(children).spacing(space::XS).wrap().into()
 }
 
 // ---------------------------------------------------------------------------
@@ -311,8 +392,18 @@ pub fn page_fixed<'a, M: 'a>(
     if let Some(desc) = description {
         head = head.push(desc);
     }
+    page_custom(head, content)
+}
+
+/// The same scaffold for a screen whose header is a *control* rather than a
+/// title — the assistant, where the model you are talking to is the thing worth
+/// the top of the page and the title only repeated the tab above it.
+pub fn page_custom<'a, M: 'a>(
+    head: impl Into<Element<'a, M>>,
+    content: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
     container(
-        column![head, container(content.into()).height(Length::Fill)]
+        column![head.into(), container(content.into()).height(Length::Fill)]
             .spacing(space::LG)
             .padding(space::LG),
     )
@@ -476,6 +567,42 @@ pub fn badge_icon<'a, M: 'a>(
     .into()
 }
 
+/// Braille dots — the classic CLI spinner, cycled by an ever-incrementing
+/// frame counter (see `coder::Message::AnimTick`). Text, not an icon glyph: it
+/// draws in any monospace font, so it costs nothing beyond what [`badge_icon`]
+/// already costs.
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The spinner's glyph for a given frame. `frame` wraps freely; only its
+/// remainder mod the frame count is ever read.
+pub fn spinner_char(frame: u8) -> char {
+    SPINNER_FRAMES[frame as usize % SPINNER_FRAMES.len()]
+}
+
+/// [`badge_icon`], but the leading glyph spins instead of sitting still — the
+/// difference between "this is broken" and "this is working" when a step can
+/// take minutes and the badge's text does not change in between.
+pub fn badge_spinner<'a, M: 'a>(
+    frame: u8,
+    label: impl text::IntoFragment<'a>,
+    tone: Tone,
+) -> Element<'a, M> {
+    container(
+        row![
+            text(spinner_char(frame))
+                .size(font::XS)
+                .font(iced::Font::MONOSPACE)
+                .style(theme::text_tone(tone)),
+            text(label).size(font::XS).style(theme::text_tone(tone)),
+        ]
+        .spacing(space::XS)
+        .align_y(iced::Alignment::Center),
+    )
+    .padding(Padding::from([2.0, space::SM]))
+    .style(theme::badge(tone))
+    .into()
+}
+
 /// The glyph that stands for a tone: used by [`alert`] and status badges.
 pub fn tone_icon(tone: Tone) -> Icon {
     match tone {
@@ -536,6 +663,25 @@ pub fn alert<'a, M: 'a>(
 
 pub fn alert_error<'a, M: 'a>(message: impl text::IntoFragment<'a>) -> Element<'a, M> {
     alert(Tone::Danger, message, None)
+}
+
+/// [`alert_error`], but for a message the client may have suffixed with
+/// `" · trace {id}"` ([`agent_platform_client::Error`]'s `Display`) — the
+/// trace id a failed request's server-side log line carries. When present, a
+/// "View logs" button is offered instead of leaving the id as inert text the
+/// user has no way to act on.
+pub fn alert_error_traced<'a, M: 'a + Clone>(
+    message: &str,
+    on_view_logs: impl Fn(String) -> M + 'a,
+) -> Element<'a, M> {
+    match message.rsplit_once(" · trace ") {
+        Some((text, trace_id)) => alert(
+            Tone::Danger,
+            text.to_string(),
+            Some(button_ghost(Icon::Scroll, "View logs", on_view_logs(trace_id.to_string()))),
+        ),
+        None => alert(Tone::Danger, message.to_string(), None),
+    }
 }
 
 pub fn alert_warning<'a, M: 'a>(message: impl text::IntoFragment<'a>) -> Element<'a, M> {
@@ -654,6 +800,21 @@ pub fn list_item<'a, M: 'a + Clone>(
     button(content)
         .width(Length::Fill)
         .padding(space::SM)
+        .style(theme::list_item(selected))
+        .on_press(on_press)
+        .into()
+}
+
+/// Selectable list row for dense lists (log lines), where [`list_item`]'s
+/// padding would halve how many rows fit on screen.
+pub fn list_item_compact<'a, M: 'a + Clone>(
+    content: impl Into<Element<'a, M>>,
+    selected: bool,
+    on_press: M,
+) -> Element<'a, M> {
+    button(content)
+        .width(Length::Fill)
+        .padding(Padding::from([1.0, space::XS]))
         .style(theme::list_item(selected))
         .on_press(on_press)
         .into()

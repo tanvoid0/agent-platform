@@ -1,9 +1,9 @@
-//! The part of `app/action_orchestrator/` that `todos agent/step` calls, and
-//! nothing else.
+//! The action orchestrator — `app/action_orchestrator/`.
 //!
-//! `registry.list_actions` (one `SELECT`) and `engine.decide_actions` are here;
-//! the router's own 685 lines of `/action-sets`, `/sessions` and `/decide` stay
-//! proxied to Python. Nothing in this file is a route.
+//! Started as just the part `todos agent/step` calls (`registry.list_actions`
+//! and `engine.decide_actions`, with the router proxied); the eleven routes
+//! (`/action-sets`, `/sessions`, `/decide`) landed here on 2026-08-07 and the
+//! domain is whole.
 //!
 //! **The two text-parsing fallbacks are the point.** A model that answers the
 //! tool-call prompt with prose, or with one JSON object, still has to produce

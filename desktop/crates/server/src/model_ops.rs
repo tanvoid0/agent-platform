@@ -1,27 +1,39 @@
-//! Model build/train operations — `app/model_ops/`, thirteen of its seventeen
-//! routes.
+//! Model build/train operations — `app/model_ops/`, all seventeen routes.
 //!
 //! Ollama management (list, show, pull, copy, create, delete), the project
-//! scaffold and its uploads, and the registry. All of it is HTTP to Ollama,
-//! files under `MODEL_OPS_DATA_DIR`, and three tables.
+//! scaffold and its uploads, the registry, and the five pipeline-job routes.
 //!
-//! **The four pipeline routes stay with Python, and this is a hard line, not a
-//! deferral.** `POST /jobs`, `POST /operations/build`, `GET /jobs/{id}`,
-//! `/jobs/{id}/stream` and `/jobs/{id}/cancel` belong to `runner.py`, which:
+//! # The build pipeline, after the Python server
 //!
-//! - runs the build stages **inside the Python process** (`prepare` and `eval`
-//!   import `model_ops.pipeline.*`, i.e. torch), or as a `python -c` child when
-//!   `MODEL_OPS_GPU_SUBPROCESS` says so — and `eval` returns a dict through a
-//!   *function return*, not through stdout, so there is nothing for another
-//!   process to read;
-//! - cancels through a module-level `_running` dict of live subprocesses, so
-//!   **only the process that started a job can stop one**. A Rust `/cancel`
-//!   would mark the row `cancelled` and leave the training child running.
+//! `runner.py` is gone; [`spawn_pipeline_job`] replaces it. The training code
+//! itself is *not* ported and never will be — LoRA fine-tuning is torch and
+//! peft — so it stays Python, but as a **worker invoked by subprocess rather
+//! than a server**. That was already half true: `runner.py` ran `train` and
+//! `export` as a `python -c` child under `MODEL_OPS_PYTHON`, because the GPU
+//! stages need their own interpreter and their own memory. Three things changed
+//! to make the other half true:
 //!
-//! So the reads next to them stay too: a job answered from here and cancelled
-//! over there would be two servers disagreeing about the same row. The jobs the
-//! *Ollama* routes below enqueue are a different thing — no subprocess, no
-//! `_running` entry — and they run here.
+//! - **Every stage is a subprocess now**, not just the two GPU ones.
+//!   `MODEL_OPS_GPU_SUBPROCESS` used to gate that and `prepare`/`eval` ran
+//!   in-process; there is no in-process any more, so the variable is gone. The
+//!   stage scripts are the ones `_stage_script` already emitted.
+//! - **`eval`'s result comes back through stdout.** It used to be a function
+//!   return value, which is exactly why this domain could not migrate; it is
+//!   now a `@@AGP:eval@@ {json}` line the parent picks out of the log stream.
+//! - **The registry write comes back the same way.** `register_model_entry`
+//!   used to reach into SQLAlchemy from inside the training child, which meant
+//!   the child needed `database.py`, `models.py` and the whole ORM. It now
+//!   prints `@@AGP:registry@@ {json}` and [`persist_registry_entry`] here does
+//!   the write — so `model_build_jobs`, `model_projects` and
+//!   `model_registry_entries` have exactly one writer, this process.
+//!
+//! The markers are read from the same stream that is teed to the job log, so a
+//! stage that emits one still has it in its log for a human to read.
+//!
+//! Cancellation was the other stated blocker: `runner.py` kept a module-level
+//! `_running` dict, so only the process that started a job could stop one. That
+//! dict is now [`AppState::model_jobs`], and it is the *same* process, because
+//! there is only one.
 //!
 //! ponytail: written against `state.pool` like every domain but `projects`; the
 //! Postgres port converts one domain at a time and this is not converted yet.
@@ -61,6 +73,11 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(ollama_show_model).post(ollama_models_post).delete(ollama_delete),
         )
         .route(&format!("{BASE}/ollama/jobs"), post(ollama_jobs_create))
+        .route(&format!("{BASE}/jobs"), post(jobs_create))
+        .route(&format!("{BASE}/jobs/{{job_id}}"), get(jobs_get))
+        .route(&format!("{BASE}/jobs/{{job_id}}/stream"), get(jobs_stream))
+        .route(&format!("{BASE}/jobs/{{job_id}}/cancel"), post(jobs_cancel))
+        .route(&format!("{BASE}/operations/build"), post(build_operation))
         .route(&format!("{BASE}/projects"), get(projects_list).post(projects_create))
         .route(&format!("{BASE}/projects/{{name}}"), get(projects_get))
         .route(&format!("{BASE}/projects/{{name}}/knowledge"), post(upload_knowledge))
@@ -86,29 +103,26 @@ fn template_project_dir() -> PathBuf {
     projects_dir().join("_template")
 }
 
-/// `app/model_ops/data`, which ships next to the Python package — the seed for
-/// `defaults.yaml` and the `_template` project.
+/// `model_ops/data`, the seed for `defaults.yaml` and the `_template` project.
 ///
-/// Found by the same search order [`crate::upstream::resolve_python`] uses, for
-/// the same reason: this process may be a repo checkout or an installed
-/// payload, and until now nothing in Rust needed a file that belongs to the
-/// Python half.
+/// It used to live under `app/`, beside the Python server package; it now ships
+/// with the build worker, because the worker is the thing that reads the
+/// projects it seeds. Searched in the same three places [`worker_pythonpath`]
+/// looks: the explicit override, beside the executable, then the checkout.
 fn bundled_data_dir() -> Option<PathBuf> {
     let candidates = [
-        env_opt("AGENT_PLATFORM_PY_ENTRY")
-            .map(PathBuf::from)
-            .and_then(|entry| entry.parent()?.parent().map(Path::to_path_buf)),
-        std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("server"))),
+        env_opt("MODEL_OPS_WORKER_PATH").map(PathBuf::from),
+        std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("worker"))),
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .and_then(Path::parent)
-            .map(Path::to_path_buf),
+            .map(|repo| repo.join("worker")),
     ];
     candidates
         .into_iter()
         .flatten()
-        .map(|root| root.join("app").join("model_ops").join("data"))
+        .map(|root| root.join("model_ops").join("data"))
         .find(|path| path.is_dir())
 }
 
@@ -150,7 +164,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 fn io_error(e: std::io::Error) -> ApiError {
-    eprintln!("[agent-platformd] model-ops filesystem error: {e}");
+    logd!("model-ops filesystem error: {e}");
     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "An unexpected error occurred.")
 }
 
@@ -1305,9 +1319,923 @@ async fn registry_activate(
     Ok(Json(out).into_response())
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline jobs — `routes.py`'s five, and `runner.py` under them
+// ---------------------------------------------------------------------------
+
+/// `PipelineStage`, in the order `_stage_script` knows how to build.
+const PIPELINE_STAGES: [&str; 4] = ["prepare", "train", "export", "eval"];
+
+/// `POST /jobs` — create the row, answer, and run it detached, which is what
+/// `BackgroundTasks` gave Python.
+async fn jobs_create(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    principal.require_scope("model:write")?;
+    let body = parse_body(&raw)?;
+    let request = BuildRequest::parse(&body)?;
+    let out = start_pipeline_job(state, &request).await?;
+    Ok(Json(out).into_response())
+}
+
+/// `POST /operations/build` — the same thing under the reusable operation
+/// contract, so an orchestrator step can start a build.
+async fn build_operation(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    principal.require_scope("model:write")?;
+    let body = parse_body(&raw)?;
+
+    // `operation: str = Field(default="model.build")` — absent is the default,
+    // present-but-wrong is a 400.
+    match body.get("operation") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if s == "model.build" => {}
+        Some(_) => {
+            return Err(ApiError::bad_request("Unsupported operation; use model.build"));
+        }
+    }
+    let input = body.get("input").cloned().ok_or_else(|| {
+        ApiError::validation(vec![ApiError::field_error("input", "missing", "Field required")])
+    })?;
+
+    let request = BuildRequest::parse(&input).map_err(nest_under_input)?;
+    let out = start_pipeline_job(state, &request).await?;
+    Ok(Json(json!({
+        "operation": "model.build",
+        "job_id": out["id"],
+        "poll_url": out["poll_url"],
+        "stream_url": out["stream_url"],
+    }))
+    .into_response())
+}
+
+/// A validation failure on the nested body reports `["body", "input", …]`, the
+/// way pydantic locates a field inside a sub-model.
+fn nest_under_input(e: ApiError) -> ApiError {
+    if e.code != "validation_error" {
+        return e;
+    }
+    let Some(errors) = e.extra.as_ref().and_then(|x| x.get("errors")).and_then(Value::as_array)
+    else {
+        return e;
+    };
+    let nested: Vec<Value> = errors
+        .iter()
+        .cloned()
+        .map(|mut entry| {
+            if let Some(loc) = entry.get_mut("loc").and_then(Value::as_array_mut) {
+                loc.insert(1, Value::from("input"));
+            }
+            entry
+        })
+        .collect();
+    ApiError::validation(nested)
+}
+
+struct BuildRequest {
+    project: String,
+    stages: Vec<String>,
+    register_alias: Option<String>,
+    offline_eval: bool,
+    process_id: Option<i64>,
+}
+
+impl BuildRequest {
+    /// `ModelBuildJobCreateRequest`. `stages` defaults to all four, and an
+    /// unknown stage is a 422 rather than a runtime `ValueError` — the enum is
+    /// on the request model there, so it fails at the boundary.
+    fn parse(body: &Value) -> Result<Self, ApiError> {
+        let mut errors = Vec::new();
+        let project = required_str(&mut errors, body, "project");
+
+        let stages = match body.get("stages") {
+            None | Some(Value::Null) => PIPELINE_STAGES.iter().map(|s| s.to_string()).collect(),
+            Some(Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    match item.as_str() {
+                        Some(name) if PIPELINE_STAGES.contains(&name) => out.push(name.to_string()),
+                        _ => errors.push(ApiError::field_error_at(
+                            &["stages", &index.to_string()],
+                            "enum",
+                            &format!(
+                                "Input should be {}",
+                                PIPELINE_STAGES
+                                    .iter()
+                                    .map(|s| format!("'{s}'"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        )),
+                    }
+                }
+                out
+            }
+            Some(_) => {
+                errors.push(ApiError::field_error("stages", "list_type", "Input should be a valid list"));
+                Vec::new()
+            }
+        };
+
+        let register_alias = optional_str(&mut errors, body, "register_alias");
+        let offline_eval = lax_bool(&mut errors, body, "offline_eval");
+        let process_id = crate::wire::lax_int(&mut errors, body, "process_id");
+
+        if !errors.is_empty() {
+            return Err(ApiError::validation(errors));
+        }
+        Ok(Self {
+            project,
+            stages,
+            register_alias: register_alias.filter(|a| !a.is_empty()),
+            offline_eval,
+            process_id,
+        })
+    }
+}
+
+/// The shared half of `model_jobs_create`: sync the project, create the row,
+/// render the response, *then* spawn — so a client that polls the `poll_url` in
+/// the response can never beat the row into existence.
+async fn start_pipeline_job(state: Arc<AppState>, request: &BuildRequest) -> Result<Value, ApiError> {
+    // `get_project_by_name` raising `FileNotFoundError` → 404. `load_project`
+    // reads the manifest off disk and reports the same thing.
+    let project = sync_project_row(&state, &request.project).await?;
+
+    let logs_dir = ensure_data_scaffold().join("logs");
+    std::fs::create_dir_all(&logs_dir).map_err(io_error)?;
+
+    let now = sql_now();
+    let job_id: i64 = sqlx::query_scalar(
+        "INSERT INTO model_build_jobs \
+         (project_id, job_type, operation_json, stages_json, status, current_stage, log_path, \
+          result_json, register_alias, error_message, process_id, created_at, started_at, \
+          finished_at) \
+         VALUES (?, 'pipeline', NULL, ?, 'pending', NULL, NULL, NULL, ?, NULL, ?, ?, NULL, NULL) \
+         RETURNING id",
+    )
+    .bind(project.id)
+    .bind(Value::from(request.stages.clone()).to_string())
+    .bind(request.register_alias.as_deref())
+    .bind(request.process_id)
+    .bind(&now)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let log_path = logs_dir.join(format!("job_{job_id}.log"));
+    std::fs::write(&log_path, "").map_err(io_error)?;
+    sqlx::query("UPDATE model_build_jobs SET log_path = ? WHERE id = ?")
+        .bind(log_path.to_string_lossy().as_ref())
+        .bind(job_id)
+        .execute(&state.pool)
+        .await?;
+
+    // `link_process_to_job`: a job started by an orchestration step points back
+    // at it. A missing process is silently skipped, as there.
+    if let Some(process_id) = request.process_id {
+        let _ = sqlx::query("UPDATE process SET model_build_job_id = ? WHERE id = ?")
+            .bind(job_id)
+            .bind(process_id)
+            .execute(&state.pool)
+            .await;
+    }
+
+    let out = job_out(&state, job_id).await?;
+    spawn_pipeline_job(state, job_id, request.project.clone(), request.offline_eval);
+    Ok(out)
+}
+
+async fn jobs_get(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    PathId(job_id): PathId<i64>,
+) -> Result<Response, ApiError> {
+    principal.require_scope("model:read")?;
+    Ok(Json(job_out(&state, job_id).await?).into_response())
+}
+
+/// `POST /jobs/{id}/cancel`. Kills the stage subprocess if one is running, then
+/// marks the row — in that order, so a stage that dies of the kill cannot
+/// overwrite `cancelled` with `failed` afterwards (the runner checks).
+async fn jobs_cancel(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    PathId(job_id): PathId<i64>,
+) -> Result<Response, ApiError> {
+    principal.require_scope("model:write")?;
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM model_build_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let status = status.ok_or_else(|| ApiError::not_found("Job not found"))?;
+    if status != "pending" && status != "running" {
+        return Err(ApiError::new(StatusCode::CONFLICT, format!("Job is {status}")));
+    }
+
+    // `_running.pop` + `proc.terminate()`. Taking it out of the map first is
+    // what tells the runner's own arm that this was a cancellation.
+    let handle = state.model_jobs.lock().ok().and_then(|mut map| map.remove(&job_id));
+    if let Some(handle) = handle {
+        handle.cancel();
+    }
+
+    sqlx::query("UPDATE model_build_jobs SET status = 'cancelled', finished_at = ? WHERE id = ?")
+        .bind(sql_now())
+        .bind(job_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(Json(job_out(&state, job_id).await?).into_response())
+}
+
+/// `GET /jobs/{id}/stream` — SSE over the job's log file.
+///
+/// The first frame carries the last 200 lines as context, and every frame after
+/// it only what has been appended since, tracked by **byte** offset. A `done`
+/// event closes the stream on a terminal status.
+async fn jobs_stream(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    PathId(job_id): PathId<i64>,
+) -> Result<Response, ApiError> {
+    principal.require_scope("model:read")?;
+    let job: JobRow = sqlx::query_as(&format!(
+        "SELECT {JOB_COLUMNS} FROM model_build_jobs WHERE id = ?"
+    ))
+    .bind(job_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("Job not found"))?;
+
+    let log_path = job.log_path.clone();
+    let mut offset = log_path
+        .as_deref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let mut first = read_job_log_tail(log_path.as_deref(), 200);
+
+    let stream = async_stream::stream! {
+        loop {
+            let row: Option<JobRow> = sqlx::query_as(&format!(
+                "SELECT {JOB_COLUMNS} FROM model_build_jobs WHERE id = ?"
+            ))
+            .bind(job_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+            let Some(row) = row else { break };
+
+            let chunk = if first.is_empty() {
+                let (chunk, next) = read_job_log_since(log_path.as_deref(), offset);
+                offset = next;
+                chunk
+            } else {
+                std::mem::take(&mut first)
+            };
+
+            if !chunk.is_empty() {
+                let payload = json!({
+                    "log": chunk,
+                    "status": row.status,
+                    "stage": row.current_stage,
+                });
+                yield Ok::<_, std::convert::Infallible>(format!("event: log\ndata: {payload}\n\n"));
+            }
+
+            if matches!(row.status.as_str(), "succeeded" | "failed" | "cancelled") {
+                let payload = json!({
+                    "status": row.status,
+                    "result": object_or_empty(row.result_json.as_deref()),
+                });
+                yield Ok(format!("event: done\ndata: {payload}\n\n"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    };
+
+    Ok(Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "stream setup failed"))?)
+}
+
+/// `read_job_log_since` — bytes appended since `offset`, and the new offset.
+///
+/// Byte offsets, not string lengths: a tail window slides as the file grows, so
+/// slicing one by a previous length re-sends or skips lines. Restarts from 0 if
+/// the file shrank.
+fn read_job_log_since(log_path: Option<&str>, offset: u64) -> (String, u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some(path) = log_path.filter(|p| !p.is_empty()) else { return (String::new(), offset) };
+    let Ok(mut file) = std::fs::File::open(path) else { return (String::new(), offset) };
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = if size < offset { 0 } else { offset };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (String::new(), offset);
+    }
+    let mut buffer = Vec::new();
+    if file.read_to_end(&mut buffer).is_err() {
+        return (String::new(), offset);
+    }
+    (String::from_utf8_lossy(&buffer).into_owned(), start + buffer.len() as u64)
+}
+
+// ---------------------------------------------------------------------------
+// The runner
+// ---------------------------------------------------------------------------
+
+/// A live stage subprocess, so `/cancel` can reach it. `runner.py`'s `_running`
+/// dict held the `asyncio` process object; a kill sender is all this needs.
+pub struct JobHandle {
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+impl JobHandle {
+    pub fn cancel(&self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
+pub type JobMap = std::collections::HashMap<i64, Arc<JobHandle>>;
+
+/// `run_job` for `job_type == "pipeline"`.
+fn spawn_pipeline_job(state: Arc<AppState>, job_id: i64, project: String, offline_eval: bool) {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    if let Ok(mut map) = state.model_jobs.lock() {
+        map.insert(job_id, Arc::new(JobHandle { cancel: tx }));
+    }
+
+    tokio::spawn(async move {
+        let outcome = run_pipeline_job(&state, job_id, &project, offline_eval, rx).await;
+        // Whether it finished or died, it is no longer cancellable.
+        if let Ok(mut map) = state.model_jobs.lock() {
+            map.remove(&job_id);
+        }
+
+        // A job the operator cancelled mid-stage is already `cancelled`; the
+        // stage's non-zero exit must not overwrite that with `failed`.
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT status FROM model_build_jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_optional(&state.pool)
+                .await
+                .ok()
+                .flatten();
+        if current.as_deref() == Some("cancelled") {
+            return;
+        }
+
+        let log_path: Option<String> =
+            sqlx::query_scalar("SELECT log_path FROM model_build_jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_optional(&state.pool)
+                .await
+                .ok()
+                .flatten();
+
+        match outcome {
+            Ok(()) => {
+                let _ = sqlx::query(
+                    "UPDATE model_build_jobs SET status = 'succeeded', finished_at = ? WHERE id = ?",
+                )
+                .bind(sql_now())
+                .bind(job_id)
+                .execute(&state.pool)
+                .await;
+            }
+            Err(message) => {
+                append_job_log(log_path.as_deref(), &format!("ERROR: {message}\n"));
+                let truncated: String = message.chars().take(2000).collect();
+                let _ = sqlx::query(
+                    "UPDATE model_build_jobs SET status = 'failed', finished_at = ?, \
+                     error_message = ? WHERE id = ?",
+                )
+                .bind(sql_now())
+                .bind(truncated)
+                .bind(job_id)
+                .execute(&state.pool)
+                .await;
+            }
+        }
+    });
+}
+
+async fn run_pipeline_job(
+    state: &AppState,
+    job_id: i64,
+    project: &str,
+    offline_eval: bool,
+    cancelled: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let job: JobRow = sqlx::query_as(&format!(
+        "SELECT {JOB_COLUMNS} FROM model_build_jobs WHERE id = ?"
+    ))
+    .bind(job_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "Job vanished".to_string())?;
+    let log_path = job.log_path.clone();
+
+    sqlx::query("UPDATE model_build_jobs SET status = 'running', started_at = ? WHERE id = ?")
+        .bind(sql_now())
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let stages: Vec<String> = job
+        .stages()
+        .as_array()
+        .map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    for stage in &stages {
+        let stage = stage.as_str();
+        let _ = sqlx::query("UPDATE model_build_jobs SET current_stage = ? WHERE id = ?")
+            .bind(stage)
+            .bind(job_id)
+            .execute(&state.pool)
+            .await;
+        append_job_log(log_path.as_deref(), &format!("=== stage: {stage} ===\n"));
+
+        let markers =
+            run_stage(state, stage, project, offline_eval, log_path.as_deref(), cancelled.clone())
+                .await?;
+
+        // `eval` is the only stage that contributes to `result`, and it used to
+        // do so by returning a dict. Now it prints one.
+        if let Some(eval) = markers.eval {
+            let mut result = object_or_empty(
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT result_json FROM model_build_jobs WHERE id = ?",
+                )
+                .bind(job_id)
+                .fetch_optional(&state.pool)
+                .await
+                .ok()
+                .flatten()
+                .flatten()
+                .as_deref(),
+            );
+            if let Some(map) = result.as_object_mut() {
+                map.insert("eval".into(), eval);
+            }
+            let _ = sqlx::query("UPDATE model_build_jobs SET result_json = ? WHERE id = ?")
+                .bind(result.to_string())
+                .bind(job_id)
+                .execute(&state.pool)
+                .await;
+        }
+    }
+
+    // `register_ollama_alias` after every stage succeeded, from the project's
+    // manifest `ollama_tag` (its name when it has none).
+    if let Some(alias) = job.register_alias.as_deref().filter(|a| !a.is_empty()) {
+        let manifest: Option<String> =
+            sqlx::query_scalar("SELECT manifest_json FROM model_projects WHERE id = ?")
+                .bind(job.project_id)
+                .fetch_optional(&state.pool)
+                .await
+                .ok()
+                .flatten();
+        let manifest = object_or_empty(manifest.as_deref());
+        let tag = manifest
+            .get("ollama_tag")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| project.to_string());
+        if let Err(e) = register_ollama_alias(alias, &tag) {
+            append_job_log(log_path.as_deref(), &format!("WARNING: alias not registered: {e}\n"));
+        }
+    }
+
+    Ok(())
+}
+
+/// What a stage printed on its marker lines.
+#[derive(Default)]
+struct StageMarkers {
+    eval: Option<Value>,
+}
+
+/// The `@@AGP:` prefix the Python worker prints its structured results on.
+/// Chosen to be something no training library emits and no human would type.
+const MARKER_PREFIX: &str = "@@AGP:";
+
+/// Run one stage as a `MODEL_OPS_PYTHON -c …` child, teeing its combined output
+/// to the job log and picking the marker lines out as they go past.
+async fn run_stage(
+    state: &AppState,
+    stage: &str,
+    project: &str,
+    offline_eval: bool,
+    log_path: Option<&str>,
+    mut cancelled: tokio::sync::watch::Receiver<bool>,
+) -> Result<StageMarkers, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let script = stage_script(stage, project, offline_eval)?;
+    let mut command = tokio::process::Command::new(train_python());
+    command
+        .arg("-c")
+        .arg(&script)
+        .env("PYTHONPATH", worker_pythonpath())
+        // Line-buffered, or a training run's output arrives in 8 KB blocks and
+        // the log stream stalls for minutes at a time.
+        .env("PYTHONUNBUFFERED", "1")
+        // Passed explicitly rather than left to inheritance. Each of these has
+        // a *resolved* value here — `CONFIG_DIR` may be unset in the
+        // environment and still resolve to the repo's `data/llm`, and
+        // `OLLAMA_API_BASE` may have come from the `.env` file or from startup
+        // discovery. The worker's own fallbacks would land somewhere else, and
+        // a training run that writes its adapters into the wrong directory
+        // fails an hour later rather than immediately.
+        .env("CONFIG_DIR", crate::llm_config::config_dir())
+        .env("MODEL_OPS_DATA_DIR", data_dir())
+        .env("OLLAMA_API_BASE", crate::llm_config::ollama_api_base())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = command.spawn().map_err(|e| {
+        format!("Stage {stage} could not start ({}): {e}", train_python())
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| format!("Stage {stage} had no stdout"))?;
+    let stderr = child.stderr.take();
+
+    // stderr is merged into the log the way `stderr=STDOUT` merged it before,
+    // but on its own task so a stage that writes a lot to one and nothing to
+    // the other cannot deadlock on a full pipe.
+    if let Some(stderr) = stderr {
+        let log_path = log_path.map(str::to_string);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                append_job_log(log_path.as_deref(), &format!("{line}\n"));
+            }
+        });
+    }
+
+    let mut markers = StageMarkers::default();
+    let mut lines = BufReader::new(stdout).lines();
+    loop {
+        tokio::select! {
+            // Biased so a cancel that arrives while output is flowing is still
+            // seen, rather than losing every poll to the ready stdout branch.
+            biased;
+            _ = cancelled.changed() => {
+                if *cancelled.borrow() {
+                    let _ = child.kill().await;
+                    return Err(format!("Stage {stage} cancelled"));
+                }
+            }
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        append_job_log(log_path, &format!("{line}\n"));
+                        handle_marker(state, &line, &mut markers).await;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| format!("Stage {stage} failed to run: {e}"))?;
+    if !status.success() {
+        // `RuntimeError(f"Stage {stage} exited with code {code}")`. A signalled
+        // process has no code on Unix, which Python rendered as a negative
+        // number; `code()` is `None` there, so it is spelled out instead.
+        return Err(match status.code() {
+            Some(code) => format!("Stage {stage} exited with code {code}"),
+            None => format!("Stage {stage} was terminated by a signal"),
+        });
+    }
+    Ok(markers)
+}
+
+/// `@@AGP:eval@@ {json}` and `@@AGP:registry@@ {json}`. Anything else on a
+/// marker line is ignored rather than fatal — a worker from a newer build must
+/// not fail a job on a parent that does not know its marker yet.
+async fn handle_marker(state: &AppState, line: &str, markers: &mut StageMarkers) {
+    let Some(rest) = line.trim().strip_prefix(MARKER_PREFIX) else { return };
+    let Some((kind, payload)) = rest.split_once("@@") else { return };
+    let Ok(payload) = serde_json::from_str::<Value>(payload.trim()) else {
+        logd!("model-ops: unparseable {kind} marker from the build worker");
+        return;
+    };
+    match kind {
+        "eval" => markers.eval = Some(payload),
+        "registry" => {
+            // `set_active` rides in the envelope; `register_model_entry`'s
+            // second argument defaulted to True.
+            let set_active = payload
+                .get("set_active")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let entry = payload.get("entry").cloned().unwrap_or(payload.clone());
+            if let Err(e) = persist_registry_entry(state, &entry, set_active).await {
+                logd!("model-ops: registry entry not stored: {e:?}");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `persist_registry_entry`. Upserts on `(project_id, version)`.
+async fn persist_registry_entry(
+    state: &AppState,
+    entry: &Value,
+    set_active: bool,
+) -> Result<(), ApiError> {
+    // `entry.get("project") or entry.get("ollama_tag")` — no name, no write.
+    let project_name = entry
+        .get("project")
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("ollama_tag").and_then(Value::as_str))
+        .map(str::to_string);
+    let Some(project_name) = project_name.filter(|n| !n.is_empty()) else { return Ok(()) };
+    let project = sync_project_row(state, &project_name).await?;
+
+    let version = entry
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("v1")
+        .to_string();
+    let tag = entry
+        .get("ollama_tag")
+        .and_then(Value::as_str)
+        .unwrap_or(&project_name)
+        .to_string();
+
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM model_registry_entries WHERE project_id = ? AND version = ?",
+    )
+    .bind(project.id)
+    .bind(&version)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let entry_id = match existing {
+        Some(id) => id,
+        None => sqlx::query_scalar(
+            "INSERT INTO model_registry_entries (project_id, version, ollama_tag, is_active) \
+             VALUES (?, ?, ?, 0) RETURNING id",
+        )
+        .bind(project.id)
+        .bind(&version)
+        .bind(&tag)
+        .fetch_one(&state.pool)
+        .await?,
+    };
+
+    // `eval_score` is only written when present: `if entry.get("eval_score") is
+    // not None`, so a later stage cannot blank an earlier one's number.
+    sqlx::query(
+        "UPDATE model_registry_entries \
+         SET base_model = ?, adapter_path = ?, gguf_path = ?, metadata_json = ?, \
+             eval_score = COALESCE(?, eval_score) \
+         WHERE id = ?",
+    )
+    .bind(entry.get("base_model").and_then(Value::as_str))
+    .bind(entry.get("adapter").and_then(Value::as_str))
+    .bind(entry.get("gguf").and_then(Value::as_str))
+    .bind(entry.to_string())
+    .bind(entry.get("eval_score").and_then(Value::as_f64))
+    .bind(entry_id)
+    .execute(&state.pool)
+    .await?;
+
+    if set_active {
+        sqlx::query("UPDATE model_registry_entries SET is_active = 0 WHERE project_id = ?")
+            .bind(project.id)
+            .execute(&state.pool)
+            .await?;
+        sqlx::query("UPDATE model_registry_entries SET is_active = 1, ollama_tag = ? WHERE id = ?")
+            .bind(&tag)
+            .bind(entry_id)
+            .execute(&state.pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// `config_bridge.register_ollama_alias`: add or update an alias in the ollama
+/// provider block of `config.yaml`.
+fn register_ollama_alias(alias: &str, ollama_model: &str) -> Result<(), String> {
+    let path = crate::llm_config::config_yaml_path();
+    let mut data: Value = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_yaml::from_str(&text).map_err(|e| e.to_string())?,
+        Err(_) => json!({}),
+    };
+    if !data.is_object() {
+        data = json!({});
+    }
+    let root = data.as_object_mut().expect("just forced to an object");
+
+    let providers = root
+        .entry("providers")
+        .or_insert_with(|| json!([]));
+    if !providers.is_array() {
+        *providers = json!([]);
+    }
+    let providers = providers.as_array_mut().expect("just forced to an array");
+
+    let index = providers
+        .iter()
+        .position(|p| p.get("name").and_then(Value::as_str) == Some("ollama"))
+        .unwrap_or_else(|| {
+            providers.push(json!({"name": "ollama", "models": []}));
+            providers.len() - 1
+        });
+    let block = providers[index].as_object_mut().ok_or("ollama block is not a mapping")?;
+    let models = block.entry("models").or_insert_with(|| json!([]));
+    if !models.is_array() {
+        *models = json!([]);
+    }
+    let models = models.as_array_mut().expect("just forced to an array");
+
+    match models
+        .iter_mut()
+        .find(|m| m.get("model_name").and_then(Value::as_str) == Some(alias))
+    {
+        Some(found) => {
+            found["model"] = Value::from(ollama_model);
+        }
+        None => models.push(json!({"model_name": alias, "model": ollama_model})),
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let rendered = serde_yaml::to_string(&data).map_err(|e| e.to_string())?;
+    std::fs::write(&path, rendered).map_err(|e| e.to_string())
+}
+
+/// `_train_python`: `MODEL_OPS_PYTHON`, else whatever `python` is on PATH.
+///
+/// Python's fallback was `sys.executable` — the interpreter running the server,
+/// which no longer exists. There is no better default left, so an install that
+/// wants the build pipeline sets the variable; [`run_stage`] names it in the
+/// error when the spawn fails, which is the only way an operator finds out.
+fn train_python() -> String {
+    env_opt("MODEL_OPS_PYTHON").unwrap_or_else(|| "python".to_string())
+}
+
+/// `_app_pythonpath`: the directory the `model_ops` package sits in.
+///
+/// `MODEL_OPS_WORKER_PATH` is the override; otherwise `worker/` beside the
+/// executable (where the installer puts it), then `worker/` in the checkout
+/// this was built from.
+///
+/// The checkout branch is not a nicety: a dev build runs out of
+/// `target/debug/`, which has no `worker/` beside it, and without it every
+/// build stage dies with `ModuleNotFoundError: No module named 'model_ops'` —
+/// found by running one, not by reading. [`bundled_data_dir`] searches the same
+/// three places for the same reason.
+fn worker_pythonpath() -> String {
+    let candidates = [
+        env_opt("MODEL_OPS_WORKER_PATH").map(PathBuf::from),
+        std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("worker"))),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .map(|repo| repo.join("worker")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|path| path.join("model_ops").is_dir())
+        .map(|path| path.to_string_lossy().into_owned())
+        // Nothing found: hand the relative name over anyway so the stage fails
+        // with Python's own `ModuleNotFoundError` naming the package, which is
+        // a better error than anything invented here.
+        .unwrap_or_else(|| "worker".to_string())
+}
+
+/// `_stage_script` — the `python -c` body for one stage.
+///
+/// The project name is interpolated through a JSON string literal, which is a
+/// valid Python string literal for every character that can appear here and
+/// closes the injection the `{project!r}` in Python left open in principle.
+fn stage_script(stage: &str, project: &str, offline_eval: bool) -> Result<String, String> {
+    let name = Value::from(project).to_string();
+    let body = match stage {
+        "prepare" => format!(
+            "from model_ops.pipeline.merge_knowledge import merge_packs\n\
+             from model_ops.pipeline.build_dataset import build_dataset\n\
+             merge_packs({name})\n\
+             build_dataset({name})\n"
+        ),
+        "train" => format!("from model_ops.pipeline.train_lora import train\ntrain({name})\n"),
+        "export" => format!(
+            "from model_ops.pipeline.export_ollama import merge_and_export_gguf\n\
+             merge_and_export_gguf({name})\n"
+        ),
+        // The one stage whose result travels: it printed nothing before, and
+        // the parent read its return value.
+        "eval" => format!(
+            "import json\n\
+             from model_ops.pipeline.eval import run_eval\n\
+             _r = run_eval({name}, offline={})\n\
+             print('{MARKER_PREFIX}eval@@ ' + json.dumps(_r if _r is not None else {{}}))\n",
+            if offline_eval { "True" } else { "False" }
+        ),
+        other => return Err(format!("Unknown stage: {other}")),
+    };
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stage scripts are strings compiled by another interpreter, so a typo
+    /// here is a runtime failure minutes into a build. These assert the import
+    /// lines and the marker the parent then parses.
+    #[test]
+    fn stage_scripts_name_the_pipeline_entry_points() {
+        let prepare = stage_script("prepare", "my-app", false).unwrap();
+        assert!(prepare.contains("merge_packs(\"my-app\")"), "{prepare}");
+        assert!(prepare.contains("build_dataset(\"my-app\")"), "{prepare}");
+
+        assert!(stage_script("train", "x", false).unwrap().contains("train(\"x\")"));
+        assert!(stage_script("export", "x", false)
+            .unwrap()
+            .contains("merge_and_export_gguf(\"x\")"));
+
+        let eval = stage_script("eval", "x", true).unwrap();
+        assert!(eval.contains("run_eval(\"x\", offline=True)"), "{eval}");
+        assert!(eval.contains("@@AGP:eval@@"), "{eval}");
+        assert!(stage_script("eval", "x", false).unwrap().contains("offline=False"));
+
+        assert_eq!(stage_script("nope", "x", false), Err("Unknown stage: nope".into()));
+    }
+
+    /// A project name with a quote in it must not break out of the literal.
+    #[test]
+    fn a_hostile_project_name_stays_inside_its_string() {
+        let script = stage_script("train", "x\"); import os; os.system(\"rm -rf /", false).unwrap();
+        assert!(script.contains(r#"train("x\"); import os; os.system(\"rm -rf /")"#), "{script}");
+        // One `train(` call, so nothing was appended as a second statement.
+        assert_eq!(script.matches("train(").count(), 1);
+    }
+
+    /// The parser has to ignore anything that is not a marker, because every
+    /// line of a training run's output goes through it.
+    #[test]
+    fn only_marker_lines_are_parsed() {
+        assert_eq!(split_marker("Epoch 1/3: loss=0.42"), None);
+        assert_eq!(split_marker("@@AGP:eval@@ {\"score\": 1}"), Some(("eval", "{\"score\": 1}")));
+        // Leading whitespace is tolerated; a marker with no `@@` terminator is not.
+        assert_eq!(split_marker("   @@AGP:registry@@ {}"), Some(("registry", "{}")));
+        assert_eq!(split_marker("@@AGP:broken {}"), None);
+    }
+
+    /// The half of `handle_marker` that has no database in it, so it can be
+    /// tested without one.
+    fn split_marker(line: &str) -> Option<(&str, &str)> {
+        let rest = line.trim().strip_prefix(MARKER_PREFIX)?;
+        let (kind, payload) = rest.split_once("@@")?;
+        Some((kind, payload.trim()))
+    }
+
+    /// `read_job_log_since` is what makes the SSE stream not re-send what the
+    /// client already has.
+    #[test]
+    fn the_log_stream_only_sends_what_is_new() {
+        let dir = std::env::temp_dir().join("agp-model-ops-since");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("job.log");
+        let as_str = path.to_string_lossy().into_owned();
+
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let (chunk, offset) = read_job_log_since(Some(&as_str), 0);
+        assert_eq!(chunk, "one\ntwo\n");
+        assert_eq!(offset, 8);
+
+        // Nothing appended, nothing sent, offset unchanged.
+        assert_eq!(read_job_log_since(Some(&as_str), offset), (String::new(), offset));
+
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let (chunk, offset) = read_job_log_since(Some(&as_str), offset);
+        assert_eq!(chunk, "three\n");
+        assert_eq!(offset, 14);
+
+        // A truncated file restarts from the beginning rather than reading past
+        // its end forever.
+        std::fs::write(&path, "new\n").unwrap();
+        assert_eq!(read_job_log_since(Some(&as_str), offset), ("new\n".to_string(), 4));
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn an_empty_pull_stream_still_counts_as_success() {

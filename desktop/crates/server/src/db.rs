@@ -111,9 +111,109 @@ pub fn connect_lazy(url: &str, backend: Backend) -> AnyPool {
         }),
         Backend::Postgres => opts,
     };
-    // Lazy on purpose: the schema is Alembic's, created by the Python child on
-    // its first start, which may not have happened when state is built.
+    // Still lazy: `serve` calls [`ensure_schema`] before it binds, but a test
+    // that builds an `AppState` and never touches the database should not need
+    // a file on disk for it.
     opts.connect_lazy(url).expect("connection string was validated at startup")
+}
+
+/// The schema Alembic used to create, applied at startup.
+///
+/// **This replaces Alembic, and the replacement is deliberately dumber than it
+/// was.** ADR 0007 rule 2 made Alembic the only migration owner for as long as
+/// two servers shared the database — a second migration tool would have raced
+/// it. There is no second server now, and Alembic cannot stay: it is
+/// `app/alembic/`, which went with the rest of the Python package.
+///
+/// What ships instead is one `schema.sql`, generated from the final Alembic
+/// head (`e0f1a2b3c4d5`) as `CREATE TABLE IF NOT EXISTS` plus its indexes. An
+/// existing database already has every one of those tables, so applying it is a
+/// no-op there; a fresh one gets the schema in a single pass instead of
+/// replaying thirty revisions.
+///
+/// ponytail: **this creates, it does not migrate.** A future column change has
+/// nowhere to go — the honest upgrade is a versioned migration runner
+/// (`sqlx::migrate!`, or a `schema_version` table and a list of steps), and it
+/// should be built the first time a column actually has to change rather than
+/// speculatively now. The thirty historical revisions are not worth carrying
+/// into it: every database in existence is already at head.
+pub async fn ensure_schema(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    // Comment lines are dropped **before** splitting, not after. Splitting
+    // first glues the file's header comment onto the first `CREATE`, and a
+    // filter on "starts with `--`" then silently discards both — which showed
+    // up as one missing table, not as an error.
+    let sql: String = SCHEMA_SQL
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("
+");
+
+    for statement in sql.split(';') {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        sqlx::query(statement).execute(pool).await?;
+    }
+    Ok(())
+}
+
+const SCHEMA_SQL: &str = include_str!("schema.sql");
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    /// The whole file has to execute against a real SQLite, twice.
+    ///
+    /// Once because a statement the splitter mangles is a server that starts
+    /// and then 500s on the first query; twice because every install after the
+    /// first runs this against a database that already has the tables, and an
+    /// `IF NOT EXISTS` that was missed would fail there and nowhere else.
+    #[tokio::test]
+    async fn the_schema_applies_to_an_empty_database_and_again_to_a_full_one() {
+        let path = std::env::temp_dir().join(format!("agp-schema-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let url = url_for(&path, None);
+        let pool = connect_lazy(&url, Backend::Sqlite);
+
+        ensure_schema(&pool).await.expect("first apply");
+        ensure_schema(&pool).await.expect("second apply must be a no-op");
+
+        // Spot-check the tables the domains actually query, one per area, so a
+        // truncated or misparsed file cannot pass this.
+        // Real table names, which are not all what the domains are called:
+        // teams live in `teamtemplate` and DAG tasks in `tasknode`.
+        for table in [
+            "project", "teamtemplate", "process", "tasknode", "todo_items", "todo_boards",
+            "workflows", "workflow_runs", "api_tokens", "workspace", "assistant_chat_threads",
+            "coder_chat_threads", "model_build_jobs", "model_registry_entries", "action_sets",
+            "eventlog",
+        ] {
+            let found: Option<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            assert_eq!(found.as_deref(), Some(table), "missing table {table}");
+        }
+
+        // Indexes came across too — they are separate statements in the file
+        // and a splitter that dropped them would still pass the check above.
+        let indexes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name LIKE 'ix_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(indexes > 20, "only {indexes} named indexes");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// SQLite wants a path, `Any` wants a URL. Postgres DSNs pass through untouched.
@@ -121,8 +221,11 @@ pub fn url_for(db_path: &std::path::Path, database_url: Option<&str>) -> String 
     match database_url {
         Some(dsn) => dsn.to_string(),
         // Forward slashes: a Windows `\` is an escape inside a URL, and sqlx
-        // parses this string as one.
-        None => format!("sqlite:{}", db_path.display().to_string().replace('\\', "/")),
+        // parses this string as one. `mode=rwc` creates the file — the `Any`
+        // driver takes no `create_if_missing`, and this is the pool
+        // `ensure_schema` runs on, so without it a fresh install cannot make
+        // the database it is about to populate.
+        None => format!("sqlite:{}?mode=rwc", db_path.display().to_string().replace('\\', "/")),
     }
 }
 
@@ -174,7 +277,7 @@ mod tests {
     #[test]
     fn a_sqlite_path_becomes_a_url_and_a_dsn_passes_through() {
         let p = std::path::Path::new(r"C:\Users\x\agent_platform.db");
-        assert_eq!(url_for(p, None), "sqlite:C:/Users/x/agent_platform.db");
+        assert_eq!(url_for(p, None), "sqlite:C:/Users/x/agent_platform.db?mode=rwc");
         assert_eq!(
             url_for(p, Some("postgresql://u:p@h/db")),
             "postgresql://u:p@h/db"

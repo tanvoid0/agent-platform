@@ -68,7 +68,7 @@ pub async fn middleware(mut req: Request, next: Next) -> Response {
 
 fn log_request(request_id: &str, method: &str, path: &str, status: u16, elapsed: std::time::Duration) {
     let line = json!({
-        "timestamp": chrono_now(),
+        "timestamp": iso_now(),
         "level": "INFO",
         "logger": "agent_platform.request",
         "message": "request completed",
@@ -80,12 +80,16 @@ fn log_request(request_id: &str, method: &str, path: &str, status: u16, elapsed:
         "status_code": status,
         "duration_ms": elapsed.as_millis(),
     });
+    let line = line.to_string();
     println!("{line}");
+    // …and into the ring `GET /system/logs` serves, which is where Python's
+    // root-logger handler picked the same line up.
+    crate::observability::record(&line);
 }
 
 /// RFC3339 with the same shape `datetime.isoformat()` produces
 /// (`…+00:00`, not `…Z`), so `logs.rs`'s `clock()` splits it identically.
-fn chrono_now() -> String {
+pub fn iso_now() -> String {
     let now = std::time::SystemTime::now();
     let unix = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let secs = unix.as_secs();

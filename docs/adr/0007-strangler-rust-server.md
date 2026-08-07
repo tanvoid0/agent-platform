@@ -4,7 +4,40 @@ Date: 2026-08-05
 
 ## Status
 
-Accepted. Reopens the question [ADR 0004](0004-desktop-shell-tauri-python-sidecar.md)
+**Accepted, and completed 2026-08-07.** `app/` is deleted; `agent-platformd`
+answers every route and the proxy fallback is a 404. The migration ran
+2026-08-05 → 2026-08-07.
+
+Two decisions in this document were **overridden** by the completion, and both
+were mine to override only because the thing they protected no longer exists:
+
+- **Rule 5 (byte-identical or it does not land)** governed a period when two
+  servers answered the same API and a divergence meant clients saw different
+  answers depending on routing. With one server there is nothing to diverge
+  from. Four behaviours changed as a result, listed in `plan.md`'s migration
+  section: PDF extraction moved off PyMuPDF to the `pdf-extract` crate (page
+  text differs; the `### Layout notes` block is gone), `/system/status` renamed
+  `python` to `server` and coarsened `platform`, Alembic was replaced by a
+  create-only `schema.sql`, and `/openapi.json` became a checked-in file.
+- **"Staying Python permanently"** (below) named three things: the MCP client,
+  the `model_ops` training pipeline, and PDF extraction. Only the training
+  pipeline is still Python. PDF extraction was ported at the cost above. The MCP
+  client went with `tool_handlers.py` — it was only reachable through the DAG
+  tool-calling path, which has never been enabled in this deployment and which
+  `executor.rs` already refused to run.
+
+The training pipeline survives as `worker/`, and the sentence "these keep their
+Python implementation and live *behind* the Rust server" is still exactly right
+— it is just a subprocess now rather than a proxied HTTP server. Its two stated
+blockers (a result returned through a function call, and a registry write issued
+from inside the training child) were closed by having the worker print
+`@@AGP:<kind>@@ {json}` markers that the parent parses off the same stream it
+tees into the job log.
+
+The rest of this document is the decision as written on 2026-08-05, kept as the
+record of why the migration took the shape it did. Read it in the past tense.
+
+Reopens the question [ADR 0004](0004-desktop-shell-tauri-python-sidecar.md)
 closed and [ADR 0006](0006-in-process-rust-core.md) closed again — on a different
 mechanism. 0004 and 0006 both rejected a *port*: a rewrite with a flag day at the
 end of it. This ADR proposes no flag day and no rewrite; it puts a Rust process in

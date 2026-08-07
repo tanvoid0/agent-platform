@@ -133,6 +133,9 @@ impl State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// "View logs" on a traced error banner — intercepted in `main::update`
+    /// before it reaches here, so this arm exists only to satisfy exhaustiveness.
+    TraceLogs(String),
     DraftChanged(String),
     Send,
     /// One chunk of the streamed reply.
@@ -146,6 +149,7 @@ pub enum Message {
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
+        Message::TraceLogs(_) => Task::none(),
         Message::DraftChanged(v) => {
             state.draft = v;
             Task::none()

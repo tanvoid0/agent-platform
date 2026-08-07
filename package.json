@@ -2,16 +2,14 @@
   "name": "agent-platform",
   "private": true,
   "scripts": {
-    "sync:contract-enums": "python scripts/sync_contract_enums.py",
     "smoke": "python scripts/smoke_workflow.py",
     "smoke:live": "python scripts/smoke_workflow.py --live http://127.0.0.1:18410",
-    "docker:up": "npm run sync:contract-enums && docker compose up --build",
-    "docker:up:server": "npm run sync:contract-enums && docker compose -f docker-compose.agent-only.yml up --build",
-    "postinstall": "python -m pip install -r app/requirements.txt",
+    "docker:up": "docker compose up --build",
+    "docker:up:server": "docker compose -f docker-compose.agent-only.yml up --build",
     "dev": "cargo run --manifest-path desktop/Cargo.toml -p agent-platform-desktop",
-    "start": "python scripts/start.py",
+    "start": "cargo run --manifest-path desktop/Cargo.toml -p agent-platform-server",
     "kill:server-port": "kill-port 18410 --silent",
-    "dev:server": "pnpm kill:server-port && python -m uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410"
+    "dev:server": "pnpm kill:server-port && cargo run --manifest-path desktop/Cargo.toml -p agent-platform-server"
   },
   "devDependencies": {
     "kill-port": "^2.0.1"

@@ -5,10 +5,11 @@
 //! steps after it are recorded as `skipped` so a reader can tell "did not run"
 //! from "ran and passed".
 //!
-//! The scheduler moved with the engine deliberately. Two servers polling the
-//! same `workflows` table would each fire every due workflow, so `upstream.rs`
-//! starts the Python child with `AGENT_PLATFORM_WORKFLOW_SCHEDULER=0` — its loop
-//! and this one cannot both be live.
+//! The scheduler moved with the engine deliberately: two servers polling the
+//! same `workflows` table would each fire every due workflow, so while the
+//! Python child existed it was started with `AGENT_PLATFORM_WORKFLOW_SCHEDULER=0`.
+//! That variable is still the switch — it is now just an operator control for
+//! "run the API without firing scheduled workflows".
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -394,21 +395,12 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
     if crate::env_opt("AGENT_PLATFORM_WORKFLOW_SCHEDULER").as_deref() == Some("0") {
         return;
     }
-    // Attached to a server we did not start (`AGENT_PLATFORM_UPSTREAM`): its
-    // scheduler is already running and we cannot switch it off, so staying quiet
-    // is the only way not to fire everything twice.
-    if state.upstream.child_alive().is_none() {
-        eprintln!(
-            "[agent-platformd] workflow scheduler not started: attached to an upstream that owns it"
-        );
-        return;
-    }
-    eprintln!("[agent-platformd] workflow scheduler started (poll every {POLL_INTERVAL:?})");
+    logd!("workflow scheduler started (poll every {POLL_INTERVAL:?})");
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
             if let Err(e) = run_due_workflows(&state).await {
-                eprintln!("[agent-platformd] workflow scheduler tick failed: {e}");
+                logd!("workflow scheduler tick failed: {e}");
             }
         }
     });
@@ -437,8 +429,8 @@ async fn run_due_workflows(state: &AppState) -> Result<(), sqlx::Error> {
 
     for (id, steps_json, _) in due {
         match execute_workflow(state, id, &steps_json, json!({}), "schedule").await {
-            Ok(run_id) => eprintln!("[agent-platformd] scheduled workflow {id} finished (run {run_id})"),
-            Err(e) => eprintln!("[agent-platformd] scheduled workflow {id} crashed: {e}"),
+            Ok(run_id) => logd!("scheduled workflow {id} finished (run {run_id})"),
+            Err(e) => logd!("scheduled workflow {id} crashed: {e}"),
         }
     }
     Ok(())

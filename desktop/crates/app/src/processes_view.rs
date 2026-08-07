@@ -136,7 +136,7 @@ fn detail_pane<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message>
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
 
     if let Some(err) = &state.error {
-        blocks.push(dismissible(ui::alert_error(err.clone())));
+        blocks.push(dismissible(ui::alert_error_traced(err, Message::TraceLogs)));
     }
 
     let Some(process) = state.selected_process() else {

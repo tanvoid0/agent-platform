@@ -1,11 +1,11 @@
 # Agent Platform
 
-Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-compatible LLM proxy (`/v1/*` on the same process).
+Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-compatible LLM proxy (`/v1/*` on the same process). One Rust binary, `agent-platformd` — see [ADR 0007](docs/adr/0007-strangler-rust-server.md) for how it replaced the FastAPI server it started life in front of.
 
-**Portfolio context:** The backend is the product. The UI is a native desktop app ([`desktop/`](desktop/), Rust + iced) that talks to this API — the server ships no browser UI of its own beyond the `/tokens` dashboard.
+**Portfolio context:** The backend is the product. The UI is a native desktop app ([`desktop/`](desktop/), Rust + iced) that talks to this API — the server ships no browser UI at all.
 
-- **API:** `http://127.0.0.1:18410` — OpenAPI at **`/docs`**, model build/train at **`/api/v1/model-ops/*`** ([`docs/model-ops-api.md`](docs/model-ops-api.md))
-- **Tokens:** `http://127.0.0.1:18410/tokens` — issue and revoke workspace API tokens
+- **API:** `http://127.0.0.1:18410` — OpenAPI document at **`/openapi.json`**, model build/train at **`/api/v1/model-ops/*`** ([`docs/model-ops-api.md`](docs/model-ops-api.md))
+- **Tokens:** issued and revoked through `/api/v1/workspaces/{id}/api-tokens`, or from the desktop app
 - **Everything else** — runs, teams, projects, providers, model ops — lives in the desktop app
 
 Provider catalog behavior is normalized across `/api/v1/llm-proxy/ui/providers` and `/api/v1/llm-proxy/test/model-options`: each provider exposes the same capability shape (`streaming`, `tools`, `json_mode`, `model_discovery`). When a provider cannot list models live, the server falls back in order to provider aliases from `config.yaml`, then `orchestrator_ui.yaml` `fallback_models`, then the provider default model.
@@ -58,16 +58,16 @@ cd desktop && cargo run -p agent-platform-desktop
 API server only, no desktop shell:
 
 ```bash
-python scripts/start.py
+cd desktop && cargo run -p agent-platform-server
 ```
 
-Opens `http://127.0.0.1:18410` — API docs at `/docs`. No Bearer token unless `AGENT_PLATFORM_MASTER_KEY` is set. Use `--no-browser` to stay headless.
+Binds `http://127.0.0.1:18410`; the OpenAPI document is at `/openapi.json`. No Bearer token unless `AGENT_PLATFORM_MASTER_KEY` is set.
 
 First-time setup from this folder:
 
 ```bash
 cp .env.example .env
-pnpm install          # root: Python deps (postinstall) + dev tooling
+pnpm install          # dev tooling only — the server is Rust and cargo owns its deps
 ```
 
 Set **`AGENT_PLATFORM_MASTER_KEY`** in `.env` (Bearer for `/v1` and protected `/api/v1/*`). The desktop app manages its own key; this one is for direct API callers.
@@ -75,7 +75,7 @@ Set **`AGENT_PLATFORM_MASTER_KEY`** in `.env` (Bearer for `/v1` and protected `/
 | Mode | Local (no Docker) | Docker |
 |------|-------------------|--------|
 | **Desktop app** | `cd desktop && cargo run -p agent-platform-desktop` | — |
-| **API server** | `pnpm start` / `python scripts/start.py` | `pnpm docker:up` |
+| **API server** | `pnpm start` / `cargo run -p agent-platform-server` | `pnpm docker:up` |
 
 Verify setup (offline — no server required):
 
@@ -92,7 +92,7 @@ pnpm smoke:live
 
 ## Docker
 
-Image name: **`agent-platform`**. [`Dockerfile`](Dockerfile) builds the FastAPI backend only (no UI, no nginx).
+Image name: **`agent-platform`**. [`Dockerfile`](Dockerfile) compiles `agent-platformd` and ships it on a slim Debian base — no interpreter, no UI, no nginx. The model-ops training pipeline is not in this image; it needs torch and a GPU, and lives in [`Dockerfile.train`](Dockerfile.train).
 
 ```bash
 pnpm docker:up
@@ -102,8 +102,9 @@ Uses a named volume for SQLite, workspaces, and **`/app/data/llm`** (`config.yam
 
 ## Repo structure
 
-- `app/` FastAPI backend, API routes, orchestration, tests
-- `desktop/` native desktop app (Rust + iced) that drives this API
+- `desktop/crates/server/` the API server (`agent-platformd`) — routes, orchestration, LLM proxy
+- `desktop/crates/app/` native desktop app (Rust + iced); `desktop/crates/client/` its HTTP/SSE client
+- `worker/` the model-ops LoRA training pipeline (Python, run as a subprocess — not a server)
 - `docs/` ADRs, plans, integration notes
 
 ### Performance tuning (high-core desktop)
@@ -111,15 +112,16 @@ Uses a named volume for SQLite, workspaces, and **`/app/data/llm`** (`config.yam
 Set in `agent-platform/.env` before `docker compose up --build`:
 
 ```bash
-AGENT_PLATFORM_UVICORN_WORKERS=8
 AGENT_PLATFORM_DAG_MAX_CONCURRENT_TASKS=12
 ```
+
+(`AGENT_PLATFORM_UVICORN_WORKERS` is gone — there are no worker processes to size. The server is one process on a tokio pool.)
 
 **LM Studio / Ollama on Docker Desktop:** keep loopback URLs in config — the API rewrites `127.0.0.1` to `host.docker.internal` inside the container (`AGENT_PLATFORM_LOCAL_LLM_DOCKER_FIX=1`).
 
 ## Tools policy (Phase 3)
 
-See [app/tools_policy.py](app/tools_policy.py). Default is **no tools**; enable with env vars documented in `.env.example`.
+Default is **no tools**. The DAG task tool-calling path (`AGENT_PLATFORM_TOOLS_ENABLED` plus a non-empty allowlist) was never enabled in this deployment and its implementation went with the Python server — `agent-platformd` **refuses to run a task** whose configuration asks for tools rather than answering without them. See `executor.rs`. The MCP client went the same way, for the same reason: it was only reachable through that path.
 
 ## Hygiene and smoke checks
 

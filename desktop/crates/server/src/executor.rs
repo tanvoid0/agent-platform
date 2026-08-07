@@ -28,11 +28,13 @@
 //! # The tool-calling path is dead by default
 //!
 //! `AGENT_PLATFORM_TOOLS_ENABLED` is unset and `ToolPolicy::is_allowed` returns
-//! false on an empty allowlist, so `_invoke_task_llm`'s tool branch has never
-//! run in this deployment. [`load_policy`] is ported (three env reads) and the
-//! task **refuses to run** when the branch would fire, rather than quietly
-//! answering without the tools the operator asked for. That keeps
-//! `tool_handlers.py`'s 782 LOC out of this port entirely.
+//! false on an empty allowlist, so `_invoke_task_llm`'s tool branch never ran in
+//! this deployment. [`load_policy`] is ported (three env reads) and the task
+//! **refuses to run** when the branch would fire, rather than quietly answering
+//! without the tools the operator asked for. That kept `tool_handlers.py`'s 782
+//! LOC out of the port — and when the Python server was deleted, that file and
+//! the MCP client only reachable through it went with it. The refusal is
+//! permanent now rather than a placeholder.
 //!
 //! # Deliberate divergences
 //!
@@ -551,8 +553,8 @@ async fn generate_planner_dag(
         {
             Ok(dag) => return Ok(PlanOutcome { dag, tokens, cost }),
             Err(e) => {
-                eprintln!(
-                    "[agent-platformd] planner attempt {}/{max_attempts}: {e}",
+                logd!(
+                    "planner attempt {}/{max_attempts}: {e}",
                     attempt + 1
                 );
                 last_err = e;
@@ -615,8 +617,8 @@ async fn generate_subdag_expansion(
         {
             Ok(subagents) => return Ok(ExpansionOutcome { subagents, tokens, cost }),
             Err(e) => {
-                eprintln!(
-                    "[agent-platformd] sub-decomposition attempt {}/{max_attempts}: {e}",
+                logd!(
+                    "sub-decomposition attempt {}/{max_attempts}: {e}",
                     attempt + 1
                 );
                 last_err = e;
@@ -775,7 +777,7 @@ const TASK_COLUMNS: &str = "id, client_uuid, parent_client_uuid, role, system_pr
 /// it as "no dependencies" is the reading that lets the wave make progress.
 fn parse_dependencies(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_else(|_| {
-        eprintln!("[agent-platformd] unreadable dependencies_json: {raw}");
+        logd!("unreadable dependencies_json: {raw}");
         Vec::new()
     })
 }
@@ -811,7 +813,7 @@ async fn append_event(
     .execute(&state.pool)
     .await;
     if let Err(e) = result {
-        eprintln!("[agent-platformd] event log write failed for process {process_id}: {e}");
+        logd!("event log write failed for process {process_id}: {e}");
     }
 }
 
@@ -866,10 +868,10 @@ pub(crate) async fn record_api_token_usage(
             .execute(&state.pool)
             .await;
             if let Err(e) = insert {
-                eprintln!("[agent-platformd] daily usage insert failed for token {token_id}: {e}");
+                logd!("daily usage insert failed for token {token_id}: {e}");
             }
         }
-        Err(e) => eprintln!("[agent-platformd] daily usage update failed for token {token_id}: {e}"),
+        Err(e) => logd!("daily usage update failed for token {token_id}: {e}"),
         Ok(_) => {}
     }
 
@@ -886,7 +888,7 @@ pub(crate) async fn record_api_token_usage(
     .execute(&state.pool)
     .await;
     if let Err(e) = lifetime {
-        eprintln!("[agent-platformd] token usage update failed for token {token_id}: {e}");
+        logd!("token usage update failed for token {token_id}: {e}");
     }
 }
 
@@ -1449,8 +1451,8 @@ impl Executor {
         // `mark_process_planning` writes the status and nothing else, so a
         // previous run's `failure_reason` stays visible while re-planning.
         if let Err(e) = set_process_status_only(&self.state, self.process_id, "planning").await {
-            eprintln!(
-                "[agent-platformd] process {} could not be marked planning: {e}",
+            logd!(
+                "process {} could not be marked planning: {e}",
                 self.process_id
             );
             return;
@@ -1485,7 +1487,7 @@ impl Executor {
         };
 
         if let Err(e) = self.apply_planner_success(&outcome).await {
-            eprintln!("[agent-platformd] planner result could not be stored: {e}");
+            logd!("planner result could not be stored: {e}");
             let reason = "Planning failed: unexpected error";
             self.apply_planner_failure(reason).await;
             self.log("error", reason, None).await;
@@ -1534,7 +1536,7 @@ impl Executor {
             .flatten()
             .and_then(|p| p.token_id);
         if let Err(e) = fail_process(&self.state, self.process_id, reason).await {
-            eprintln!("[agent-platformd] process {} could not be failed: {e}", self.process_id);
+            logd!("process {} could not be failed: {e}", self.process_id);
         }
         record_api_token_usage(&self.state, token_id, 0, 0.0, true).await;
     }
@@ -1552,7 +1554,7 @@ impl Executor {
         {
             Ok(validated) => validated,
             Err(e) => {
-                eprintln!("[agent-platformd] auto-approve skipped (invalid DAG): {e}");
+                logd!("auto-approve skipped (invalid DAG): {e}");
                 self.log("error", &format!("Auto-approve skipped: {e}"), None).await;
                 return;
             }
@@ -1561,14 +1563,14 @@ impl Executor {
         if let Err(e) =
             apply_validated_planner_to_process(&self.state, self.process_id, &validated).await
         {
-            eprintln!("[agent-platformd] auto-approve could not persist the DAG: {e}");
+            logd!("auto-approve could not persist the DAG: {e}");
             return;
         }
         // Status only: Python assigns `run.status` here and never touches
         // `failure_reason`, so a retry after a failure keeps the old text until
         // `execute_dag` clears it.
         if let Err(e) = set_process_status_only(&self.state, self.process_id, "approved").await {
-            eprintln!("[agent-platformd] auto-approve could not mark approved: {e}");
+            logd!("auto-approve could not mark approved: {e}");
             return;
         }
         self.log("status_change", "Process auto-approved; scheduling execution", None).await;
@@ -1589,13 +1591,13 @@ impl Executor {
         {
             Ok(row) => row.is_some(),
             Err(e) => {
-                eprintln!("[agent-platformd] execute_dag could not read tasks: {e}");
+                logd!("execute_dag could not read tasks: {e}");
                 return;
             }
         };
         let status = if awaiting_left { "task_review_required" } else { "running" };
         if let Err(e) = set_process_status(&self.state, self.process_id, status, None).await {
-            eprintln!("[agent-platformd] execute_dag could not set status: {e}");
+            logd!("execute_dag could not set status: {e}");
             return;
         }
         self.log(
@@ -1613,11 +1615,11 @@ impl Executor {
             // Cancellation and pause are DB-mediated: `/cancel` and `/sync`
             // write a status and this read is where the loop notices.
             if let Err(e) = sync_review_assignments(&self.state, self.process_id).await {
-                eprintln!("[agent-platformd] review assignment sync failed: {e}");
+                logd!("review assignment sync failed: {e}");
                 return;
             }
             let Ok(Some(process)) = load_process(&self.state, self.process_id).await else {
-                eprintln!("[agent-platformd] process {} vanished mid-run", self.process_id);
+                logd!("process {} vanished mid-run", self.process_id);
                 return;
             };
             if process.status == "cancelled" {
@@ -1637,7 +1639,7 @@ impl Executor {
             let snapshot = match load_dag_task_snapshot(&self.state, self.process_id).await {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
-                    eprintln!("[agent-platformd] execute_dag snapshot failed: {e}");
+                    logd!("execute_dag snapshot failed: {e}");
                     return;
                 }
             };
@@ -1676,7 +1678,7 @@ impl Executor {
                     }
                     while let Some(joined) = wave.join_next().await {
                         if let Err(e) = joined {
-                            eprintln!("[agent-platformd] task in wave crashed: {e}");
+                            logd!("task in wave crashed: {e}");
                         }
                     }
                 }
@@ -1691,7 +1693,7 @@ impl Executor {
             Ok(Some(inputs)) => inputs,
             Ok(None) => return,
             Err(e) => {
-                eprintln!("[agent-platformd] task {task_id} could not be started: {e}");
+                logd!("task {task_id} could not be started: {e}");
                 return;
             }
         };
@@ -1719,7 +1721,7 @@ impl Executor {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[agent-platformd] task {task_id} result could not be stored: {e}");
+                        logd!("task {task_id} result could not be stored: {e}");
                     }
                 }
             }
@@ -1857,7 +1859,7 @@ impl Executor {
                  to use. Unset AGENT_PLATFORM_TOOLS_ENABLED, or run the Python server directly.",
                 policy.budget_per_run
             );
-            eprintln!("[agent-platformd] {message}");
+            logd!("{message}");
             return Err(LlmFailure::Unexpected(message));
         }
 
@@ -1948,7 +1950,7 @@ impl Executor {
                 format!("Task {} failed: {failure}", task.client_uuid),
             ),
             LlmFailure::Unexpected(_) => {
-                eprintln!("[agent-platformd] task {} failed (unexpected): {failure}", task.id);
+                logd!("task {} failed (unexpected): {failure}", task.id);
                 (
                     truncate_reason_default(&format!(
                         "Task {} failed: unexpected error",
@@ -1966,7 +1968,7 @@ impl Executor {
             .and_then(|p| p.token_id);
 
         if let Err(e) = self.write_task_failure(task.id, failure, &reason).await {
-            eprintln!("[agent-platformd] task {} failure could not be stored: {e}", task.id);
+            logd!("task {} failure could not be stored: {e}", task.id);
         }
         record_api_token_usage(&self.state, token_id, 0, 0.0, true).await;
         self.log("error", &event, Some(task.id)).await;
@@ -2013,7 +2015,7 @@ impl Executor {
             {
                 Ok(row) => row,
                 Err(e) => {
-                    eprintln!("[agent-platformd] sub-DAG expansion could not read task: {e}");
+                    logd!("sub-DAG expansion could not read task: {e}");
                     return;
                 }
             };
@@ -2027,7 +2029,7 @@ impl Executor {
         {
             Ok(planner) => planner,
             Err(e) => {
-                eprintln!("[agent-platformd] sub-DAG expansion skipped (invalid dag_json): {e}");
+                logd!("sub-DAG expansion skipped (invalid dag_json): {e}");
                 return;
             }
         };
@@ -2070,7 +2072,7 @@ impl Executor {
         {
             Ok(expansion) => expansion,
             Err(e) => {
-                eprintln!("[agent-platformd] sub-DAG expansion LLM failed: {e}");
+                logd!("sub-DAG expansion LLM failed: {e}");
                 self.log("error", &format!("Sub-DAG expansion skipped: {e}"), None).await;
                 return;
             }
@@ -2091,7 +2093,7 @@ impl Executor {
         {
             Ok(created) => created,
             Err(e) => {
-                eprintln!("[agent-platformd] sub-DAG merge validation failed: {e}");
+                logd!("sub-DAG merge validation failed: {e}");
                 self.log("error", &format!("Sub-DAG expansion merge failed: {e}"), None).await;
                 return;
             }
@@ -2206,7 +2208,7 @@ where
     tokio::spawn(async move {
         if std::panic::AssertUnwindSafe(fut).catch_unwind().await.is_err() {
             let reason = format!("{what} crashed unexpectedly (agent-platformd bug)");
-            eprintln!("[agent-platformd] process {process_id}: {reason}");
+            logd!("process {process_id}: {reason}");
             let _ = fail_process(&state, process_id, &reason).await;
             append_event(&state, process_id, None, "error", &reason).await;
         }
@@ -2291,21 +2293,15 @@ struct RecoveryCounts {
 
 /// Requeue work a restart interrupted.
 ///
-/// **Declines when this daemon did not spawn the server it is attached to**
-/// (`AGENT_PLATFORM_UPSTREAM`), the same rule and the same shape
-/// `workflow_engine::spawn_scheduler` uses: two servers both recovering means
-/// every interrupted process gets planned twice. The Python child we *do* spawn
-/// is started with `AGENT_PLATFORM_RESUME_ON_STARTUP=0`.
+/// `AGENT_PLATFORM_RESUME_ON_STARTUP=0` switches it off. That flag, and the
+/// matching one on the workflow scheduler, existed because a second server —
+/// the Python child — was reading the same tables and would plan every
+/// interrupted process twice. There is no second server now, so the flag is
+/// what it reads like: "start without replaying anything".
 pub fn spawn_startup_recovery(state: Arc<AppState>) {
     if !resume_on_startup_enabled() {
-        eprintln!(
-            "[agent-platformd] startup recovery disabled (AGENT_PLATFORM_RESUME_ON_STARTUP)"
-        );
-        return;
-    }
-    if state.upstream.child_alive().is_none() {
-        eprintln!(
-            "[agent-platformd] startup recovery not started: attached to an upstream that owns it"
+        logd!(
+            "startup recovery disabled (AGENT_PLATFORM_RESUME_ON_STARTUP)"
         );
         return;
     }
@@ -2316,11 +2312,11 @@ pub fn spawn_startup_recovery(state: Arc<AppState>) {
         match run {
             Ok(Ok(counts)) => {
                 if counts != RecoveryCounts::default() {
-                    eprintln!("[agent-platformd] startup recovery: {counts:?}");
+                    logd!("startup recovery: {counts:?}");
                 }
             }
-            Ok(Err(e)) => eprintln!("[agent-platformd] startup recovery failed: {e}"),
-            Err(_) => eprintln!("[agent-platformd] startup recovery panicked"),
+            Ok(Err(e)) => logd!("startup recovery failed: {e}"),
+            Err(_) => logd!("startup recovery panicked"),
         }
     });
 }
@@ -2381,8 +2377,8 @@ async fn recover_interrupted_processes(
                 counts.replanned += 1;
             }
             Some(Recovery::SkipApprovedWithoutDag) => {
-                eprintln!(
-                    "[agent-platformd] startup recovery: process {} approved without DAG JSON; \
+                logd!(
+                    "startup recovery: process {} approved without DAG JSON; \
                      skipping",
                     row.id
                 );

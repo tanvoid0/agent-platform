@@ -9,9 +9,9 @@
 .cursor/
 agent-logs.logs
 
-# Python / tooling
+# Python tooling — for `worker/` (the model-ops build pipeline) and the helper
+# scripts. The server itself is Rust; there is no Python package here any more.
 __pycache__/
-.pytest_cache/
 *.py[cod]
 .venv/
 venv/
@@ -20,7 +20,6 @@ env/
 # Runtime / build
 data/
 dist/
-app/static/dist/
 node_modules/
 .agents/
 skills-lock.json
@@ -30,8 +29,11 @@ desktop/target/
 # MSVC leaves object files where it was invoked — cargo's own output is under
 # target/, so anything named *.obj out here is a stray.
 *.obj
-desktop/payload/*
-!desktop/payload/.gitkeep
+# `.cargo-check-target/` is the out-of-repo build dir CLAUDE.md tells you to use
+# when the app is running and holding `desktop/target/`. It gets created at the
+# repo root (and, if you run cargo from a crate dir, under that crate) often
+# enough that ignoring it is cheaper than explaining it every time.
+.cargo-check-target/
 
 # Piper voice models (60 MB+ each; download per README)
 services/speech-service/voices/

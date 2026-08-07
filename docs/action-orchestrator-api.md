@@ -1,5 +1,12 @@
 # Action Orchestrator API
 
+> **Paths in this document predate the Rust migration.** The FastAPI server
+> (`app/`) was deleted on 2026-08-07 — every route it describes is now served by
+> `agent-platformd` (`desktop/crates/server/src/`), byte-identically except for the
+> four changes listed in `plan.md`'s migration section. The behaviour here still
+> holds; the file references do not. See [ADR 0007](adr/0007-strangler-rust-server.md).
+
+
 The Action Orchestrator API allows clients to register their executable capabilities (actions) and use AI to decide which actions to perform based on goals and context. The server returns action recommendations that clients execute themselves.
 
 **Base URL:** `http://127.0.0.1:18410/api/v1`

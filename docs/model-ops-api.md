@@ -182,7 +182,8 @@ When starting a build job with `process_id`, the orchestration `Process` row get
 |----------|---------|
 | `MODEL_OPS_DATA_DIR` | Project artifacts (default: `{CONFIG_DIR}/model_ops`) |
 | `OLLAMA_API_BASE` | Ollama host for export/eval |
-| `MODEL_OPS_GPU_SUBPROCESS` | `1` (default) run train/export in child process |
+| `MODEL_OPS_PYTHON` | Interpreter (with torch) the server spawns stages with — **required** for build jobs |
+| `MODEL_OPS_WORKER_PATH` | Where `worker/` lives; defaults to beside the executable, then the checkout |
 | `LLAMA_CPP_BIN` / `LLAMA_CPP_CONVERT` | GGUF conversion tools |
 | `HF_TOKEN` | HuggingFace gated models |
 
@@ -192,7 +193,15 @@ When starting a build job with `process_id`, the orchestration `Process` row get
 docker compose -f docker-compose.yml -f docker-compose.train.yml --profile train up --build
 ```
 
-Uses `Dockerfile.train` with `app/model_ops/requirements-train.txt` and NVIDIA GPU reservations.
+Uses `Dockerfile.train` with `worker/requirements.txt` and NVIDIA GPU reservations.
+
+**Every stage is a subprocess now.** `MODEL_OPS_GPU_SUBPROCESS` is gone: it used
+to gate whether `train`/`export` ran in a child process while `prepare`/`eval`
+ran inside the API server. The server is Rust ([ADR 0007](adr/0007-strangler-rust-server.md))
+and the pipeline is Python, so there is no in-process option — all four stages
+run as `MODEL_OPS_PYTHON -c …` children against `worker/`, and they report
+structured results by printing `@@AGP:<kind>@@ {json}` lines the server parses
+out of the job log.
 
 ---
 

@@ -1,5 +1,12 @@
 # Workspace Tenancy — Implementation Plan
 
+> **Paths in this document predate the Rust migration.** The FastAPI server
+> (`app/`) was deleted on 2026-08-07 — every route it describes is now served by
+> `agent-platformd` (`desktop/crates/server/src/`), byte-identically except for the
+> four changes listed in `plan.md`'s migration section. The behaviour here still
+> holds; the file references do not. See [ADR 0007](adr/0007-strangler-rust-server.md).
+
+
 > **Landed.** Shipped and covered by `app/tests/test_workspace_tenancy.py` and
 > `test_workspace_service.py`. Kept as the design record; for how the system
 > behaves now, read [API_WORKSPACE_SCOPING.md](./API_WORKSPACE_SCOPING.md) and

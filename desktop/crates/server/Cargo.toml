@@ -55,6 +55,8 @@ bytes = "1"
 # trusts for this. Already in the tree transitively (serde_yaml); declared
 # directly because this is the first module that imports it.
 regex = "1"
+pdf-extract = "0.12"
+async-stream = "0.3.6"
 
 [target.'cfg(windows)'.dependencies]
 # Job object with kill-on-close: the only thing that reaps the Python child when

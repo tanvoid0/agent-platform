@@ -1,9 +1,12 @@
-//! Design tokens ported from shadcn/ui's default (zinc) theme.
+//! Design tokens: shadcn/ui's structure, LM Studio's dark palette.
 //!
-//! shadcn defines its palette as CSS custom properties in HSL; those exact values
-//! are reproduced here as the two palettes below, so the native app reads as the
-//! same design system. Semantic names (`background`, `card`, `muted_foreground`,
-//! `border`, …) are shadcn's, not iced's — screens use these, never raw colors.
+//! Semantic names (`background`, `card`, `muted_foreground`, `border`, …) and the
+//! spacing/radius/type scales below are shadcn's, not iced's — screens use these,
+//! never raw colors. The light block is still shadcn's default (zinc) `:root`
+//! verbatim; the dark block is not, because the two design languages disagree
+//! about depth. shadcn leans on shadows, LM Studio on flat fills separated by a
+//! hairline — so the dark ramp is retuned for the latter and [`card`] casts no
+//! shadow at all. See [`dark_tokens`].
 
 use iced::widget::{button, container, text, text_input};
 use iced::{Background, Border, Color, Shadow, Theme, Vector};
@@ -115,30 +118,41 @@ fn light_tokens() -> Tokens {
     }
 }
 
-/// shadcn default (zinc) — `.dark`.
+/// LM Studio-style dark: a near-neutral canvas, flat elevation steps, and a
+/// border lighter than every fill so panels are separated by a hairline instead
+/// of a shadow.
+///
+/// shadcn's `.dark` collapses `border`, `muted`, `secondary` and `accent` onto a
+/// single value. That is fine when cards cast shadows, but this language has no
+/// shadows to fall back on — a card's edge and a hovered row would be the same
+/// color, leaving panels with no visible boundary. Hence the split, and the test
+/// below that keeps it.
 fn dark_tokens() -> Tokens {
     Tokens {
-        // lifted off shadcn's 3.9% — that reads as flat black on a full-screen canvas
-        background: hsl(240.0, 6.0, 8.0),
+        background: hsl(240.0, 5.0, 7.0), // canvas
         foreground: hsl(0.0, 0.0, 98.0),
-        card: hsl(240.0, 6.0, 11.0),
+        card: hsl(240.0, 5.0, 10.0), // panel on the canvas
         card_foreground: hsl(0.0, 0.0, 98.0),
-        popover: hsl(240.0, 6.0, 11.0),
+        popover: hsl(240.0, 5.0, 12.0), // floats above a panel, so one step up again
         primary: hsl(0.0, 0.0, 98.0),
         primary_foreground: hsl(240.0, 5.9, 10.0),
-        secondary: hsl(240.0, 3.7, 15.9),
+        secondary: hsl(240.0, 4.0, 15.0),
         secondary_foreground: hsl(0.0, 0.0, 98.0),
-        muted: hsl(240.0, 3.7, 15.9),
+        muted: hsl(240.0, 4.0, 15.0),
         muted_foreground: hsl(240.0, 5.0, 64.9),
-        accent: hsl(240.0, 3.7, 15.9),
+        accent: hsl(240.0, 4.0, 16.0), // hover / selected fill
         destructive: hsl(0.0, 62.8, 30.6),
         destructive_foreground: hsl(0.0, 0.0, 98.0),
         success: hsl(142.1, 70.6, 45.3),
         warning: hsl(47.9, 95.8, 53.1),
-        info: hsl(217.2, 91.2, 59.8),
-        border: hsl(240.0, 3.7, 15.9),
-        input: hsl(240.0, 3.7, 15.9),
-        ring: hsl(240.0, 4.9, 83.9),
+        // Restrained blue rather than Tailwind's blue-500: at this canvas
+        // lightness a fully saturated accent is the only thing the eye lands on.
+        info: hsl(217.0, 78.0, 58.0),
+        border: hsl(240.0, 4.0, 20.0), // the hairline — lighter than any fill
+        input: hsl(240.0, 4.0, 20.0),
+        // Focus reads as the accent. shadcn's near-white ring is a second bright
+        // value competing with `foreground` on every focused field.
+        ring: hsl(217.0, 78.0, 58.0),
         dark: true,
     }
 }
@@ -228,18 +242,16 @@ pub fn text_tone(tone: Tone) -> impl Fn(&Theme) -> text::Style {
 
 // -- surfaces ---------------------------------------------------------------
 
-/// shadcn `Card`: bg-card, rounded-lg, border, shadow-sm.
+/// shadcn `Card`: bg-card, rounded-lg, border — but no shadow. Depth comes from
+/// the fill stepping up off the canvas and the border catching the edge; a card
+/// is inline, not floating, so it has nothing to cast onto. Overlays that really
+/// do float ([`select_menu`]) keep theirs.
 pub fn card(theme: &Theme) -> container::Style {
     let t = tokens(theme);
     container::Style {
         background: Some(Background::Color(t.card)),
         text_color: Some(t.card_foreground),
         border: Border { color: t.border, width: 1.0, radius: radius::LG.into() },
-        shadow: Shadow {
-            color: alpha(Color::BLACK, if t.dark { 0.4 } else { 0.06 }),
-            offset: Vector::new(0.0, 1.0),
-            blur_radius: 3.0,
-        },
         ..container::Style::default()
     }
 }
@@ -475,6 +487,23 @@ pub fn select_menu(theme: &Theme) -> iced::widget::overlay::menu::Style {
     }
 }
 
+/// shadcn `Tooltip`: bg-primary text-primary-foreground, floats over
+/// everything so it gets the same shadow as [`select_menu`].
+pub fn tooltip(theme: &Theme) -> container::Style {
+    let t = tokens(theme);
+    container::Style {
+        background: Some(Background::Color(t.primary)),
+        text_color: Some(t.primary_foreground),
+        border: Border { color: t.primary, width: 0.0, radius: radius::MD.into() },
+        shadow: Shadow {
+            color: alpha(Color::BLACK, if t.dark { 0.5 } else { 0.12 }),
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 8.0,
+        },
+        ..container::Style::default()
+    }
+}
+
 // -- separators -------------------------------------------------------------
 
 pub fn separator(theme: &Theme) -> iced::widget::rule::Style {
@@ -501,6 +530,21 @@ mod tests {
         // `0 84.2% 60.2%` (destructive) is a saturated red: r >> g, b.
         let red = hsl(0.0, 84.2, 60.2);
         assert!(red.r > 0.9 && red.g < 0.4 && red.b < 0.4);
+    }
+
+    /// The dark ramp is the whole look, and `card()` gave up its shadow on the
+    /// strength of it: fills that step upward, under a border lighter than all of
+    /// them. A border that sinks back into a fill leaves every panel edgeless.
+    #[test]
+    fn dark_fills_step_up_under_a_lighter_border() {
+        let t = dark_tokens();
+        // All near-neutral at one hue, so channel sum orders them by lightness.
+        let level = |c: Color| c.r + c.g + c.b;
+        assert!(level(t.background) < level(t.card), "a panel must lift off the canvas");
+        assert!(level(t.card) < level(t.popover), "an overlay must lift off a panel");
+        assert!(level(t.popover) < level(t.muted));
+        assert!(level(t.muted) <= level(t.accent), "hover must not darken a muted fill");
+        assert!(level(t.accent) < level(t.border), "the border must read as a hairline over every fill");
     }
 
     #[test]

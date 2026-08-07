@@ -164,6 +164,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Refresh => refresh(client),
         Message::Loaded(Ok(items)) => {
             state.loaded = true;
+            state.error = None;
             // A selected workflow that no longer exists takes its runs with it.
             if state.selected.is_some_and(|id| !items.iter().any(|w| w.id == id)) {
                 state.selected = None;
@@ -211,6 +212,20 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.running = None;
             match result {
                 Ok(run) => {
+                    // The banner and the error below are on this page; a run
+                    // the user walked away from needs telling.
+                    crate::notify::away(
+                        "workflows",
+                        &format!("Workflow run #{}", run.id),
+                        &format!(
+                            "{}{}",
+                            run.status,
+                            run.error
+                                .as_deref()
+                                .map(|e| format!(" — {}", truncate_error(e)))
+                                .unwrap_or_default()
+                        ),
+                    );
                     // A failed run is bad news and must look like it; only a
                     // clean run goes in the green banner.
                     if run.status == "succeeded" {

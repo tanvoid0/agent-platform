@@ -88,6 +88,9 @@ icons! {
     ChevronLeft => chevron_left,
     ChevronRight => chevron_right,
     ListChecks => list_checks,
+    ArrowLeft => arrow_left,
+    ArrowRight => arrow_right,
+    Globe => globe,
 
     // theme
     Sun => sun,
@@ -102,6 +105,7 @@ icons! {
     Alert => triangle_alert,
     Info => info,
     Clock => clock_four,
+    Terminal => terminal,
     Inbox => inbox,
 }
 

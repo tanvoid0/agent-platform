@@ -1,5 +1,12 @@
 # Backend performance fixes — plan
 
+> **Paths in this document predate the Rust migration.** The FastAPI server
+> (`app/`) was deleted on 2026-08-07 — every route it describes is now served by
+> `agent-platformd` (`desktop/crates/server/src/`), byte-identically except for the
+> four changes listed in `plan.md`'s migration section. The behaviour here still
+> holds; the file references do not. See [ADR 0007](adr/0007-strangler-rust-server.md).
+
+
 Two fixes to the FastAPI server, chosen because they are cheap, safe, and stay
 valuable regardless of any later framework decision. Everything here is
 internal: no API surface changes, no schema changes, no new dependencies.

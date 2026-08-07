@@ -1,5 +1,12 @@
 # API Contract Coverage
 
+> **Paths in this document predate the Rust migration.** The FastAPI server
+> (`app/`) was deleted on 2026-08-07 — every route it describes is now served by
+> `agent-platformd` (`desktop/crates/server/src/`), byte-identically except for the
+> four changes listed in `plan.md`'s migration section. The behaviour here still
+> holds; the file references do not. See [ADR 0007](adr/0007-strangler-rust-server.md).
+
+
 This document defines the API responses that must remain compatible for the native desktop client and other thin clients. (Written when the consumer was the in-repo `web/` UI; that UI is deleted, the contracts are not — `desktop/crates/client/` consumes the same shapes, and `scripts/sync_contract_enums.py` turns server-side enum drift into a Rust compile error.)
 
 The contract suite is the pytest `contract` marker. `pnpm smoke` runs that suite through `python scripts/smoke_workflow.py`, so CI can fail fast on response-shape drift.

@@ -84,7 +84,7 @@ pub fn panel<'a>(
     if let Some(err) = &state.error {
         blocks.push(
             ui::cluster(vec![
-                container(ui::alert_error(err.clone())).width(Length::Fill).into(),
+                container(ui::alert_error_traced(err, Message::TraceLogs)).width(Length::Fill).into(),
                 ui::button_ghost(Icon::X, "Dismiss", Message::DismissError),
             ])
             .into(),

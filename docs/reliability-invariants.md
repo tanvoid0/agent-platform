@@ -1,5 +1,12 @@
 # Reliability invariants: ADR 0001 Section 6 vs implementation
 
+> **Paths in this document predate the Rust migration.** The FastAPI server
+> (`app/`) was deleted on 2026-08-07 — every route it describes is now served by
+> `agent-platformd` (`desktop/crates/server/src/`), byte-identically except for the
+> four changes listed in `plan.md`'s migration section. The behaviour here still
+> holds; the file references do not. See [ADR 0007](adr/0007-strangler-rust-server.md).
+
+
 This document tracks [ADR 0001 Section 6](adr/0001-agent-platform-orchestration.md) (“Proposed decision”) against the current **agent-platform** backend and the native desktop client. It includes an **idempotency** audit of process HTTP routes.
 
 > Re-checked 2026-08-04. The client references below were the deleted `web/` React app; they now point at the iced app ([ADR 0005](adr/0005-native-iced-desktop-headless-server.md)). The invariants themselves are unchanged — both clients reconcile over HTTP and treat SSE as a hint.

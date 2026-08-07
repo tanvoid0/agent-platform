@@ -297,7 +297,7 @@ async fn touch_last_used(state: &AppState, token_id: i64, last_used_at: Option<N
         .execute(&state.pool)
         .await;
     if let Err(e) = result {
-        eprintln!("[agent-platformd] last_used_at update failed for token {token_id}: {e}");
+        logd!("last_used_at update failed for token {token_id}: {e}");
     }
 }
 
@@ -344,7 +344,7 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// A database that is missing or mid-migration must not read as "bad credential" —
 /// that would send a caller chasing their token instead of the server.
 fn db_error(e: sqlx::Error) -> AuthError {
-    eprintln!("[agent-platformd] token lookup failed: {e}");
+    logd!("token lookup failed: {e}");
     AuthError::new(
         StatusCode::INTERNAL_SERVER_ERROR,
         "TOKEN_ERROR",

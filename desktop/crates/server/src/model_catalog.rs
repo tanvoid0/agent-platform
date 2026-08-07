@@ -273,8 +273,8 @@ pub async fn coerce_local_model_if_needed(
         if tags.is_empty() || ollama_tag_matches(&tags, model) {
             return model.to_string();
         }
-        eprintln!(
-            "[agent-platformd] Ollama model {model:?} not in local tags; falling back to {:?}",
+        logd!(
+            "Ollama model {model:?} not in local tags; falling back to {:?}",
             tags[0]
         );
         return tags[0].clone();
@@ -301,8 +301,8 @@ pub async fn coerce_local_model_if_needed(
             }
             return want.to_string();
         }
-        eprintln!(
-            "[agent-platformd] LM Studio model {model:?} not listed; falling back to {:?}",
+        logd!(
+            "LM Studio model {model:?} not listed; falling back to {:?}",
             ids[0]
         );
         if env_flag("LM_STUDIO_TRY_LOAD_MODEL", true) {

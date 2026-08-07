@@ -1,9 +1,9 @@
 //! Server sidecar management, ported from the Tauri shell (`desktop/src-tauri/src/lib.rs`).
 //!
-//! The child is `agent-platformd` (ADR 0007), which binds our port and spawns the
-//! Python server itself on an ephemeral one. Everything desktop-specific (loopback
-//! bind, per-install key, per-user data dirs, fixed port) is still passed as
-//! environment — the daemon forwards it to Python unchanged.
+//! The child is `agent-platformd` (ADR 0007), which binds our port and *is* the
+//! server — it spawned a Python child of its own until the migration finished.
+//! Everything desktop-specific (loopback bind, per-install key, per-user data
+//! dirs, fixed port) is passed as environment.
 //! Differences from the Tauri version: the port is fixed (Ollama-style background
 //! server — external clients need a stable address) and there is no CORS env at
 //! all (a native client has no origin).
@@ -95,12 +95,47 @@ pub fn system_is_dark() -> bool {
     dark
 }
 
+/// Which animation the E.V. canvas draws. Both are fed by the same live audio
+/// analysis — this only picks how it is dressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HudStyle {
+    /// A soft orb, drawn on the GPU. Calm enough to sit on the Dashboard all
+    /// day, and the only one of the three with a smooth halo.
+    #[default]
+    Bubble,
+    /// The same idea on iced's canvas, for machines where the GPU backend is
+    /// unavailable and [`HudStyle::Bubble`] renders nothing.
+    BubbleCanvas,
+    /// The suit heads-up display: spectrum web, reticle, telemetry.
+    Suit,
+}
+
+impl HudStyle {
+    pub const ALL: [HudStyle; 3] =
+        [HudStyle::Bubble, HudStyle::BubbleCanvas, HudStyle::Suit];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HudStyle::Bubble => "Bubble",
+            HudStyle::BubbleCanvas => "Bubble (canvas)",
+            HudStyle::Suit => "Suit HUD",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub port: u16,
     pub start_minimized: bool,
     pub theme: ThemeMode,
+    /// Which E.V. animation the canvas draws.
+    pub hud_style: HudStyle,
+    /// How fast E.V. reads a reply aloud, as percent of the voice's normal
+    /// pace. See `assistant::VOICE_RATES`.
+    #[serde(default = "default_voice_rate")]
+    pub voice_rate: i32,
     /// Chat screen's provider/model override, kept across restarts.
     /// Empty = the server's default.
     pub chat_provider: String,
@@ -120,10 +155,35 @@ pub struct Settings {
     /// listens and the model only answers this app's chat.
     #[serde(default)]
     pub local_server_port: u16,
+    /// Folder the Coder screen opens on. Persisted because it is the one thing
+    /// that screen cannot work without, and re-picking it every launch is the
+    /// difference between a tool and a demo.
+    #[serde(default)]
+    pub coder_workspace: String,
+    /// Coder screen's provider/model override, kept across restarts. Empty
+    /// means the server's default — which is `llama3` and cannot hold a tool
+    /// loop, so this is the setting that decides whether the screen works.
+    #[serde(default)]
+    pub coder_provider: String,
+    #[serde(default)]
+    pub coder_model: String,
+    /// Ask the Coder agent for a plan before each turn's tool loop. On by
+    /// default: it costs one extra call and is the largest quality difference
+    /// available on the local models this screen mostly runs.
+    #[serde(default = "default_true")]
+    pub coder_plan: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_local_n_ctx() -> u32 {
     8192
+}
+
+fn default_voice_rate() -> i32 {
+    crate::assistant::DEFAULT_VOICE_RATE
 }
 
 impl Default for Settings {
@@ -132,11 +192,17 @@ impl Default for Settings {
             port: DEFAULT_PORT,
             start_minimized: false,
             theme: ThemeMode::default(),
+            hud_style: HudStyle::default(),
+            voice_rate: default_voice_rate(),
             chat_provider: String::new(),
             chat_model: String::new(),
             local_model_path: String::new(),
             local_n_ctx: default_local_n_ctx(),
             local_server_port: 0,
+            coder_workspace: String::new(),
+            coder_provider: String::new(),
+            coder_model: String::new(),
+            coder_plan: true,
         }
     }
 }
@@ -198,7 +264,8 @@ impl LogRing {
 pub struct Shell {
     pub server: Option<Child>,
     pub log: Arc<Mutex<LogRing>>,
-    /// `agent-platformd`, which owns the Python process from here on.
+    /// `agent-platformd`. It is the whole server — there is no second process
+    /// behind it any more.
     pub daemon: PathBuf,
     pub port: u16,
     pub key: String,
@@ -274,8 +341,7 @@ impl Shell {
         std::fs::create_dir_all(&self.data_dir)?;
         let port = self.port;
         let mut cmd = Command::new(&self.daemon);
-        // No args: the daemon knows how to find and start Python (and sets that
-        // process's own bind port and LLM_ORCHESTRATOR_BASE_URL from this).
+        // No args: everything the daemon needs comes through the environment.
         cmd.env("AGENT_PLATFORM_HOST", "127.0.0.1")
             .env("AGENT_PLATFORM_PORT", port.to_string())
             .env("AGENT_PLATFORM_MASTER_KEY", &self.key)
@@ -325,8 +391,8 @@ pub fn load_or_create_key(dir: &Path) -> std::io::Result<String> {
     Ok(key)
 }
 
-/// The server binary, which always sits beside ours — `target/<profile>` in a dev
-/// build, the install dir otherwise. Finding Python is its problem now, not ours.
+/// The server binary, which always sits beside ours — `target/<profile>` in a
+/// dev build, the install dir otherwise.
 pub fn resolve_server() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let daemon = exe.parent()?.join(DAEMON_EXE);
@@ -334,8 +400,8 @@ pub fn resolve_server() -> Option<PathBuf> {
 }
 
 /// Ties children to this process at the OS level, so a crash cannot leave a
-/// server holding the port and the database. Mirrors the same trick in
-/// `crates/server/src/upstream.rs`, which the daemon applies to Python.
+/// server holding the port and the database. The daemon used to do the same to
+/// its Python child; this is the one copy left.
 #[cfg(windows)]
 mod job {
     use std::os::windows::io::AsRawHandle;

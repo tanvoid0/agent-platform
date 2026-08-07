@@ -1,4 +1,9 @@
-# GPU training worker profile — extends the default stack.
+# GPU training worker profile — the model-ops build pipeline, with torch.
+#
+# This is the one piece of the platform that is still Python, and it is not a
+# server: `agent-platformd` runs a stage by spawning it. To use this container
+# as that interpreter, set MODEL_OPS_PYTHON on the server to a command that
+# execs into here (or run the stages by hand — see worker/README.md).
 #
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.train.yml --profile train up --build
@@ -14,19 +19,19 @@ services:
       dockerfile: Dockerfile.train
     entrypoint: ["sleep", "infinity"]
     environment:
-      AGENT_PLATFORM_CONTAINER_MODE: train
-      DATABASE_URL: ""
-      AGENT_PLATFORM_DB_PATH: /app/data/agent_platform.db
-      CONFIG_DIR: /app/data/llm
-      CONFIG_PATH: /app/data/llm/config.yaml
+      # No database and no CONFIG_PATH: the worker touches neither. It reads
+      # and writes files under MODEL_OPS_DATA_DIR and reports results to
+      # whoever spawned it on stdout — that is what let the build-job routes
+      # leave Python (ADR 0007), and it is why this container shares only the
+      # data volume with the server.
       MODEL_OPS_DATA_DIR: /app/data/llm/model_ops
-      MODEL_OPS_GPU_SUBPROCESS: "0"
+      CONFIG_DIR: /app/data/llm
+      # `eval` calls Ollama directly.
       OLLAMA_API_BASE: ${OLLAMA_API_BASE:-http://host.docker.internal:11434}
     env_file:
       - .env
     volumes:
       - agent_platform_data:/app/data
-      - ./app:/app
     deploy:
       resources:
         reservations:

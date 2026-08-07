@@ -24,7 +24,7 @@ import time
 try:
     import httpx
 except ImportError:
-    print("Install dependencies: pip install -r app/requirements.txt", file=sys.stderr)
+    print("Install dependencies: pip install httpx", file=sys.stderr)
     raise
 
 DEFAULT_BASE = "http://127.0.0.1:18410"

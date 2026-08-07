@@ -9,6 +9,7 @@
 //! on screen is a canned loop — the web spokes *are* the spectrum bins.
 
 use crate::assistant::{Message, Mode, State, BANDS, WAVE};
+use crate::shell::HudStyle;
 use crate::ui::{self, space, theme, Icon, Tone};
 use iced::widget::canvas::{self, Frame, Geometry, LineCap, Path, Stroke, Text};
 use iced::widget::{canvas as canvas_widget, column, container, markdown, scrollable};
@@ -17,9 +18,35 @@ use iced::{mouse, Color, Element, Length, Point, Radians, Rectangle, Renderer, T
 /// The live HUD canvas alone, for embedding outside this screen (the
 /// Dashboard). Whoever shows it must also run the `assistant::Tick`
 /// subscription, or the canvas freezes.
-pub fn hud(state: &State, height: impl Into<Length>) -> Element<'_, Message> {
-    container(
-        canvas_widget(Hud {
+pub fn hud<'a>(
+    state: &'a State,
+    height: impl Into<Length>,
+    style: HudStyle,
+    iced_theme: &Theme,
+) -> Element<'a, Message> {
+    let height = height.into();
+    let body: Element<'a, Message> = match style {
+        HudStyle::Bubble => {
+            let orb = iced::widget::shader(crate::bubble_shader::Bubble::new(state, iced_theme))
+                .width(Length::Fill)
+                .height(height);
+            // A shader cannot draw text, so the status line the reference types
+            // out under its orb is a real text widget stacked over it. Same
+            // reveal, same `elapsed` clock as the canvas styles use.
+            let shown = typed(mode_label(state.mode()), state.elapsed);
+            iced::widget::stack![
+                orb,
+                container(iced::widget::text(shown.to_string()).size(17))
+                    .width(Length::Fill)
+                    .height(height)
+                    .align_x(iced::Center)
+                    .align_y(iced::alignment::Vertical::Bottom)
+                    .padding(space::LG),
+            ]
+            .into()
+        }
+        _ => canvas_widget(Hud {
+            style,
             phase: state.phase,
             mode: state.mode(),
             prev: state.mode_prev,
@@ -35,14 +62,25 @@ pub fn hud(state: &State, height: impl Into<Length>) -> Element<'_, Message> {
             wave: &state.wave,
         })
         .width(Length::Fill)
-        .height(height),
-    )
-    .style(theme::hud_backdrop)
-    .width(Length::Fill)
-    .into()
+        .height(height)
+        .into(),
+    };
+    container(body).style(theme::hud_backdrop).width(Length::Fill).into()
 }
 
-pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
+/// What the orb says it is doing. Shared by both bubble styles so the GPU and
+/// canvas versions never drift apart on wording.
+pub fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Idle => "Standing by",
+        Mode::Armed => "Mic live",
+        Mode::Listening => "Listening",
+        Mode::Thinking => "Thinking",
+        Mode::Speaking => "Speaking",
+    }
+}
+
+pub fn view<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Element<'a, Message> {
     let mode = state.mode();
 
     // Only meaningful in voice mode: every line of it reports the mic.
@@ -165,11 +203,12 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
     // mic telemetry, so nothing on screen implies audio is running.
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
     if state.voice {
-        blocks.push(hud(state, 224.0));
+        blocks.push(hud(state, 224.0, style, iced_theme));
         blocks.push(status());
     }
     if let Some(err) = &state.error {
-        let mut row = vec![container(ui::alert_error(err.clone())).width(Length::Fill).into()];
+        let mut row =
+            vec![container(ui::alert_error_traced(err, Message::TraceLogs)).width(Length::Fill).into()];
         if err.contains("Privacy → Microphone") {
             row.push(ui::button_secondary(Icon::Settings, "Open Settings", Message::OpenMicSettings));
         }
@@ -179,20 +218,19 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
     blocks.push(container(transcript).height(Length::Fill).into());
     blocks.push(composer);
 
-    // One thread, two skins: Text is the plain transcript, Voice adds the HUD,
-    // the mic and the spoken reply.
-    let mut actions: Vec<Element<'_, Message>> = vec![
-        ui::segmented([
-            ("Text", !state.voice, Message::ToggleVoice),
-            ("Voice", state.voice, Message::ToggleVoice),
-        ]),
+    // Who is answering leads the page. The old header put a 24px "E.V." title and
+    // a line of flavour text here and pushed these two into a trailing cluster of
+    // five equal-weight widgets — but the tab strip above already names the
+    // assistant, and the Text/Voice control already says which mode it is in.
+    // Both were repeating something on screen; the model was not.
+    let mut head: Vec<Element<'_, Message>> = vec![
         container(ui::select(
             "Provider (default)",
             state.provider_ids(),
             (!state.provider.is_empty()).then(|| state.provider.clone()),
             Message::ProviderChanged,
         ))
-        .width(170)
+        .width(180)
         .into(),
         container(ui::select(
             "Model (default)",
@@ -200,30 +238,28 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
             (!state.model.is_empty()).then(|| state.model.clone()),
             Message::ModelChanged,
         ))
-        .width(220)
+        .width(260)
         .into(),
     ];
     // pick_list cannot deselect, so going back to the server default needs its
     // own button — shown only while an override is active.
     if !state.provider.is_empty() || !state.model.is_empty() {
-        actions.push(ui::button_ghost(Icon::X, "Default", Message::UseDefaults));
+        head.push(ui::button_ghost(Icon::X, "Default", Message::UseDefaults));
     }
-    actions.push(ui::button_outline(Icon::Trash, "Clear", Message::Clear));
+    // Everything past the spacer recedes: one thread, two skins — Text is the
+    // plain transcript, Voice adds the HUD, the mic and the spoken reply.
+    head.push(ui::spacer());
+    head.push(ui::segmented([
+        ("Text", !state.voice, Message::ToggleVoice),
+        ("Voice", state.voice, Message::ToggleVoice),
+    ]));
+    head.push(ui::button_ghost(Icon::Trash, "Clear", Message::Clear));
 
-    ui::page_fixed(
-        "E.V.",
-        Some(ui::muted(if state.voice {
-            "Onboard suit AI. Replies are spoken."
-        } else {
-            "Onboard suit AI, in text."
-        })),
-        Some(ui::cluster(actions).into()),
-        {
-            let body: Element<'_, Message> =
-                column(blocks).spacing(space::MD).height(Length::Fill).into();
-            body
-        },
-    )
+    ui::page_custom(ui::cluster(head), {
+        let body: Element<'_, Message> =
+            column(blocks).spacing(space::MD).height(Length::Fill).into();
+        body
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +288,7 @@ const HOLO_CYAN: Color = Color::from_rgb(0.208, 0.816, 1.0); // #35D0FF
 const HOT: Color = Color::from_rgb(0.94, 0.98, 1.0); // filament white
 
 struct Hud<'a> {
+    style: HudStyle,
     /// Seconds of animation time.
     phase: f32,
     mode: Mode,
@@ -298,7 +335,7 @@ fn fade(c: Color, a: f32) -> Color {
 
 /// Band energy at a fractional position across the spectrum, interpolated so
 /// `BARS` bars can ride `BANDS` bins without stair-stepping.
-fn band_at(bands: &[f32], x: f32) -> f32 {
+pub fn band_at(bands: &[f32], x: f32) -> f32 {
     if bands.is_empty() {
         return 0.0;
     }
@@ -330,6 +367,32 @@ fn glow(frame: &mut Frame, path: &Path, color: Color, width: f32) {
     }
 }
 
+/// How much of `label` has been typed after `elapsed` seconds in this state.
+/// Split on character boundaries, not bytes: this runs inside `draw`, where a
+/// slice through the middle of a multi-byte character is a panic mid-render, and
+/// the day someone writes "Écoute" here is the day it fires.
+fn typed(label: &str, elapsed: f32) -> &str {
+    const CPS: f32 = 18.0;
+    let n = (elapsed.max(0.0) * CPS) as usize;
+    match label.char_indices().nth(n) {
+        Some((byte, _)) => &label[..byte],
+        None => label,
+    }
+}
+
+/// Three colours as a closed wheel: `u` turns once around and lands back on `a`.
+/// The band's colour is read off this per segment, so a discontinuity anywhere
+/// in it — including the wrap — is a hard seam across the ring.
+fn wheel(a: Color, b: Color, c: Color, u: f32) -> Color {
+    let u = u.rem_euclid(1.0) * 3.0;
+    let f = u.fract();
+    match u as usize {
+        0 => mix_color(a, b, f),
+        1 => mix_color(b, c, f),
+        _ => mix_color(c, a, f),
+    }
+}
+
 fn mono(content: String, position: Point, color: Color, size: f32) -> Text {
     Text { content, position, color, size: size.into(), font: iced::Font::MONOSPACE, ..Text::default() }
 }
@@ -345,6 +408,21 @@ impl canvas::Program<Message> for Hud<'_> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        match self.style {
+            // `Bubble` never reaches the canvas — it is the shader widget. Kept
+            // total rather than unreachable so a new style cannot slip through.
+            HudStyle::Bubble | HudStyle::BubbleCanvas => {
+                self.draw_bubble(&mut frame, iced_theme, bounds)
+            }
+            HudStyle::Suit => self.draw_suit(&mut frame, iced_theme, bounds),
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+impl Hud<'_> {
+    fn draw_suit(&self, frame: &mut Frame, iced_theme: &Theme, bounds: Rectangle) {
         use std::f32::consts::{PI, TAU};
 
         let t = theme::tokens(iced_theme);
@@ -369,7 +447,6 @@ impl canvas::Program<Message> for Hud<'_> {
         let hot = if t.dark { HOT } else { Color::from_rgb(0.05, 0.07, 0.12) };
         let web = Color { a: if t.dark { 0.40 } else { 0.55 }, ..ink(SPIDEY_RED) };
 
-        let mut frame = Frame::new(renderer, bounds.size());
         let (w, h) = (bounds.width, bounds.height);
         let center = Point::new(w / 2.0, h / 2.0);
         // Power-on: everything sweeps out from the core and fades up once.
@@ -516,7 +593,7 @@ impl canvas::Program<Message> for Hud<'_> {
             let travel = (self.phase * 1.6).fract();
             let r0 = r_max * (0.16 + travel * 0.82);
             let glint = Path::line(at(r0, a), at(r0 + r_max * 0.12, a));
-            glow(&mut frame, &glint, fade(hot, hot_e * (1.0 - travel)), 1.6);
+            glow(frame, &glint, fade(hot, hot_e * (1.0 - travel)), 1.6);
         }
 
         // -- Spectrum rim: mirrored bars, bass at 12 o'clock -----------------
@@ -558,7 +635,7 @@ impl canvas::Program<Message> for Hud<'_> {
             }
             let a = f * TAU - PI / 2.0;
             let bar = Path::line(at(r_in, a), at(r_in + r_max * (0.05 + 0.34 * e), a));
-            glow(&mut frame, &bar, fade(mix_color(accent, hot, e - 0.4), boot), 1.8);
+            glow(frame, &bar, fade(mix_color(accent, hot, e - 0.4), boot), 1.8);
         }
         // Peak-hold: a dashed ring parked at the loudest bin.
         const DASH: [f32; 2] = [3.0, 7.0];
@@ -706,7 +783,7 @@ impl canvas::Program<Message> for Hud<'_> {
                 Stroke::default().with_color(fade(ink(t.warning), 0.12)).with_width(1.0),
             );
             let edge = Path::line(center, at(r_max * 1.05, spin));
-            glow(&mut frame, &edge, fade(ink(t.warning), 0.8), 1.4);
+            glow(frame, &edge, fade(ink(t.warning), 0.8), 1.4);
         }
 
         // -- Chrome: brackets, telemetry, input meter -------------------------
@@ -824,7 +901,244 @@ impl canvas::Program<Message> for Hud<'_> {
             mix_color(holo, accent, 0.35),
             12.0,
         ));
+    }
 
-        vec![frame.into_geometry()]
+    /// The default animation: a pastel disc inside a thin ring with one hot arc,
+    /// and the state typed out underneath.
+    ///
+    /// Built against measurements of a reference loop rather than by eye, and
+    /// three of those measurements overturned the obvious guesses. The band is
+    /// *one* hue whose intensity falls off around the circumference — not a
+    /// rainbow travelling around it; the hue turns over time instead. The
+    /// interior is a near-opaque pastel wash cycling pink → lavender → mint, not
+    /// a white centre. And the band is thin: half-max width lands near a tenth
+    /// of the radius.
+    fn draw_bubble(&self, frame: &mut Frame, iced_theme: &Theme, bounds: Rectangle) {
+        use std::f32::consts::TAU;
+
+        let t = theme::tokens(iced_theme);
+        let hue = |m: Mode| match m {
+            Mode::Idle => mix_color(SPIDEY_BLUE, HOLO_CYAN, 0.35),
+            // An open mic is never the same colour as an idle one, here either.
+            Mode::Armed => t.success,
+            Mode::Listening => SPIDEY_RED,
+            Mode::Thinking => t.warning,
+            Mode::Speaking => HOLO_CYAN,
+        };
+        let ink = |c: Color| if t.dark { c } else { mix_color(c, Color::BLACK, 0.22) };
+        let accent = ink(mix_color(hue(self.prev), hue(self.mode), self.mix));
+        // The two the hue turns through. Measured, the reference sits around a
+        // vivid blue-violet and drifts to pink; the mode's own colour anchors it
+        // so Listening still reads red rather than always violet.
+        let cool = ink(mix_color(accent, HOLO_CYAN, 0.5));
+        let warm = ink(mix_color(accent, Color::from_rgb(1.0, 0.42, 0.82), 0.6));
+        // What the interior washes toward: the backdrop this canvas sits on.
+        let paper =
+            if t.dark { Color::from_rgb(0.04, 0.05, 0.08) } else { Color::from_rgb(0.99, 0.99, 1.0) };
+        let pastel = |c: Color| mix_color(c, paper, if t.dark { 0.55 } else { 0.60 });
+
+        let (w, h) = (bounds.width, bounds.height);
+        let center = Point::new(w / 2.0, h / 2.0 - h * 0.05);
+        let boot = self.boot;
+        let energy = self.energy.clamp(0.0, 1.0);
+        let bass = band_at(self.bands, 0.08);
+        let breathe = 0.5 + 0.5 * (self.phase * 0.55).sin();
+        // Thinking turns the hue and the hot arc faster, rather than bolting a
+        // spinner onto a still shape.
+        let ph = self.phase * if self.mode == Mode::Thinking { 1.9 } else { 1.0 };
+        // Leaves room under the disc for the status line, which is part of the
+        // composition rather than a caption bolted beneath it.
+        let unit = (w.min(h) * 0.5 - 10.0).max(10.0);
+        let r = unit
+            * (0.60 + 0.02 * breathe + 0.05 * energy + 0.03 * bass + 0.02 * self.beat).min(0.70)
+            * (0.7 + 0.3 * boot);
+
+        // Barely there: measured, the reference's edge stays within about a tenth
+        // of its radius. The life is in the colour, not in the outline.
+        let edge = |a: f32| {
+            let amp = 0.010 + 0.025 * energy + 0.012 * bass;
+            1.0 + amp
+                * ((a * 2.0 + ph * 0.29).sin()
+                    + 0.6 * (a * 3.0 - ph * 0.43).sin()
+                    + 0.3 * (a * 5.0 + ph * 0.19).sin())
+        };
+        // Spectrum around the band, mirrored left to right so it reads as
+        // designed rather than as noise.
+        let swell = |f: f32| {
+            let x = if f <= 0.5 { f * 2.0 } else { (1.0 - f) * 2.0 };
+            band_at(self.bands, x)
+        };
+
+        // -- Interior: a pastel wash, near-opaque -------------------------------
+        // Continuous gradients, never stacked fills: alpha stacked in steps is
+        // what puts countable contour rings inside a soft shape. The two hues are
+        // one turn of the wheel apart and both crawl, so the disc keeps shifting
+        // without ever landing on a colour it just held.
+        let wash_a = pastel(wheel(accent, cool, warm, ph * 0.035));
+        let wash_b = pastel(wheel(accent, cool, warm, ph * 0.035 + 0.28));
+        let axis = ph * 0.07;
+        let (ax, ay) = (r * axis.cos(), r * axis.sin());
+        frame.fill(
+            &Path::circle(center, r * 0.99),
+            iced::advanced::graphics::gradient::Linear::new(
+                Point::new(center.x - ax, center.y - ay),
+                Point::new(center.x + ax, center.y + ay),
+            )
+            .add_stop(0.0, fade(wash_a, 0.90 * boot))
+            .add_stop(0.5, fade(mix_color(wash_a, wash_b, 0.5), 0.80 * boot))
+            .add_stop(1.0, fade(wash_b, 0.90 * boot)),
+        );
+        // Two soft masses drifting inside it. This is the liquid: the interior
+        // sliding under a still rim, which is what the reference does and what a
+        // deforming outline does not.
+        for n in 0..2 {
+            let n = n as f32;
+            let a = ph * (0.13 + n * 0.08) + n * 2.7;
+            let d = r * 0.26 * (0.5 + 0.5 * (ph * 0.11 + n * 1.9).sin());
+            let c = Point::new(center.x + d * a.cos(), center.y + d * a.sin());
+            let rad = r * (0.55 + 0.12 * (ph * 0.17 + n * 2.0).sin());
+            let tint = pastel(wheel(accent, cool, warm, ph * 0.035 + 0.55 + n * 0.2));
+            let blob_axis = ph * 0.09 + n * 2.2;
+            let (bx, by) = (rad * blob_axis.cos(), rad * blob_axis.sin());
+            frame.fill(
+                &Path::circle(c, rad),
+                iced::advanced::graphics::gradient::Linear::new(
+                    Point::new(c.x - bx, c.y - by),
+                    Point::new(c.x + bx, c.y + by),
+                )
+                .add_stop(0.0, fade(tint, 0.0))
+                .add_stop(0.5, fade(tint, (0.40 + 0.25 * energy) * boot))
+                .add_stop(1.0, fade(tint, 0.0)),
+            );
+        }
+
+        // -- The band -----------------------------------------------------------
+        // One hue, one hot arc. Measured, the reference's chroma runs about 5:1
+        // between its brightest point and the far side — so this is an intensity
+        // gradient around the ring, and the hue itself turns on the clock.
+        let live = wheel(accent, cool, warm, ph * 0.045);
+        let faint = mix_color(live, paper, 0.72);
+        let hot = ph * 0.06;
+        const SEGS: usize = 160;
+        let seg = |i: usize, of: usize, spread: f32| {
+            let a0 = i as f32 * TAU / of as f32;
+            let step = TAU / of as f32;
+            Path::new(|b| {
+                // Overlapping into the next segment, so the seams close.
+                for k in 0..=3 {
+                    let a = a0 + step * k as f32 / 3.0 * spread;
+                    let rr = r * edge(a);
+                    let p = Point::new(center.x + rr * a.cos(), center.y + rr * a.sin());
+                    if k == 0 {
+                        b.move_to(p);
+                    } else {
+                        b.line_to(p);
+                    }
+                }
+            })
+        };
+        for pass in 0..2 {
+            // Haze first, then the band on top of it. The haze is what stops the
+            // ring sitting on the page like something drawn with a compass.
+            let (wide, dim) = if pass == 0 { (3.2, 0.16) } else { (1.0, 1.0) };
+            for i in 0..SEGS {
+                let f = i as f32 / SEGS as f32;
+                let d = (f - hot).rem_euclid(1.0);
+                // 1 at the hot point, 0 at the far side, tightened so the arc
+                // stays an arc rather than a slow global brightening.
+                let heat = (1.0 - d.min(1.0 - d) * 2.0).powf(1.6);
+                let width = r * (0.045 + 0.085 * heat + 0.075 * swell(f) + 0.02 * self.beat);
+                frame.stroke(
+                    &seg(i, SEGS, 1.6),
+                    Stroke::default()
+                        .with_color(fade(
+                            mix_color(faint, live, heat),
+                            (0.18 + 0.82 * heat) * dim * boot,
+                        ))
+                        .with_width(width * wide)
+                        .with_line_cap(LineCap::Round),
+                );
+            }
+        }
+
+        // Talking sheds the band outward — the tell that this is driven by sound
+        // and not by a timer.
+        if energy > 0.02 && matches!(self.mode, Mode::Speaking | Mode::Listening) {
+            for k in 0..3 {
+                let p = (ph * 0.45 + k as f32 / 3.0).fract();
+                let out = 1.0 - p;
+                frame.stroke(
+                    &Path::circle(center, r * (1.03 + p * 0.5)),
+                    Stroke::default()
+                        .with_color(fade(live, out * out * 0.30 * energy * boot))
+                        .with_width(1.0 + 2.5 * out),
+                );
+            }
+        }
+
+        // -- The status line ------------------------------------------------------
+        // Typed out left to right at its final centred position, the way the
+        // reference reveals its caption. `elapsed` resets on every mode change,
+        // so each new state types itself in without any extra state to keep.
+        let shown = typed(mode_label(self.mode), self.elapsed);
+        if !shown.is_empty() {
+            let size = (h * 0.085).clamp(13.0, 26.0);
+            frame.fill_text(Text {
+                content: shown.to_string(),
+                position: Point::new(center.x, (center.y + r * 1.42).min(h - size)),
+                color: fade(ink(mix_color(live, Color::BLACK, if t.dark { 0.0 } else { 0.45 })), boot),
+                size: size.into(),
+                align_x: iced::alignment::Horizontal::Center.into(),
+                align_y: iced::alignment::Vertical::Center,
+                ..Text::default()
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The band reads its colour off `wheel` per segment, so any jump in it —
+    /// at a stop or across the wrap — draws a hard seam across the ring.
+    #[test]
+    fn the_colour_wheel_closes_on_itself() {
+        let (a, b, c) = (
+            Color::from_rgb(0.9, 0.1, 0.2),
+            Color::from_rgb(0.1, 0.8, 0.3),
+            Color::from_rgb(0.2, 0.3, 1.0),
+        );
+        let near = |x: Color, y: Color, what: &str| {
+            let d = (x.r - y.r).abs() + (x.g - y.g).abs() + (x.b - y.b).abs();
+            assert!(d < 0.02, "{what}: {x:?} vs {y:?}");
+        };
+        // Wraps: just under 1.0 is just under a full turn, so it lands on `a`.
+        near(wheel(a, b, c, 0.9999), a, "wrap");
+        near(wheel(a, b, c, 0.0), a, "start");
+        // And the same turn one lap along is the same colour.
+        near(wheel(a, b, c, 0.37), wheel(a, b, c, 1.37), "periodic");
+        // Each stop is hit exactly, from both sides.
+        near(wheel(a, b, c, 1.0 / 3.0), b, "stop b");
+        near(wheel(a, b, c, 2.0 / 3.0), c, "stop c");
+        near(wheel(a, b, c, 0.3333 - 0.0005), b, "approach b");
+    }
+
+    /// The status line types itself in, and it is sliced every frame — on
+    /// characters, never bytes, or a multi-byte label panics mid-render.
+    #[test]
+    fn the_status_line_types_in_without_splitting_a_character() {
+        assert_eq!(typed("Listening", 0.0), "");
+        assert_eq!(typed("Listening", 0.1), "L");
+        assert_eq!(typed("Listening", 10.0), "Listening");
+        // Past the end stays put rather than running off it.
+        assert_eq!(typed("Hi", 1e6), "Hi");
+        // Accented characters advance one character at a time, not one byte.
+        let s = "\u{c9}coute";
+        for n in 0..=6 {
+            let out = typed(s, n as f32 / 18.0);
+            assert_eq!(out.chars().count(), n.min(6), "{out:?}");
+            assert!(s.starts_with(out));
+        }
     }
 }

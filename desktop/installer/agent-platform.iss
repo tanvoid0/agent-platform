@@ -2,19 +2,21 @@
 ; Per-user install, no admin required — matches a small local-first tool.
 ;
 ; Compile with: iscc desktop\installer\agent-platform.iss
-; (normally invoked via scripts/build_installer.py, which builds the exe and
-; payload first)
+; (normally invoked via scripts/build_installer.py, which builds the exes first)
 ;
 ; Expects, relative to this .iss file's SourceDir (desktop\):
 ;   target\release\agent-platform.exe   the compiled app (icon already embedded)
 ;   target\release\agent-platformd.exe  the API server the app spawns (ADR 0007)
 ;   target\release\*.dll                llama.cpp + ggml, only in a local-llm build
-;   payload\                            Python runtime + server (scripts/bundle_server.py)
+;   ..\worker\                          the model-ops build worker (Python sources)
 ;   crates\app\icon.ico                 app icon, reused for the installer/shortcuts
 ;
-; payload\ is installed as {app}\server\ — agent-platformd looks for the bundled
-; runtime at <exe dir>\server\runtime and <exe dir>\server\scripts, and the app
-; looks for agent-platformd beside itself.
+; **No Python runtime ships any more.** The server used to be a Python process
+; this installer carried an embedded CPython for, under payload\. It is Rust
+; now. The only Python left is the LoRA training worker, which needs torch and
+; therefore an interpreter the user points at with MODEL_OPS_PYTHON — so the
+; worker's own sources ship (they are small and pure) and the interpreter does
+; not. Model-ops build jobs are the only feature that needs one.
 
 #define MyAppName "Agent Platform"
 #define MyAppVersion "0.2.0"
@@ -53,7 +55,19 @@ Source: "..\target\release\agent-platformd.exe"; DestDir: "{app}"; Flags: ignore
 ; will not link), and cargo drops them beside the exe. A default build has none,
 ; hence skipifsourcedoesntexist — the exe then never looks for them.
 Source: "..\target\release\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\payload\*"; DestDir: "{app}\server"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The model-ops build worker — a few hundred lines of Python that
+; agent-platformd runs as a subprocess per pipeline stage. It looks for this at
+; <exe dir>\worker unless MODEL_OPS_WORKER_PATH says otherwise.
+Source: "..\..\worker\*"; DestDir: "{app}\worker"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[UninstallDelete]
+; Inno removes only the files it installed, and Python leaves __pycache__
+; directories that were never in the manifest — one un-removable directory
+; strands the whole tree above it, and the uninstaller then exits 0 having left
+; the files behind, which is worse than failing because nothing says so. This
+; used to guard ~50 MB of bundled runtime under {app}\server; the worker is far
+; smaller but caches the same way.
+Type: filesandordirs; Name: "{app}\worker"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"

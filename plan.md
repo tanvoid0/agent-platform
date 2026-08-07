@@ -5,81 +5,83 @@ here: `docs/native-desktop-migration.md` and `docs/adr/`.
 
 ## What it is
 
-Three deliverables, one repo:
+Two deliverables, one repo (three, if you count the training worker):
 
-- **Server** (`app/`): headless FastAPI service — multi-agent **process**
-  orchestration (goal → planner DAG → approval → topological execution), plus an
-  **embedded** OpenAI-compatible LLM proxy on `/v1/*` in the same process. All
-  REST is under **`/api/v1/...`** (bare-root mounts are gone); the only browser
-  page is the `/tokens` dashboard.
 - **API server** (`desktop/crates/server`, bin `agent-platformd`): Rust/axum,
-  binds `http://127.0.0.1:18410`, serves the domains that have migrated and
-  reverse-proxies the rest to a Python child it spawns on an ephemeral port
-  ([ADR 0007](docs/adr/0007-strangler-rust-server.md)). Also the intended cloud
-  artifact. `GET /` and `/health` are its own.
+  binds `http://127.0.0.1:18410`, **serves every route itself** — multi-agent
+  process orchestration (goal → planner DAG → approval → topological
+  execution), the assistant, coder, todos, workflows, workspaces, tokens, and
+  an **embedded** OpenAI-compatible LLM proxy on `/v1/*` in the same process.
+  All REST is under **`/api/v1/...`**; `GET /`, `/health` and `/openapi.json`
+  are the only routes outside it. Also the cloud artifact
+  ([ADR 0007](docs/adr/0007-strangler-rust-server.md)).
 - **Desktop** (`desktop/`): native Rust **iced 0.14** app — the only UI. It
   spawns (or attaches to) `agent-platformd` on port 18410 and talks to the API.
   The old `web/` React app and Tauri shell are deleted (ADR 0005).
+- **Training worker** (`worker/`): the model-ops LoRA pipeline. Python, because
+  it is torch and peft, but **not a server** — `agent-platformd` runs each build
+  stage as a subprocess and reads results off its stdout.
+
+**The FastAPI server is gone.** `app/` was deleted 2026-08-07 along with
+`scripts/start.py`, `scripts/bundle_server.py`, `scripts/sync_contract_enums.py`,
+`pytest.ini` and `requirements-dev.txt`. What that cost, and what moved rather
+than died, is the section below.
 
 ## Where to edit
 
 | Area | Path |
 |------|------|
-| App wiring, routers | `app/main.py` |
-| Processes REST + SSE | `app/process_routes.py` (thin; logic in `app/services/*_service.py`) |
-| Planner, executor | `app/orchestrator.py`, `app/dag_schema.py`, `app/services/dag_runtime_service.py` |
-| DB, Alembic | `app/database.py` (SQLite WAL or Postgres via `DATABASE_URL`), `app/alembic/` |
-| LLM proxy, BYOK, providers | `app/llm_proxy/` |
-| Assistant "E.V." | `app/assistant/` (server), `desktop/.../assistant.rs` + `assistant_view.rs`, `stt.rs` |
-| Assistant board + planning chat | `app/assistant/` (server; `services/assistant_chat.py`, `domain_forms.py`, `clarifying_form.py`), `desktop/.../agenda.rs` + `agenda_view.rs` (the board) and `agenda_chat.rs` + `agenda_chat_view.rs` (the chat pane inside it) |
-| Coder agent | `app/coder/` (loop, threads, approval, PLAN step), `desktop/.../coder.rs` + `coder_view.rs` + `coder_tools.rs` (the desktop-side executor) + `coder_notes.rs` + `coder_git.rs` (checkpoints) + `coder_files.rs` (tree, viewer) + `coder_term.rs` (PTY terminal) |
-| Workflows engine + assist | `app/workflows/` |
-| Todos / boards | `app/todos/` |
-| Model ops (training, Ollama, registry) | `app/model_ops/` |
-| Teams, projects, workspaces, docs | `app/teams_routes.py`, `app/projects_routes.py`, `app/workspace_*.py` |
-| Tokens (workspace scoping) | `desktop/crates/server/src/api_tokens.rs` (the CRUD) + `auth.rs` (verification, `last_used_at`); `app/api_tokens/` keeps the shared helpers Python still imports — see `docs/workspace-tenancy-plan.md` |
-| Rust API server, proxy, auth | `desktop/crates/server/src/` — `lib.rs` (router), `proxy.rs`, `auth.rs`, `upstream.rs`; `db.rs` is the SQLite/Postgres choke point (placeholder rewriting, pool construction) |
-| Migrated domains (Rust) | `desktop/crates/server/src/{projects,teams,todos,workflows}.rs` + `workflow_engine.rs`; todos' agent routes in `action_orchestrator.rs`; shared shapes in `wire.rs`, `error.rs` |
-| Processes / orchestrator (Rust) | `desktop/crates/server/src/{processes,executor,dag_schema}.rs` — the DAG executor and all eleven process routes; the planner and sub-DAG halves, not `tool_handlers.py` |
-| LLM proxy (Rust) | `desktop/crates/server/src/` — `llm.rs` (routes), `llm_config.rs`, `byok.rs`, `provider_catalog.rs`, `model_capabilities.rs`, `model_catalog.rs`, `upstream_http.rs`, `usage.rs`; env seeding in `dotenv.rs`, correlation ids in `request_id.rs` |
-| Assistant + chat (Rust) | `desktop/crates/server/src/{assistant,assistant_turn,clarifying_form,chat,chat_usage,chat_thread_title,context_budget}.rs` — the whole assistant domain bar `POST /chat/threads`, plus `POST /api/v1/chat` |
-| Coder (Rust) | `desktop/crates/server/src/{coder,coder_loop,coder_tools}.rs` — all ten routes, the agent turn, `LocalExecutor` and the delegated tool park (`AppState::coder_pending`) |
-| Desktop HTTP/SSE client | `desktop/crates/client/` (enums generated by `scripts/sync_contract_enums.py`) |
+| Router, startup, the 404 fallback | `desktop/crates/server/src/lib.rs` |
+| Schema (replaced Alembic) | `desktop/crates/server/src/schema.sql` + `db::ensure_schema`; `db.rs` is also the SQLite/Postgres choke point (placeholder rewriting, pool construction) |
+| Auth, tokens | `auth.rs` (verification, `last_used_at`), `api_tokens.rs` (the CRUD) — see `docs/workspace-tenancy-plan.md` |
+| Processes / orchestrator | `{processes,executor,dag_schema}.rs` — the DAG executor and all eleven process routes |
+| LLM proxy, BYOK, providers | `llm.rs` (routes), `llm_config.rs`, `byok.rs`, `provider_catalog.rs`, `model_capabilities.rs`, `model_catalog.rs`, `upstream_http.rs`, `usage.rs`; admin surface in `llm_admin.rs`, `config.yaml` validation in `config_schema.rs` |
+| Assistant "E.V." + planning chat | `{assistant,assistant_turn,clarifying_form}.rs`; desktop `assistant.rs`/`assistant_view.rs` + `stt.rs`, and `agenda.rs`/`agenda_view.rs` (board) + `agenda_chat.rs`/`agenda_chat_view.rs` (chat pane) |
+| Chat | `{chat,chat_usage,chat_thread_title,context_budget}.rs` |
+| Coder agent | `{coder,coder_loop,coder_tools}.rs`; desktop `coder.rs` + `coder_view.rs` + `coder_tools.rs` (the desktop-side executor) + `coder_notes.rs` + `coder_git.rs` (checkpoints) + `coder_files.rs` (tree, viewer) + `coder_term.rs` (PTY terminal) |
+| Todos / boards | `todos.rs`; the agent routes in `action_orchestrator.rs` |
+| Workflows engine + assist | `workflows.rs` + `workflow_engine.rs` (and its interval scheduler) |
+| Teams, projects | `teams.rs`, `projects.rs` |
+| Workspaces, files, documents | `workspaces.rs`, `workspace_files.rs`, `documents.rs` (upload ingest + PDF extraction) |
+| Model ops (Ollama, registry, build jobs) | `model_ops.rs` — all seventeen routes and the stage runner; the pipeline itself is `worker/model_ops/pipeline/` |
+| Logs, status | `observability.rs` (the ring `logd!` writes to), `system.rs` (`/system/status`, `/system/logs`) |
+| Env seeding, correlation ids | `dotenv.rs`, `request_id.rs` |
+| Shared shapes | `wire.rs`, `error.rs` |
+| Desktop HTTP/SSE client | `desktop/crates/client/` (`enums.rs` is hand-maintained now — the generator went with `app/shared_enums.py`) |
 | Desktop screens | `desktop/crates/app/src/` — state/update in `x.rs`, rendering in `x_view.rs` |
-| API reference (Settings → API) | `desktop/crates/app/src/apidocs.rs` + `apidocs_view.rs` — the endpoint list is parsed from the server's `/openapi.json`, never hand-written; `RUST_ROUTES` there is the one static bit and mirrors the Rust `routes()` functions |
+| API reference (Settings → API) | `desktop/crates/app/src/apidocs.rs` + `apidocs_view.rs` — parsed from `/openapi.json`, which is now a checked-in file (`desktop/crates/server/src/openapi.json`) served verbatim |
 | Desktop UI kit | `desktop/crates/app/src/ui/` — shadcn-derived tokens + widgets; screens compose kit fns only |
 
 ## Runbook
 
 ```bash
-pip install -r app/requirements.txt
-uvicorn main:app --app-dir app --host 127.0.0.1 --port 18410   # Python alone
+cd desktop && cargo run -p agent-platform-server                # the server, alone
+cd desktop && cargo run -p agent-platform-desktop               # the app (spawns it)
 ```
 
-```bash
-cd desktop && cargo run -p agent-platform-server                # Rust + Python child
-```
+`agent-platformd` is self-contained: no child process, no interpreter. It
+creates its own SQLite file and applies `schema.sql` on startup. It is
+SQLite-only and refuses to start with `DATABASE_URL` set.
 
-`agent-platformd` finds Python itself: `AGENT_PLATFORM_PYTHON` +
-`AGENT_PLATFORM_PY_ENTRY`, else the bundled payload beside the exe, else the repo
-checkout. `AGENT_PLATFORM_UPSTREAM` attaches to a server someone else is running
-instead of spawning one. It is SQLite-only and refuses to start with
-`DATABASE_URL` set.
-
-- Desktop dev: `cd desktop && cargo run -p agent-platform-desktop` (needs
-  cmake + libclang; machine paths in `desktop/.cargo/config.toml`). It spawns
-  `agent-platformd` from its own directory, so build both.
+- Desktop dev needs cmake + libclang (machine paths in
+  `desktop/.cargo/config.toml`). The app spawns `agent-platformd` from its own
+  directory, so **build both**.
 - Windows installer: `python scripts/build_installer.py` (Inno Setup) — builds
-  and packages both binaries.
-- Tests: `pytest` (repo root), `cd desktop && cargo test`. Run `cargo build` too:
-  dev-dependencies unify features back into the lib, so `cargo test` alone can
-  pass on a lib whose own feature list is missing something it uses.
+  both binaries and packages them with `worker/`. No Python runtime ships.
+- Tests: `cd desktop && cargo test`. Run `cargo build` too: dev-dependencies
+  unify features back into the lib, so `cargo test` alone can pass on a lib
+  whose own feature list is missing something it uses.
 - A running app holds `target/debug/agent-platformd.exe`; build with
   `--target-dir <somewhere outside the repo>` rather than closing it —
   `.gitignore` pins `desktop/target/` exactly, so a sibling dir shows up
   untracked.
 - Hygiene: `python scripts/check_repo_hygiene.py`.
-- Migrations run on startup; new rev: `cd app && alembic revision --autogenerate -m "msg"`.
+- **Schema changes**: `schema.sql` + `db::ensure_schema` replaced Alembic, and
+  it **creates rather than migrates** — a new column needs a versioned runner
+  built first. Read the doc comment before touching a table.
+- **Build jobs** need `MODEL_OPS_PYTHON` pointing at an interpreter with torch;
+  `worker/requirements.txt` lists the rest. Without it a job fails on the first
+  stage with the spawn error, naming the interpreter it tried.
 - **SSE** (`GET /api/v1/processes/{id}/stream`): tails `EventLog` (~0.8s poll),
   closes with a `terminal` event on terminal status or a human gate
   (`approval_required` / `task_review_required`) — clients refresh via
@@ -124,8 +126,43 @@ instead of spawning one. It is SQLite-only and refuses to start with
     a timeout says so. Covered by a test against a dead port.
   - Providers, Model ops, Logs, Settings → API and the Coder files pane and
     terminal drawer read clean (the terminal's colour, wrapping and prompt
-    redraw were driven, not just opened). **Not swept:** nothing on the list —
-    next pass should start from whatever lands next.
+    redraw were driven, not just opened).
+  - **Swept 2026-08-07**, driving the live app rather than reading — Dashboard,
+    Processes, Projects, Teams, Workflows, Assistants (E.V. + Memory), Coder:
+    - **A stale error banner never cleared.** `Message::Listed(Ok(list))` in
+      `processes.rs` was the one arm in the file that didn't clear
+      `state.error` on success — every sibling success arm (`Detailed(Ok)`,
+      `TeamsLoaded(Ok)`, …) already did. A single request that fails during the
+      app-races-the-daemon startup window wedges the banner **forever**: the
+      list keeps loading fine underneath (confirmed live — `/health` was 200,
+      the process list was populating), but the red "Cannot reach the server"
+      banner never goes away, even after leaving the screen and coming back,
+      because nothing ever cleared it. Same bug, same missing line, found and
+      fixed in six more files by grepping for the asymmetry (`.error = Some`
+      with no matching `.error = None` on the paired success arm):
+      `workflows.rs` (`Loaded(Ok)`), `todos.rs` (`BoardsLoaded(Ok)`,
+      `BoardLoaded(Ok)`), `agenda.rs` (`ProjectsLoaded`/`DashboardLoaded`/
+      `ReviewsLoaded(Ok)`), `library.rs` — Projects **and** Teams
+      (`ProjectsLoaded`/`TeamsLoaded`/`TeamDetailLoaded(Ok)`), `providers.rs`
+      (`EnvLoaded`/`CatalogLoaded(Ok)`), `modelops.rs` (`ProjectsLoaded`/
+      `OllamaLoaded`/`RegistryLoaded(Ok)`). `apidocs.rs` and `coder.rs` already
+      had it right — that's what made the missing line elsewhere visible as a
+      bug rather than a style choice. 194 `cargo test -p agent-platform-desktop`
+      cases still pass.
+    - **A junk memory with no content.** The Assistants → Memory list had a row
+      titled "Remembered:" with nothing under it — `memories.json` confirmed
+      the *stored text itself* was the literal string `"Remembered:"`, not a
+      rendering bug. The harvester model apparently narrated the save instead
+      of stating a fact, and `memory.rs::parse_harvest`'s defensive filter
+      (`line.len() > 3`, meant to catch exactly this per its own comment) let
+      an 11-character label through. Fixed by also rejecting lines that end in
+      `:` — a real memory is `clean()`'s "short third-person statement", never
+      a bare label. Regression test added; the stray row itself is still in
+      the live store (local user data — left for the user to delete via the
+      trash icon rather than hand-edited).
+    - Dashboard, Projects, Teams, Workflows, the Assistants E.V. pane and the
+      Coder screen (header, transcript, session list) all read clean — no
+      cutoffs, no overflow, no orphaned controls.
 - **E.V. voice** — `POST /v1/audio/speech` proxies whatever `SPEECH_API_BASE`
   points at and the desktop tries it before its own engines. The self-hosted
   model is picked and stood up: `services/speech-service/` (Piper, CPU ONNX,
@@ -177,7 +214,85 @@ instead of spawning one. It is SQLite-only and refuses to start with
 - **Document routing** — per-model native PDF/vision vs derived markdown
   (capability flags exist on providers).
 
-### Rust server migration — next steps
+### Rust server migration — **closed 2026-08-07**
+
+> **The Python server is deleted.** `app/` is gone, `agent-platformd` answers
+> every route, and the proxy fallback is a 404. Everything below this box is the
+> record of how it got there; nothing in it is outstanding work. What replaced
+> the last six proxied shapes:
+>
+> | Was proxied | Now | Note |
+> |---|---|---|
+> | `POST /assistant/chat/threads` | `assistant.rs::chat_threads_create` | ~40 LOC; it was only ever proxied because it shares a path with the GET |
+> | `POST /llm-proxy/config-yaml` | `config_schema.rs` | a hand-rolled Draft 2020-12 subset that reproduces `jsonschema`'s message wording — verified against the real library on six documents |
+> | `/system/status`, `/system/logs` | `system.rs` + `observability.rs` | needed a log ring in Rust first; `logd!` feeds it and every `eprintln!` became one |
+> | `POST /upload`, `GET /file` on a `.pdf` | `documents.rs` | extractor is the `pdf-extract` crate, **not** PyMuPDF — see below |
+> | model-ops' five job routes | `model_ops.rs` | the pipeline is still Python, as a subprocess worker |
+> | `todos agent/step` naming a document | `todos.rs::merge_workspace_documents` | fell out of the PDF port |
+>
+> **Four things changed behaviour, and none of them is byte-identical.** ADR 0007
+> rule 5 ("a domain lands byte-identical or it does not land") governed the
+> strangler period; retiring the interpreter overrides it, and these are the
+> receipts:
+>
+> 1. **PDF text differs.** `pdf-extract` is not PyMuPDF. Document *shape* is
+>    preserved (title, page count, `## Page N`, the scanned-page notice) because
+>    the excerpt and the chat context are built from it, but word and line breaks
+>    inside a page differ, and **`### Layout notes` are gone** — they came from
+>    per-block bounding boxes the crate does not expose. Re-ingesting converges a
+>    workspace on the new extractor. See `documents.rs`.
+> 2. **`/system/status` renamed `python` to `server`.** It was
+>    `sys.version.split()[0]`; there is no interpreter to ask. It now reports the
+>    crate version, and `platform` is `windows-x86_64` where Python said
+>    `Windows-11-10.0.26200-SP0` (a build number needs `os_info` or three blocks
+>    of `unsafe`). The desktop's Status card and `SystemStatus` moved with it.
+> 3. **Alembic is gone.** `schema.sql` + `db::ensure_schema` create the schema
+>    from the final head (`e0f1a2b3c4d5`). **It creates; it does not migrate** —
+>    the next column change needs a versioned runner built first. Existing
+>    databases are unaffected (every statement is `IF NOT EXISTS`, and they are
+>    all at head already).
+> 4. **`/openapi.json` is a checked-in file.** FastAPI generated it from route
+>    declarations; axum cannot enumerate its own router, so the document was
+>    captured on the day `app/` was deleted and is now served verbatim from
+>    `desktop/crates/server/src/openapi.json`. **It will drift and nothing
+>    detects that** — the honest fix is `utoipa` annotations, worth doing the
+>    first time a stale entry misleads someone. It is what Settings → API renders.
+>
+> **Two features died with the interpreter, both already dead in practice.** The
+> DAG task tool-calling path (`tool_handlers.py`, 782 LOC) and the MCP client
+> that was only reachable through it: `AGENT_PLATFORM_TOOLS_ENABLED` has never
+> been set in this deployment, and `executor.rs` already *refused* to run a task
+> configured for tools rather than answering without them. That refusal is now
+> permanent — the "or run the Python server directly" escape hatch in its error
+> message is the part that is no longer true. Coder tools and the assistant's
+> action tools are unaffected; they are different code (`coder_tools.rs`,
+> `action_orchestrator.rs`).
+>
+> **What is still Python, and always will be:** `worker/` — the LoRA training
+> pipeline. It is torch and peft and there is no porting it. It is no longer a
+> *server*, though: `agent-platformd` spawns each stage as a subprocess with
+> `MODEL_OPS_PYTHON`, and the stage reports back on stdout with
+> `@@AGP:<kind>@@ {json}` markers. That is what closed the two blockers ADR 0007
+> named for this domain — `eval`'s result came back through a function return
+> (now a marker) and `register_model_entry` wrote the database from inside the
+> training child (now a marker the parent persists), so `model_build_jobs` and
+> the registry tables have one writer. Cancellation was the third: `runner.py`'s
+> module-level `_running` dict is `AppState::model_jobs`, and it works now
+> because there is only one process.
+>
+> **Proven by running it**, not by reading: a fresh database created and
+> populated from `schema.sql`; workspace → project → assistant thread created and
+> listed; a real PDF uploaded, extracted and read back through `workspace_read`;
+> `config-yaml` rejected for bad YAML and for a schema violation with the exact
+> sentence `jsonschema` produces, then accepted; a two-stage (`prepare`, `eval`)
+> build job run to `succeeded` with its `eval` result parsed off the worker's
+> stdout into `result_json`; the job's SSE stream, `cancel` 409/404, and
+> `operations/build` including its nested validation `loc`. 468 tests pass.
+
+<details>
+<summary>Historical: the strangler migration, 2026-08-05 → 2026-08-07</summary>
+
+
 
 > **Read this first if you are picking the work up cold (2026-08-06).**
 >
@@ -466,8 +581,16 @@ Ordered by what unblocks what:
      400**, where Python answers the 422 envelope. The handlers take raw
      `Bytes` and parse them, which also gets `json_invalid` (with
      `JSONDecodeError.pos` as a byte offset) and `model_attributes_type` right.
-     **The same latent bug is in every other domain that takes
-     `Option<Json<…>>`** — worth a sweep, not fixed here.
+     **The same latent bug was in every other domain that takes
+     `Option<Json<…>>`** — swept 2026-08-07: `chat.rs`, `teams.rs`,
+     `projects.rs`, `workflows.rs`, `processes.rs`, `assistant.rs`, `todos.rs`
+     and `coder.rs` (30 handlers) all now take `Bytes` and go through two new
+     shared helpers in `wire.rs` — `parse_body_typed` (required body) and
+     `parse_body_or_default` (an empty body means the same as no
+     `Content-Type` at all, i.e. defaults). `coder.rs`'s `require_body` moved
+     onto the same two rather than keeping its own copy. 213 `cargo test`
+     cases plus the 5 integration tests still pass; no route's required-vs-
+     defaulted semantics changed, only the empty-body-with-json-header crash.
    - **Pydantic reports one failure per field**: a non-string `name` is
      `string_type` alone, not `string_type` *and* `string_too_short`.
    - **A `loc` index is an integer**, not a string — `["body", "scopes", 1]`.
@@ -2206,6 +2329,8 @@ declares FKs the data does not honour, and timestamps are read and written as
 text through `wire.rs` because the same column holds both naive and `+00:00`
 values. Both are documented in the ADR's consequences.
 
+</details>
+
 ### The planning chat — the assistant roadmap's last unported surface
 
 Shipped 2026-08-06: [`agenda_chat.rs`](desktop/crates/app/src/agenda_chat.rs)
@@ -2710,8 +2835,9 @@ closed the migration's oldest split, since `auth.rs` had been reading that table
 since day one while Python owned every write. **`last_used_at` advances again**,
 which had been silently broken for every token whose traffic Rust answers. Five
 validation differences came out of the cross-render, one of which
-(`Option<Json<T>>` rejecting an empty body as a plain-text 400) **is latent in
-every other domain that takes an optional JSON body** and is worth a sweep.
+(`Option<Json<T>>` rejecting an empty body as a plain-text 400) **was latent in
+every other domain that takes an optional JSON body — swept 2026-08-07**, see
+step 6's note above.
 
 Then two more routers moved the same day. **The LLM-proxy admin surface**
 (step 7, `llm_admin.rs`) took fourteen of fifteen routes and closed the

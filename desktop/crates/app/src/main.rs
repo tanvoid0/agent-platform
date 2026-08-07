@@ -2,19 +2,33 @@
 //!
 //! Ollama-style background behavior: the window's close button asks whether to
 //! quit or minimize to tray; tray keeps the daemon running with zero windows
-//! (server keeps serving on its fixed port); the tray offers Show / Restart /
-//! Quit. Quit kills the child we spawned and
+//! (server keeps serving on its fixed port); the tray carries a live server
+//! status line plus Show / Talk to E.V. / Open logs / Restart server / Restart
+//! app / Quit. Quit kills the child we spawned and
 //! hard-exits — `iced::exit()` hangs on Windows wgpu teardown (verified in the
 //! Phase 0 spike), and the tray icon must be dropped first or it lingers.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agenda;
+mod agenda_chat;
+mod agenda_chat_view;
 mod agenda_view;
+mod apidocs;
+mod apidocs_view;
 mod assistant;
 mod assistant_view;
+mod bubble_shader;
 mod chat;
 mod chat_view;
+mod coder;
+mod coder_browser;
+mod coder_files;
+mod coder_git;
+mod coder_term;
+mod coder_notes;
+mod coder_tools;
+mod coder_view;
 mod domain;
 mod graph;
 mod history;
@@ -25,6 +39,7 @@ mod local_llm;
 #[cfg(feature = "local-llm")]
 mod local_server;
 mod library_view;
+mod logs;
 mod memory;
 mod memory_view;
 mod modelops;
@@ -47,8 +62,8 @@ use agent_platform_client::sse::ChatChunk;
 use agent_platform_client::types::SystemStatus;
 use agent_platform_client::Client;
 use iced::{window, Element, Subscription, Task};
-use shell::{Settings, Shell, ThemeMode};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use shell::{HudStyle, Settings, Shell, ThemeMode};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 /// Top-level destinations. Everything the user configures or inspects rather
@@ -63,8 +78,10 @@ pub enum Screen {
     Workflows,
     Plans,
     Agenda,
+    Coder,
     Assistant,
     Memory,
+    Logs,
     Settings,
 }
 
@@ -76,7 +93,7 @@ impl Screen {
     pub fn needs_server(self) -> bool {
         // Dashboard is the landing page and reports server health itself, so it
         // must render against a dead API rather than hide behind the guard.
-        !matches!(self, Screen::Settings | Screen::Memory | Screen::Dashboard)
+        !matches!(self, Screen::Settings | Screen::Memory | Screen::Logs | Screen::Dashboard)
     }
 
     /// The assistant and its memory share one sidebar entry and one tab strip:
@@ -92,25 +109,33 @@ impl Screen {
 pub enum SettingsTab {
     Providers,
     ModelOps,
+    Appearance,
     Status,
-    Logs,
+    Api,
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 4] =
-        [SettingsTab::Providers, SettingsTab::ModelOps, SettingsTab::Status, SettingsTab::Logs];
+    pub const ALL: [SettingsTab; 5] = [
+        SettingsTab::Providers,
+        SettingsTab::ModelOps,
+        SettingsTab::Appearance,
+        SettingsTab::Status,
+        SettingsTab::Api,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             SettingsTab::Providers => "Providers",
             SettingsTab::ModelOps => "Model ops",
+            SettingsTab::Appearance => "Appearance",
             SettingsTab::Status => "Status",
-            SettingsTab::Logs => "Logs",
+            SettingsTab::Api => "API",
         }
     }
 
     /// Gating is per tab, not per page: Status and Logs are exactly the tabs a
-    /// user needs while the server is not answering.
+    /// user needs while the server is not answering, and API still has its
+    /// connection details and quickstart to show without one.
     pub fn needs_server(self) -> bool {
         matches!(self, SettingsTab::Providers | SettingsTab::ModelOps)
     }
@@ -137,6 +162,11 @@ pub struct LogsState {
     pub filter: String,
     pub paused: bool,
     pub dropped: u64,
+    /// Absolute id of `lines[0]`. Rows are selected by absolute id, so trimming
+    /// the front of the buffer cannot silently reassign a selection to a
+    /// different line.
+    pub base: u64,
+    pub selected: std::collections::HashSet<u64>,
 }
 
 pub struct App {
@@ -147,7 +177,13 @@ pub struct App {
     /// Set while the in-app quit-or-tray prompt is up; holds the window whose
     /// close was intercepted so "Minimize to tray" knows what to hide.
     pub close_prompt: Option<window::Id>,
+    /// Whether the window has the OS focus. Work that finishes behind another
+    /// app is work the user did not see finish — see [`watching_key`].
+    pub focused: bool,
     tray: Option<TrayIcon>,
+    /// The tray's disabled status line, and the text it currently shows.
+    tray_status: Option<MenuItem>,
+    tray_status_text: String,
     /// Which plate the tray icon currently carries, so the health poll can spot
     /// an OS theme switch and repaint it.
     tray_light_plate: bool,
@@ -181,6 +217,8 @@ pub struct App {
     pub workflows: workflows::State,
     pub todos: todos::State,
     pub agenda: agenda::State,
+    pub coder: coder::State,
+    pub apidocs: apidocs::State,
 }
 
 impl App {
@@ -205,6 +243,12 @@ impl App {
     /// Whether what the user is currently looking at can actually work. The
     /// single guard: the sidebar, the settings tabs, the content area and the
     /// pollers all ask this one question, so none of them can disagree.
+    /// What the user is actually looking at — `None` while the window is
+    /// closed to the tray or sitting behind another app.
+    fn on_screen(&self) -> Option<(Screen, SettingsTab)> {
+        (self.window.is_some() && self.focused).then_some((self.screen, self.settings_tab))
+    }
+
     pub fn view_available(&self) -> bool {
         let needs_server = match self.screen {
             Screen::Settings => self.settings_tab.needs_server(),
@@ -222,6 +266,8 @@ impl App {
 pub enum Message {
     Tray(String),
     WindowOpened(window::Id),
+    /// The window gained or lost the OS focus.
+    WindowFocus(bool),
     WindowCloseRequested(window::Id),
     CloseConfirmed,
     MinimizeToTray,
@@ -238,10 +284,23 @@ pub enum Message {
     LogsTick,
     ApiLogs(Result<(Vec<String>, i64, i64), String>),
     LogFilterChanged(String),
+    /// "View logs" on a traced error banner: jump to the Logs screen filtered
+    /// to the request that failed.
+    TraceLogs(String),
     ToggleLogsPaused,
     ClearLogs,
+    /// Click a log row: toggle it in the selection.
+    ToggleLogLine(u64),
+    /// Copy the selection, or every line matching the filter when nothing is
+    /// selected — the common case is "give me what I am looking at".
+    CopyLogs,
+    SelectAllLogs,
+    ClearLogSelection,
     ToggleKeyRevealed,
     SetTheme(ThemeMode),
+    SetHudStyle(HudStyle),
+    /// How fast E.V. reads aloud, as percent of the voice's normal pace.
+    SetVoiceRate(i32),
     PickLocalModel,
     /// The GGUF for in-process inference: `None` is a cancelled picker, and an
     /// empty string clears the setting (back to server-answered turns).
@@ -264,6 +323,8 @@ pub enum Message {
     Workflows(workflows::Message),
     Todos(todos::Message),
     Agenda(agenda::Message),
+    Coder(coder::Message),
+    ApiDocs(apidocs::Message),
 }
 
 /// One frame of the app icon as RGBA, picked by its edge in pixels.
@@ -346,25 +407,72 @@ fn tray_icon_image(light_plate: bool) -> Option<tray_icon::Icon> {
     tray_icon::Icon::from_rgba(rgba, w, h).ok()
 }
 
-fn build_tray(port: u16) -> Option<TrayIcon> {
+/// The tray menu, plus the disabled status line the health poll keeps current
+/// (see [`sync_tray_status`]) — it is the only item whose text changes.
+fn build_tray(port: u16) -> Option<(TrayIcon, MenuItem)> {
     let menu = Menu::new();
-    let items = [
-        MenuItem::with_id("show", "Show Agent Platform", true, None),
-        MenuItem::with_id("server", &format!("Server: 127.0.0.1:{port}"), false, None),
-        MenuItem::with_id("restart", "Restart server", true, None),
-        MenuItem::with_id("quit", "Quit", true, None),
+    let status = MenuItem::with_id("server", &format!("Server: 127.0.0.1:{port}"), false, None);
+    menu.append(&status).ok()?;
+    let items: [&dyn tray_icon::menu::IsMenuItem; 9] = [
+        &PredefinedMenuItem::separator(),
+        &MenuItem::with_id("show", "Show Agent Platform", true, None),
+        &MenuItem::with_id("assistant", "Talk to E.V.", true, None),
+        &MenuItem::with_id("logs", "Open logs", true, None),
+        &PredefinedMenuItem::separator(),
+        &MenuItem::with_id("restart", "Restart server", true, None),
+        &MenuItem::with_id("restart-app", "Restart app", true, None),
+        &PredefinedMenuItem::separator(),
+        &MenuItem::with_id("quit", "Quit", true, None),
     ];
-    for item in &items {
+    for item in items {
         menu.append(item).ok()?;
     }
-    TrayIconBuilder::new()
+    let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Agent Platform")
         // The notification area follows the system theme, so a dark system gets
         // the light plate.
         .with_icon(tray_icon_image(shell::system_is_dark())?)
         .build()
-        .ok()
+        .ok()?;
+    Some((tray, status))
+}
+
+/// The tray's status line, rebuilt from the health poll the app already runs —
+/// no extra request, and it stays right while the window is closed.
+fn tray_status_text(app: &App) -> String {
+    let addr = format!("127.0.0.1:{}", app.shell.port);
+    match app.server_state() {
+        ServerState::Ready => {
+            let active = app.status.as_ref().map(|s| s.processes.active).unwrap_or(0);
+            format!("Server: running on {addr} · {active} active")
+        }
+        ServerState::Starting => format!("Server: starting on {addr}"),
+        ServerState::Unreachable => format!("Server: stopped ({addr})"),
+        ServerState::Conflict => format!("Server: port {} taken", app.shell.port),
+    }
+}
+
+/// Push the current status into the tray, skipping the no-op writes so an open
+/// menu is not repainted every poll.
+fn sync_tray_status(app: &mut App) {
+    let text = tray_status_text(app);
+    if text == app.tray_status_text {
+        return;
+    }
+    if let Some(item) = &app.tray_status {
+        item.set_text(&text);
+    }
+    app.tray_status_text = text;
+}
+
+/// Bring the window up for a tray action: open it if the app is running with no
+/// windows, otherwise raise the one that is already there.
+fn show_window(app: &App) -> Task<Message> {
+    match app.window {
+        Some(id) => window::gain_focus(id),
+        None => open_window(),
+    }
 }
 
 fn boot() -> (App, Task<Message>) {
@@ -424,15 +532,23 @@ fn boot() -> (App, Task<Message>) {
     }
 
     let client = Client::new(sh.origin(), key);
-    let tray = build_tray(port);
-    if tray.is_none() {
-        sh.log_line("[shell] tray unavailable".to_string());
-    }
+    let (tray, tray_status) = match build_tray(port) {
+        Some((tray, status)) => (Some(tray), Some(status)),
+        None => {
+            sh.log_line("[shell] tray unavailable".to_string());
+            (None, None)
+        }
+    };
 
     let minimized =
         settings.start_minimized || std::env::args().any(|a| a == "--minimized");
     let (chat_provider, chat_model) =
         (settings.chat_provider.clone(), settings.chat_model.clone());
+    let voice_rate = settings.voice_rate;
+    let coder_workspace = settings.coder_workspace.clone();
+    let (coder_provider, coder_model) =
+        (settings.coder_provider.clone(), settings.coder_model.clone());
+    let coder_plan = settings.coder_plan;
     let local_n_ctx = settings.local_n_ctx;
     let local_server_port = settings.local_server_port;
 
@@ -457,7 +573,12 @@ fn boot() -> (App, Task<Message>) {
         client,
         window: None,
         close_prompt: None,
+        // Corrected by the first focus event; a window that opens is focused,
+        // and one that never opens is covered by `window: None`.
+        focused: true,
         tray,
+        tray_status,
+        tray_status_text: String::new(),
         tray_light_plate: shell::system_is_dark(),
         screen: Screen::Dashboard,
         settings_tab: SettingsTab::Providers,
@@ -480,17 +601,21 @@ fn boot() -> (App, Task<Message>) {
             filter: String::new(),
             paused: false,
             dropped: 0,
+            base: 0,
+            selected: std::collections::HashSet::new(),
         },
         processes: processes::State::default(),
         library: library::State::default(),
         modelops: modelops::State::default(),
-        assistant: assistant::State::with_defaults(chat_provider, chat_model),
+        assistant: assistant::State::with_defaults(chat_provider, chat_model, voice_rate),
         memory: memory::Store::load(&app_dir),
         history: history::Store::load(&app_dir),
         providers: providers::State::default(),
         workflows: workflows::State::default(),
         todos: todos::State::default(),
         agenda: agenda::State::default(),
+        coder: coder::State::restored(&coder_workspace, coder_provider, coder_model, coder_plan),
+        apidocs: apidocs::State::default(),
     };
     let task = if minimized { Task::none() } else { open_window() };
     let bootstrap = Task::batch([
@@ -525,10 +650,38 @@ fn quit(app: &mut App) -> ! {
     std::process::exit(0)
 }
 
+/// "View logs" on any traced error banner, from any screen: jump to
+/// Settings → Logs pre-filtered to the request that failed. One request logs
+/// under the same id on both servers ([`request_id`] on the Rust side,
+/// `app/observability.py` on the Python side), so the filter finds the line
+/// regardless of which server answered.
+fn trace_logs_task(app: &mut App, trace_id: String) -> Task<Message> {
+    app.logs.filter = trace_id;
+    app.logs.paused = false;
+    app.screen = Screen::Logs;
+    app.copied = None;
+    enter_screen(app)
+}
+
 /// The one fetch the current view needs on entry. Skipped entirely while the
 /// server is not ready, so a blocked view never fires a request that can only
 /// fail — [`Message::StatusFetched`] replays it the moment the server answers.
-fn enter_screen(app: &App) -> Task<Message> {
+fn enter_screen(app: &mut App) -> Task<Message> {
+    // The Coder preview is a child window, not something iced draws, so it has
+    // no z-order against wgpu content: left alone it floats over whatever
+    // screen comes next. Leaving Coder takes it off the screen; entering puts
+    // it back (see the `Screen::Coder` arm), repositioned for a window that may
+    // have been resized while it was hidden.
+    if app.screen != Screen::Coder && app.coder.browser_open {
+        return Task::batch([
+            Task::done(Message::Coder(coder::Message::BrowserHide)),
+            enter_screen_inner(app),
+        ]);
+    }
+    enter_screen_inner(app)
+}
+
+fn enter_screen_inner(app: &mut App) -> Task<Message> {
     if !app.view_available() {
         return Task::none();
     }
@@ -542,17 +695,43 @@ fn enter_screen(app: &App) -> Task<Message> {
         Screen::Workflows => Task::done(Message::Workflows(workflows::Message::Refresh)),
         Screen::Plans => Task::done(Message::Todos(todos::Message::Refresh)),
         Screen::Agenda => Task::done(Message::Agenda(agenda::Message::Refresh)),
-        // The dropdowns need the provider catalog once; chat itself works
-        // without it, so a failed load costs nothing but empty pickers.
-        Screen::Assistant if app.assistant.catalog.is_empty() => {
-            assistant::load_catalog(&app.client).map(Message::Assistant)
+        // Past sessions every visit — another window, or the CLI, can have
+        // added one. The model dropdowns are fetched once; they change only
+        // when a provider is configured, which is a different screen.
+        Screen::Coder => {
+            let mut tasks = vec![
+                coder::load_threads(&mut app.coder, &app.client).map(Message::Coder),
+                // Checkpoints live in the folder, so another window — or the
+                // user's own `git` — can have moved them since the last visit.
+                coder::load_checkpoints(&mut app.coder).map(Message::Coder),
+            ];
+            if app.coder.catalog.is_empty() {
+                tasks.push(coder::load_catalog(&app.client).map(Message::Coder));
+            }
+            // The preview is a child window, not something iced draws, so it
+            // has to be put back on screen by hand — and repositioned, since
+            // the window may have been resized while it was hidden.
+            if app.coder.browser_open {
+                tasks.push(Task::done(Message::Coder(coder::Message::BrowserSync)));
+            }
+            Task::batch(tasks)
         }
-        Screen::Assistant | Screen::Memory => Task::none(),
+        // The dropdowns offer only configured providers, so the catalog is
+        // refetched on every entry rather than cached: configuring one in
+        // Settings has to make it selectable here without a restart. Chat
+        // itself works without it, so a failed load costs nothing but empty
+        // pickers.
+        Screen::Assistant => assistant::load_catalog(&app.client).map(Message::Assistant),
+        Screen::Memory => Task::none(),
+        Screen::Logs => Task::done(Message::LogsTick),
         Screen::Settings => match app.settings_tab {
-            SettingsTab::Logs => Task::done(Message::LogsTick),
             SettingsTab::ModelOps => Task::done(Message::ModelOps(modelops::Message::Refresh)),
             SettingsTab::Providers => Task::done(Message::Providers(providers::Message::Refresh)),
-            SettingsTab::Status => Task::none(),
+            // The endpoint list is fetched once and kept: the surface changes
+            // when the server is rebuilt, not while it runs. `Reload` on the
+            // page is the way to ask again.
+            SettingsTab::Api => Task::done(Message::ApiDocs(apidocs::Message::Refresh)),
+            SettingsTab::Status | SettingsTab::Appearance => Task::none(),
         },
     }
 }
@@ -565,22 +744,70 @@ fn fetch_status(client: &Client) -> Task<Message> {
     )
 }
 
+/// Which surface's key the user is looking at, for [`notify::away`]. `None`
+/// stands for a window that is hidden or behind another app: nothing is being
+/// watched there, so everything that finishes gets a toast.
+///
+/// Screens with no background work of their own share the empty key with that
+/// case — it matches nothing, which is exactly right for them too.
+fn watching_key(on_screen: Option<(Screen, SettingsTab)>) -> &'static str {
+    match on_screen {
+        Some((Screen::Processes, _)) => "processes",
+        Some((Screen::Coder, _)) => "coder",
+        Some((Screen::Assistant, _)) => "assistant",
+        Some((Screen::Workflows, _)) => "workflows",
+        Some((Screen::Settings, SettingsTab::ModelOps)) => "modelops",
+        _ => "",
+    }
+}
+
+/// One line of a finished turn, for its toast: the error if it failed, else the
+/// first thing it actually said.
+fn preview(error: Option<&str>, text: &str) -> String {
+    let line = error.unwrap_or(text).lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    match line.char_indices().nth(140) {
+        _ if line.is_empty() => "Finished.".to_string(),
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    }
+}
+
 fn update(app: &mut App, message: Message) -> Task<Message> {
+    let task = dispatch(app, message);
+    // Rewritten after every message rather than in the handful of arms that
+    // move the user: one write cannot drift from the screen that is actually
+    // on, and five of them can.
+    notify::watching(watching_key(app.on_screen()));
+    task
+}
+
+fn dispatch(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::Tray(id) => match id.as_str() {
-            "show" => {
-                if app.window.is_none() {
-                    open_window()
-                } else {
-                    Task::none()
-                }
-            }
+            "show" => show_window(app),
+            // The window has to exist before the nav means anything on screen,
+            // but the nav itself is state, so the order does not matter. E.V. is
+            // the Assistant tab specifically, not whichever chat tab was last
+            // open — Memory is the other one.
+            "assistant" => Task::batch([
+                show_window(app),
+                Task::done(Message::Nav(Screen::Assistant)),
+            ]),
+            "logs" => Task::batch([
+                show_window(app),
+                Task::done(Message::Nav(Screen::Logs)),
+            ]),
             "restart" => update(app, Message::RestartServer),
+            "restart-app" => update(app, Message::RestartApp),
             "quit" => quit(app),
             _ => Task::none(),
         },
         Message::WindowOpened(id) => {
             app.window = Some(id);
+            Task::none()
+        }
+        Message::WindowFocus(focused) => {
+            app.focused = focused;
             Task::none()
         }
         Message::WindowCloseRequested(id) => {
@@ -608,6 +835,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if app.close_prompt.is_some() {
                 app.close_prompt = None;
                 Task::none()
+            } else if app.assistant.sending || app.assistant.speaking() {
+                // A reply that is still arriving or still being read out loud is
+                // the most urgent thing Esc could mean.
+                update(app, Message::Assistant(assistant::Message::Abort))
             } else {
                 update(
                     app,
@@ -672,6 +903,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.status_error = Some(e);
                 }
             }
+            sync_tray_status(app);
             // The screen the user is already looking at was blocked while the
             // server came up; load it now rather than waiting for a re-click.
             if was != ServerState::Ready && app.server_state() == ServerState::Ready {
@@ -703,7 +935,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.logs.ring_cursor = chunk.next;
                 app.logs.dropped += chunk.dropped;
                 app.logs.lines.extend(chunk.lines);
-                trim_log_view(&mut app.logs.lines);
+                trim_log_view(&mut app.logs);
                 Task::none()
             }
         }
@@ -712,7 +944,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.logs.api_cursor = next;
                 app.logs.dropped += dropped.max(0) as u64;
                 app.logs.lines.extend(lines);
-                trim_log_view(&mut app.logs.lines);
+                trim_log_view(&mut app.logs);
             }
             Task::none()
         }
@@ -720,16 +952,53 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.logs.filter = f;
             Task::none()
         }
+        Message::TraceLogs(trace_id) => trace_logs_task(app, trace_id),
         Message::ToggleLogsPaused => {
             app.logs.paused = !app.logs.paused;
             Task::none()
         }
         Message::ClearLogs => {
+            app.logs.base += app.logs.lines.len() as u64;
             app.logs.lines.clear();
+            app.logs.selected.clear();
             Task::none()
+        }
+        Message::ToggleLogLine(id) => {
+            if !app.logs.selected.remove(&id) {
+                app.logs.selected.insert(id);
+            }
+            Task::none()
+        }
+        Message::SelectAllLogs => {
+            app.logs.selected = visible_log_ids(&app.logs).collect();
+            Task::none()
+        }
+        Message::ClearLogSelection => {
+            app.logs.selected.clear();
+            Task::none()
+        }
+        Message::CopyLogs => {
+            let text = copy_text(&app.logs);
+            if text.is_empty() {
+                return Task::none();
+            }
+            update(app, Message::Copy("logs", text))
         }
         Message::SetTheme(mode) => {
             app.settings.theme = mode;
+            save_settings(app);
+            Task::none()
+        }
+        Message::SetHudStyle(style) => {
+            app.settings.hud_style = style;
+            save_settings(app);
+            Task::none()
+        }
+        Message::SetVoiceRate(rate) => {
+            app.settings.voice_rate = rate;
+            // Takes effect on the next sentence synthesized, not the next
+            // restart — which is how you can hear what you just picked.
+            app.assistant.voice_rate = rate;
             save_settings(app);
             Task::none()
         }
@@ -815,18 +1084,25 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Quit => quit(app),
+        Message::Processes(processes::Message::TraceLogs(id))
+        | Message::Processes(processes::Message::Chat(chat::Message::TraceLogs(id))) => {
+            trace_logs_task(app, id)
+        }
         Message::Processes(msg) => {
             processes::update(&mut app.processes, &app.client, msg).map(Message::Processes)
         }
+        Message::Library(library::Message::TraceLogs(id)) => trace_logs_task(app, id),
         Message::Library(msg) => {
             library::update(&mut app.library, &app.client, msg).map(Message::Library)
         }
+        Message::ModelOps(modelops::Message::TraceLogs(id)) => trace_logs_task(app, id),
         Message::ModelOps(msg) => {
             modelops::update(&mut app.modelops, &app.client, msg).map(Message::ModelOps)
         }
         // The assistant takes two memory hooks: recall refreshed before every
         // message (so an edit in the dashboard lands on the next turn, not the
         // next restart) and one harvest when a reply completes.
+        Message::Assistant(assistant::Message::TraceLogs(id)) => trace_logs_task(app, id),
         Message::Assistant(msg) => {
             let closed = matches!(msg, assistant::Message::Chunk(ChatChunk::Done));
             // Autosave at the moments the thread actually changed shape: the
@@ -839,14 +1115,31 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if matches!(msg, assistant::Message::Clear) {
                 app.history.close(assistant::NAME);
             }
+            // The turn streams on its own task and does not care which screen is
+            // open, so the user is free to walk away from it — and gets told
+            // when it lands. `sending` going false is the whole turn ending, not
+            // a `Done` between tool rounds, which keeps it.
+            let was_sending = app.assistant.sending;
+            let aborted = matches!(msg, assistant::Message::Abort);
             app.assistant.memory = app.memory.system_block();
-            let turn =
-                assistant::update(&mut app.assistant, &app.client, msg).map(Message::Assistant);
+            let turn = assistant::update(&mut app.assistant, &app.client, &mut app.memory, msg)
+                .map(Message::Assistant);
             if save {
                 app.history.autosave(
                     assistant::NAME,
                     &app.assistant.messages,
                     &app.assistant.reasoning,
+                );
+            }
+            // Stopping it yourself is not news.
+            if was_sending && !app.assistant.sending && !aborted {
+                notify::away(
+                    "assistant",
+                    assistant::NAME,
+                    &preview(
+                        app.assistant.error.as_deref(),
+                        app.assistant.messages.last().map_or("", |m| m.content.as_str()),
+                    ),
                 );
             }
             // The provider/model override survives restarts: any change lands
@@ -902,12 +1195,56 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::Providers(providers::Message::TraceLogs(id)) => trace_logs_task(app, id),
         Message::Providers(msg) => {
             providers::update(&mut app.providers, &app.client, msg).map(Message::Providers)
         }
+        Message::Todos(todos::Message::TraceLogs(id)) => trace_logs_task(app, id),
         Message::Todos(msg) => todos::update(&mut app.todos, &app.client, msg).map(Message::Todos),
+        Message::Agenda(agenda::Message::TraceLogs(id))
+        | Message::Agenda(agenda::Message::Chat(agenda_chat::Message::TraceLogs(id))) => {
+            trace_logs_task(app, id)
+        }
         Message::Agenda(msg) => {
             agenda::update(&mut app.agenda, &app.client, msg).map(Message::Agenda)
+        }
+        Message::ApiDocs(apidocs::Message::TraceLogs(id)) => trace_logs_task(app, id),
+        Message::ApiDocs(msg) => {
+            apidocs::update(&mut app.apidocs, &app.client, msg).map(Message::ApiDocs)
+        }
+        Message::Coder(coder::Message::TraceLogs(id)) => trace_logs_task(app, id),
+        Message::Coder(msg) => {
+            // The folder and the model outlive the session, so they are settings
+            // rather than screen state; everything else the Coder screen holds
+            // is not.
+            let persist = matches!(
+                msg,
+                coder::Message::RootPicked(Some(_))
+                    | coder::Message::ProviderChanged(_)
+                    | coder::Message::ModelChanged(_)
+                    | coder::Message::TogglePlan(_)
+            );
+            let was_sending = app.coder.sending;
+            let task = coder::update(&mut app.coder, &app.client, msg).map(Message::Coder);
+            // Same as the assistant: the turn outlives the visit to the screen.
+            // An approval pause counts as finishing — that one is *waiting* on
+            // the user, so it is the toast that matters most.
+            if was_sending && !app.coder.sending {
+                let body = match &app.coder.pending {
+                    Some(p) => format!("Waiting for approval: {}", p.command),
+                    None => preview(app.coder.error.as_deref(), app.coder.last_reply()),
+                };
+                notify::away("coder", "Coder", &body);
+            }
+            if persist {
+                app.settings.coder_workspace =
+                    app.coder.root.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                app.settings.coder_provider = app.coder.provider.clone();
+                app.settings.coder_model = app.coder.model.clone();
+                app.settings.coder_plan = app.coder.plan;
+                save_settings(app);
+            }
+            task
         }
         Message::Workflows(msg) => {
             workflows::update(&mut app.workflows, &app.client, msg).map(Message::Workflows)
@@ -915,11 +1252,46 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     }
 }
 
-fn trim_log_view(lines: &mut Vec<String>) {
+fn trim_log_view(logs: &mut LogsState) {
     const MAX: usize = 8000;
-    if lines.len() > MAX {
-        lines.drain(..lines.len() - MAX);
+    if logs.lines.len() > MAX {
+        let cut = logs.lines.len() - MAX;
+        logs.lines.drain(..cut);
+        logs.base += cut as u64;
+        // A selected line that scrolled out of the buffer cannot be copied, so
+        // it must not keep counting toward "3 selected".
+        let base = logs.base;
+        logs.selected.retain(|id| *id >= base);
     }
+}
+
+/// Absolute ids of the lines the filter currently shows, oldest first.
+fn visible_log_ids(logs: &LogsState) -> impl Iterator<Item = u64> + '_ {
+    let filter = logs.filter.to_lowercase();
+    logs.lines.iter().enumerate().filter_map(move |(i, l)| {
+        (filter.is_empty() || l.to_lowercase().contains(&filter)).then(|| logs.base + i as u64)
+    })
+}
+
+/// What Copy puts on the clipboard: the selection if there is one, otherwise
+/// every line the filter shows.
+fn copy_text(logs: &LogsState) -> String {
+    let pick: Vec<&String> = logs
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| {
+            let id = logs.base + *i as u64;
+            if logs.selected.is_empty() {
+                let f = logs.filter.to_lowercase();
+                f.is_empty() || l.to_lowercase().contains(&f)
+            } else {
+                logs.selected.contains(&id)
+            }
+        })
+        .map(|(_, l)| l)
+        .collect();
+    pick.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
 }
 
 fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
@@ -930,6 +1302,13 @@ fn subscription(app: &App) -> Subscription<Message> {
     let mut subs = vec![
         window::close_events().map(Message::WindowClosed),
         window::close_requests().map(Message::WindowCloseRequested),
+        // Whether the user is actually in front of the app decides whether
+        // finished work gets a toast — see [`watching_key`].
+        window::events().filter_map(|(_, event)| match event {
+            window::Event::Focused => Some(Message::WindowFocus(true)),
+            window::Event::Unfocused => Some(Message::WindowFocus(false)),
+            _ => None,
+        }),
         // Tray menu events: global receiver, polled.
         Subscription::run(|| {
             iced::stream::channel(16, async |mut out| {
@@ -962,7 +1341,7 @@ fn subscription(app: &App) -> Subscription<Message> {
     let live = app.window.is_some() && app.view_available();
     let tab = |t: SettingsTab| app.screen == Screen::Settings && app.settings_tab == t;
 
-    if live && tab(SettingsTab::Logs) && !app.logs.paused {
+    if live && app.screen == Screen::Logs && !app.logs.paused {
         subs.push(iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::LogsTick));
     }
     if live && app.screen == Screen::Processes {
@@ -970,6 +1349,53 @@ fn subscription(app: &App) -> Subscription<Message> {
             iced::time::every(std::time::Duration::from_secs(3))
                 .map(|_| Message::Processes(processes::Message::ListTick)),
         );
+    }
+    // The open shell's PTY. Not gated on the screen or the window: the terminal
+    // is a live process the user started, and a `cargo build` must keep printing
+    // into it while they read the transcript — or while they are on another
+    // screen entirely. It ends when they close the drawer, which is what drops
+    // the session.
+    // The preview's child window is positioned in window coordinates, so a
+    // resize moves the hole out from under it until it is told. Only while it
+    // is actually on screen: everywhere else it is hidden anyway.
+    if app.screen == Screen::Coder && app.coder.browser_open {
+        subs.push(
+            window::resize_events()
+                .map(|_| Message::Coder(coder::Message::BrowserSync)),
+        );
+    }
+    if let Some(session) = app.coder.term.as_ref() {
+        subs.push(session.0.subscription().map(|e| Message::Coder(coder::Message::Term(e))));
+    }
+    // The Coder screen's clock. A turn in flight, or one parked on the approval
+    // gate — both are waits the user is sitting through. Otherwise nothing is
+    // counting, and a permanent 1s timer would wake the app for no reason.
+    if app.coder.sending || app.coder.pending.is_some() {
+        subs.push(
+            iced::time::every(std::time::Duration::from_secs(1))
+                .map(|_| Message::Coder(coder::Message::Tick)),
+        );
+    }
+    // The Coder screen's spinner. Same idea as the clock above but faster and
+    // wider: it also runs for a sidebar fetch, which has no seconds worth
+    // counting but still needs to say "in progress" as something other than a
+    // blank list.
+    if app.coder.sending
+        || app.coder.pending.is_some()
+        || app.coder.threads_loading
+        || app.coder.checkpoints_loading
+    {
+        subs.push(
+            iced::time::every(std::time::Duration::from_millis(90))
+                .map(|_| Message::Coder(coder::Message::AnimTick)),
+        );
+    }
+    // A run the user walked away from keeps its poll and its stream: leaving the
+    // page does not stop the run, and this poll is what notices it go terminal
+    // and fires the completion toast. The list above is display only, so it
+    // stops with the page.
+    let watching_run = live && app.screen == Screen::Processes;
+    if watching_run || app.processes.is_live() {
         if app.processes.selected.is_some() {
             subs.push(
                 iced::time::every(app.processes.detail_poll_interval())
@@ -994,15 +1420,36 @@ fn subscription(app: &App) -> Subscription<Message> {
     // The Dashboard embeds E.V.'s live HUD, so it needs the same heartbeat. On
     // the assistant screen the tick is the HUD, the mic gate and the speech
     // queue — all three are voice mode, so text mode runs at 0 fps.
+    // Settings → Appearance previews the picked animation, so it needs the beat
+    // too — otherwise you choose between two still frames.
     let hud_live = (app.screen == Screen::Assistant && app.assistant.voice)
-        || app.screen == Screen::Dashboard;
+        || app.screen == Screen::Dashboard
+        || tab(SettingsTab::Appearance);
     if live && hud_live {
+        // Frames, not a timer: this fires once per drawn frame at the display's
+        // own rate, so the animation lands on the compositor's schedule instead
+        // of fighting it. A `time::every(16ms)` on Windows is quantised to the
+        // ~15.6 ms system tick, which is what made a 60 fps animation stutter.
+        // The analyzer inside still steps at a fixed 60 Hz.
         subs.push(
-            iced::time::every(assistant::TICK)
-                .map(|_| Message::Assistant(assistant::Message::Tick)),
+            iced::window::frames().map(|at| Message::Assistant(assistant::Message::Tick(at))),
+        );
+    } else if app.assistant.busy() {
+        // Walking away does not stop the reply. The tokens arrive on their own
+        // task either way, but the speech queue and the audio sink are drained
+        // from this beat — so with no canvas to drive it (another screen, or no
+        // window at all) it comes off a timer instead, and E.V. finishes the
+        // sentence it was in the middle of. `frames()` needs something drawing;
+        // this does not, and there is no animation left to stutter.
+        subs.push(
+            iced::time::every(std::time::Duration::from_millis(16))
+                .map(|at| Message::Assistant(assistant::Message::Tick(at))),
         );
     }
-    if live && tab(SettingsTab::ModelOps) && app.modelops.job_running() {
+    // Build jobs run on the server, so the poll that reports one finished has to
+    // outlive the visit to the tab that started it — same reason as the run
+    // above. `job_running` is false unless a job is actually in flight.
+    if app.modelops.job_running() {
         subs.push(
             iced::time::every(app.modelops.poll_interval())
                 .map(|_| Message::ModelOps(modelops::Message::JobTick)),
@@ -1097,12 +1544,75 @@ mod tests {
         assert_eq!(count(&light, [255, 78, 62]), count(&dark, [255, 78, 62]), "robot changed");
     }
 
+    /// The whole notification rule: a toast fires unless the user is looking
+    /// straight at the thing that finished. Getting this backwards means either
+    /// no toast at all or one for work that is already on screen.
+    #[test]
+    fn only_the_screen_in_front_of_the_user_suppresses_its_own_toast() {
+        let tab = SettingsTab::Providers;
+        assert_eq!(watching_key(Some((Screen::Coder, tab))), "coder");
+        assert_eq!(watching_key(Some((Screen::Assistant, tab))), "assistant");
+        // Same page, other tab: the conversation is not on screen.
+        assert_eq!(watching_key(Some((Screen::Memory, tab))), "");
+        // Model ops is a tab, so the screen alone is not enough.
+        assert_eq!(watching_key(Some((Screen::Settings, tab))), "");
+        assert_eq!(watching_key(Some((Screen::Settings, SettingsTab::ModelOps))), "modelops");
+        // Hidden, or behind another app: nothing is being watched, so nothing
+        // may match — including the screen that is technically still selected.
+        assert_eq!(watching_key(None), "");
+        for screen in [Screen::Processes, Screen::Coder, Screen::Assistant, Screen::Workflows] {
+            assert_ne!(watching_key(Some((screen, tab))), watching_key(None));
+        }
+    }
+
+    /// The toast body is one line of someone else's markdown, so it has to
+    /// survive an empty reply and a multi-byte cut.
+    #[test]
+    fn a_toast_says_one_line_and_prefers_the_error() {
+        assert_eq!(preview(None, "Done.\n\nDetails below."), "Done.");
+        assert_eq!(preview(None, "\n\n  indented  \n"), "indented");
+        assert_eq!(preview(Some("stream failed"), "half an answer"), "stream failed");
+        assert_eq!(preview(None, ""), "Finished.");
+        let long = "é".repeat(300);
+        assert!(preview(None, &long).ends_with('…'), "a long line is cut");
+    }
+
+    /// Selection survives the buffer wrapping: ids are absolute, so trimming
+    /// the front must not hand a selection to a different line.
+    #[test]
+    fn copying_follows_the_selection_not_the_row_position() {
+        let mut logs = LogsState {
+            lines: (0..3).map(|i| format!("line {i}")).collect(),
+            ring_cursor: 0,
+            api_cursor: 0,
+            filter: String::new(),
+            paused: false,
+            dropped: 0,
+            base: 0,
+            selected: [1, 2].into_iter().collect(),
+        };
+        assert_eq!(copy_text(&logs), "line 1
+line 2");
+
+        // The buffer wraps by one: ids stay put, the dropped selection goes.
+        logs.lines.remove(0);
+        logs.base += 1;
+        logs.selected.retain(|id| *id >= logs.base);
+        assert_eq!(copy_text(&logs), "line 1
+line 2");
+        logs.selected.clear();
+        logs.filter = "line 2".into();
+        assert_eq!(copy_text(&logs), "line 2", "no selection copies what the filter shows");
+        assert_eq!(visible_log_ids(&logs).collect::<Vec<_>>(), vec![2]);
+    }
+
     /// The guard is only useful if it leaves a way out. Settings must open with
     /// no server, and at least one of its tabs must work there — that is where
     /// the user finds out what went wrong.
     #[test]
     fn diagnostics_stay_reachable_without_a_server() {
         assert!(!Screen::Settings.needs_server());
+        assert!(!Screen::Logs.needs_server(), "logs must open against a dead API");
         assert!(!Screen::Dashboard.needs_server(), "the landing page must open against a dead API");
         for screen in [
             Screen::Processes,
@@ -1111,6 +1621,9 @@ mod tests {
             Screen::Workflows,
             Screen::Plans,
             Screen::Agenda,
+            // The Coder screen's tools run here, but the agent loop it answers
+            // to is the server's — a dead API means no turn to answer.
+            Screen::Coder,
             Screen::Assistant,
         ]
         {
@@ -1119,6 +1632,6 @@ mod tests {
 
         let usable: Vec<_> =
             SettingsTab::ALL.iter().filter(|t| !t.needs_server()).map(|t| t.label()).collect();
-        assert_eq!(usable, vec!["Status", "Logs"]);
+        assert_eq!(usable, vec!["Appearance", "Status", "API"]);
     }
 }

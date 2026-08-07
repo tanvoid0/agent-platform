@@ -142,15 +142,20 @@ impl Store {
         if !self.enabled || self.items.is_empty() {
             return None;
         }
+        // Each fact carries its id: without one, "forget the thing about Rust"
+        // makes the model guess which row that is, and a live run watched it
+        // guess wrong and delete the user's address instead.
         let facts = self
             .items
             .iter()
-            .map(|m| format!("- {}", m.text))
+            .map(|m| format!("- [{}] {}", m.id, m.text))
             .collect::<Vec<_>>()
             .join("\n");
         Some(format!(
             "What you remember about the user from previous conversations. Use it \
-             when it is relevant and never recite it back unprompted:\n{facts}"
+             when it is relevant and never recite it back unprompted. The bracketed \
+             number is the memory's id for update_memory and forget — never say an \
+             id out loud:\n{facts}"
         ))
     }
 
@@ -250,6 +255,141 @@ impl Store {
     }
 }
 
+// --- The toolkit ------------------------------------------------------------
+// Harvest is the passive half: it guesses. These are the active half — what the
+// assistant reaches for when the user *says* "remember this", "that's wrong,
+// change it" or "forget that". Without them the only honest answer to "forget
+// my address" was to open the dashboard and do it by hand.
+
+/// Tool names handled here. The assistant checks this before dispatching a call
+/// to the terminal.
+pub const TOOLS: [&str; 4] = ["list_memories", "remember", "update_memory", "forget"];
+
+/// The memory half of the assistant's tool spec, in OpenAI function form.
+pub fn tools_spec() -> Vec<serde_json::Value> {
+    let tool = |name: &str, description: &str, properties: serde_json::Value, required: &[&str]| {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                }
+            }
+        })
+    };
+    let text = |description: &str| serde_json::json!({ "type": "string", "description": description });
+    let id = serde_json::json!({
+        "type": "integer",
+        "description": "The id from list_memories."
+    });
+    vec![
+        tool(
+            "list_memories",
+            "List every long-term memory with its id. Call this before updating or \
+             forgetting one — the id is the only way to name it.",
+            serde_json::json!({}),
+            &[],
+        ),
+        tool(
+            "remember",
+            "Save one durable fact about the user to long-term memory. Use it when the \
+             user asks you to remember something.",
+            serde_json::json!({
+                "text": text("The fact, as a short third-person statement. \"Lives in London.\"")
+            }),
+            &["text"],
+        ),
+        tool(
+            "update_memory",
+            "Replace the text of one remembered fact, when the user corrects it.",
+            serde_json::json!({ "id": id, "text": text("The corrected fact.") }),
+            &["id", "text"],
+        ),
+        tool(
+            "forget",
+            "Delete one remembered fact for good, when the user asks you to forget it.",
+            serde_json::json!({ "id": id }),
+            &["id"],
+        ),
+    ]
+}
+
+/// Run one memory tool call. `None` means the call was for some other tool.
+///
+/// Synchronous and infallible on purpose: the store is right here in memory, and
+/// every problem the model can cause (a bad id, a blank fact, memory switched
+/// off) is answered in the tool result so it can correct itself.
+pub fn run_tool(store: &mut Store, name: &str, arguments: &str) -> Option<String> {
+    if !TOOLS.contains(&name) {
+        return None;
+    }
+    if !store.enabled {
+        return Some(
+            "error: long-term memory is switched off. Tell the user to turn it back on \
+             in the Memory dashboard."
+                .into(),
+        );
+    }
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    let text = clean(args.get("text").and_then(|v| v.as_str()).unwrap_or_default());
+    // Models write an id as a number or as a string, depending on the day.
+    let id = args.get("id").and_then(|v| {
+        v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    });
+    let missing = |id: u64| format!("error: no memory with id {id}. Call list_memories first.");
+
+    Some(match name {
+        "list_memories" if store.items.is_empty() => "(nothing remembered yet)".into(),
+        "list_memories" => store.items.iter().map(|m| format!("{}: {}\n", m.id, m.text)).collect(),
+        "remember" if text.is_empty() => {
+            "error: remember needs {\"text\": \"the fact\"}".into()
+        }
+        "remember" => {
+            if store.add(text, crate::assistant::NAME) {
+                let id = store.items.last().expect("add() just pushed").id;
+                store.save();
+                format!("Remembered, id {id}.")
+            } else {
+                "Already remembered — nothing added.".into()
+            }
+        }
+        "update_memory" | "forget" if id.is_none() => {
+            format!("error: {name} needs {{\"id\": <number>}} — the id from list_memories.")
+        }
+        "update_memory" if text.is_empty() => {
+            "error: update_memory needs the new {\"text\": \"…\"}; use forget to delete."
+                .into()
+        }
+        // Both echo what they hit, so a wrong id is visible in the transcript
+        // instead of being a silent deletion the user finds out about later.
+        "update_memory" => match store.items.iter_mut().find(|m| m.id == id.unwrap()) {
+            Some(item) => {
+                let was = std::mem::replace(&mut item.text, text);
+                store.save();
+                format!("Updated memory {}: was \"{was}\".", id.unwrap())
+            }
+            None => missing(id.unwrap()),
+        },
+        "forget" => {
+            let id = id.unwrap();
+            match store.items.iter().find(|m| m.id == id).map(|m| m.text.clone()) {
+                // Through the same path as the dashboard's delete, so a row open
+                // in the editor is closed rather than left editing a ghost.
+                Some(was) => {
+                    let _ = update(store, Message::Delete(id));
+                    format!("Forgotten: \"{was}\".")
+                }
+                None => missing(id),
+            }
+        }
+        _ => unreachable!("TOOLS and this match are the same list"),
+    })
+}
+
 const HARVESTER: &str = "You maintain an AI assistant's long-term memory of its user. \
 From the exchange you are given, extract only durable facts that would still be \
 useful months later in a completely unrelated conversation: the user's identity, \
@@ -275,6 +415,10 @@ fn parse_harvest(reply: &str) -> Vec<String> {
                 // A model that decides to explain itself does it in a sentence
                 // about memory, not in a fact about the user.
                 && line.len() > 3
+                // A bare label like "Remembered:" or "Note:" is the model
+                // narrating the act of saving rather than stating a fact — a
+                // real memory is a full sentence, never just a trailing colon.
+                && !line.ends_with(':')
         })
         .take(MAX_PER_HARVEST)
         .collect()
@@ -479,6 +623,9 @@ mod tests {
         assert!(parse_harvest("").is_empty());
         // A chatty model must not push out real facts.
         assert_eq!(parse_harvest("a\nb\nOne.\nTwo.\nThree.\nFour.").len(), MAX_PER_HARVEST);
+        // A bare "Remembered:" is the model narrating the save, not a fact —
+        // seen live, stored as a memory with no content.
+        assert_eq!(parse_harvest("Remembered:\nPrefers Rust."), vec!["Prefers Rust."]);
     }
 
     #[test]
@@ -497,7 +644,8 @@ mod tests {
         assert_eq!(s.system_block(), None, "nothing remembered, nothing to say");
         s.add("Prefers Rust.".into(), "Chat");
         let block = s.system_block().expect("a fact makes a block");
-        assert!(block.contains("- Prefers Rust."));
+        // The id rides along: it is what update_memory and forget are given.
+        assert!(block.contains(&format!("- [{}] Prefers Rust.", s.items[0].id)));
 
         s.enabled = false;
         assert_eq!(s.system_block(), None, "off means off, without losing the facts");
@@ -553,6 +701,68 @@ mod tests {
         let _ = update(&mut s, Message::EditChanged("   ".into()));
         let _ = update(&mut s, Message::SaveEdit);
         assert!(s.items.is_empty());
+    }
+
+    /// The whole point of the toolkit: what the user asks for out loud —
+    /// remember, correct, forget — lands in the store on that turn.
+    #[test]
+    fn the_toolkit_reads_writes_corrects_and_deletes() {
+        let mut s = store();
+        let run = |s: &mut Store, name: &str, args: &str| {
+            run_tool(s, name, args).expect("a memory tool")
+        };
+
+        assert!(run(&mut s, "list_memories", "{}").contains("nothing remembered"));
+        assert!(run(&mut s, "remember", r#"{"text":"Lives in London."}"#).contains("id 1"));
+        assert_eq!(s.items[0].source, crate::assistant::NAME);
+        // A second identical fact is not a second memory.
+        assert!(run(&mut s, "remember", r#"{"text":"lives in london"}"#).contains("Already"));
+        assert_eq!(s.items.len(), 1);
+
+        run(&mut s, "remember", r#"{"text":"Prefers Rust."}"#);
+        let listed = run(&mut s, "list_memories", "{}");
+        assert!(listed.contains("1: Lives in London.") && listed.contains("2: Prefers Rust."));
+
+        // Ids come back as strings about as often as numbers.
+        assert!(run(&mut s, "update_memory", r#"{"id":"1","text":"Lives in Leeds."}"#)
+            .contains("Updated"));
+        assert_eq!(s.items[0].text, "Lives in Leeds.");
+        assert!(run(&mut s, "forget", r#"{"id":2}"#).contains("Forgotten"));
+        assert_eq!(s.items.len(), 1);
+
+        // Everything written is on disk, not just in this Store.
+        assert_eq!(Store::load(&s.dir).items.len(), 1);
+
+        // Bad calls answer the model instead of doing something arbitrary.
+        assert!(run(&mut s, "forget", r#"{"id":99}"#).contains("no memory with id 99"));
+        assert!(run(&mut s, "update_memory", "{}").starts_with("error:"));
+        assert!(run(&mut s, "remember", r#"{"text":"  "}"#).starts_with("error:"));
+        assert!(run(&mut s, "remember", "not json").starts_with("error:"));
+        assert_eq!(s.items.len(), 1, "nothing was written by a broken call");
+
+        // Not a memory tool → not this module's business.
+        assert!(run_tool(&mut s, "run_command", "{}").is_none());
+
+        // Memory off means off for the model too, in both directions.
+        s.enabled = false;
+        assert!(run(&mut s, "remember", r#"{"text":"Uses Windows."}"#).contains("switched off"));
+        assert!(run(&mut s, "list_memories", "{}").contains("switched off"));
+        assert_eq!(s.items.len(), 1);
+    }
+
+    /// The model is only told about tools it can actually reach.
+    #[test]
+    fn every_advertised_tool_is_a_handled_one() {
+        let spec = tools_spec();
+        let names: Vec<String> = spec
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, TOOLS);
+        let mut s = store();
+        for name in &names {
+            assert!(run_tool(&mut s, name, "{}").is_some(), "{name} is advertised but unhandled");
+        }
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub fn view(state: &State, kind: Kind) -> Element<'_, Message> {
 
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
     if let Some(err) = &state.error {
-        blocks.push(dismissible(ui::alert_error(err.clone())));
+        blocks.push(dismissible(ui::alert_error_traced(err, Message::TraceLogs)));
     }
 
     blocks.push(match (&state.draft, kind) {

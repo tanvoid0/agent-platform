@@ -46,7 +46,7 @@ use sqlx::FromRow;
 use crate::auth::Principal;
 use crate::error::{ApiError, PathId};
 use crate::teams::{parse_roster, resolved_team_color, with_default_accents, TeamRoster};
-use crate::wire::{iso_from_sql, sql_now, sql_time, sql_time_opt};
+use crate::wire::{iso_from_sql, parse_body_or_default, sql_now, sql_time, sql_time_opt};
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -724,10 +724,15 @@ async fn start_process(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     headers: HeaderMap,
-    body: Option<Json<StartProcessRequest>>,
+    // Raw bytes, not `Option<Json<StartProcessRequest>>`: axum's `Json`
+    // extractor only yields `None` for a body-less request with no
+    // `Content-Type` at all — an empty body sent *with* `application/json`
+    // (an argument-less POST from most clients) fails to parse and axum
+    // answers its own plain-text 400 before this handler runs.
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     principal.require_scope("process:write")?;
-    let req = body.map(|Json(req)| req).unwrap_or_default();
+    let req: StartProcessRequest = parse_body_or_default(&body)?;
 
     let mut errors = Vec::new();
     if req.goal.is_none() {
@@ -852,12 +857,15 @@ async fn approve_dag(
     principal: Principal,
     headers: HeaderMap,
     PathId(process_id): PathId<i64>,
-    body: Option<Json<ApproveDagRequest>>,
+    // Raw bytes, not `Option<Json<ApproveDagRequest>>` — see `start_process`'s
+    // comment.
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     principal.require_scope("process:write")?;
     let proc = accessible_process(&state, &principal, &headers, process_id).await?;
 
-    let dag_json = body.map(|Json(req)| req).unwrap_or_default().dag_json.ok_or_else(|| {
+    let req: ApproveDagRequest = parse_body_or_default(&body)?;
+    let dag_json = req.dag_json.ok_or_else(|| {
         ApiError::validation(vec![ApiError::field_error("dag_json", "missing", "Field required")])
     })?;
 
@@ -922,12 +930,14 @@ async fn review_task(
     principal: Principal,
     headers: HeaderMap,
     PathId((process_id, task_id)): PathId<(i64, i64)>,
-    body: Option<Json<ReviewTaskRequest>>,
+    // Raw bytes, not `Option<Json<ReviewTaskRequest>>` — see `start_process`'s
+    // comment.
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     principal.require_scope("process:write")?;
     let proc = accessible_process(&state, &principal, &headers, process_id).await?;
 
-    let req = body.map(|Json(req)| req).unwrap_or_default();
+    let req: ReviewTaskRequest = parse_body_or_default(&body)?;
     let decision = match req.decision.as_deref() {
         None => {
             return Err(ApiError::validation(vec![ApiError::field_error(
@@ -1572,7 +1582,7 @@ async fn stream_events(
                     // Python's generator would raise and drop the connection; the
                     // client reconnects either way.
                     Err(e) => {
-                        eprintln!("[agent-platformd] process stream: {e}");
+                        logd!("process stream: {e}");
                         return None;
                     }
                 };
@@ -1594,7 +1604,7 @@ async fn stream_events(
             {
                 Ok(rows) => rows,
                 Err(e) => {
-                    eprintln!("[agent-platformd] process stream: {e}");
+                    logd!("process stream: {e}");
                     return None;
                 }
             };

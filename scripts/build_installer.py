@@ -5,8 +5,12 @@
 
 Orchestrates:
     cargo build --release -p agent-platform-desktop   (desktop/target/release/agent-platform.exe)
-    python scripts/bundle_server.py                    (desktop/payload/)
     iscc desktop/installer/agent-platform.iss           (dist/agent-platform-setup.exe)
+
+There is no bundling step any more. It used to run scripts/bundle_server.py to
+assemble an embedded CPython plus the whole app/ package into desktop/payload/;
+the server is Rust now, and the only Python that ships is worker/, which the
+.iss copies straight from the checkout.
 
 Windows only — this app has only ever been built and run on Windows; macOS/Linux
 packaging (and their own signing/notarization) is not implemented.
@@ -124,7 +128,6 @@ def main() -> None:
         build += ["--features", features]
     _run(build, cwd=DESKTOP)
     check_local_llm_dlls(features)
-    _run([sys.executable, str(REPO / "scripts" / "bundle_server.py")])
     sign_exe()
     _run([iscc, str(ISS)])
 

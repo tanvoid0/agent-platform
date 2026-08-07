@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Smoke checks for unified local dev and Docker workflows.
+"""Smoke checks for local dev and Docker workflows.
 
-Runs offline checks (hygiene + fast API tests). Optionally probes a running server.
+Runs offline checks (hygiene + the Rust test suite). Optionally probes a running
+server.
+
+The offline half used to be `pytest -m contract` inside `app/`. That package is
+gone (ADR 0007) and the contract tests went with it — the equivalent now lives
+in the server crate, so this shells out to cargo. It is slower than pytest was;
+`--skip-tests` still gets you hygiene alone.
 """
 
 from __future__ import annotations
@@ -26,18 +32,11 @@ def run_hygiene() -> int:
 
 
 def run_api_smoke_tests() -> int:
-    return _run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-m",
-            "contract",
-            "-q",
-            "--tb=short",
-        ],
-        cwd=REPO_ROOT / "app",
-    )
+    # `--target-dir` is deliberately left alone: if the desktop app is running it
+    # holds `desktop/target/debug/agent-platformd.exe` and this will fail to
+    # link. That is the documented trade (see CLAUDE.md) and a clear error beats
+    # this script quietly building into a second directory.
+    return _run(["cargo", "test", "-q"], cwd=REPO_ROOT / "desktop")
 
 
 def probe_health(base_url: str) -> int:

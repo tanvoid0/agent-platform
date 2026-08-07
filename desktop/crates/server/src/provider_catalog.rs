@@ -482,24 +482,35 @@ pub async fn build(http: &reqwest::Client, options: CatalogOptions) -> Value {
             }
         }
 
-        if models.is_empty() {
-            models = alias_rows(&aliases);
-            if configured && reachable.is_none() {
-                reachable = Some(false);
-            }
-        }
-        if models.is_empty() {
-            models = alias_rows(&fallback_models(provider, &aliases));
-        }
-        if models.is_empty() && !default_for_row.is_empty() {
-            models = vec![json!({ "id": default_for_row, "source": "alias" })];
-        }
+        // A local backend we actually asked and could not reach has no models,
+        // imaginary or otherwise — the alias/UI-fallback/provider-default ladder
+        // is for a cloud provider having a bad moment, not "go start the app".
+        let offline_local =
+            matches!(provider, "ollama" | "lm_studio") && options.include_live && reachable == Some(false);
 
-        if default_provider == provider && !default_model.is_empty() {
-            default_for_row = default_model.clone();
-        } else if let Some(first) = models.first().and_then(|m| m.get("id")).and_then(Value::as_str)
-        {
-            default_for_row = first.to_string();
+        if !offline_local {
+            if models.is_empty() {
+                models = alias_rows(&aliases);
+                if configured && reachable.is_none() {
+                    reachable = Some(false);
+                }
+            }
+            if models.is_empty() {
+                models = alias_rows(&fallback_models(provider, &aliases));
+            }
+            if models.is_empty() && !default_for_row.is_empty() {
+                models = vec![json!({ "id": default_for_row, "source": "alias" })];
+            }
+
+            if default_provider == provider && !default_model.is_empty() {
+                default_for_row = default_model.clone();
+            } else if let Some(first) =
+                models.first().and_then(|m| m.get("id")).and_then(Value::as_str)
+            {
+                default_for_row = first.to_string();
+            }
+        } else {
+            default_for_row = String::new();
         }
 
         providers.push(json!({
@@ -577,44 +588,58 @@ pub async fn build_admin(http: &reqwest::Client) -> Value {
         let configured = *configured;
         let aliases = aliases_by_provider.get(*provider).cloned().unwrap_or_default();
         let mut model_source = source.map(str::to_string);
-        let mut warning: Option<&str> = None;
+        let mut warning: Option<String> = None;
         let mut fallback_note: Option<&str> = None;
 
         let discovered_any = discovered.as_ref().is_some_and(|ids| !ids.is_empty());
         let mut models: Vec<String> = discovered.unwrap_or_default();
-        if models.is_empty() && !aliases.is_empty() {
-            models = aliases.clone();
-            model_source = Some("config_aliases".into());
-            fallback_note = Some("Provider catalog unavailable; using config.yaml aliases.");
-        }
-        if models.is_empty() {
-            models = fallback_models(provider, &aliases);
-            if !models.is_empty() {
-                model_source = Some("ui_fallback_models".into());
-                fallback_note =
-                    Some("Provider catalog unavailable; using configured UI fallback models.");
+        // A local backend that is not running has no models, imaginary or
+        // otherwise — the alias/UI-fallback/provider-default ladder below exists
+        // for a cloud provider having a bad moment, not for "go start the app".
+        let is_local = matches!(*provider, "ollama" | "lm_studio");
+        let offline_local = is_local && configured && !discovered_any;
+
+        if !offline_local {
+            if models.is_empty() && !aliases.is_empty() {
+                models = aliases.clone();
+                model_source = Some("config_aliases".into());
+                fallback_note = Some("Provider catalog unavailable; using config.yaml aliases.");
+            }
+            if models.is_empty() {
+                models = fallback_models(provider, &aliases);
+                if !models.is_empty() {
+                    model_source = Some("ui_fallback_models".into());
+                    fallback_note =
+                        Some("Provider catalog unavailable; using configured UI fallback models.");
+                }
             }
         }
         let default_model_for_row = default_model_for_provider(provider);
-        if models.is_empty() && !default_model_for_row.is_empty() {
+        if !offline_local && models.is_empty() && !default_model_for_row.is_empty() {
             models = vec![default_model_for_row.to_string()];
             model_source = Some("provider_default".into());
             fallback_note = Some("Provider catalog unavailable; using the provider default model.");
         }
-        if configured && !discovered_any && fallback_note.is_none() {
+        if offline_local {
+            warning = Some(format!("{} is not running or not reachable.", provider_label(provider)));
+        } else if configured && !discovered_any && fallback_note.is_none() {
             warning =
-                Some("Provider did not return a model catalog; fallback values are being used.");
+                Some("Provider did not return a model catalog; fallback values are being used.".into());
         }
         let model_source = model_source.unwrap_or_else(|| "unavailable".into());
 
-        let mut selected = default_model_for_row.to_string();
-        if default_provider == *provider && !default_model.is_empty() {
-            selected = default_model.clone();
-        } else if let Some(first) = models.first() {
-            selected = first.clone();
+        let mut selected = String::new();
+        let mut options = Vec::new();
+        if !offline_local {
+            selected = default_model_for_row.to_string();
+            if default_provider == *provider && !default_model.is_empty() {
+                selected = default_model.clone();
+            } else if let Some(first) = models.first() {
+                selected = first.clone();
+            }
+            options.push(selected.clone());
+            options.extend(models);
         }
-        let mut options = vec![selected.clone()];
-        options.extend(models);
 
         providers.push(json!({
             "id": provider,

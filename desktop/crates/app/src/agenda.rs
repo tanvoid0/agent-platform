@@ -6,11 +6,12 @@
 //! reviewer's pending suggestions. Cards are *completed* here rather than moved
 //! — Plans is the screen for moving things through columns.
 
+use crate::agenda_chat;
 use agent_platform_client::types::*;
 use agent_platform_client::Client;
 use iced::Task;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct State {
     pub projects: Vec<ProjectSummary>,
     pub project: Option<i64>,
@@ -23,6 +24,9 @@ pub struct State {
     pub loading: bool,
     pub busy: bool,
     pub error: Option<String>,
+    /// The planning chat beside the board. It proposes what goes on the board,
+    /// so it follows this screen's project rather than picking its own.
+    pub chat: agenda_chat::State,
 }
 
 impl Default for State {
@@ -36,6 +40,7 @@ impl Default for State {
             loading: false,
             busy: false,
             error: None,
+            chat: agenda_chat::State::default(),
         }
     }
 }
@@ -53,6 +58,9 @@ impl State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// "View logs" on a traced error banner — intercepted in `main::update`
+    /// before it reaches here, so this arm exists only to satisfy exhaustiveness.
+    TraceLogs(String),
     Refresh,
     ProjectsLoaded(Result<Vec<ProjectSummary>, String>),
     SelectProject(i64),
@@ -66,6 +74,7 @@ pub enum Message {
     /// Any write finished; the dashboard is refetched rather than patched.
     Done(Result<(), String>),
     Dismiss,
+    Chat(agenda_chat::Message),
 }
 
 fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
@@ -105,11 +114,13 @@ fn reload(state: &State, client: &Client) -> Task<Message> {
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
+        Message::TraceLogs(_) => Task::none(),
         Message::Refresh => {
             state.loading = true;
             Task::batch([refresh(client), reload(state, client)])
         }
         Message::ProjectsLoaded(Ok(projects)) => {
+            state.error = None;
             // Open the first project on a cold start; an assistant board is
             // created server-side on first read, so there is always something.
             let first = projects.first().map(|p| p.id);
@@ -120,13 +131,17 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                     Some(id) => {
                         state.project = Some(id);
                         state.loading = true;
-                        load(client, id, &state.horizon)
+                        Task::batch([
+                            load(client, id, &state.horizon),
+                            agenda_chat::set_project(&mut state.chat, client, Some(id))
+                                .map(Message::Chat),
+                        ])
                     }
                     None => {
                         state.loading = false;
                         state.dashboard = None;
                         state.project = None;
-                        Task::none()
+                        agenda_chat::set_project(&mut state.chat, client, None).map(Message::Chat)
                     }
                 },
             }
@@ -139,7 +154,10 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.dashboard = None;
             state.reviews.clear();
             state.loading = true;
-            load(client, id, &state.horizon)
+            Task::batch([
+                load(client, id, &state.horizon),
+                agenda_chat::set_project(&mut state.chat, client, Some(id)).map(Message::Chat),
+            ])
         }
         Message::SetHorizon(horizon) => {
             if state.horizon == horizon {
@@ -151,10 +169,12 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         }
         Message::DashboardLoaded(Ok(dashboard)) => {
             state.loading = false;
+            state.error = None;
             state.dashboard = Some(*dashboard);
             Task::none()
         }
         Message::ReviewsLoaded(Ok(reviews)) => {
+            state.error = None;
             state.reviews = reviews;
             Task::none()
         }
@@ -198,6 +218,19 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Dismiss => {
             state.error = None;
             Task::none()
+        }
+        // An applied proposal writes to the board this screen is showing, so the
+        // board is refetched alongside the chat's own reload — the point of
+        // putting the two side by side is that the rows appear as they are
+        // approved.
+        Message::Chat(msg) => {
+            let board_changed = matches!(msg, agenda_chat::Message::Applied(Ok(_)));
+            let task = agenda_chat::update(&mut state.chat, client, msg).map(Message::Chat);
+            if board_changed {
+                Task::batch([task, reload(state, client)])
+            } else {
+                task
+            }
         }
 
         Message::ProjectsLoaded(Err(e))

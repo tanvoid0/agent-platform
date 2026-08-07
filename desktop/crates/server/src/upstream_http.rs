@@ -97,8 +97,8 @@ pub async fn send_with_retry(
             Err(e) => {
                 if should_retry_transport(&e, transport_attempt, policy.max_retries) {
                     let delay = backoff(transport_attempt, policy.backoff_ms);
-                    eprintln!(
-                        "[agent-platformd] retry {context} attempt={}/{} delay={:.2}s url={} err={}",
+                    logd!(
+                        "retry {context} attempt={}/{} delay={:.2}s url={} err={}",
                         transport_attempt + 1,
                         policy.max_retries,
                         delay.as_secs_f64(),
@@ -137,8 +137,8 @@ pub async fn send_with_retry(
                 .filter(|s| *s >= 0.0)
                 .map(|s| Duration::from_secs_f64(s.min(30.0)))
                 .unwrap_or_else(|| backoff(rate_limit_attempt, policy.rate_limit_backoff_ms));
-            eprintln!(
-                "[agent-platformd] rate_limited {context} attempt={}/{} delay={:.2}s url={} status={}",
+            logd!(
+                "rate_limited {context} attempt={}/{} delay={:.2}s url={} status={}",
                 rate_limit_attempt + 1,
                 policy.rate_limit_max_retries,
                 delay.as_secs_f64(),
@@ -192,8 +192,8 @@ pub async fn open_stream(
                 .filter(|s| *s >= 0.0)
                 .map(|s| Duration::from_secs_f64(s.min(30.0)))
                 .unwrap_or_else(|| backoff(rate_limit_attempt, policy.rate_limit_backoff_ms));
-            eprintln!(
-                "[agent-platformd] rate_limited {context} attempt={}/{} delay={:.2}s status={status}",
+            logd!(
+                "rate_limited {context} attempt={}/{} delay={:.2}s status={status}",
                 rate_limit_attempt + 1,
                 policy.rate_limit_max_retries,
                 delay.as_secs_f64(),

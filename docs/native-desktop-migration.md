@@ -1,5 +1,12 @@
 # Native desktop migration
 
+> **Paths in this document predate the Rust migration.** The FastAPI server
+> (`app/`) was deleted on 2026-08-07 — every route it describes is now served by
+> `agent-platformd` (`desktop/crates/server/src/`), byte-identically except for the
+> four changes listed in `plan.md`'s migration section. This document is the history of how the desktop got here and is
+> deliberately not updated. See [ADR 0007](adr/0007-strangler-rust-server.md).
+
+
 Replacing the Tauri + WebView2 shell with a native Rust UI (iced), keeping the
 existing Python server as a child process.
 

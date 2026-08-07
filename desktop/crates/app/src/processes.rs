@@ -258,6 +258,9 @@ impl State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// "View logs" on a traced error banner — intercepted in `main::update`
+    /// before it reaches here, so this arm exists only to satisfy exhaustiveness.
+    TraceLogs(String),
     // data in
     ListTick,
     Listed(Result<Vec<ProcessRecord>, String>),
@@ -356,6 +359,7 @@ fn fetch_detail(client: &Client, id: i64) -> Task<Message> {
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
+        Message::TraceLogs(_) => Task::none(),
         Message::ListTick => {
             // Teams/projects are fetched at boot, before the app's own server has
             // finished starting — that first request fails. Retry on the list
@@ -367,6 +371,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             Task::batch(tasks)
         }
         Message::Listed(Ok(list)) => {
+            state.error = None;
             state.processes = list;
             // Auto-select the newest run so the pane is never blank on first load.
             if state.selected.is_none() {
@@ -396,10 +401,10 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Detailed(Ok(detail)) => {
             let previous = state.selected_process().map(|p| p.status);
             if became_terminal(previous, detail.process.status) {
-                crate::notify::job_finished(
+                crate::notify::away(
+                    "processes",
                     &format!("Run #{}", detail.process.id),
-                    &detail.process.goal,
-                    detail.process.status.as_str(),
+                    &format!("{}: {}", detail.process.goal, detail.process.status.as_str()),
                 );
             }
             state.detail = Some(*detail);

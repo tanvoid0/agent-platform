@@ -168,8 +168,8 @@ pub fn sanitize_llm_model_alias(value: &str) -> Option<String> {
         .map(|c| if ('\u{2010}'..='\u{2015}').contains(&c) { '-' } else { c })
         .collect();
     if is_role_slug(&folded.to_lowercase()) {
-        eprintln!(
-            "[agent-platformd] ignoring llm model {} \
+        logd!(
+            "ignoring llm model {} \
              (looks like a role/skill slug, not a proxy model alias)",
             py_repr(&folded)
         );

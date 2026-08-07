@@ -9,13 +9,6 @@
 //! only ever write the columns a user edited (`UPDATE … SET title = ?`), never
 //! a whole row.
 //!
-//! **One request shape still goes to Python.** `agent/step` may name workspace
-//! documents, and reading those means the workspace filesystem — path
-//! normalisation, the traversal guard, and PDF text extraction through PyMuPDF,
-//! which has no Rust equivalent. Rather than grow a second traversal guard here
-//! for the domain that has not migrated yet, a step that names a document is
-//! handed to `proxy::forward` whole. See [`agent_step`].
-//!
 //! `spawn-process` is also the one place here that writes the `process` table.
 //! It inserts a `pending` row and stops — the response tells the caller to
 //! `POST /processes/{id}/sync` — so it needs no executor. Its snapshot builder
@@ -23,7 +16,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, Request, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -42,7 +35,7 @@ use crate::teams::{
     parse_roster, random_palette_color, resolved_team_color, stable_palette_color,
     with_default_accents, TeamRoster,
 };
-use crate::wire::{check_len, datetime_to_sql, sql_now, sql_time, sql_time_opt};
+use crate::wire::{check_len, datetime_to_sql, parse_body_typed, sql_now, sql_time, sql_time_opt};
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -491,7 +484,12 @@ async fn create_board(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Query(q): Query<ProjectQuery>,
-    body: Option<Json<BoardCreate>>,
+    // Raw bytes, not `Option<Json<BoardCreate>>`: axum's `Json` extractor
+    // only yields `None` for a body-less request with no `Content-Type` at
+    // all — an empty body sent *with* `application/json` (an argument-less
+    // POST from most clients) fails to parse and axum answers its own
+    // plain-text 400 before this handler runs.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
     if principal.workspace_id.is_some() {
@@ -501,9 +499,12 @@ async fn create_board(
         crate::projects::assert_access(&state, &principal, project_id).await?;
     }
 
-    let Json(req) = body.ok_or_else(|| {
-        ApiError::validation(vec![ApiError::field_error("name", "missing", "Field required")])
-    })?;
+    if body.is_empty() {
+        return Err(ApiError::validation(vec![ApiError::field_error(
+            "name", "missing", "Field required",
+        )]));
+    }
+    let req: BoardCreate = parse_body_typed(&body)?;
     let mut errors = Vec::new();
     match req.name.as_deref() {
         None => errors.push(ApiError::field_error("name", "missing", "Field required")),
@@ -633,13 +634,18 @@ async fn update_board(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId(board_id): PathId<i64>,
-    body: Option<Json<BoardUpdate>>,
+    // Raw bytes, not `Option<Json<BoardUpdate>>` — see `create_board`'s
+    // comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
     assert_board_access(&state, &principal, board_id).await?;
     load_board(&state, board_id).await?;
 
-    let Json(req) = body.ok_or_else(|| ApiError::validation(vec![]))?;
+    if body.is_empty() {
+        return Err(ApiError::validation(vec![]));
+    }
+    let req: BoardUpdate = parse_body_typed(&body)?;
     let mut errors = Vec::new();
     check_len(&mut errors, &["name"], req.name.as_deref(), 1, 256);
     check_len(&mut errors, &["default_model"], req.default_model.as_deref(), 0, 128);
@@ -735,15 +741,20 @@ async fn create_category(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId(board_id): PathId<i64>,
-    body: Option<Json<CategoryCreate>>,
+    // Raw bytes, not `Option<Json<CategoryCreate>>` — see `create_board`'s
+    // comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
     assert_board_access(&state, &principal, board_id).await?;
     load_board(&state, board_id).await?;
 
-    let Json(req) = body.ok_or_else(|| {
-        ApiError::validation(vec![ApiError::field_error("name", "missing", "Field required")])
-    })?;
+    if body.is_empty() {
+        return Err(ApiError::validation(vec![ApiError::field_error(
+            "name", "missing", "Field required",
+        )]));
+    }
+    let req: CategoryCreate = parse_body_typed(&body)?;
     let mut errors = Vec::new();
     match req.name.as_deref() {
         None => errors.push(ApiError::field_error("name", "missing", "Field required")),
@@ -811,13 +822,18 @@ async fn update_category(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId((board_id, category_id)): PathId<(i64, i64)>,
-    body: Option<Json<CategoryUpdate>>,
+    // Raw bytes, not `Option<Json<CategoryUpdate>>` — see `update_board`'s
+    // comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
     assert_board_access(&state, &principal, board_id).await?;
     load_category(&state, board_id, category_id).await?;
 
-    let Json(req) = body.ok_or_else(|| ApiError::validation(vec![]))?;
+    if body.is_empty() {
+        return Err(ApiError::validation(vec![]));
+    }
+    let req: CategoryUpdate = parse_body_typed(&body)?;
     let mut errors = Vec::new();
     check_len(&mut errors, &["name"], req.name.as_deref(), 1, 128);
     check_len(&mut errors, &["color"], req.color.as_deref(), 0, 32);
@@ -956,15 +972,20 @@ async fn create_item(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId(board_id): PathId<i64>,
-    body: Option<Json<ItemCreate>>,
+    // Raw bytes, not `Option<Json<ItemCreate>>` — see `create_board`'s
+    // comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
     assert_board_access(&state, &principal, board_id).await?;
     load_board(&state, board_id).await?;
 
-    let Json(req) = body.ok_or_else(|| {
-        ApiError::validation(vec![ApiError::field_error("title", "missing", "Field required")])
-    })?;
+    if body.is_empty() {
+        return Err(ApiError::validation(vec![ApiError::field_error(
+            "title", "missing", "Field required",
+        )]));
+    }
+    let req: ItemCreate = parse_body_typed(&body)?;
     let mut errors = Vec::new();
     match req.title.as_deref() {
         None => errors.push(ApiError::field_error("title", "missing", "Field required")),
@@ -1029,14 +1050,15 @@ async fn update_item(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId(item_id): PathId<i64>,
-    body: Option<Json<Value>>,
+    // Raw bytes, not `Option<Json<Value>>` — see `create_board`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
     assert_item_access(&state, &principal, item_id).await?;
     let item = load_item(&state, item_id).await?;
 
-    let patch: Map<String, Value> = match body {
-        Some(Json(Value::Object(map))) => map,
+    let patch: Map<String, Value> = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(map)) => map,
         _ => Map::new(),
     };
     let str_field = |key: &str| patch.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -2117,12 +2139,15 @@ async fn spawn_process(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId(item_id): PathId<i64>,
-    body: Option<Json<SpawnProcessRequest>>,
+    // Raw bytes, not `Option<Json<SpawnProcessRequest>>` — see
+    // `create_board`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:write")?;
     assert_item_access(&state, &principal, item_id).await?;
 
-    let req = body.map(|Json(req)| req);
+    let req: Option<SpawnProcessRequest> =
+        if body.is_empty() { None } else { Some(parse_body_typed(&body)?) };
     let team_template_id = match req.as_ref().and_then(|r| r.team_template_id) {
         None => {
             return Err(ApiError::validation(vec![ApiError::field_error(
@@ -2750,27 +2775,6 @@ struct StepRequest {
 const DEFAULT_STEP_GOAL: &str = "What should I do next for this task?";
 
 impl StepRequest {
-    /// Would `merge_workspace_documents` read anything?
-    ///
-    /// This is the whole reason the route can still reach Python, so it mirrors
-    /// that function's guard exactly rather than approximating it: the request's
-    /// own `document_paths` is copied into the context by the route, a
-    /// `document_path` is only consulted when `document_paths` is absent or
-    /// null, and any other type there makes Python return without reading a
-    /// file.
-    fn names_documents(&self) -> bool {
-        if !self.document_paths.is_empty() {
-            return true;
-        }
-        match self.context.get("document_paths") {
-            Some(Value::Array(paths)) => !paths.is_empty(),
-            None | Some(Value::Null) => self
-                .context
-                .get("document_path")
-                .is_some_and(crate::action_orchestrator::py_truthy),
-            Some(_) => false,
-        }
-    }
 }
 
 /// FastAPI validates the body before the handler runs, so every error here
@@ -2871,6 +2875,73 @@ fn parse_step_request(raw: &[u8]) -> Result<StepRequest, ApiError> {
     Ok(StepRequest { goal, model, context, document_paths })
 }
 
+/// `agent_bridge.merge_workspace_documents`: attach an excerpt of each named
+/// document to the planner's context.
+///
+/// Every failure is per-document and non-fatal — an unreadable path becomes a
+/// `{"path", "error"}` entry so the model can say so, rather than failing the
+/// step. A board with no project reads nothing at all.
+async fn merge_workspace_documents(state: &AppState, item: &ItemRow, context: &mut Map<String, Value>) {
+    // `context.get("document_paths")`, falling back to a single
+    // `document_path` **only when the list key is absent or null** — a present
+    // non-list makes the function return without reading anything.
+    let paths: Vec<String> = match context.get("document_paths") {
+        Some(Value::Array(items)) => {
+            items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+        }
+        Some(other) if !other.is_null() => return,
+        _ => match context.get("document_path").and_then(Value::as_str) {
+            Some(one) if !one.is_empty() => vec![one.to_string()],
+            _ => return,
+        },
+    };
+    if paths.is_empty() {
+        return;
+    }
+
+    let project_id: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT project_id FROM todo_boards WHERE id = ?")
+            .bind(item.board_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+    let Some(project_id) = project_id.flatten().filter(|id| *id != 0) else { return };
+
+    let mut docs: Vec<Value> = Vec::new();
+    for raw in paths {
+        let rel = raw.trim();
+        if rel.is_empty() {
+            continue;
+        }
+        match crate::documents::read_for_llm(project_id, rel) {
+            Ok(payload) => {
+                let content = payload.get("content").and_then(Value::as_str).unwrap_or_default();
+                // `len(content) > 8000` — characters, and the marker replaces
+                // nothing, it is appended to the first 8000.
+                let excerpt = if content.chars().count() > 8000 {
+                    let head: String = content.chars().take(8000).collect();
+                    format!("{head}
+
+_(truncated)_")
+                } else {
+                    content.to_string()
+                };
+                docs.push(json!({
+                    "path": payload.get("path").cloned().unwrap_or_else(|| Value::from(rel)),
+                    "content_kind": payload.get("content_kind").cloned().unwrap_or(Value::Null),
+                    "excerpt": excerpt,
+                }));
+            }
+            Err(e) => docs.push(json!({ "path": rel, "error": e.code() })),
+        }
+    }
+
+    if !docs.is_empty() {
+        context.insert("workspace_documents".into(), Value::Array(docs));
+    }
+}
+
 #[derive(Serialize)]
 struct AgentStepResponse {
     thought: Option<String>,
@@ -2885,37 +2956,18 @@ struct AgentStepResponse {
 /// for the user to accept through `agent/apply`, and the only write is one
 /// appended `agent_step` event.
 ///
-/// **A step that names a workspace document is forwarded to Python whole.**
-/// `merge_workspace_documents` reads through the workspace filesystem — path
-/// normalisation, the traversal guard under the project directory, and for a
-/// PDF with no derived markdown yet, extraction through PyMuPDF, which has no
-/// Rust equivalent at all. The alternatives were both worse: porting the text
-/// half would put a second path-traversal guard in the tree for a domain that
-/// migrates in step 4 anyway, and would leave a request that names a PDF
-/// answering from an error stub where Python answers from the document's text.
-/// Handing the request over keeps Python's answer *exactly* for the case Python
-/// is still needed for, and keeps Rust's for the case — no documents — that is
-/// almost all of them. `health` in `lib.rs` delegates the same way.
-///
-/// The body is parsed before the handover so a malformed request still gets
-/// this server's 422 rather than a round trip, and because Python's own
-/// validation runs first too.
+/// A step that names workspace documents reads them here, through
+/// [`merge_workspace_documents`]. That single call is what kept this route
+/// reaching Python: the read goes through the sandbox guard and, for a PDF,
+/// through text extraction, and neither had a Rust side. Both do now
+/// ([`crate::documents`]), so the handover is gone.
 async fn agent_step(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId(item_id): PathId<i64>,
-    request: Request,
+    raw: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    let (parts, body) = request.into_parts();
-    let raw = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .map_err(|_| ApiError::bad_request("Could not read request body"))?;
     let req = parse_step_request(&raw)?;
-
-    if req.names_documents() {
-        let forwarded = Request::from_parts(parts, axum::body::Body::from(raw));
-        return Ok(crate::proxy::forward(State(state), forwarded).await);
-    }
 
     require_scope(&principal, "todos:write")?;
     assert_item_access(&state, &principal, item_id).await?;
@@ -2947,6 +2999,13 @@ async fn agent_step(
     let mut context = build_item_context_json(&state, &item, &profile).await?;
     // `context.update(extra_context)`: the caller's keys win over the item's.
     context.extend(req.context);
+    // `if req.document_paths: ctx["document_paths"] = list(...)` — the request
+    // field overwrites whatever the caller's own `context` put under that key,
+    // and an empty list leaves it alone.
+    if !req.document_paths.is_empty() {
+        context.insert("document_paths".into(), Value::from(req.document_paths.clone()));
+    }
+    merge_workspace_documents(&state, &item, &mut context).await;
     if !profile.system_prompt.is_empty() {
         context.insert("planner_system_prompt".into(), json!(profile.system_prompt));
     }

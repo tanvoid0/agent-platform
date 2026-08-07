@@ -1,18 +1,23 @@
 # Desktop shell
 
-Native Rust ([iced](https://iced.rs)) app that draws its own UI and runs the ordinary
-agent-platform Python server beside it as a child process. The server is not modified for
-desktop — see [ADR 0004](../docs/adr/0004-desktop-shell-tauri-python-sidecar.md) for the
-sidecar rationale (written for the earlier Tauri shell; the child-process contract is
-unchanged) and [`docs/native-desktop-migration.md`](../docs/native-desktop-migration.md)
-for the migration off Tauri/WebView2.
+Native Rust ([iced](https://iced.rs)) app that draws its own UI and runs the
+agent-platform server beside it as a child process. That server is
+`agent-platformd` (`crates/server`), also in this workspace — it was a Python
+process until [ADR 0007](../docs/adr/0007-strangler-rust-server.md) finished on
+2026-08-07, and the child-process contract did not change when it moved.
+
+See [ADR 0004](../docs/adr/0004-desktop-shell-tauri-python-sidecar.md) for the
+sidecar rationale (written for the earlier Tauri shell) and
+[`docs/native-desktop-migration.md`](../docs/native-desktop-migration.md) for the
+migration off Tauri/WebView2.
 
 ## Layout
 
 ```
 desktop/
-  crates/client/    HTTP + SSE client, generated enums, DAG validation
+  crates/client/    HTTP + SSE client, contract enums, DAG validation
   crates/app/       the iced application
+  crates/server/    agent-platformd — the API server the app spawns
 ```
 
 ## Run it
@@ -21,7 +26,7 @@ desktop/
 cd desktop && cargo run -p agent-platform-desktop
 ```
 
-Opens the window and spawns `scripts/start.py` on a free loopback port (or attaches to one
+Opens the window and spawns `agent-platformd` on a free loopback port (or attaches to one
 already running, after verifying the per-install key). The window does not wait for
 `/health`: Status polls, and Logs shows the server's output from the first line, so a start
 that fails is visible in the app.

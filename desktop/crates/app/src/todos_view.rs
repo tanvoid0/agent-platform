@@ -34,7 +34,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
     if let Some(err) = &state.error {
         blocks.push(
             ui::cluster(vec![
-                container(ui::alert_error(err.clone())).width(Length::Fill).into(),
+                container(ui::alert_error_traced(err, Message::TraceLogs)).width(Length::Fill).into(),
                 ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss),
             ])
             .into(),
@@ -142,9 +142,13 @@ fn board(state: &State) -> Element<'_, Message> {
         Column::with_children(vec![
             composer.into(),
             // Columns scroll sideways rather than squeezing: five of them below
-            // ~1000px would leave cards too narrow to read.
+            // ~1000px would leave cards too narrow to read. The `spacing` is the
+            // scrollbar's own gutter — iced 0.14 floats it over the content, and
+            // without this it sits on the bottom row of every column (an empty
+            // one renders as a half-cut "—").
             scrollable(Row::with_children(columns).spacing(space::SM))
                 .direction(scrollable::Direction::Horizontal(Default::default()))
+                .spacing(space::SM)
                 .into(),
         ])
         .spacing(space::MD),

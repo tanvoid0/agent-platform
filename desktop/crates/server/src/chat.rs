@@ -39,7 +39,7 @@ use axum::extract::State;
 use axum::http::{header::CONTENT_TYPE, HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::Router;
 use futures::channel::mpsc;
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -48,6 +48,7 @@ use crate::auth::{Principal, ProxyPrincipal};
 use crate::context_budget::{fit_chat_messages_for_request, max_output_tokens_default};
 use crate::dag_schema::sanitize_llm_model_alias;
 use crate::error::ApiError;
+use crate::wire::parse_body;
 use crate::{env_opt, AppState};
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -61,17 +62,16 @@ async fn chat(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     // FastAPI validates the body during dependency solving, so a malformed one
-    // 422s before `require_scope` is ever reached. Same order here.
-    body: Option<Json<Value>>,
+    // 422s before `require_scope` is ever reached. Same order here. Read as raw
+    // `Bytes`, not `Option<Json<Value>>`: axum's `Json` extractor only yields
+    // `None` when `Content-Type` is absent — an empty body *with*
+    // `application/json` set (what an argument-less POST from most clients
+    // looks like) fails to parse and axum answers its own plain-text 400
+    // before this handler runs, never the 422 envelope the comment above
+    // promises.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    // ponytail: `None` also covers a body that is present but unparseable, or
-    // sent without `application/json` — FastAPI reports `json_invalid` for the
-    // first and parses the second anyway. Same 422, different entry.
-    let Json(body) = body.ok_or_else(|| {
-        ApiError::validation(vec![json!({
-            "type": "missing", "loc": ["body"], "msg": "Field required",
-        })])
-    })?;
+    let body = parse_body(&body)?;
     let payload = payload_from(body)?;
 
     principal.require_scope("chat:write")?;

@@ -51,7 +51,7 @@ use crate::coder_tools::{make_executor, Executor};
 use crate::context_budget::{tool_result_soft_cap_tokens, truncate_text_to_tokens};
 use crate::dag_schema::python_json;
 use crate::error::ApiError;
-use crate::wire::{iso_from_sql, sql_now};
+use crate::wire::{iso_from_sql, parse_body_or_default, parse_body_typed, sql_now};
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -358,10 +358,12 @@ struct ThreadCreateRequest {
 async fn threads_create(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    body: Option<Json<ThreadCreateRequest>>,
+    // Raw bytes, not `Option<Json<ThreadCreateRequest>>` — see
+    // `require_body`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_chat_write(&principal)?;
-    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let req: ThreadCreateRequest = parse_body_or_default(&body)?;
     let mut errors = Vec::new();
     check_len(&mut errors, "title", req.title.as_deref(), 128);
     check_len(&mut errors, "workspace_root", req.workspace_root.as_deref(), 1024);
@@ -645,7 +647,7 @@ async fn finish_stream(
     stop: Option<TurnStop>,
 ) {
     if let Err(e) = p.write(state).await {
-        eprintln!("[agent-platformd] coder thread {} persist failed: {e}", p.thread_id);
+        logd!("coder thread {} persist failed: {e}", p.thread_id);
     }
     if matches!(stop, Some(TurnStop::ClientGone)) {
         return;
@@ -832,14 +834,19 @@ fn require_thread_id(thread_id: Option<i64>) -> Result<i64, ApiError> {
     }
 }
 
-/// A body that failed to deserialize is FastAPI's `{"loc": ["body"], "type":
-/// "missing"}` — the shape `assistant.rs` already answers with.
-fn require_body<T: Default>(body: Option<Json<T>>) -> Result<T, ApiError> {
-    body.map(|Json(b)| b).ok_or_else(|| {
-        ApiError::validation(vec![json!({
+/// A missing body is FastAPI's `{"loc": ["body"], "type": "missing"}` — the
+/// shape `assistant.rs` already answers with. Takes raw bytes, not
+/// `Option<Json<T>>`: axum's `Json` extractor only yields `None` for a
+/// body-less request with no `Content-Type` at all — an empty body sent
+/// *with* `application/json` (an argument-less POST from most clients) fails
+/// to parse and axum answers its own plain-text 400 before the handler runs.
+fn require_body<T: serde::de::DeserializeOwned>(body: &axum::body::Bytes) -> Result<T, ApiError> {
+    if body.is_empty() {
+        return Err(ApiError::validation(vec![json!({
             "type": "missing", "loc": ["body"], "msg": "Field required",
-        })])
-    })
+        })]));
+    }
+    parse_body_typed(body)
 }
 
 /// `api_auth.agent_platform_client_header` — what picks the delegated executor.
@@ -880,10 +887,12 @@ async fn chat_send(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     headers: HeaderMap,
-    body: Option<Json<SendRequest>>,
+    // Raw bytes, not `Option<Json<SendRequest>>` — see `require_body`'s
+    // comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_chat_write(&principal)?;
-    let body = require_body(body)?;
+    let body: SendRequest = require_body(&body)?;
     let message = body.validate()?.to_string();
     require_master_key(&state)?;
 
@@ -979,10 +988,12 @@ async fn chat_stream(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     headers: HeaderMap,
-    body: Option<Json<SendRequest>>,
+    // Raw bytes, not `Option<Json<SendRequest>>` — see `require_body`'s
+    // comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_chat_write(&principal)?;
-    let body = require_body(body)?;
+    let body: SendRequest = require_body(&body)?;
     let message = body.validate()?.to_string();
     require_master_key(&state)?;
 
@@ -1082,10 +1093,12 @@ async fn chat_retry(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     headers: HeaderMap,
-    body: Option<Json<RetryRequest>>,
+    // Raw bytes, not `Option<Json<RetryRequest>>` — see `require_body`'s
+    // comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_chat_write(&principal)?;
-    let body = require_body(body)?;
+    let body: RetryRequest = require_body(&body)?;
     let thread_id = require_thread_id(body.thread_id)?;
     let mut errors = Vec::new();
     check_len(&mut errors, "workspace_root", body.common.workspace_root.as_deref(), 1024);
@@ -1123,7 +1136,7 @@ async fn chat_retry(
             pending: None,
         };
         if let Err(e) = pre.write(&state).await {
-            eprintln!("[agent-platformd] coder retry {} truncate failed: {e}", thread.id);
+            logd!("coder retry {} truncate failed: {e}", thread.id);
         }
 
         let setup = resolve_workspace(&thread, req.workspace_root.as_deref()).and_then(|root| {
@@ -1197,10 +1210,12 @@ async fn chat_approve(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     headers: HeaderMap,
-    body: Option<Json<ApprovalRequest>>,
+    // Raw bytes, not `Option<Json<ApprovalRequest>>` — see `require_body`'s
+    // comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_chat_write(&principal)?;
-    let body = require_body(body)?;
+    let body: ApprovalRequest = require_body(&body)?;
     let mut errors = Vec::new();
     if body.thread_id.is_none() {
         errors.push(ApiError::field_error("thread_id", "missing", "Field required"));
@@ -1398,10 +1413,12 @@ struct ToolResultRequest {
 async fn chat_tool_result(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    body: Option<Json<ToolResultRequest>>,
+    // Raw bytes, not `Option<Json<ToolResultRequest>>` — see `require_body`'s
+    // comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_chat_write(&principal)?;
-    let body = require_body(body)?;
+    let body: ToolResultRequest = require_body(&body)?;
     let thread_id = require_thread_id(body.thread_id)?;
     let call_id = match body.call_id.as_deref() {
         None => {

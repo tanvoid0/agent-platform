@@ -1,0 +1,512 @@
+-- Generated from Alembic head e0f1a2b3c4d5. See db.rs::ensure_schema.
+--
+-- `playground_chat_threads` was in that head and is not here: the playground was
+-- deleted rather than ported, so no code reads or writes it and a fresh install
+-- should not be given the table. An existing database keeps its own copy — this
+-- file only creates.
+
+CREATE TABLE IF NOT EXISTS action_sessions (
+	id INTEGER NOT NULL, 
+	client_id VARCHAR(256), 
+	action_set_id INTEGER NOT NULL, 
+	goal TEXT NOT NULL, 
+	context_json TEXT, 
+	status VARCHAR(32) DEFAULT 'active' NOT NULL, 
+	current_step INTEGER DEFAULT '0' NOT NULL, 
+	max_steps INTEGER DEFAULT '10' NOT NULL, 
+	execution_mode VARCHAR(16) DEFAULT 'client' NOT NULL, 
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	completed_at DATETIME, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(action_set_id) REFERENCES action_sets (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS action_sets (
+	id INTEGER NOT NULL, 
+	client_id VARCHAR(256), 
+	name VARCHAR(255) NOT NULL, 
+	description TEXT, 
+	metadata_json TEXT, 
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	PRIMARY KEY (id)
+);
+
+CREATE TABLE IF NOT EXISTS actions (
+	id INTEGER NOT NULL, 
+	set_id INTEGER NOT NULL, 
+	action_id VARCHAR(128) NOT NULL, 
+	name VARCHAR(255) NOT NULL, 
+	description TEXT NOT NULL, 
+	parameters_json TEXT DEFAULT '{}' NOT NULL, 
+	execution_mode VARCHAR(16) DEFAULT 'client' NOT NULL, 
+	endpoint VARCHAR(512), 
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(set_id) REFERENCES action_sets (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS api_token_usage_daily (
+	id INTEGER NOT NULL, 
+	token_id INTEGER NOT NULL, 
+	usage_date VARCHAR(10) NOT NULL, 
+	request_count INTEGER DEFAULT '0' NOT NULL, 
+	error_count INTEGER DEFAULT '0' NOT NULL, 
+	total_tokens INTEGER DEFAULT '0' NOT NULL, 
+	total_cost FLOAT DEFAULT '0.0' NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(token_id) REFERENCES api_tokens (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS "api_tokens" (
+	id INTEGER NOT NULL, 
+	project_id INTEGER, 
+	name VARCHAR(256) NOT NULL, 
+	prefix VARCHAR(32) NOT NULL, 
+	token_hash VARCHAR(64) NOT NULL, 
+	scopes_json TEXT DEFAULT '[]' NOT NULL, 
+	status VARCHAR(16) DEFAULT 'active' NOT NULL, 
+	rate_limit_per_minute INTEGER, 
+	expires_at DATETIME, 
+	last_used_at DATETIME, 
+	revoked_at DATETIME, 
+	revoked_reason VARCHAR(512), 
+	held_reason VARCHAR(512), 
+	total_requests INTEGER DEFAULT '0' NOT NULL, 
+	total_errors INTEGER DEFAULT '0' NOT NULL, 
+	total_tokens INTEGER DEFAULT '0' NOT NULL, 
+	total_cost FLOAT DEFAULT '0.0' NOT NULL, 
+	created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL, 
+	updated_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL, 
+	workspace_id INTEGER, 
+	PRIMARY KEY (id), 
+	CONSTRAINT fk_api_tokens_workspace_id_workspace FOREIGN KEY(workspace_id) REFERENCES workspace (id), 
+	FOREIGN KEY(project_id) REFERENCES project (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS assistant_chat_threads (
+	id INTEGER NOT NULL, 
+	project_id INTEGER NOT NULL, 
+	messages_json VARCHAR, 
+	pending_actions_json VARCHAR, 
+	last_profile_slug VARCHAR(64), 
+	created_at DATETIME NOT NULL, 
+	updated_at DATETIME NOT NULL, title VARCHAR(128), 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(project_id) REFERENCES project (id)
+);
+
+CREATE TABLE IF NOT EXISTS assistant_domain_profiles (
+	id INTEGER NOT NULL, 
+	project_id INTEGER NOT NULL, 
+	domain VARCHAR(64) NOT NULL, 
+	profile_json VARCHAR, 
+	created_at DATETIME NOT NULL, 
+	updated_at DATETIME NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(project_id) REFERENCES project (id)
+);
+
+CREATE TABLE IF NOT EXISTS assistant_reviews (
+	id INTEGER NOT NULL, 
+	project_id INTEGER NOT NULL, 
+	status VARCHAR(32) NOT NULL, 
+	summary VARCHAR, 
+	stats_json VARCHAR, 
+	proposed_actions_json VARCHAR, 
+	created_at DATETIME NOT NULL, 
+	updated_at DATETIME NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(project_id) REFERENCES project (id)
+);
+
+CREATE TABLE IF NOT EXISTS coder_chat_threads (
+	id INTEGER NOT NULL, 
+	title VARCHAR(128), 
+	workspace_root VARCHAR(1024), 
+	messages_json TEXT, 
+	pending_call_json TEXT, 
+	model VARCHAR(128), 
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	PRIMARY KEY (id)
+);
+
+CREATE TABLE IF NOT EXISTS "eventlog" (
+                        id INTEGER NOT NULL,
+                        process_id INTEGER NOT NULL,
+                        task_id INTEGER,
+                        event_type VARCHAR NOT NULL,
+                        content VARCHAR NOT NULL,
+                        created_at DATETIME NOT NULL,
+                        PRIMARY KEY (id),
+                        FOREIGN KEY(process_id) REFERENCES process (id),
+                        FOREIGN KEY(task_id) REFERENCES tasknode (id)
+                    );
+
+CREATE TABLE IF NOT EXISTS "model_build_jobs" (
+	id INTEGER NOT NULL, 
+	project_id INTEGER, 
+	stages_json TEXT NOT NULL, 
+	status VARCHAR(32) NOT NULL, 
+	current_stage VARCHAR(32), 
+	log_path VARCHAR(1024), 
+	result_json TEXT, 
+	register_alias VARCHAR(128), 
+	error_message VARCHAR(2048), 
+	process_id INTEGER, 
+	created_at DATETIME NOT NULL, 
+	started_at DATETIME, 
+	finished_at DATETIME, 
+	job_type VARCHAR(32) DEFAULT 'pipeline' NOT NULL, 
+	operation_json TEXT, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(project_id) REFERENCES model_projects (id)
+);
+
+CREATE TABLE IF NOT EXISTS model_projects (
+	id INTEGER NOT NULL, 
+	name VARCHAR(128) NOT NULL, 
+	description VARCHAR(512), 
+	manifest_json TEXT, 
+	workspace_id INTEGER, 
+	created_at DATETIME NOT NULL, 
+	updated_at DATETIME NOT NULL, 
+	PRIMARY KEY (id)
+);
+
+CREATE TABLE IF NOT EXISTS model_registry_entries (
+	id INTEGER NOT NULL, 
+	project_id INTEGER NOT NULL, 
+	version VARCHAR(32) NOT NULL, 
+	ollama_tag VARCHAR(128) NOT NULL, 
+	base_model VARCHAR(256), 
+	adapter_path VARCHAR(512), 
+	gguf_path VARCHAR(512), 
+	eval_score FLOAT, 
+	is_active BOOLEAN DEFAULT 0 NOT NULL, 
+	metadata_json TEXT, 
+	created_at DATETIME NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(project_id) REFERENCES model_projects (id)
+);
+
+CREATE TABLE IF NOT EXISTS planner_agent_profiles (
+	id INTEGER NOT NULL, 
+	slug VARCHAR(64) NOT NULL, 
+	name VARCHAR(256) NOT NULL, 
+	requirement_type VARCHAR(64) NOT NULL, 
+	system_prompt TEXT DEFAULT '' NOT NULL, 
+	default_model VARCHAR(128), 
+	action_set_id INTEGER, 
+	skill_paths_json TEXT, 
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(action_set_id) REFERENCES action_sets (id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS "process" (
+	id INTEGER NOT NULL, 
+	goal VARCHAR NOT NULL, 
+	status VARCHAR NOT NULL, 
+	dag_json VARCHAR, 
+	failure_reason VARCHAR, 
+	total_tokens INTEGER NOT NULL, 
+	total_cost FLOAT NOT NULL, 
+	tool_invocations_used INTEGER NOT NULL, 
+	created_at DATETIME NOT NULL, 
+	updated_at DATETIME NOT NULL, 
+	team_template_id INTEGER, 
+	team_snapshot_json VARCHAR, 
+	client_id VARCHAR(256), 
+	project_id INTEGER, token_id INTEGER, model_build_job_id INTEGER, 
+	PRIMARY KEY (id), 
+	CONSTRAINT fk_run_team_template_id FOREIGN KEY(team_template_id) REFERENCES teamtemplate (id) ON DELETE SET NULL, 
+	CONSTRAINT fk_process_project_id_project FOREIGN KEY(project_id) REFERENCES project (id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS "project" (
+	id INTEGER NOT NULL, 
+	name VARCHAR(256) NOT NULL, 
+	description VARCHAR(4096), 
+	color VARCHAR(32), 
+	created_at DATETIME NOT NULL, 
+	updated_at DATETIME NOT NULL, 
+	workspace_payload_json VARCHAR, 
+	last_todo_board_id INTEGER, 
+	planning_prefs_json VARCHAR, 
+	assistant_board_id INTEGER, 
+	workspace_id INTEGER, 
+	PRIMARY KEY (id), 
+	CONSTRAINT fk_project_workspace_id_workspace FOREIGN KEY(workspace_id) REFERENCES workspace (id)
+);
+
+CREATE TABLE IF NOT EXISTS session_results (
+	id INTEGER NOT NULL, 
+	session_id INTEGER NOT NULL, 
+	step_number INTEGER NOT NULL, 
+	action_id VARCHAR(128) NOT NULL, 
+	result_json TEXT, 
+	error TEXT, 
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(session_id) REFERENCES action_sessions (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_steps (
+	id INTEGER NOT NULL, 
+	session_id INTEGER NOT NULL, 
+	step_number INTEGER NOT NULL, 
+	thought TEXT, 
+	actions_json TEXT DEFAULT '[]' NOT NULL, 
+	status VARCHAR(32) DEFAULT 'pending' NOT NULL, 
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	executed_at DATETIME, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(session_id) REFERENCES action_sessions (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS "tasknode" (
+                        id INTEGER NOT NULL,
+                        process_id INTEGER NOT NULL,
+                        client_uuid VARCHAR NOT NULL,
+                        parent_client_uuid VARCHAR,
+                        role VARCHAR NOT NULL,
+                        system_prompt VARCHAR NOT NULL,
+                        instructions VARCHAR NOT NULL,
+                        llm_model VARCHAR(128),
+                        dependencies_json VARCHAR NOT NULL,
+                        status VARCHAR NOT NULL,
+                        requires_review INTEGER NOT NULL DEFAULT 0,
+                        review_feedback VARCHAR,
+                        revision_count INTEGER NOT NULL DEFAULT 0,
+                        draft_output VARCHAR,
+                        output VARCHAR,
+                        tokens_used INTEGER NOT NULL,
+                        started_at DATETIME,
+                        completed_at DATETIME, failure_debug_json VARCHAR, reviewer_client_uuid VARCHAR,
+                        PRIMARY KEY (id),
+                        FOREIGN KEY(process_id) REFERENCES process (id)
+                    );
+
+CREATE TABLE IF NOT EXISTS "teamtemplate" (
+	id INTEGER NOT NULL, 
+	name VARCHAR(256) NOT NULL, 
+	description VARCHAR(4096), 
+	color VARCHAR(32), 
+	roster_json VARCHAR NOT NULL, 
+	created_at DATETIME NOT NULL, 
+	updated_at DATETIME NOT NULL, 
+	category VARCHAR(128), 
+	workspace_id INTEGER, 
+	PRIMARY KEY (id), 
+	CONSTRAINT fk_teamtemplate_workspace_id_workspace FOREIGN KEY(workspace_id) REFERENCES workspace (id)
+);
+
+CREATE TABLE IF NOT EXISTS "todo_boards" (
+	id INTEGER NOT NULL, 
+	name VARCHAR(256) NOT NULL, 
+	description TEXT, 
+	default_model VARCHAR(128), 
+	created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL, 
+	updated_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL, 
+	project_id INTEGER, 
+	PRIMARY KEY (id), 
+	CONSTRAINT fk_todo_boards_project_id FOREIGN KEY(project_id) REFERENCES project (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS todo_categories (
+	id INTEGER NOT NULL, 
+	board_id INTEGER NOT NULL, 
+	name VARCHAR(128) NOT NULL, 
+	color VARCHAR(32), 
+	sort_order INTEGER DEFAULT '0' NOT NULL, 
+	planner_profile_id INTEGER, 
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(board_id) REFERENCES todo_boards (id) ON DELETE CASCADE, 
+	FOREIGN KEY(planner_profile_id) REFERENCES planner_agent_profiles (id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS todo_item_events (
+	id INTEGER NOT NULL, 
+	item_id INTEGER NOT NULL, 
+	event_type VARCHAR(64) NOT NULL, 
+	content_json VARCHAR NOT NULL, 
+	created_at DATETIME NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(item_id) REFERENCES todo_items (id)
+);
+
+CREATE TABLE IF NOT EXISTS todo_items (
+	id INTEGER NOT NULL, 
+	board_id INTEGER NOT NULL, 
+	category_id INTEGER, 
+	title VARCHAR(512) NOT NULL, 
+	description TEXT DEFAULT '' NOT NULL, 
+	status VARCHAR(32) DEFAULT 'plan' NOT NULL, 
+	priority INTEGER DEFAULT '0' NOT NULL, 
+	tags_json TEXT, 
+	plan_json TEXT, 
+	assigned_profile_id INTEGER, 
+	linked_process_id INTEGER, 
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, metadata_json VARCHAR, parent_item_id INTEGER, due_at DATETIME, scheduled_at DATETIME, time_horizon VARCHAR(16), item_kind VARCHAR(32), recurrence_json VARCHAR, completion_json VARCHAR, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(board_id) REFERENCES todo_boards (id) ON DELETE CASCADE, 
+	FOREIGN KEY(category_id) REFERENCES todo_categories (id) ON DELETE SET NULL, 
+	FOREIGN KEY(assigned_profile_id) REFERENCES planner_agent_profiles (id) ON DELETE SET NULL, 
+	FOREIGN KEY(linked_process_id) REFERENCES process (id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS workflow_runs (
+	id INTEGER NOT NULL, 
+	workflow_id INTEGER NOT NULL, 
+	"trigger" VARCHAR DEFAULT 'manual' NOT NULL, 
+	status VARCHAR DEFAULT 'running' NOT NULL, 
+	input_json TEXT, 
+	steps_json TEXT DEFAULT '[]' NOT NULL, 
+	error TEXT, 
+	started_at DATETIME NOT NULL, 
+	finished_at DATETIME, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(workflow_id) REFERENCES workflows (id)
+);
+
+CREATE TABLE IF NOT EXISTS workflows (
+	id INTEGER NOT NULL, 
+	client_id VARCHAR, 
+	name VARCHAR NOT NULL, 
+	description VARCHAR, 
+	steps_json TEXT DEFAULT '[]' NOT NULL, 
+	enabled BOOLEAN DEFAULT 1 NOT NULL, 
+	interval_seconds INTEGER, 
+	next_run_at DATETIME, 
+	created_at DATETIME NOT NULL, 
+	updated_at DATETIME NOT NULL, 
+	PRIMARY KEY (id)
+);
+
+CREATE TABLE IF NOT EXISTS workspace (
+	id INTEGER NOT NULL, 
+	name VARCHAR(256) NOT NULL, 
+	slug VARCHAR(128) NOT NULL, 
+	description VARCHAR(4096), 
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, archived_at DATETIME, 
+	PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_action_sessions_action_set_id ON action_sessions (action_set_id);
+
+CREATE INDEX IF NOT EXISTS ix_action_sessions_client_id ON action_sessions (client_id);
+
+CREATE INDEX IF NOT EXISTS ix_action_sets_client_id ON action_sets (client_id);
+
+CREATE INDEX IF NOT EXISTS ix_action_sets_name ON action_sets (name);
+
+CREATE INDEX IF NOT EXISTS ix_actions_action_id ON actions (action_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_actions_set_action ON actions (set_id, action_id);
+
+CREATE INDEX IF NOT EXISTS ix_actions_set_id ON actions (set_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_api_token_usage_daily_token_date ON api_token_usage_daily (token_id, usage_date);
+
+CREATE INDEX IF NOT EXISTS ix_api_token_usage_daily_token_id ON api_token_usage_daily (token_id);
+
+CREATE INDEX IF NOT EXISTS ix_api_token_usage_daily_usage_date ON api_token_usage_daily (usage_date);
+
+CREATE INDEX IF NOT EXISTS ix_api_tokens_prefix ON api_tokens (prefix);
+
+CREATE INDEX IF NOT EXISTS ix_api_tokens_project_id ON api_tokens (project_id);
+
+CREATE INDEX IF NOT EXISTS ix_api_tokens_status ON api_tokens (status);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_api_tokens_token_hash ON api_tokens (token_hash);
+
+CREATE INDEX IF NOT EXISTS ix_api_tokens_workspace_id ON api_tokens (workspace_id);
+
+CREATE INDEX IF NOT EXISTS ix_assistant_chat_threads_project_id ON assistant_chat_threads (project_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_assistant_domain_profiles_project_domain ON assistant_domain_profiles (project_id, domain);
+
+CREATE INDEX IF NOT EXISTS ix_assistant_reviews_project_id ON assistant_reviews (project_id);
+
+CREATE INDEX IF NOT EXISTS ix_eventlog_process_id ON eventlog (process_id);
+
+CREATE INDEX IF NOT EXISTS ix_model_build_jobs_job_type ON model_build_jobs (job_type);
+
+CREATE INDEX IF NOT EXISTS ix_model_build_jobs_process_id ON model_build_jobs (process_id);
+
+CREATE INDEX IF NOT EXISTS ix_model_build_jobs_project_id ON model_build_jobs (project_id);
+
+CREATE INDEX IF NOT EXISTS ix_model_build_jobs_status ON model_build_jobs (status);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_model_projects_name ON model_projects (name);
+
+CREATE INDEX IF NOT EXISTS ix_model_projects_workspace_id ON model_projects (workspace_id);
+
+CREATE INDEX IF NOT EXISTS ix_model_registry_entries_is_active ON model_registry_entries (is_active);
+
+CREATE INDEX IF NOT EXISTS ix_model_registry_entries_ollama_tag ON model_registry_entries (ollama_tag);
+
+CREATE INDEX IF NOT EXISTS ix_model_registry_entries_project_id ON model_registry_entries (project_id);
+
+CREATE INDEX IF NOT EXISTS ix_planner_agent_profiles_requirement_type ON planner_agent_profiles (requirement_type);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_planner_agent_profiles_slug ON planner_agent_profiles (slug);
+
+CREATE INDEX IF NOT EXISTS ix_process_client_id ON process (client_id);
+
+CREATE INDEX IF NOT EXISTS ix_process_model_build_job_id ON process (model_build_job_id);
+
+CREATE INDEX IF NOT EXISTS ix_process_token_id ON process (token_id);
+
+CREATE INDEX IF NOT EXISTS ix_project_workspace_id ON project (workspace_id);
+
+CREATE INDEX IF NOT EXISTS ix_session_results_session_id ON session_results (session_id);
+
+CREATE INDEX IF NOT EXISTS ix_session_results_step_number ON session_results (step_number);
+
+CREATE INDEX IF NOT EXISTS ix_session_steps_session_id ON session_steps (session_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_session_steps_session_step ON session_steps (session_id, step_number);
+
+CREATE INDEX IF NOT EXISTS ix_session_steps_step_number ON session_steps (step_number);
+
+CREATE INDEX IF NOT EXISTS ix_tasknode_client_uuid ON tasknode (client_uuid);
+
+CREATE INDEX IF NOT EXISTS ix_tasknode_parent_client_uuid ON tasknode (parent_client_uuid);
+
+CREATE INDEX IF NOT EXISTS ix_tasknode_reviewer_client_uuid ON tasknode (reviewer_client_uuid);
+
+CREATE INDEX IF NOT EXISTS ix_teamtemplate_workspace_id ON teamtemplate (workspace_id);
+
+CREATE INDEX IF NOT EXISTS ix_todo_boards_project_id ON todo_boards (project_id);
+
+CREATE INDEX IF NOT EXISTS ix_todo_categories_board_id ON todo_categories (board_id);
+
+CREATE INDEX IF NOT EXISTS ix_todo_item_events_item_id ON todo_item_events (item_id);
+
+CREATE INDEX IF NOT EXISTS ix_todo_items_board_id ON todo_items (board_id);
+
+CREATE INDEX IF NOT EXISTS ix_todo_items_status ON todo_items (status);
+
+CREATE INDEX IF NOT EXISTS ix_workflow_runs_status ON workflow_runs (status);
+
+CREATE INDEX IF NOT EXISTS ix_workflow_runs_workflow_id ON workflow_runs (workflow_id);
+
+CREATE INDEX IF NOT EXISTS ix_workflows_client_id ON workflows (client_id);
+
+CREATE INDEX IF NOT EXISTS ix_workflows_name ON workflows (name);
+
+CREATE INDEX IF NOT EXISTS ix_workflows_next_run_at ON workflows (next_run_at);
+
+CREATE INDEX IF NOT EXISTS ix_workspace_archived_at ON workspace (archived_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_workspace_slug ON workspace (slug);

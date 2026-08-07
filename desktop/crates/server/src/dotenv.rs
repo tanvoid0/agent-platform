@@ -1,11 +1,11 @@
-//! Seed the process environment the way the Python server does, before anything
-//! reads it.
+//! Seed the process environment from the repo's `.env` and platform YAML,
+//! before anything reads it.
 //!
-//! `app/database.py` calls `load_dotenv(<root>/.env)` at import time and then
-//! `apply_platform_yaml_defaults()`, so by the time any Python code reads
-//! `os.environ` it holds the union of the shell, the repo's `.env`, and the
-//! `env:` block of `config/agent_platform.yaml`. The daemon inherited only the
-//! shell, and every value it *missed* was one where the two halves disagreed:
+//! `app/database.py` used to do this at import time — `load_dotenv(<root>/.env)`
+//! then `apply_platform_yaml_defaults()` — so `os.environ` held the union of
+//! the shell, the `.env`, and the `env:` block of
+//! `config/agent_platform.yaml`. The daemon inherited only the shell, and every
+//! value it *missed* was one where the two halves disagreed:
 //!
 //! - `AGENT_PLATFORM_MASTER_KEY` in `.env` meant Python required a bearer token
 //!   while Rust, seeing no key, left auth wide open in front of it.
@@ -14,6 +14,10 @@
 //!   refuse exactly that could never see the variable that triggers it.
 //! - Provider keys (`AIMLAPI_API_KEY`, `SPEECH_API_BASE`, …) meant the two
 //!   servers answered `/v1/capabilities` differently for the same request.
+//!
+//! Those three failures are gone with the Python half, but the loading is not
+//! a compatibility shim — it is now the only thing that reads either file, and
+//! an operator who puts a master key in `.env` still expects it to be read.
 //!
 //! Precedence, highest first: the real environment, `<root>/.env`, then the YAML
 //! `env:` block — the same order `load_dotenv` and `setdefault` produce, both of
@@ -43,7 +47,7 @@ pub fn load_env_files() {
         let path = root.join(".env");
         let applied = apply_missing(&parse_file(&path), &[]);
         if applied > 0 {
-            eprintln!("[agent-platformd] loaded {applied} var(s) from {}", path.display());
+            logd!("loaded {applied} var(s) from {}", path.display());
         }
     }
 
@@ -53,33 +57,36 @@ pub fn load_env_files() {
     if let Some(path) = yaml {
         let applied = apply_missing(&yaml_env_map(&path), &YAML_SECRET_KEYS);
         if applied > 0 {
-            eprintln!("[agent-platformd] loaded {applied} default(s) from {}", path.display());
+            logd!("loaded {applied} default(s) from {}", path.display());
         }
     }
 }
 
-/// The directory holding `app/`, `scripts/` and `.env` — the same one
-/// `app/database.py` resolves relative to itself. Same search order as
-/// `upstream::resolve_python`, which finds `scripts/start.py` under it.
+/// The directory holding `.env` and `config/`.
+///
+/// Keyed on `config/agent_platform.yaml`, which is committed and is one of the
+/// two files this module reads. It used to look for `scripts/start.py` — the
+/// Python entry point — and check an installed `<exe dir>/server` before the
+/// checkout; neither exists now, so both are gone and the marker is a file that
+/// is still there.
 fn server_root() -> Option<PathBuf> {
-    if let Some(entry) = env_opt("AGENT_PLATFORM_PY_ENTRY") {
-        let entry = PathBuf::from(entry);
-        if let Some(root) = entry.parent().and_then(Path::parent) {
-            return Some(root.to_path_buf());
-        }
+    if let Some(explicit) = env_opt("AGENT_PLATFORM_ROOT") {
+        return Some(PathBuf::from(explicit));
     }
 
+    // Beside the installed executable first, then the checkout this was built
+    // from — a dev run has no files next to `target/debug/`.
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(root) = exe.parent().map(|p| p.join("server")) {
-            if root.join("scripts").join("start.py").is_file() {
-                return Some(root);
+        if let Some(dir) = exe.parent() {
+            if dir.join("config").join("agent_platform.yaml").is_file() {
+                return Some(dir.to_path_buf());
             }
         }
     }
 
     // crates/server -> crates -> desktop -> repo root
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?.parent()?;
-    repo.join("scripts").join("start.py").is_file().then(|| repo.to_path_buf())
+    repo.join("config").join("agent_platform.yaml").is_file().then(|| repo.to_path_buf())
 }
 
 /// Set every key that is not already present. Presence, not emptiness: an

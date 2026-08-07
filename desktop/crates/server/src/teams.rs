@@ -26,7 +26,7 @@ use sqlx::FromRow;
 
 use crate::auth::Principal;
 use crate::error::{ApiError, PathId};
-use crate::wire::{check_len, sql_now, sql_time};
+use crate::wire::{check_len, parse_body, sql_now, sql_time};
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -339,7 +339,7 @@ struct TeamSummary {
 
 pub(crate) fn parse_roster(roster_json: &str) -> Result<TeamRoster, ApiError> {
     serde_json::from_str(roster_json).map_err(|e| {
-        eprintln!("[agent-platformd] unreadable roster_json: {e}");
+        logd!("unreadable roster_json: {e}");
         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "An unexpected error occurred.")
     })
 }
@@ -458,9 +458,23 @@ async fn list_teams(
 async fn create_team(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    body: Option<Json<TeamCreate>>,
+    // Raw bytes, not `Option<Json<TeamCreate>>`: axum's `Json` extractor only
+    // yields `None` for a body-less request with no `Content-Type` at all — an
+    // empty body sent *with* `application/json` (an argument-less POST from
+    // most clients) fails to parse and axum answers its own plain-text 400
+    // before this handler runs.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    let Json(req) = body.ok_or_else(|| missing_fields())?;
+    if body.is_empty() {
+        return Err(missing_fields());
+    }
+    let req: TeamCreate = serde_json::from_value(parse_body(&body)?).map_err(|e| {
+        ApiError::validation(vec![ApiError::field_error_at(
+            &["body"],
+            "model_attributes_type",
+            &e.to_string(),
+        )])
+    })?;
 
     let mut errors = Vec::new();
     match req.name.as_deref() {
@@ -542,13 +556,17 @@ async fn update_team(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     PathId(team_id): PathId<i64>,
-    body: Option<Json<Value>>,
+    // Raw bytes, not `Option<Json<Value>>` — see `create_team`'s comment. A
+    // missing, empty or malformed body all mean "no patch", same as the old
+    // catch-all arm below; only the crash on the empty-body-with-json-header
+    // case is new coverage.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let row = load_row(&state, team_id).await?;
     assert_owned(&principal, &row)?;
 
-    let patch: Map<String, Value> = match body {
-        Some(Json(Value::Object(map))) => map,
+    let patch: Map<String, Value> = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(map)) => map,
         _ => Map::new(),
     };
     let field = |key: &str| -> Option<String> {

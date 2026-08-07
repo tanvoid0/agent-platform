@@ -338,6 +338,32 @@ pub fn parse_body(raw: &axum::body::Bytes) -> Result<Value, ApiError> {
     }
 }
 
+/// A typed body, deserialized from `parse_body`'s `Value`. Shared by every
+/// handler that used to take `Json<T>` directly rather than hand-parsing
+/// fields — the struct-shaped counterpart to `parse_body`.
+pub fn parse_body_typed<T: serde::de::DeserializeOwned>(raw: &axum::body::Bytes) -> Result<T, ApiError> {
+    serde_json::from_value(parse_body(raw)?).map_err(|e| {
+        ApiError::validation(vec![ApiError::field_error_at(
+            &["body"],
+            "model_attributes_type",
+            &e.to_string(),
+        )])
+    })
+}
+
+/// Same as `parse_body_typed`, but an empty body defaults rather than errors —
+/// for the `Option<Json<T>>` handlers that used to `unwrap_or_default()` on
+/// `None`. `None` from axum's extractor and an empty byte body were meant to
+/// mean the same thing; only the latter used to crash instead of defaulting.
+pub fn parse_body_or_default<T: Default + serde::de::DeserializeOwned>(
+    raw: &axum::body::Bytes,
+) -> Result<T, ApiError> {
+    if raw.is_empty() {
+        return Ok(T::default());
+    }
+    parse_body_typed(raw)
+}
+
 /// `json.JSONDecodeError.pos` — the 0-based **byte** offset of the offending
 /// character, where serde reports a 1-based line and column.
 ///

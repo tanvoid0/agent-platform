@@ -105,6 +105,9 @@ impl State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// "View logs" on a traced error banner — intercepted in `main::update`
+    /// before it reaches here, so this arm exists only to satisfy exhaustiveness.
+    TraceLogs(String),
     Refresh,
     EnvLoaded(Result<Box<LlmEnv>, String>),
     CatalogLoaded(Result<Vec<ProviderEntry>, String>),
@@ -136,8 +139,10 @@ pub fn refresh(client: &Client) -> Task<Message> {
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
+        Message::TraceLogs(_) => Task::none(),
         Message::Refresh => refresh(client),
         Message::EnvLoaded(Ok(env)) => {
+            state.error = None;
             // Reloading is also the post-save path, so drafts are dropped: what
             // the server now reports is the truth.
             state.drafts.clear();
@@ -147,6 +152,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             Task::none()
         }
         Message::CatalogLoaded(Ok(providers)) => {
+            state.error = None;
             state.catalog = providers;
             state.catalog_loaded = true;
             Task::none()

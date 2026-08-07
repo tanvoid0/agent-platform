@@ -1,0 +1,23 @@
+# The model-ops build worker: what `agent-platformd` spawns per pipeline stage.
+#
+# Not a server — no FastAPI, no SQLAlchemy, no HTTP framework. It reads and
+# writes files under MODEL_OPS_DATA_DIR and reports results on stdout. That is
+# the whole reason the build-job routes could leave Python (ADR 0007).
+
+# --- always needed (the `prepare` and `eval` stages) ---
+pyyaml>=6.0
+jsonschema>=4.21
+
+# --- the GPU stages (`train`, `export`) ---
+# Install these in the interpreter MODEL_OPS_PYTHON points at. `prepare` and
+# `eval` run without them, so a machine that only prepares datasets can stop at
+# the block above.
+#
+# torch is not listed: pick the build that matches your CUDA, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+transformers>=4.45.0
+datasets>=2.18.0
+peft>=0.13.0
+trl>=0.11.0
+accelerate>=0.34.0
+bitsandbytes>=0.44.0; platform_system != "Darwin"

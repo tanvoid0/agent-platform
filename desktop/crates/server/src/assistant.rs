@@ -6,10 +6,10 @@
 //! `reviews/run`/`apply`/`dismiss` + `items/{id}/complete`, `chat/retry` +
 //! `chat/submit-form`, and `POST /reset`.
 //!
-//! `POST /chat/threads` is the one path still handed to Python, and by choice
-//! rather than by blocker: it shares its path with the `GET` this module owns,
-//! so it is declared to `proxy::forward` explicitly (leaving it to the
-//! router's fallback would answer 405 instead of falling through).
+//! `POST /chat/threads` was the last path handed to Python and is now here too
+//! ([`chat_threads_create`]), so the domain is whole. It shares its path with
+//! the `GET`, which is why both live on one `.route(...)` — a second `.route`
+//! for the same path would panic, and leaving the `POST` off would answer 405.
 //!
 //! `chat/apply` and `reviews/{id}/apply` both close through
 //! [`apply_board_actions`], the board-scoped twin of `todos.rs`'s per-item
@@ -64,21 +64,16 @@ use crate::todos::{
     py_repr, CategoryOut, CategoryRow, ItemOut, ItemRow, ProfileRow as PlannerProfileRow,
     CATEGORY_COLUMNS, ITEM_COLUMNS, PROFILE_COLUMNS,
 };
-use crate::wire::{iso_from_sql, iso_string, parse_naive, sql_now};
+use crate::wire::{iso_from_sql, iso_string, parse_body_or_default, parse_body_typed, parse_naive, sql_now};
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/assistant/dashboard", get(dashboard))
         .route("/api/v1/assistant/goals", get(goals))
-        // `POST /chat/threads` and `PATCH /profile/{domain}` share a path with
-        // a route Rust now owns and would otherwise 405 instead of falling
-        // through to Python — same trap `processes.rs` hit porting `list`
-        // ahead of `start`; declared here explicitly rather than left to the
-        // router's fallback, which only fires on a path with no match at all.
         .route(
             "/api/v1/assistant/chat/threads",
-            get(chat_threads_list).post(crate::proxy::forward),
+            get(chat_threads_list).post(chat_threads_create),
         )
         .route("/api/v1/assistant/chat/context-usage", get(chat_context_usage))
         .route("/api/v1/assistant/chat/thread", get(chat_thread))
@@ -489,6 +484,51 @@ async fn chat_threads_list(
     Ok(Json(json!({ "project_id": project_id, "threads": threads })).into_response())
 }
 
+/// `POST /assistant/chat/threads` — `assistant_chat.create_chat_thread`.
+///
+/// `title or "New chat"` is applied in the *route*, not the row writer, so a
+/// thread created here is titled where `_resolve_thread`'s implicit one is not
+/// — [`create_thread_row`] is called with `None` there and the list route
+/// falls back at render time. Matching that split matters: the smart-title
+/// task keys off `is_placeholder_title`, and a literal `"New chat"` in the
+/// column is a placeholder while a `NULL` is not yet one.
+async fn chat_threads_create(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Query(q): Query<ProjectIdQuery>,
+    // Raw bytes rather than `Json<...>`, for the reason `patch_domain_profile`
+    // gives: axum's own rejection is a plain-text 400, not this shape.
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    // FastAPI declares this body `= ...`, so an absent one is a 422 and not an
+    // empty `ChatThreadCreateRequest`.
+    if body.is_empty() {
+        return Err(ApiError::validation(vec![json!({
+            "type": "missing", "loc": ["body"], "msg": "Field required",
+        })]));
+    }
+    let raw: Value = parse_body_typed(&body)?;
+    let mut errors = Vec::new();
+    let title = crate::wire::optional_str(&mut errors, &raw, "title");
+    crate::wire::check_len(&mut errors, &["title"], title.as_deref(), 0, 128);
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+
+    let project_id = require_project(&state, &principal, q.project_id).await?;
+    let title = title.unwrap_or_else(|| "New chat".to_string());
+    let row = create_thread_row(&state, project_id, Some(&title)).await?;
+
+    Ok(Json(json!({
+        "thread_id": row.id,
+        "project_id": project_id,
+        // `row.title or "New chat"` — an empty string reaching the column
+        // renders as the default, which the insert above does not itself do.
+        "title": if title.is_empty() { "New chat".to_string() } else { title },
+    }))
+    .into_response())
+}
+
 // ---------------------------------------------------------------------------
 // GET /assistant/profile, /assistant/profile/{domain}
 // ---------------------------------------------------------------------------
@@ -565,16 +605,22 @@ async fn patch_domain_profile(
     principal: Principal,
     Path(domain): Path<String>,
     Query(q): Query<ProjectIdQuery>,
-    body: Option<Json<ProfilePatchBody>>,
+    // Raw bytes, not `Option<Json<ProfilePatchBody>>`: axum's `Json` extractor
+    // only yields `None` for a body-less request with no `Content-Type` at
+    // all — an empty body sent *with* `application/json` (an argument-less
+    // POST from most clients) fails to parse and axum answers its own
+    // plain-text 400 before this handler runs.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let project_id = require_project(&state, &principal, q.project_id).await?;
     // `DomainProfilePatch` has no required fields, but the body itself is —
     // FastAPI 422s a request with no body at all rather than defaulting it.
-    let Some(Json(body)) = body else {
+    if body.is_empty() {
         return Err(ApiError::validation(vec![json!({
             "type": "missing", "loc": ["body"], "msg": "Field required",
         })]));
-    };
+    }
+    let body: ProfilePatchBody = parse_body_typed(&body)?;
 
     let profile = crate::todos::merge_domain_profile(&state, project_id, &domain, &body.profile).await?;
     Ok(Json(json!({ "project_id": project_id, "domain": domain, "profile": profile })).into_response())
@@ -1259,10 +1305,12 @@ async fn complete_item(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Path(item_id): Path<i64>,
-    body: Option<Json<CompleteItemRequest>>,
+    // Raw bytes, not `Option<Json<CompleteItemRequest>>` — see
+    // `patch_domain_profile`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     crate::todos::assert_item_access(&state, &principal, item_id).await?;
-    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let req: CompleteItemRequest = parse_body_or_default(&body)?;
 
     let row: Option<ItemRow> =
         sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"))
@@ -1381,8 +1429,11 @@ async fn reviews_run(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Query(q): Query<ProjectIdQuery>,
-    body: Option<Json<ReviewRunRequest>>,
+    // Raw bytes, not `Option<Json<ReviewRunRequest>>` — see
+    // `patch_domain_profile`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
+    let req: ReviewRunRequest = parse_body_or_default(&body)?;
     let project_id = require_project(&state, &principal, q.project_id).await?;
     let board_id = ensure_assistant_board(&state, project_id).await?;
 
@@ -1426,7 +1477,7 @@ async fn reviews_run(
     context.insert("user_domain_profiles".into(), Value::Object(profiles));
     context.insert("items_summary".into(), Value::Array(items_summary));
 
-    let requested_model = body.and_then(|Json(b)| b.model).filter(|m| !m.is_empty());
+    let requested_model = req.model.filter(|m| !m.is_empty());
     let board_default_model: Option<String> =
         sqlx::query_scalar("SELECT default_model FROM todo_boards WHERE id = ?")
             .bind(board_id)
@@ -1480,8 +1531,11 @@ async fn reviews_apply(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Path(review_id): Path<i64>,
-    body: Option<Json<ReviewApplyRequest>>,
+    // Raw bytes, not `Option<Json<ReviewApplyRequest>>` — see
+    // `patch_domain_profile`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
+    let req: ReviewApplyRequest = parse_body_or_default(&body)?;
     let review_id = require_review(&state, &principal, review_id).await?;
 
     #[derive(FromRow)]
@@ -1506,7 +1560,7 @@ async fn reviews_apply(
 
     let board_id = ensure_assistant_board(&state, review.project_id).await?;
 
-    let requested = body.and_then(|Json(b)| b.actions).filter(|a| !a.is_empty());
+    let requested = req.actions.filter(|a| !a.is_empty());
     let to_apply: Vec<PlannedAction> = match requested {
         Some(actions) => actions,
         None => json_array(review.proposed_actions_json)
@@ -1883,10 +1937,12 @@ async fn assistant_reset(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Query(q): Query<ProjectIdQuery>,
-    body: Option<Json<AssistantResetRequest>>,
+    // Raw bytes, not `Option<Json<AssistantResetRequest>>` — see
+    // `patch_domain_profile`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let project_id = require_project(&state, &principal, q.project_id).await?;
-    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let req: AssistantResetRequest = parse_body_or_default(&body)?;
     if !req.confirm {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -2375,6 +2431,10 @@ struct ChatThreadRow {
     messages_json: Option<String>,
     pending_actions_json: Option<String>,
     last_profile_slug: Option<String>,
+    /// Selected because `CHAT_THREAD_COLUMNS` is one list for both the select
+    /// and `FromRow`, which needs a field per column. Nothing reads it — the
+    /// list route renders from its own narrower `ThreadRow`.
+    #[allow(dead_code)]
     created_at: String,
     updated_at: String,
 }
@@ -2612,8 +2672,11 @@ async fn generate_assistant_turn(
         .or_else(|| board_default_model.filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "gemma4:31b-cloud".to_string());
 
-    let mut content = String::new();
-    let mut planned_out: Vec<PlannedAction> = Vec::new();
+    // Declared without initializers: every branch below assigns both before
+    // anything reads them, and seeding them with empties only hid that from the
+    // compiler (it warned that the seed was never read).
+    let mut content: String;
+    let mut planned_out: Vec<PlannedAction>;
     let mut thought: Option<String> = None;
     let mut pending_form: Option<Value> = None;
 
@@ -2964,14 +3027,17 @@ async fn chat_send(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Query(q): Query<ProjectIdQuery>,
-    body: Option<Json<ChatSendBody>>,
+    // Raw bytes, not `Option<Json<ChatSendBody>>` — see
+    // `patch_domain_profile`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let project_id = require_project(&state, &principal, q.project_id).await?;
-    let Some(Json(body)) = body else {
+    if body.is_empty() {
         return Err(ApiError::validation(vec![json!({
             "type": "missing", "loc": ["body"], "msg": "Field required",
         })]));
-    };
+    }
+    let body: ChatSendBody = parse_body_typed(&body)?;
     let message = match body.message.as_deref() {
         None => {
             return Err(ApiError::validation(vec![ApiError::field_error(

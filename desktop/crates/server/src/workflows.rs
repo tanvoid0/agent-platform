@@ -24,7 +24,7 @@ use sqlx::FromRow;
 
 use crate::auth::Principal;
 use crate::error::{ApiError, PathId};
-use crate::wire::iso_from_sql;
+use crate::wire::{iso_from_sql, parse_body};
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -362,14 +362,29 @@ async fn create_workflow(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     headers: HeaderMap,
-    body: Option<Json<WorkflowCreate>>,
+    // Raw bytes, not `Option<Json<WorkflowCreate>>`: axum's `Json` extractor
+    // only yields `None` for a body-less request with no `Content-Type` at
+    // all — an empty body sent *with* `application/json` (an argument-less
+    // POST from most clients) fails to parse and axum answers its own
+    // plain-text 400 before this handler runs.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let scope = client_scope(&principal, &headers);
-    let Json(req) = body.ok_or_else(|| {
+    let missing_body = || {
         ApiError::validation(vec![
             ApiError::field_error("name", "missing", "Field required"),
             ApiError::field_error("steps", "missing", "Field required"),
         ])
+    };
+    if body.is_empty() {
+        return Err(missing_body());
+    }
+    let req: WorkflowCreate = serde_json::from_value(parse_body(&body)?).map_err(|e| {
+        ApiError::validation(vec![ApiError::field_error_at(
+            &["body"],
+            "model_attributes_type",
+            &e.to_string(),
+        )])
     })?;
 
     let mut errors = Vec::new();
@@ -444,13 +459,14 @@ async fn update_workflow(
     principal: Principal,
     headers: HeaderMap,
     PathId(workflow_id): PathId<i64>,
-    body: Option<Json<Value>>,
+    // Raw bytes, not `Option<Json<Value>>` — see `create_workflow`'s comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let scope = client_scope(&principal, &headers);
     accessible_workflow(&state, scope.as_deref(), workflow_id).await?;
 
-    let patch: Map<String, Value> = match body {
-        Some(Json(Value::Object(map))) => map,
+    let patch: Map<String, Value> = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(map)) => map,
         _ => Map::new(),
     };
 
@@ -799,11 +815,22 @@ fn completion_content(data: &Value) -> Result<&str, ApiError> {
 async fn assist(
     State(state): State<Arc<AppState>>,
     _principal: Principal,
-    body: Option<Json<AssistRequest>>,
+    // Raw bytes, not `Option<Json<AssistRequest>>` — see `create_workflow`'s
+    // comment.
+    body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let missing_message =
         || ApiError::validation(vec![ApiError::field_error("message", "missing", "Field required")]);
-    let Json(req) = body.ok_or_else(missing_message)?;
+    if body.is_empty() {
+        return Err(missing_message());
+    }
+    let req: AssistRequest = serde_json::from_value(parse_body(&body)?).map_err(|e| {
+        ApiError::validation(vec![ApiError::field_error_at(
+            &["body"],
+            "model_attributes_type",
+            &e.to_string(),
+        )])
+    })?;
     let message = req.message.ok_or_else(missing_message)?;
 
     let mut user_parts = vec![message.trim().to_string()];

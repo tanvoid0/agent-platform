@@ -1,10 +1,12 @@
 //! Agenda rendering: what to do now on top, what the reviewer thinks under it.
 
 use crate::agenda::{Message, State};
+use crate::agenda_chat;
+use crate::agenda_chat_view;
 use crate::ui::{self, space, Icon, Tone};
 use agent_platform_client::types::{AssistantReview, TodoItem, ASSISTANT_HORIZONS};
-use iced::widget::{container, row, Row};
-use iced::{Element, Length};
+use iced::widget::{container, row, scrollable, Row};
+use iced::{Element, Length, Theme};
 
 fn horizon_label(horizon: &str) -> &'static str {
     match horizon {
@@ -15,13 +17,13 @@ fn horizon_label(horizon: &str) -> &'static str {
     }
 }
 
-pub fn view(state: &State) -> Element<'_, Message> {
-    let mut blocks: Vec<Element<'_, Message>> = Vec::new();
+pub fn view<'a>(state: &'a State, theme: &Theme) -> Element<'a, Message> {
+    let mut blocks: Vec<Element<'a, Message>> = Vec::new();
 
     if let Some(err) = &state.error {
         blocks.push(
             ui::cluster(vec![
-                container(ui::alert_error(err.clone())).width(Length::Fill).into(),
+                container(ui::alert_error_traced(err, Message::TraceLogs)).width(Length::Fill).into(),
                 ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss),
             ])
             .into(),
@@ -40,7 +42,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
                  make a project first.",
             )
         });
-        return page(state, blocks);
+        return page(state, theme, blocks);
     }
 
     let Some(dashboard) = &state.dashboard else {
@@ -49,7 +51,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
         } else {
             ui::empty_state_icon(Icon::Clock, "Pick a project.")
         });
-        return page(state, blocks);
+        return page(state, theme, blocks);
     };
 
     let stats = &dashboard.stats;
@@ -78,10 +80,14 @@ pub fn view(state: &State) -> Element<'_, Message> {
     blocks.extend(section(state, "Habits", &dashboard.habits_due, None));
     blocks.extend(section(state, "Goals", &dashboard.goals, None));
 
-    page(state, blocks)
+    page(state, theme, blocks)
 }
 
-fn page<'a>(state: &'a State, blocks: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+fn page<'a>(
+    state: &'a State,
+    theme: &Theme,
+    blocks: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
     let review = if state.busy {
         ui::button_sized(
             Some(Icon::Clock),
@@ -94,20 +100,45 @@ fn page<'a>(state: &'a State, blocks: Vec<Element<'a, Message>>) -> Element<'a, 
         ui::button_secondary(Icon::Sparkles, "Run review", Message::RunReview)
     };
 
-    ui::page(
+    let description = Some(ui::muted(
+        "The assistant's own board: what is due, what slipped, and what it \
+         suggests changing.",
+    ));
+    let actions = Some(
+        ui::cluster(vec![
+            if state.chat.open {
+                ui::button_ghost(Icon::Message, "Hide assistant", Message::Chat(agenda_chat::Message::Close))
+            } else {
+                ui::button_secondary(Icon::Message, "Ask assistant", Message::Chat(agenda_chat::Message::Open))
+            },
+            review,
+            ui::button_default(Icon::Refresh, "Refresh", Message::Refresh),
+        ])
+        .into(),
+    );
+
+    if !state.chat.open {
+        return ui::page("Agenda", description, actions, ui::stack_lg(blocks));
+    }
+
+    // Board and chat share the page, so the page itself must not scroll: the
+    // board scrolls on its own and the chat pins its composer. `ui::page` would
+    // nest both inside a third scrollable.
+    ui::page_fixed(
         "Agenda",
-        Some(ui::muted(
-            "The assistant's own board: what is due, what slipped, and what it \
-             suggests changing.",
-        )),
-        Some(
-            ui::cluster(vec![
-                review,
-                ui::button_default(Icon::Refresh, "Refresh", Message::Refresh),
-            ])
-            .into(),
-        ),
-        ui::stack_lg(blocks),
+        description,
+        actions,
+        row![
+            container(
+                scrollable(ui::stack_lg(blocks))
+                    .spacing(space::SM)
+                    .height(Length::Fill)
+            )
+            .width(Length::Fill),
+            ui::separator_vertical(),
+            agenda_chat_view::pane(&state.chat, theme).map(Message::Chat),
+        ]
+        .spacing(space::MD),
     )
 }
 

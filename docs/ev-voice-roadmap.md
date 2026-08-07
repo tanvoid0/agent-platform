@@ -1,5 +1,12 @@
 # E.V. voice roadmap
 
+> **Paths in this document predate the Rust migration.** The FastAPI server
+> (`app/`) was deleted on 2026-08-07 — every route it describes is now served by
+> `agent-platformd` (`desktop/crates/server/src/`), byte-identically except for the
+> four changes listed in `plan.md`'s migration section. The behaviour here still
+> holds; the file references do not. See [ADR 0007](adr/0007-strangler-rust-server.md).
+
+
 Status as of 2026-08-03. E.V. lives in `desktop/crates/app/src/assistant.rs` /
 `assistant_view.rs`.
 

@@ -1,11 +1,13 @@
 //! Integration tests against a live server.
 //!
 //! Skipped unless `AGENT_PLATFORM_TEST_URL` (+ optional `AGENT_PLATFORM_TEST_KEY`)
-//! is set. Point it at a throwaway server, e.g.:
+//! is set. Point it at a throwaway server — throwaway meaning its own
+//! `AGENT_PLATFORM_DB_PATH`, because the daemon creates and populates whatever
+//! file it is given:
 //!
 //! ```text
 //! AGENT_PLATFORM_PORT=18499 AGENT_PLATFORM_MASTER_KEY=test-key \
-//!   python scripts/start.py --skip-build --no-browser
+//!   AGENT_PLATFORM_DB_PATH=/tmp/agp-test.db cargo run -p agent-platform-server
 //! AGENT_PLATFORM_TEST_URL=http://127.0.0.1:18499 AGENT_PLATFORM_TEST_KEY=test-key \
 //!   cargo test -p agent-platform-client -- --nocapture
 //! ```

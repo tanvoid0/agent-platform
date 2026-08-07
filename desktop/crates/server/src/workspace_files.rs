@@ -3,22 +3,13 @@
 //! (`/projects/{id}/workspace/*` and `/projects/{id}/files/*`, the same handlers
 //! mounted twice).
 //!
-//! **Two request shapes stay with Python, and both are the same reason.**
-//! `document_service` extracts PDF text through PyMuPDF, which has no Rust
-//! equivalent — so:
+//! **All eight routes are here now**, including `POST /upload` and `GET /file`
+//! on a `.pdf` — the two that were handed to Python for PyMuPDF. Extraction
+//! moved to [`crate::documents`], on a different library, and that module
+//! documents exactly how the derived markdown changed as a result.
 //!
-//! - `POST /upload` is not registered here at all. It is multipart, and whether
-//!   it needs extraction depends on the filename *inside* the body, which
-//!   cannot be known without consuming the body that would then have to be
-//!   replayed to the proxy.
-//! - `GET /file` **for a `.pdf` path** is handed to [`crate::proxy::forward`]
-//!   whole, including the case where the derived markdown already exists — a
-//!   miss there re-ingests, and re-ingesting is extraction.
-//!
-//! Everything else — the traversal guard, listing, text reads and writes,
-//! delete, mkdir and the two directory-ensuring routes — is here. This is the
-//! same split `todos agent/step` already takes for a step that names a document,
-//! and the guard below is the one that note said should not be written twice.
+//! The traversal guard below is the one `todos agent/step` was told not to
+//! write twice; it is still the only copy.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -34,7 +25,7 @@ use serde_json::{json, Value};
 use crate::auth::Principal;
 use crate::error::{ApiError, PathId};
 use crate::wire::{check_len, lax_int, parse_body, required_str};
-use crate::{env_opt, proxy, AppState};
+use crate::{env_opt, AppState};
 
 pub fn routes() -> Router<Arc<AppState>> {
     // The canonical prefix and the legacy alias, which `workspace_routes.py`
@@ -49,8 +40,8 @@ pub fn routes() -> Router<Arc<AppState>> {
                 &format!("{base}/file"),
                 get(read_file).put(write_file).delete(delete_file),
             )
-            .route(&format!("{base}/mkdir"), post(make_dir));
-        // `/upload` is deliberately absent — see the module note.
+            .route(&format!("{base}/mkdir"), post(make_dir))
+            .route(&format!("{base}/upload"), post(upload_file));
     }
     router
 }
@@ -62,14 +53,14 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// `WorkspaceError`, which the routes render as `"{code}: {message}"` under
 /// their own status.
 #[derive(Debug)]
-struct WorkspaceError {
+pub(crate) struct WorkspaceError {
     code: &'static str,
     message: String,
     status: StatusCode,
 }
 
 impl WorkspaceError {
-    fn new(code: &'static str, message: impl Into<String>, status: u16) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>, status: u16) -> Self {
         Self {
             code,
             message: message.into(),
@@ -77,8 +68,14 @@ impl WorkspaceError {
         }
     }
 
-    fn bad(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn bad(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(code, message, 400)
+    }
+
+    /// `getattr(e, "code", str(e))` — what `merge_workspace_documents` puts in
+    /// a per-document `error` entry instead of the whole sentence.
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
     }
 }
 
@@ -88,7 +85,7 @@ impl From<WorkspaceError> for ApiError {
     }
 }
 
-type WsResult<T> = Result<T, WorkspaceError>;
+pub(crate) type WsResult<T> = Result<T, WorkspaceError>;
 
 /// `str(OSError)` — `[WinError 145] The directory is not empty: '<path>'`, or
 /// `[Errno 39] Directory not empty: '<path>'` off Windows.
@@ -111,7 +108,7 @@ fn os_error_text(e: &std::io::Error, path: &Path) -> String {
 
 const MAX_PATH_SEGMENTS: usize = 32;
 
-fn max_file_bytes() -> u64 {
+pub(crate) fn max_file_bytes() -> u64 {
     env_opt("AGENT_PLATFORM_WORKSPACE_MAX_FILE_BYTES")
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .unwrap_or(8 * 1024 * 1024)
@@ -119,7 +116,7 @@ fn max_file_bytes() -> u64 {
 
 /// `AGENT_PLATFORM_WORKSPACE_ROOT`, else `<db dir>/workspaces` — with `data` as
 /// the directory when the DB path has none.
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     let root = match env_opt("AGENT_PLATFORM_WORKSPACE_ROOT") {
         Some(explicit) => expanduser(&explicit),
         None => {
@@ -185,7 +182,7 @@ fn project_sandbox_dir(project_id: i64) -> WsResult<PathBuf> {
     Ok(workspace_root().join(format!("project-{project_id}")))
 }
 
-fn ensure_project_dir(project_id: i64) -> WsResult<PathBuf> {
+pub(crate) fn ensure_project_dir(project_id: i64) -> WsResult<PathBuf> {
     let dir = project_sandbox_dir(project_id)?;
     let _ = std::fs::create_dir_all(&dir);
     Ok(resolve_lexical(&dir))
@@ -193,7 +190,7 @@ fn ensure_project_dir(project_id: i64) -> WsResult<PathBuf> {
 
 /// `normalize_relative_path`: `/`-separated, no `..`, no absolute segments.
 /// Empty means the sandbox root.
-fn normalize_relative_path(rel: &str) -> WsResult<String> {
+pub(crate) fn normalize_relative_path(rel: &str) -> WsResult<String> {
     let s = rel.replace('\\', "/");
     let s = s.trim();
     if s.is_empty() || s == "." {
@@ -222,7 +219,7 @@ fn normalize_relative_path(rel: &str) -> WsResult<String> {
 }
 
 /// `_resolve_under_project_for_write`: the target, which need not exist.
-fn resolve_for_write(project_id: i64, rel: &str) -> WsResult<PathBuf> {
+pub(crate) fn resolve_for_write(project_id: i64, rel: &str) -> WsResult<PathBuf> {
     let base = ensure_project_dir(project_id)?;
     let normalized = normalize_relative_path(rel)?;
     if normalized.is_empty() {
@@ -289,7 +286,7 @@ fn list_dir(project_id: i64, rel: &str) -> WsResult<Vec<Value>> {
         .collect())
 }
 
-fn read_text_file(project_id: i64, rel: &str) -> WsResult<String> {
+pub(crate) fn read_text_file(project_id: i64, rel: &str) -> WsResult<String> {
     let path = resolve_for_write(project_id, rel)?;
     if path.is_dir() {
         return Err(WorkspaceError::bad("is_directory", "Path is a directory"));
@@ -308,7 +305,7 @@ fn read_text_file(project_id: i64, rel: &str) -> WsResult<String> {
         .map_err(|_| WorkspaceError::new("not_utf8", "File is not valid UTF-8 text", 415))
 }
 
-fn write_text_file(project_id: i64, rel: &str, content: &str) -> WsResult<()> {
+pub(crate) fn write_text_file(project_id: i64, rel: &str, content: &str) -> WsResult<()> {
     let path = resolve_for_write(project_id, rel)?;
     if path.is_dir() {
         return Err(WorkspaceError::bad("is_directory", "Path is a directory"));
@@ -527,8 +524,11 @@ async fn workspace_list(
     Ok(Json(json!({ "entries": entries })).into_response())
 }
 
-/// `GET /file`, except for PDFs — those are the proxy's, since a miss on the
-/// derived markdown re-runs the PyMuPDF extraction.
+/// `GET /file` — `read_workspace_file_for_llm`, PDFs included.
+///
+/// A `.pdf` resolves through its derived markdown, extracting on the spot if
+/// that file is not there yet, which is why this route can *write*. That was
+/// the reason it stayed with Python: the miss path is an ingest.
 async fn read_file(
     State(state): State<Arc<AppState>>,
     principal: Principal,
@@ -537,23 +537,55 @@ async fn read_file(
 ) -> Result<Response, ApiError> {
     let query = request.uri().query().map(str::to_string);
     let path = require_query(query.as_deref(), "path")?;
-    if path.to_lowercase().ends_with(".pdf") {
-        return Ok(proxy::forward(State(state), request).await);
+    require_project(&state, &principal, project_id).await?;
+    Ok(Json(crate::documents::read_for_llm(project_id, &path)?).into_response())
+}
+
+/// `POST /upload` — multipart, one `file` part, `dest` from the query string
+/// (default `documents`).
+async fn upload_file(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    PathId(project_id): PathId<i64>,
+    RawQuery(query): RawQuery,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Response, ApiError> {
+    require_project(&state, &principal, project_id).await?;
+    let dest = string_query(query.as_deref(), "dest").unwrap_or_else(|| "documents".to_string());
+
+    // `file: UploadFile = File(...)` — the part is required and named `file`;
+    // anything else in the body is ignored, as FastAPI ignores it.
+    let mut found: Option<(String, Vec<u8>)> = None;
+    loop {
+        let field = multipart
+            .next_field()
+            .await
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("read_failed: {e}")))?;
+        let Some(field) = field else { break };
+        if field.name() != Some("file") {
+            continue;
+        }
+        // `(file.filename or "upload").strip()`.
+        let name = field.file_name().unwrap_or("upload").trim().to_string();
+        let name = if name.is_empty() { "upload".to_string() } else { name };
+        let data = field
+            .bytes()
+            .await
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("read_failed: {e}")))?;
+        found = Some((name, data.to_vec()));
+        break;
     }
 
-    require_project(&state, &principal, project_id).await?;
-    let normalized = normalize_relative_path(&path)?;
-    if normalized.is_empty() {
-        return Err(WorkspaceError::bad("invalid_path", "path is required").into());
-    }
-    let content = read_text_file(project_id, &normalized)?;
-    Ok(Json(json!({
-        "path": normalized,
-        "content": content,
-        "content_kind": "text",
-        "derived_path": Value::Null,
-    }))
-    .into_response())
+    let Some((filename, data)) = found else {
+        return Err(ApiError::validation(vec![ApiError::field_error(
+            "file",
+            "missing",
+            "Field required",
+        )]));
+    };
+
+    let result = crate::documents::ingest_upload(project_id, &filename, &data, &dest)?;
+    Ok(Json(result.to_json()).into_response())
 }
 
 async fn write_file(

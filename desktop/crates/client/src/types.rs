@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-pub use crate::enums_gen::*;
+pub use crate::enums::*;
 
 // ---------------------------------------------------------------------------
 // Planner DAG (mirrors app/dag_schema.py)
@@ -415,7 +415,10 @@ pub struct SystemStatus {
     pub service: String,
     pub env: String,
     pub uptime_seconds: f64,
-    pub python: String,
+    /// `agent-platformd`'s own version. Was `python` (the interpreter version)
+    /// until the Python child was retired and there was no interpreter left in
+    /// the server to ask.
+    pub server: String,
     pub platform: String,
     pub listening_on: ListeningOn,
     pub auth_required: bool,
