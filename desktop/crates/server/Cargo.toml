@@ -13,15 +13,46 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "signal"] }
 # `stream` is what keeps SSE responses unbuffered through the proxy. No gzip
 # feature on purpose: decompressing here would invalidate the headers we copy.
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
+# `json` is used by the lib itself; without it here only `cargo test` builds,
+# because the dev-dependency below unifies the feature back in.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "any", "chrono", "macros"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` because a Python dict renders in insertion order and a
+# `serde_json::Map` is a `BTreeMap`, which renders sorted. That is not cosmetic:
+# `context_usage.categories.tools` counts the tokens of `json.dumps(tools)`, and
+# the real `TOOL_SPECS` measured 518 tokens in Python's order against 510 sorted
+# — a number in a response body a cross-render diffs. Everywhere else in this
+# crate it moves output the same direction, toward what Python emits.
+serde_json = { version = "1", features = ["preserve_order"] }
+# Only ever deserialized into a `serde_json::Value` so the config tree is walked
+# with the same API as everything else here. Archived upstream, which is fine for
+# a read-only parse of two local files; swap for `saphyr` if that ever bites.
+serde_yaml = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 sha2 = "0.10"
+# Already in the tree via reqwest. Declared because the BYOK base-URL allowlist
+# is an SSRF guard, and that is not a job for string splitting.
+url = "2"
 getrandom = "0.2"
 subtle = "2"
 futures = "0.3"
+# Real BPE, not an estimate. `context_usage` is a response body field on the chat
+# routes and `tiktoken>=0.7.0` is a hard requirement on the Python side, so it
+# never takes its own char fallback — a heuristic here would differ on ten
+# numbers per response *and* shrink the outgoing prompt differently near the
+# context budget, which means the two servers would send the model different
+# messages. The vocab ships in the crate.
+tiktoken-rs = "0.6"
+# Already in the tree via reqwest/hyper. Declared so a streamed chat response
+# forwards its chunks through untouched instead of copying every SSE frame.
+bytes = "1"
+# `assistant/clarifying_form.py`'s field-kind inference and paren-option
+# parsing are seven small patterns Python expresses as regexes; hand-rolling
+# them risks a quieter divergence than pulling in the crate everyone already
+# trusts for this. Already in the tree transitively (serde_yaml); declared
+# directly because this is the first module that imports it.
+regex = "1"
 
 [target.'cfg(windows)'.dependencies]
 # Job object with kill-on-close: the only thing that reaps the Python child when

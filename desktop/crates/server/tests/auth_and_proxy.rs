@@ -143,9 +143,12 @@ async fn auth_tiers_and_proxy_passthrough() {
     let (status, body) = get(&origin, guarded, Some(MASTER)).await;
     assert_eq!((status, body.as_str()), (200, "GET /api/v1/system/status"));
 
-    // Query strings survive too — SSE cursors ride in them.
-    let (_, body) = get(&origin, "/api/v1/processes?limit=5", Some(MASTER)).await;
-    assert_eq!(body, "GET /api/v1/processes?limit=5");
+    // Query strings survive too — SSE cursors ride in them. This probe has to
+    // name a route that is still Python's: it read `/api/v1/processes?limit=5`
+    // until the read half of that domain migrated, and then asserted Rust's own
+    // 400 against the upstream's echo.
+    let (_, body) = get(&origin, "/api/v1/system/logs?limit=5", Some(MASTER)).await;
+    assert_eq!(body, "GET /api/v1/system/logs?limit=5");
 
     // Missing and wrong credentials, both TOKEN_INVALID like the Python server.
     let (status, body) = get(&origin, guarded, None).await;
@@ -153,10 +156,12 @@ async fn auth_tiers_and_proxy_passthrough() {
     let (status, body) = get(&origin, guarded, Some("nope")).await;
     assert_eq!((status, code_of(&body).as_str()), (401, "TOKEN_INVALID"));
 
-    // Unguarded surfaces fall through unauthenticated: /health is open and the
-    // LLM proxy under /v1 authenticates itself.
+    // The layer guards `/api/v1/*` only: `/health` is open, and `/v1/*` is the
+    // LLM proxy, where each route decides for itself. Anything under `/v1` that
+    // has not migrated reaches the upstream without this layer rejecting it.
     assert_eq!(get(&origin, "/health", None).await.0, 200);
-    assert_eq!(get(&origin, "/v1/models", None).await.0, 200);
+    let (status, body) = get(&origin, "/v1/not-migrated", None).await;
+    assert_eq!((status, body.as_str()), (200, "GET /v1/not-migrated"));
 
     // Workspace tokens, one case per exception in api_tokens/exceptions.py.
     let cases = [
@@ -189,6 +194,107 @@ async fn auth_tiers_and_proxy_passthrough() {
     assert_eq!(get(&origin, guarded, Some("agp_live_limited")).await.0, 200);
     let (status, body) = get(&origin, guarded, Some("agp_live_limited")).await;
     assert_eq!((status, code_of(&body).as_str()), (429, "RATE_LIMIT_EXCEEDED"));
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn every_response_carries_a_correlation_id() {
+    // Python stamps one on every response and repeats it in the error envelope.
+    // Without it, a failure in the Rust half cannot be lined up with the same
+    // request in the Python half's log.
+    let db = temp_db_path();
+    seed_db(&db).await;
+    let origin = start_server(&db, Some(MASTER)).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{origin}/api/v1/system/status"))
+        .send()
+        .await
+        .unwrap();
+    let generated = resp.headers().get("x-request-id").unwrap().to_str().unwrap().to_string();
+    assert_eq!(generated.len(), 36, "{generated}");
+    let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(body["error"]["request_id"], generated);
+    assert_eq!(body["error"]["code"], "TOKEN_INVALID");
+
+    // A caller's own id wins, and reaches the upstream: the stub echoes the path
+    // it was asked for, so a 200 here means the proxied request carried through.
+    let resp = reqwest::Client::new()
+        .get(format!("{origin}/api/v1/system/status"))
+        .bearer_auth(MASTER)
+        .header("X-Request-ID", "caller-supplied-id")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("x-request-id").unwrap(), "caller-supplied-id");
+    assert_eq!(resp.text().await.unwrap(), "GET /api/v1/system/status");
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test]
+async fn llm_proxy_routes_authenticate_per_route() {
+    // `require_token` guards `/api/v1/*` only, so every migrated `/v1` route
+    // carries its own answer to "who is calling" — including "nobody, on
+    // purpose". Getting that wrong in either direction is silent: a route that
+    // stops checking serves the config to anyone, and one that starts checking
+    // breaks the desktop's pre-key probe.
+    let db = temp_db_path();
+    seed_db(&db).await;
+    let origin = start_server(&db, Some(MASTER)).await;
+
+    let (status, body) = get(&origin, "/v1/health/readiness", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["checks"][0]["name"], "provider_config");
+
+    let (status, body) = get(&origin, "/v1/capabilities", None).await;
+    assert_eq!((status, code_of(&body).as_str()), (401, "TOKEN_INVALID"));
+
+    // `/v1/models` is Rust's now, so it is authenticated here rather than by the
+    // upstream — the stub would have answered 200 to anyone.
+    let (status, body) = get(&origin, "/v1/models", None).await;
+    assert_eq!((status, code_of(&body).as_str()), (401, "TOKEN_INVALID"));
+    let (status, body) = get(&origin, "/v1/models", Some(MASTER)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["object"], "list");
+    assert!(v["data"].is_array(), "{body}");
+
+    // `?live=false` keeps the catalog off every upstream, so this stays fast and
+    // deterministic with no backend running.
+    let (status, body) = get(&origin, "/v1/catalog?live=false", None).await;
+    assert_eq!((status, code_of(&body).as_str()), (401, "TOKEN_INVALID"));
+    let (status, body) = get(&origin, "/v1/catalog?live=false", Some(MASTER)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["object"], "catalog");
+    assert_eq!(v["providers"][0]["id"], "ollama");
+    assert_eq!(v["providers"][0]["configured"], true);
+    assert!(v["resolved_defaults"]["provider"].is_string(), "{body}");
+
+    // `/v1/health` takes no token either, and answers about the default provider.
+    let (status, body) = get(&origin, "/v1/health?provider=banana", None).await;
+    assert_eq!(status, 400, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["status"], "error");
+    assert!(v["detail"].as_str().unwrap().starts_with("provider must be"), "{body}");
+
+    let (status, body) = get(&origin, "/v1/capabilities", Some(MASTER)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["object"], "capabilities");
+    assert_eq!(v["modalities"][0], "chat");
+    // Both local backends carry a loopback default, so this holds with no
+    // config on disk — which is what this test has.
+    assert_eq!(v["providers"]["ollama"]["chat"], true);
+    assert_eq!(v["providers"]["ollama"]["configured"], true);
+    assert_eq!(v["providers"]["image_local"]["configured"], false);
+    assert_eq!(v["resolved"]["chat"], "ollama");
+    assert_eq!(v["resolved"]["image_generation"], Value::Null);
+    assert_eq!(v["byok"]["providers"][0]["id"], "openai");
 
     let _ = std::fs::remove_file(&db);
 }

@@ -215,7 +215,7 @@ pub(crate) fn random_palette_color(avoid: &[String]) -> String {
     pool[byte[0] as usize % pool.len()].to_string()
 }
 
-fn resolved_team_color(team_color: Option<&str>, stable_key: Option<&str>) -> String {
+pub(crate) fn resolved_team_color(team_color: Option<&str>, stable_key: Option<&str>) -> String {
     let explicit = team_color.unwrap_or("").trim();
     if !explicit.is_empty() {
         return explicit.to_string();
@@ -256,7 +256,11 @@ fn assign_missing_accents(roster: &TeamRoster, team_color: Option<&str>) -> (Tea
 
 /// Read path: fill accents deterministically so two GETs of an old row that
 /// never had colors do not disagree with each other.
-fn with_default_accents(roster: &TeamRoster, team_color: Option<&str>, key: &str) -> TeamRoster {
+pub(crate) fn with_default_accents(
+    roster: &TeamRoster,
+    team_color: Option<&str>,
+    key: &str,
+) -> TeamRoster {
     let mut resolved_team = team_color.unwrap_or("").trim().to_string();
     if resolved_team.is_empty() {
         resolved_team = stable_palette_color(&format!("team:{key}")).to_string();
@@ -333,7 +337,7 @@ struct TeamSummary {
     updated_at: String,
 }
 
-fn parse_roster(roster_json: &str) -> Result<TeamRoster, ApiError> {
+pub(crate) fn parse_roster(roster_json: &str) -> Result<TeamRoster, ApiError> {
     serde_json::from_str(roster_json).map_err(|e| {
         eprintln!("[agent-platformd] unreadable roster_json: {e}");
         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "An unexpected error occurred.")

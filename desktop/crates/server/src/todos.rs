@@ -1,36 +1,48 @@
 //! Todo boards, ported from `app/todos/routes.py` + `services/board_service.py`.
 //!
-//! **This domain is split, not moved.** Rust serves the CRUD; Python still
-//! serves `items/{id}/agent/*`, `planning-form/submit` and `spawn-process`,
-//! because those go through the LLM proxy and the orchestrator, neither of
-//! which has migrated. Those Python routes write `todo_items` and
-//! `todo_item_events` — so unlike projects and teams, this table has two
-//! writers, which is what ADR 0007's rule 1 exists to prevent. It was a
-//! deliberate call to take visible progress over waiting for `llm_proxy`.
+//! **The domain is whole.** Every route in `app/todos/routes.py` answers from
+//! here, Python keeps no writer of `todo_boards`, `todo_categories`,
+//! `todo_items` or `todo_item_events`, and the two-writer exception ADR 0007
+//! carried for this domain is closed — not narrowed, closed.
 //!
-//! What keeps it survivable: Rust only ever writes the columns a user edits
-//! (`UPDATE … SET title = ?`), never a whole row, so a concurrent agent write
-//! to `plan_json` or `metadata_json` cannot be clobbered by a rename. The
-//! reverse is not true — SQLAlchemy flushes whole rows, so an agent step that
-//! loaded an item before a rename will write the old title back. The window is
-//! one request wide and both writers are the same user, but it is real, and it
-//! closes when `llm_proxy` moves.
+//! The discipline that kept it survivable while it was split stays house style:
+//! only ever write the columns a user edited (`UPDATE … SET title = ?`), never
+//! a whole row.
+//!
+//! **One request shape still goes to Python.** `agent/step` may name workspace
+//! documents, and reading those means the workspace filesystem — path
+//! normalisation, the traversal guard, and PDF text extraction through PyMuPDF,
+//! which has no Rust equivalent. Rather than grow a second traversal guard here
+//! for the domain that has not migrated yet, a step that names a document is
+//! handed to `proxy::forward` whole. See [`agent_step`].
+//!
+//! `spawn-process` is also the one place here that writes the `process` table.
+//! It inserts a `pending` row and stops — the response tells the caller to
+//! `POST /processes/{id}/sync` — so it needs no executor. Its snapshot builder
+//! is `pub(crate)` because `POST /processes` has to produce the same bytes.
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::FromRow;
 
 use crate::auth::Principal;
+use crate::dag_schema::sanitize_llm_model_alias;
 use crate::error::{ApiError, PathId};
-use crate::teams::{random_palette_color, stable_palette_color};
-use crate::wire::{check_len, sql_now, sql_time, sql_time_opt};
+// `resolved_team_color`, `with_default_accents` and `parse_roster` are the read
+// path of `app/team_schema.py`; `spawn-process` snapshots a template through
+// exactly the same three, so they are used, not copied.
+use crate::teams::{
+    parse_roster, random_palette_color, resolved_team_color, stable_palette_color,
+    with_default_accents, TeamRoster,
+};
+use crate::wire::{check_len, datetime_to_sql, sql_now, sql_time, sql_time_opt};
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -58,12 +70,21 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(get_item).patch(update_item).delete(delete_item),
         )
         .route("/api/v1/todos/items/{item_id}/events", get(item_events))
+        .route("/api/v1/todos/items/{item_id}/agent/apply", post(agent_apply))
+        .route("/api/v1/todos/items/{item_id}/agent/chat", post(agent_chat))
+        .route("/api/v1/todos/items/{item_id}/agent/step", post(agent_step))
+        .route(
+            "/api/v1/todos/items/{item_id}/planning-form/submit",
+            post(planning_form_submit),
+        )
+        .route(
+            "/api/v1/todos/items/{item_id}/spawn-process",
+            post(spawn_process),
+        )
         .route("/api/v1/todos/planner-profiles", get(planner_profiles))
-    // Not here on purpose: items/{id}/agent/*, planning-form/submit and
-    // spawn-process fall through to Python. See the module docs.
 }
 
-const TODO_STATUSES: [&str; 5] = ["plan", "backlog", "in_progress", "review", "done"];
+pub(crate) const TODO_STATUSES: [&str; 5] = ["plan", "backlog", "in_progress", "review", "done"];
 const TODO_TIME_HORIZONS: [&str; 4] = ["day", "week", "month", "goal"];
 const TODO_ITEM_KINDS: [&str; 5] = ["task", "habit", "goal", "review", "chore"];
 
@@ -111,7 +132,7 @@ async fn assert_board_access(
     }
 }
 
-async fn assert_item_access(
+pub(crate) async fn assert_item_access(
     state: &AppState,
     principal: &Principal,
     item_id: i64,
@@ -152,20 +173,23 @@ const BOARD_COLUMNS: &str =
      (SELECT COUNT(*) FROM todo_categories c WHERE c.board_id = b.id) AS category_count, \
      (SELECT COUNT(*) FROM todo_items i WHERE i.board_id = b.id) AS item_count";
 
+// `pub(crate)`: `assistant.rs`'s dashboard reuses these rather than re-querying
+// `todo_categories`/`todo_items` with a second copy of the same column list and
+// palette-fallback logic.
 #[derive(FromRow)]
-struct CategoryRow {
-    id: i64,
-    board_id: i64,
-    name: String,
-    color: Option<String>,
-    sort_order: i64,
-    planner_profile_id: Option<i64>,
-    created_at: String,
-    updated_at: String,
+pub(crate) struct CategoryRow {
+    pub(crate) id: i64,
+    pub(crate) board_id: i64,
+    pub(crate) name: String,
+    pub(crate) color: Option<String>,
+    pub(crate) sort_order: i64,
+    pub(crate) planner_profile_id: Option<i64>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
 }
 
 #[derive(Serialize)]
-struct CategoryOut {
+pub(crate) struct CategoryOut {
     id: i64,
     board_id: i64,
     name: String,
@@ -199,41 +223,41 @@ impl From<CategoryRow> for CategoryOut {
     }
 }
 
-const CATEGORY_COLUMNS: &str =
+pub(crate) const CATEGORY_COLUMNS: &str =
     "id, board_id, name, color, sort_order, planner_profile_id, created_at, updated_at";
 
-#[derive(FromRow)]
-struct ItemRow {
-    id: i64,
-    board_id: i64,
-    category_id: Option<i64>,
-    title: String,
-    description: String,
-    status: String,
-    priority: i64,
-    tags_json: Option<String>,
-    plan_json: Option<String>,
-    metadata_json: Option<String>,
-    assigned_profile_id: Option<i64>,
-    linked_process_id: Option<i64>,
-    parent_item_id: Option<i64>,
-    due_at: Option<String>,
-    scheduled_at: Option<String>,
-    time_horizon: Option<String>,
-    item_kind: Option<String>,
-    recurrence_json: Option<String>,
-    completion_json: Option<String>,
-    created_at: String,
-    updated_at: String,
+#[derive(FromRow, Clone)]
+pub(crate) struct ItemRow {
+    pub(crate) id: i64,
+    pub(crate) board_id: i64,
+    pub(crate) category_id: Option<i64>,
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) status: String,
+    pub(crate) priority: i64,
+    pub(crate) tags_json: Option<String>,
+    pub(crate) plan_json: Option<String>,
+    pub(crate) metadata_json: Option<String>,
+    pub(crate) assigned_profile_id: Option<i64>,
+    pub(crate) linked_process_id: Option<i64>,
+    pub(crate) parent_item_id: Option<i64>,
+    pub(crate) due_at: Option<String>,
+    pub(crate) scheduled_at: Option<String>,
+    pub(crate) time_horizon: Option<String>,
+    pub(crate) item_kind: Option<String>,
+    pub(crate) recurrence_json: Option<String>,
+    pub(crate) completion_json: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
 }
 
-const ITEM_COLUMNS: &str = "id, board_id, category_id, title, description, status, priority, \
+pub(crate) const ITEM_COLUMNS: &str = "id, board_id, category_id, title, description, status, priority, \
      tags_json, plan_json, metadata_json, assigned_profile_id, linked_process_id, parent_item_id, \
      due_at, scheduled_at, time_horizon, item_kind, recurrence_json, completion_json, \
      created_at, updated_at";
 
 #[derive(Serialize)]
-struct ItemOut {
+pub(crate) struct ItemOut {
     id: i64,
     board_id: i64,
     category_id: Option<i64>,
@@ -459,7 +483,7 @@ struct BoardCreate {
     template_slug: Option<String>,
 }
 
-fn default_board_model() -> Option<String> {
+pub(crate) fn default_board_model() -> Option<String> {
     Some("gemma4:31b-cloud".into())
 }
 
@@ -515,7 +539,11 @@ async fn create_board(
     Ok((StatusCode::CREATED, Json(load_board(&state, board_id).await?)).into_response())
 }
 
-async fn apply_board_template(state: &AppState, board_id: i64, slug: &str) -> Result<(), ApiError> {
+pub(crate) async fn apply_board_template(
+    state: &AppState,
+    board_id: i64,
+    slug: &str,
+) -> Result<(), ApiError> {
     let Some((_, _, _, categories)) = BOARD_TEMPLATES.iter().find(|(s, ..)| *s == slug) else {
         return Err(ApiError::bad_request(format!("Unknown board template: {slug}")));
     };
@@ -838,7 +866,7 @@ async fn update_category(
 // Items
 // ---------------------------------------------------------------------------
 
-async fn load_item(state: &AppState, item_id: i64) -> Result<ItemOut, ApiError> {
+pub(crate) async fn load_item(state: &AppState, item_id: i64) -> Result<ItemOut, ApiError> {
     let row: Option<ItemRow> =
         sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"))
             .bind(item_id)
@@ -985,11 +1013,6 @@ async fn create_item(
     .await?;
 
     Ok((StatusCode::CREATED, Json(load_item(&state, id).await?)).into_response())
-}
-
-/// Callers send ISO-8601; the column holds SQLAlchemy's space-separated form.
-fn datetime_to_sql(raw: &str) -> String {
-    raw.replacen('T', " ", 1).trim_end_matches('Z').to_string()
 }
 
 async fn get_item(
@@ -1147,6 +1170,796 @@ struct EventRow {
     created_at: String,
 }
 
+/// Append to the item's event log. The log is append-only, which is why it was
+/// never part of the two-writer hazard: nothing here can overwrite a row Python
+/// wrote, or the other way round.
+pub(crate) async fn append_item_event(
+    state: &AppState,
+    item_id: i64,
+    event_type: &str,
+    content: Value,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO todo_item_events (item_id, event_type, content_json, created_at) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(item_id)
+    .bind(event_type)
+    .bind(content.to_string())
+    .bind(sql_now())
+    .execute(&state.pool)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Applying agent-planned actions
+// ---------------------------------------------------------------------------
+
+/// One value bound into the generated `UPDATE`. Only the columns an action
+/// actually touched are written, so a concurrent edit elsewhere in the row
+/// survives — the rule that kept this table usable while it had two writers.
+enum Bind {
+    Text(String),
+    Int(i64),
+}
+
+/// The item fields the actions can change, plus which of them were changed.
+#[derive(Default)]
+pub(crate) struct ItemPatch {
+    columns: Vec<(&'static str, Bind)>,
+}
+
+impl ItemPatch {
+    pub(crate) fn set_text(&mut self, column: &'static str, value: impl Into<String>) {
+        self.columns.retain(|(name, _)| *name != column);
+        self.columns.push((column, Bind::Text(value.into())));
+    }
+
+    pub(crate) fn set_int(&mut self, column: &'static str, value: i64) {
+        self.columns.retain(|(name, _)| *name != column);
+        self.columns.push((column, Bind::Int(value)));
+    }
+
+    pub(crate) fn set_json(&mut self, column: &'static str, value: &Value) {
+        self.set_text(column, value.to_string());
+    }
+
+    pub(crate) async fn write(self, state: &AppState, item_id: i64) -> Result<(), ApiError> {
+        let mut assignments: Vec<String> =
+            self.columns.iter().map(|(name, _)| format!("{name} = ?")).collect();
+        assignments.push("updated_at = ?".into());
+
+        // Column names come from the fixed list above, never from a request.
+        let sql = format!("UPDATE todo_items SET {} WHERE id = ?", assignments.join(", "));
+        let mut query = sqlx::query(&sql);
+        for (_, value) in self.columns {
+            query = match value {
+                Bind::Text(text) => query.bind(text),
+                Bind::Int(number) => query.bind(number),
+            };
+        }
+        query.bind(sql_now()).bind(item_id).execute(&state.pool).await?;
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct PlannedAction {
+    #[serde(default)]
+    action_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    parameters: Map<String, Value>,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ApplyActionsRequest {
+    #[serde(default)]
+    actions: Vec<PlannedAction>,
+}
+
+#[derive(Default)]
+struct ApplyResult {
+    applied: Vec<String>,
+    skipped: Vec<String>,
+    guidance: Vec<String>,
+    exports: Vec<Value>,
+}
+
+fn as_str(params: &Map<String, Value>, key: &str) -> Option<String> {
+    params.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Python's `isinstance(v, int)`, which is false for a float and — because
+/// `bool` is an `int` there — true for a boolean. serde_json keeps them apart,
+/// so a boolean would not match; nothing sends one.
+fn as_int(params: &Map<String, Value>, key: &str) -> Option<i64> {
+    params.get(key).and_then(|v| v.as_i64())
+}
+
+/// `datetime.fromisoformat` after swapping a trailing `Z`, then stored the way
+/// SQLAlchemy stores it in a naive column.
+///
+/// The offset is **dropped, not applied**: writing an aware datetime into a
+/// `DateTime` column keeps the wall clock and discards the tzinfo, so `09:00Z`
+/// lands as `09:00`. Converting to UTC first would move every scheduled item by
+/// the caller's offset relative to what Python does with the same request.
+fn as_datetime(params: &Map<String, Value>, key: &str) -> Option<String> {
+    let raw = as_str(params, key)?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Same parse as the item CRUD's `datetime_to_sql`, which is the point: this
+    // one used to reject a space separator that pydantic accepts, so an action
+    // planned with `"2026-08-06 09:00"` was silently skipped here and applied
+    // there.
+    Some(crate::wire::sql_string(crate::wire::parse_naive(raw)?))
+}
+
+pub(crate) fn now_isoformat() -> String {
+    chrono::Utc::now().naive_utc().format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
+}
+
+/// Apply the actions an agent planned, on the server, so the same rules run
+/// whichever client asked.
+///
+/// Every action is independent: one that cannot be applied is recorded in
+/// `skipped` with the reason and the rest still run. Nothing here fails the
+/// request except a missing item.
+async fn agent_apply(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    PathId(item_id): PathId<i64>,
+    raw: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    require_scope(&principal, "todos:write")?;
+    assert_item_access(&state, &principal, item_id).await?;
+
+    let request: ApplyActionsRequest = serde_json::from_slice(&raw).unwrap_or(ApplyActionsRequest {
+        actions: Vec::new(),
+    });
+
+    let row: Option<ItemRow> =
+        sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"))
+            .bind(item_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some(item) = row else {
+        return Err(ApiError::not_found("Item not found"));
+    };
+
+    let mut result = ApplyResult::default();
+    let mut patch = ItemPatch::default();
+    let mut plan = Value::Array(json_array(item.plan_json.clone()));
+    let mut metadata = json_object(item.metadata_json.clone());
+    let mut completion = json_object(item.completion_json.clone());
+    let mut title = item.title.clone();
+    let mut description = item.description.clone();
+
+    for action in &request.actions {
+        let p = &action.parameters;
+        let aid = action.action_id.as_str();
+
+        // An action addressed at a different item is not applied here.
+        if as_int(p, "item_id").is_some_and(|target| target != item_id) {
+            result.skipped.push(format!("{aid}: wrong item_id"));
+            continue;
+        }
+
+        match aid {
+            "move_item_status" => match as_str(p, "status") {
+                Some(status) if TODO_STATUSES.contains(&status.as_str()) => {
+                    patch.set_text("status", &status);
+                    result.applied.push(format!("Moved to {status}"));
+                }
+                _ => result.skipped.push("move_item_status: invalid status".into()),
+            },
+
+            "update_item" => {
+                let mut changed = false;
+                if let Some(new_title) = as_str(p, "title").filter(|t| !t.is_empty()) {
+                    title = new_title.trim().to_string();
+                    patch.set_text("title", &title);
+                    changed = true;
+                }
+                if let Some(new_description) = p.get("description").and_then(Value::as_str) {
+                    description = new_description.to_string();
+                    patch.set_text("description", &description);
+                    changed = true;
+                }
+                if let Some(priority) = as_int(p, "priority") {
+                    patch.set_int("priority", priority);
+                    changed = true;
+                }
+                if changed {
+                    result.applied.push("Updated item".into());
+                } else {
+                    result.skipped.push("update_item: empty patch".into());
+                }
+            }
+
+            "add_subtask" => match as_str(p, "step").filter(|s| !s.is_empty()) {
+                Some(step) => {
+                    let done = p.get("done").is_some_and(truthy);
+                    if let Some(steps) = plan.as_array_mut() {
+                        steps.push(json!({ "step": step, "done": done }));
+                    }
+                    patch.set_json("plan_json", &plan);
+                    result.applied.push(format!("Added subtask: {step}"));
+                }
+                None => result.skipped.push("add_subtask: missing step".into()),
+            },
+
+            "break_down_task" => {
+                let grocery = p.get("grocery_groups").and_then(Value::as_array);
+                if let Some(groups) = grocery.filter(|g| !g.is_empty()) {
+                    let rows: Vec<Value> = groups
+                        .iter()
+                        .filter_map(|group| {
+                            let group = group.as_object()?;
+                            let category = group
+                                .get("category")
+                                .and_then(Value::as_str)
+                                .filter(|c| !c.is_empty())
+                                .unwrap_or("Other");
+                            let items: Vec<Value> = group
+                                .get("items")
+                                .and_then(Value::as_array)
+                                .map(|items| items.iter().map(python_str).collect())
+                                .unwrap_or_default();
+                            Some(json!({ "category": category, "items": items, "done": false }))
+                        })
+                        .collect();
+                    if rows.is_empty() {
+                        result.skipped.push("break_down_task: empty grocery_groups".into());
+                        continue;
+                    }
+                    let count = rows.len();
+                    plan = Value::Array(rows);
+                    patch.set_json("plan_json", &plan);
+                    metadata.insert("plan_kind".into(), json!("grocery_list"));
+                    patch.set_json("metadata_json", &Value::Object(metadata.clone()));
+                    result.applied.push(format!("Grocery list: {count} groups"));
+                } else {
+                    let steps = p.get("steps").and_then(Value::as_array);
+                    let Some(steps) = steps.filter(|s| !s.is_empty()) else {
+                        result.skipped.push("break_down_task: no steps".into());
+                        continue;
+                    };
+                    let rows: Vec<Value> = steps
+                        .iter()
+                        .map(|entry| match entry.as_object() {
+                            Some(map) => {
+                                let step = map
+                                    .get("step")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| entry.to_string());
+                                json!({ "step": step, "done": map.get("done").is_some_and(truthy) })
+                            }
+                            None => json!({ "step": python_str(entry), "done": false }),
+                        })
+                        .collect();
+                    let count = rows.len();
+                    plan = Value::Array(rows);
+                    patch.set_json("plan_json", &plan);
+                    result.applied.push(format!("Plan: {count} steps"));
+                }
+            }
+
+            "suggest_next_steps" => {
+                if let Some(guidance) = as_str(p, "guidance").filter(|g| !g.is_empty()) {
+                    result.guidance.push(guidance);
+                }
+                result.applied.push("Guidance received".into());
+            }
+
+            "ask_clarifying_questions" => {
+                if let Some(questions) = p.get("questions").and_then(Value::as_array) {
+                    result.guidance.extend(questions.iter().map(|q| {
+                        python_str(q).as_str().unwrap_or_default().to_string()
+                    }));
+                }
+                result.applied.push("Questions received".into());
+            }
+
+            "present_planning_form" => {
+                let Some(form) = p.get("form").filter(|f| f.is_object()) else {
+                    result.skipped.push("present_planning_form: invalid form".into());
+                    continue;
+                };
+                let mut forms = match metadata.get("planning_forms") {
+                    Some(Value::Array(existing)) => existing.clone(),
+                    _ => Vec::new(),
+                };
+                forms.push(json!({ "spec": form, "status": "open", "answers": null }));
+                metadata.insert("pending_form_index".into(), json!(forms.len() - 1));
+                metadata.insert("planning_forms".into(), Value::Array(forms));
+                patch.set_json("metadata_json", &Value::Object(metadata.clone()));
+                result.applied.push("Planning form presented".into());
+            }
+
+            "export_markdown_checklist" => {
+                let export_title =
+                    as_str(p, "title").filter(|t| !t.is_empty()).unwrap_or_else(|| title.clone());
+                let lines: Vec<String> = match p.get("lines").and_then(Value::as_array) {
+                    Some(lines) => lines
+                        .iter()
+                        .map(|l| python_str(l).as_str().unwrap_or_default().to_string())
+                        .collect(),
+                    None => plan
+                        .as_array()
+                        .map(|steps| {
+                            steps
+                                .iter()
+                                .map(|s| {
+                                    s.get("step")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                };
+                let body = lines
+                    .iter()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| format!("- [ ] {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let content = format!("# {export_title}\n\n{body}\n");
+                let stem: String = export_title.chars().take(48).collect();
+                let stem = stem.trim();
+                let filename =
+                    format!("{}.md", if stem.is_empty() { "checklist" } else { stem });
+                result.exports.push(
+                    json!({ "kind": "markdown", "filename": filename, "content": content }),
+                );
+                result.applied.push("Markdown checklist ready".into());
+            }
+
+            "export_ics_event" => {
+                let summary =
+                    as_str(p, "summary").filter(|s| !s.is_empty()).unwrap_or_else(|| title.clone());
+                let start = as_str(p, "start").unwrap_or_default();
+                if start.is_empty() {
+                    result.skipped.push("export_ics_event: missing start".into());
+                    continue;
+                }
+                let end = as_str(p, "end").filter(|e| !e.is_empty()).unwrap_or_else(|| start.clone());
+                let ics_description = as_str(p, "description")
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| description.clone())
+                    .replace('\n', "\\n");
+                let ics = format!(
+                    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Agent Platform//Todo Planner//EN\r\n\
+                     BEGIN:VEVENT\r\n\
+                     UID:todo-item-{item_id}@agent-platform\r\n\
+                     SUMMARY:{summary}\r\n\
+                     DTSTART:{start}\r\n\
+                     DTEND:{end}\r\n\
+                     DESCRIPTION:{ics_description}\r\n\
+                     END:VEVENT\r\nEND:VCALENDAR\r\n"
+                );
+                let stem: String = summary.chars().take(48).collect();
+                let stem = stem.trim();
+                let filename = format!("{}.ics", if stem.is_empty() { "event" } else { stem });
+                result
+                    .exports
+                    .push(json!({ "kind": "ics", "filename": filename, "content": ics }));
+                result.applied.push("Calendar event ready".into());
+            }
+
+            "schedule_item" => match as_datetime(p, "scheduled_at") {
+                Some(scheduled) => {
+                    patch.set_text("scheduled_at", scheduled);
+                    if let Some(horizon) = as_str(p, "time_horizon").filter(|h| !h.is_empty()) {
+                        patch.set_text("time_horizon", horizon);
+                    }
+                    result.applied.push("Scheduled item".into());
+                }
+                None => result.skipped.push("schedule_item: invalid scheduled_at".into()),
+            },
+
+            "set_due_date" => match as_datetime(p, "due_at") {
+                Some(due) => {
+                    patch.set_text("due_at", due);
+                    result.applied.push("Due date set".into());
+                }
+                None => result.skipped.push("set_due_date: invalid due_at".into()),
+            },
+
+            "log_completion" => {
+                completion.insert("completed_at".into(), json!(now_isoformat()));
+                if let Some(minutes) = as_int(p, "time_spent_minutes") {
+                    completion.insert("time_spent_minutes".into(), json!(minutes));
+                }
+                for key in ["difficulty", "notes", "blockers"] {
+                    if let Some(value) = as_str(p, key).filter(|v| !v.is_empty()) {
+                        completion.insert(key.into(), json!(value));
+                    }
+                }
+                patch.set_json("completion_json", &Value::Object(completion.clone()));
+                patch.set_text("status", "done");
+                result.applied.push("Completion logged".into());
+            }
+
+            "adjust_plan" => {
+                if let Some(new_title) = as_str(p, "title").filter(|t| !t.is_empty()) {
+                    title = new_title.trim().to_string();
+                    patch.set_text("title", &title);
+                }
+                if let Some(new_description) = p.get("description").and_then(Value::as_str) {
+                    description = new_description.to_string();
+                    patch.set_text("description", &description);
+                }
+                if let Some(due) = as_datetime(p, "due_at") {
+                    patch.set_text("due_at", due);
+                }
+                if let Some(scheduled) = as_datetime(p, "scheduled_at") {
+                    patch.set_text("scheduled_at", scheduled);
+                }
+                if let Some(horizon) = as_str(p, "time_horizon").filter(|h| !h.is_empty()) {
+                    patch.set_text("time_horizon", horizon);
+                }
+                if let Some(status) =
+                    as_str(p, "status").filter(|s| TODO_STATUSES.contains(&s.as_str()))
+                {
+                    patch.set_text("status", status);
+                }
+                if let Some(priority) = as_int(p, "priority") {
+                    patch.set_int("priority", priority);
+                }
+                result.applied.push("Plan adjusted".into());
+            }
+
+            "create_subtask_item" => {
+                let parent_id = as_int(p, "parent_item_id").unwrap_or(item_id);
+                let Some(subtask_title) = as_str(p, "title").filter(|t| !t.is_empty()) else {
+                    result.skipped.push("create_subtask_item: missing title".into());
+                    continue;
+                };
+                let parent: Option<(i64, Option<i64>, Option<String>)> = sqlx::query_as(
+                    "SELECT board_id, category_id, time_horizon FROM todo_items WHERE id = ?",
+                )
+                .bind(parent_id)
+                .fetch_optional(&state.pool)
+                .await?;
+                let Some((board_id, category_id, parent_horizon)) = parent else {
+                    result.skipped.push("create_subtask_item: parent not found".into());
+                    continue;
+                };
+                let now = sql_now();
+                sqlx::query(
+                    "INSERT INTO todo_items (board_id, category_id, title, description, status, \
+                     priority, parent_item_id, due_at, scheduled_at, time_horizon, item_kind, \
+                     created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, 'plan', 0, ?, ?, ?, ?, 'task', ?, ?)",
+                )
+                .bind(board_id)
+                .bind(category_id)
+                .bind(&subtask_title)
+                .bind(as_str(p, "description").unwrap_or_default())
+                .bind(parent_id)
+                .bind(as_datetime(p, "due_at"))
+                .bind(as_datetime(p, "scheduled_at"))
+                .bind(parent_horizon.filter(|h| !h.is_empty()).unwrap_or_else(|| "week".into()))
+                .bind(&now)
+                .bind(&now)
+                .execute(&state.pool)
+                .await?;
+                result.applied.push(format!("Created subtask: {subtask_title}"));
+            }
+
+            "propose_review" => {
+                result.guidance.push(
+                    as_str(p, "reason").filter(|r| !r.is_empty()).unwrap_or_else(|| "Review suggested".into()),
+                );
+                result.applied.push("Review proposed".into());
+            }
+
+            "store_user_profile" => {
+                let domain = as_str(p, "domain").filter(|d| !d.is_empty());
+                let data = p.get("data").and_then(Value::as_object);
+                let (Some(domain), Some(data)) = (domain, data) else {
+                    result.skipped.push("store_user_profile: invalid domain or data".into());
+                    continue;
+                };
+                let project_id: Option<Option<i64>> =
+                    sqlx::query_scalar("SELECT project_id FROM todo_boards WHERE id = ?")
+                        .bind(item.board_id)
+                        .fetch_optional(&state.pool)
+                        .await?;
+                let Some(Some(project_id)) = project_id else {
+                    result.skipped.push("store_user_profile: no project".into());
+                    continue;
+                };
+                merge_domain_profile(&state, project_id, &domain, data).await?;
+                result.applied.push(format!("Saved {domain} profile"));
+            }
+
+            "trigger_webhook" => {
+                let Some(url) = as_str(p, "webhook_url").filter(|u| !u.is_empty()) else {
+                    result.skipped.push("trigger_webhook: missing webhook_url".into());
+                    continue;
+                };
+                match trigger_webhook(&state.http, &url, p.get("payload")).await {
+                    Ok((status, ok)) => result
+                        .applied
+                        .push(format!("Webhook {status}{}", if ok { " OK" } else { " failed" })),
+                    Err(message) => result.skipped.push(format!("trigger_webhook: {message}")),
+                }
+            }
+
+            other => result.skipped.push(format!("Unknown action: {other}")),
+        }
+    }
+
+    patch.write(&state, item_id).await?;
+
+    let planned: Vec<Value> = request
+        .actions
+        .iter()
+        .map(|a| {
+            json!({
+                "action_id": a.action_id,
+                "name": a.name,
+                "parameters": a.parameters,
+                "confidence": a.confidence,
+                "reasoning": a.reasoning,
+            })
+        })
+        .collect();
+    append_item_event(
+        &state,
+        item_id,
+        "actions_applied",
+        json!({
+            "applied": result.applied,
+            "skipped": result.skipped,
+            "guidance": result.guidance,
+            "export_count": result.exports.len(),
+            "actions": planned,
+        }),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "item": load_item(&state, item_id).await?,
+        "applied": result.applied,
+        "skipped": result.skipped,
+        "guidance": result.guidance,
+        "exports": result.exports,
+    }))
+    .into_response())
+}
+
+/// Python's `str(x)` for the list entries these actions stringify.
+pub(crate) fn python_str(value: &Value) -> Value {
+    match value {
+        Value::String(_) => value.clone(),
+        Value::Bool(true) => json!("True"),
+        Value::Bool(false) => json!("False"),
+        Value::Null => json!("None"),
+        other => json!(other.to_string()),
+    }
+}
+
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+        Value::Null => false,
+    }
+}
+
+/// `assistant.services.user_profile_service.merge_profile` — the one action here
+/// that writes another domain's table, and also `assistant.rs`'s `PATCH
+/// /profile/{domain}` handler; both need the merged profile back, so this
+/// returns it rather than `()`. Empty and null values are dropped rather than
+/// stored, so a partial patch cannot erase what is already known.
+pub(crate) async fn merge_domain_profile(
+    state: &AppState,
+    project_id: i64,
+    domain: &str,
+    patch: &Map<String, Value>,
+) -> Result<Map<String, Value>, ApiError> {
+    let existing: Option<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, profile_json FROM assistant_domain_profiles WHERE project_id = ? AND domain = ?",
+    )
+    .bind(project_id)
+    .bind(domain)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (id, mut profile) = match existing {
+        Some((id, raw)) => (Some(id), json_object(raw)),
+        None => (None, Map::new()),
+    };
+    for (key, value) in patch {
+        if !value.is_null() && value.as_str() != Some("") {
+            profile.insert(key.clone(), value.clone());
+        }
+    }
+
+    let now = sql_now();
+    let body = Value::Object(profile.clone()).to_string();
+    match id {
+        Some(id) => {
+            sqlx::query(
+                "UPDATE assistant_domain_profiles SET profile_json = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(body)
+            .bind(&now)
+            .bind(id)
+            .execute(&state.pool)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO assistant_domain_profiles \
+                 (project_id, domain, profile_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(project_id)
+            .bind(domain)
+            .bind(body)
+            .bind(&now)
+            .bind(&now)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
+    Ok(profile)
+}
+
+/// POST a JSON payload to an external webhook (n8n, Zapier, …). The URL comes
+/// from the plan, so the scheme is checked before anything is sent.
+pub(crate) async fn trigger_webhook(
+    http: &reqwest::Client,
+    url: &str,
+    payload: Option<&Value>,
+) -> Result<(u16, bool), String> {
+    let url = url.trim();
+    let parsed = url::Url::parse(url).map_err(|_| "webhook_url must be an http(s) URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+        return Err("webhook_url must be an http(s) URL".into());
+    }
+    let body = match payload {
+        Some(value @ Value::Object(_)) => value.clone(),
+        _ => json!({}),
+    };
+    let response = http
+        .post(url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    Ok((status.as_u16(), status.is_success()))
+}
+
+/// Record a user's answers to a planning form the agent presented.
+///
+/// The form lives in the item's `metadata_json` — the agent appends a `{spec,
+/// status, answers}` entry and points `pending_form_index` at it; this fills the
+/// answers in and clears that pointer.
+async fn planning_form_submit(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    PathId(item_id): PathId<i64>,
+    raw: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    require_scope(&principal, "todos:write")?;
+    assert_item_access(&state, &principal, item_id).await?;
+
+    let body = serde_json::from_slice::<Value>(&raw)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    let mut errors = Vec::new();
+    let form_index = match body.get("form_index") {
+        None | Some(Value::Null) => {
+            errors.push(ApiError::field_error("form_index", "missing", "Field required"));
+            0
+        }
+        Some(Value::Number(n)) if n.is_i64() => {
+            let value = n.as_i64().unwrap_or(-1);
+            if value < 0 {
+                errors.push(ApiError::field_error(
+                    "form_index",
+                    "greater_than_equal",
+                    "Input should be greater than or equal to 0",
+                ));
+            }
+            value
+        }
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                "form_index",
+                "int_type",
+                "Input should be a valid integer",
+            ));
+            0
+        }
+    };
+    let answers = match body.get("answers") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(map)) => map.clone(),
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                "answers",
+                "dict_type",
+                "Input should be a valid dictionary",
+            ));
+            Map::new()
+        }
+    };
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+
+    let stored: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT metadata_json FROM todo_items WHERE id = ?")
+            .bind(item_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some((metadata_json,)) = stored else {
+        return Err(ApiError::not_found("Item not found"));
+    };
+
+    let mut metadata = json_object(metadata_json);
+    let index = form_index as usize;
+    let Some(Value::Array(mut forms)) = metadata.get("planning_forms").cloned() else {
+        return Err(ApiError::bad_request("Invalid planning form index"));
+    };
+    if index >= forms.len() {
+        return Err(ApiError::bad_request("Invalid planning form index"));
+    }
+    let Some(Value::Object(mut entry)) = forms.get(index).cloned() else {
+        return Err(ApiError::bad_request("Invalid planning form entry"));
+    };
+
+    entry.insert("answers".into(), Value::Object(answers.clone()));
+    entry.insert("status".into(), json!("submitted"));
+    forms[index] = Value::Object(entry);
+    metadata.insert("planning_forms".into(), Value::Array(forms));
+    if metadata.get("pending_form_index").and_then(Value::as_i64) == Some(form_index) {
+        metadata.remove("pending_form_index");
+    }
+
+    // One column, plus the timestamp — the rule that keeps this table safe while
+    // Python still writes the agent routes beside it.
+    sqlx::query("UPDATE todo_items SET metadata_json = ?, updated_at = ? WHERE id = ?")
+        .bind(Value::Object(metadata).to_string())
+        .bind(sql_now())
+        .bind(item_id)
+        .execute(&state.pool)
+        .await?;
+
+    append_item_event(
+        &state,
+        item_id,
+        "planning_form_submitted",
+        json!({ "form_index": form_index, "answers": answers }),
+    )
+    .await?;
+
+    Ok(Json(load_item(&state, item_id).await?).into_response())
+}
+
 async fn item_events(
     State(state): State<Arc<AppState>>,
     principal: Principal,
@@ -1182,27 +1995,273 @@ async fn item_events(
     Ok(Json(json!({ "events": events })).into_response())
 }
 
-#[derive(FromRow)]
-struct ProfileRow {
-    id: i64,
-    slug: String,
-    name: String,
-    requirement_type: String,
-    system_prompt: String,
-    default_model: Option<String>,
-    action_set_id: Option<i64>,
-    skill_paths_json: Option<String>,
+// ---------------------------------------------------------------------------
+// Spawning a process (`app/todos/services/process_spawn.py`)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SpawnProcessRequest {
+    team_template_id: Option<i64>,
+    #[serde(default)]
+    goal: Option<String>,
+    #[serde(default)]
+    auto_approve: bool,
 }
+
+#[derive(FromRow)]
+struct TemplateRow {
+    id: i64,
+    name: String,
+    description: Option<String>,
+    color: Option<String>,
+    roster_json: String,
+}
+
+#[derive(Serialize)]
+struct SpawnProcessResponse {
+    process_id: i64,
+    status: &'static str,
+    item: ItemOut,
+    auto_approve: bool,
+    /// Verbatim from Python: this route deliberately schedules nothing, and the
+    /// note is the only place a caller is told so.
+    note: &'static str,
+}
+
+/// `json.dumps` escapes every non-ASCII character — `ensure_ascii=True` is the
+/// default — where serde_json emits it raw. The rest of the compact form
+/// already matches, so only string fragments are overridden.
+struct EnsureAscii;
+
+impl serde_json::ser::Formatter for EnsureAscii {
+    fn write_string_fragment<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        fragment: &str,
+    ) -> std::io::Result<()> {
+        let mut plain = 0;
+        let mut units = [0u16; 2];
+        for (i, ch) in fragment.char_indices() {
+            // DEL is ASCII but outside Python's printable range, so it escapes
+            // too. Everything below 0x20 never reaches here — serde_json has
+            // already routed it through `write_char_escape`.
+            if ch.is_ascii() && ch != '\u{7f}' {
+                continue;
+            }
+            writer.write_all(fragment[plain..i].as_bytes())?;
+            // Astral chars are a surrogate pair in Python's output, which is
+            // what UTF-16 units give us.
+            for unit in ch.encode_utf16(&mut units) {
+                writer.write_all(format!("\\u{:04x}", *unit).as_bytes())?;
+            }
+            plain = i + ch.len_utf8();
+        }
+        writer.write_all(fragment[plain..].as_bytes())
+    }
+}
+
+/// `team_schema.build_process_team_snapshot`.
+///
+/// Two details are load-bearing, because `process.team_snapshot_json` is stored
+/// and never re-derived: the payload is built from structs so the keys keep
+/// pydantic's field-declaration order (a `serde_json::Map` would sort them),
+/// and it is written through [`EnsureAscii`] so a non-ASCII team name escapes
+/// the way `json.dumps` escapes it. The separators already match — serde_json's
+/// compact form *is* `separators=(",", ":")`.
+pub(crate) fn build_process_team_snapshot(
+    team_template_id: i64,
+    name: &str,
+    description: Option<&str>,
+    color: &str,
+    roster: &TeamRoster,
+) -> String {
+    #[derive(Serialize)]
+    struct Snapshot<'a> {
+        team_template_id: i64,
+        name: &'a str,
+        description: Option<&'a str>,
+        color: &'a str,
+        roster: &'a TeamRoster,
+    }
+
+    let payload = Snapshot { team_template_id, name, description, color, roster };
+    let mut buffer = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut buffer, EnsureAscii);
+    match payload.serialize(&mut serializer) {
+        Ok(()) => String::from_utf8(buffer).unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+/// The template as it is snapshotted onto a process: the same read-path colour
+/// resolution the teams API uses, keyed by the template id.
+fn snapshot_template(row: &TemplateRow) -> Result<String, ApiError> {
+    let key = row.id.to_string();
+    let color = resolved_team_color(row.color.as_deref(), Some(&key));
+    let roster = with_default_accents(&parse_roster(&row.roster_json)?, Some(&color), &key);
+    Ok(build_process_team_snapshot(
+        row.id,
+        &row.name,
+        row.description.as_deref(),
+        &color,
+        &roster,
+    ))
+}
+
+/// Create a `pending` process from an item and link the two.
+///
+/// Nothing is scheduled: no planner call, no DAG, no executor. The row sits at
+/// `pending` until someone calls `POST /processes/{id}/sync`, which is what the
+/// `note` in the response says.
+async fn spawn_process(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    PathId(item_id): PathId<i64>,
+    body: Option<Json<SpawnProcessRequest>>,
+) -> Result<Response, ApiError> {
+    require_scope(&principal, "todos:write")?;
+    assert_item_access(&state, &principal, item_id).await?;
+
+    let req = body.map(|Json(req)| req);
+    let team_template_id = match req.as_ref().and_then(|r| r.team_template_id) {
+        None => {
+            return Err(ApiError::validation(vec![ApiError::field_error(
+                "team_template_id",
+                "missing",
+                "Field required",
+            )]))
+        }
+        Some(id) if id < 1 => {
+            return Err(ApiError::validation(vec![ApiError::field_error(
+                "team_template_id",
+                "greater_than_equal",
+                "Input should be greater than or equal to 1",
+            )]))
+        }
+        Some(id) => id,
+    };
+    let auto_approve = req.as_ref().is_some_and(|r| r.auto_approve);
+    let requested_goal = req.and_then(|r| r.goal).unwrap_or_default();
+
+    let item = load_item(&state, item_id).await?;
+
+    // Python looks the template up with a bare `session.get` — no visibility
+    // check, unlike every read in `teams.rs`. Kept as-is on purpose: this is a
+    // parity port, and narrowing it here would 404 requests Python answers.
+    let template: TemplateRow = sqlx::query_as(
+        "SELECT id, name, description, color, roster_json FROM teamtemplate WHERE id = ?",
+    )
+    .bind(team_template_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("Team template not found"))?;
+
+    // The board is read for its project, not for access — that was checked
+    // above. A board with no project spawns an unassigned process; a project
+    // that has vanished is a 404 rather than a process pointing at nothing.
+    let project_id: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT project_id FROM todo_boards WHERE id = ?")
+            .bind(item.board_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let project_id = project_id.flatten();
+    if let Some(project_id) = project_id {
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM project WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(&state.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(ApiError::not_found("Project not found"));
+        }
+    }
+
+    let team_snapshot_json = snapshot_template(&template)?;
+    // An empty goal falls back to the item itself, title and body separated by a
+    // blank line, then trimmed — an item with no description must not spawn a
+    // goal with two trailing newlines.
+    let goal = match requested_goal.trim() {
+        "" => format!("{}\n\n{}", item.title, item.description).trim().to_string(),
+        explicit => explicit.to_string(),
+    };
+
+    // Column for column with SQLModel's `Process(...)` defaults. Left out, and
+    // therefore NULL: `dag_json`, `failure_reason`, `client_id`, `token_id`,
+    // `model_build_job_id`. `token_id` in particular is *not* set here — this
+    // path never calls `record_api_token_usage`, so a todo-spawned process is
+    // outside the token-counter two-writer hazard.
+    let status = "pending";
+    let now = sql_now();
+    let process_id: i64 = sqlx::query_scalar(
+        "INSERT INTO process \
+         (goal, status, total_tokens, total_cost, tool_invocations_used, team_template_id, \
+          team_snapshot_json, project_id, created_at, updated_at) \
+         VALUES (?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(&goal)
+    .bind(status)
+    .bind(team_template_id)
+    .bind(&team_snapshot_json)
+    .bind(project_id)
+    .bind(&now)
+    .bind(&now)
+    .fetch_one(&state.pool)
+    .await?;
+
+    set_item_column(&state, item_id, "linked_process_id", process_id).await?;
+    set_item_column(&state, item_id, "updated_at", sql_now()).await?;
+
+    append_item_event(
+        &state,
+        item_id,
+        "process_spawned",
+        json!({
+            "process_id": process_id,
+            "team_template_id": team_template_id,
+            "goal": goal,
+            "auto_approve": auto_approve,
+        }),
+    )
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(SpawnProcessResponse {
+            process_id,
+            status,
+            item: load_item(&state, item_id).await?,
+            auto_approve,
+            note: "Process created. Start planning via POST /api/v1/processes/{id}/sync \
+                   or the process UI.",
+        }),
+    )
+        .into_response())
+}
+
+// `pub(crate)`: `assistant.rs`'s turn generation resolves a profile by slug,
+// the one lookup this file does not already have.
+#[derive(FromRow, Clone)]
+pub(crate) struct ProfileRow {
+    pub(crate) id: i64,
+    pub(crate) slug: String,
+    pub(crate) name: String,
+    pub(crate) requirement_type: String,
+    pub(crate) system_prompt: String,
+    pub(crate) default_model: Option<String>,
+    pub(crate) action_set_id: Option<i64>,
+    pub(crate) skill_paths_json: Option<String>,
+}
+
+pub(crate) const PROFILE_COLUMNS: &str = "id, slug, name, requirement_type, system_prompt, default_model, \
+     action_set_id, skill_paths_json";
 
 async fn planner_profiles(
     State(state): State<Arc<AppState>>,
     principal: Principal,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:read")?;
-    let rows: Vec<ProfileRow> = sqlx::query_as(
-        "SELECT id, slug, name, requirement_type, system_prompt, default_model, action_set_id, \
-         skill_paths_json FROM planner_agent_profiles ORDER BY id ASC",
-    )
+    let rows: Vec<ProfileRow> = sqlx::query_as(&format!(
+        "SELECT {PROFILE_COLUMNS} FROM planner_agent_profiles ORDER BY id ASC"
+    ))
     .fetch_all(&state.pool)
     .await?;
 
@@ -1224,6 +2283,709 @@ async fn planner_profiles(
     Ok(Json(json!({ "profiles": profiles })).into_response())
 }
 
+// ---------------------------------------------------------------------------
+// Agent chat
+// ---------------------------------------------------------------------------
+
+/// `resolve_profile_for_item` (`services/board_service.py`): the item's own
+/// profile, else its category's, else the lowest-id profile on the board.
+///
+/// The first two branches are terminal: an `assigned_profile_id` pointing at a
+/// row that no longer exists resolves to *no profile*, not to the fallback,
+/// because Python's `session.get` returns `None` and returns it.
+async fn resolve_profile_for_item(
+    state: &AppState,
+    item: &ItemRow,
+) -> Result<Option<ProfileRow>, ApiError> {
+    // `if item.assigned_profile_id:` — 0 is falsy there, so it is not an id here.
+    if let Some(profile_id) = item.assigned_profile_id.filter(|id| *id != 0) {
+        return load_profile(state, profile_id).await;
+    }
+    if let Some(category_id) = item.category_id.filter(|id| *id != 0) {
+        let category_profile: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT planner_profile_id FROM todo_categories WHERE id = ?")
+                .bind(category_id)
+                .fetch_optional(&state.pool)
+                .await?;
+        if let Some(profile_id) = category_profile.flatten().filter(|id| *id != 0) {
+            return load_profile(state, profile_id).await;
+        }
+    }
+    Ok(sqlx::query_as(&format!(
+        "SELECT {PROFILE_COLUMNS} FROM planner_agent_profiles ORDER BY id ASC LIMIT 1"
+    ))
+    .fetch_optional(&state.pool)
+    .await?)
+}
+
+async fn load_profile(state: &AppState, profile_id: i64) -> Result<Option<ProfileRow>, ApiError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {PROFILE_COLUMNS} FROM planner_agent_profiles WHERE id = ?"
+    ))
+    .bind(profile_id)
+    .fetch_optional(&state.pool)
+    .await?)
+}
+
+/// `agent_bridge.build_item_context`, rendered straight to the string the prompt
+/// carries. Python interpolates the dict itself (`f"…{context}"`), so what the
+/// model sees is `str(dict)` — key order included. Building a `Value` here would
+/// sort the keys (serde_json's map is a `BTreeMap`) and quote them the JSON way,
+/// which is a different prompt.
+async fn build_item_context(
+    state: &AppState,
+    item: &ItemRow,
+    profile: Option<&ProfileRow>,
+) -> Result<String, ApiError> {
+    let (board, category) = item_context_rows(state, item).await?;
+
+    let item_repr = py_dict(&[
+        ("id", py_repr(&json!(item.id))),
+        ("title", py_repr(&json!(item.title))),
+        ("description", py_repr(&json!(item.description))),
+        ("status", py_repr(&json!(item.status))),
+        ("priority", py_repr(&json!(item.priority))),
+        ("tags", py_repr(&Value::Array(json_array(item.tags_json.clone())))),
+        ("plan", py_repr(&Value::Array(json_array(item.plan_json.clone())))),
+        ("metadata", py_repr(&Value::Object(json_object(item.metadata_json.clone())))),
+    ]);
+    let board_repr = py_dict(&[
+        // A missing board keeps the item's own `board_id`, like Python's
+        // `board.id if board else item.board_id`.
+        ("id", py_repr(&json!(board.as_ref().map_or(item.board_id, |b| b.0)))),
+        ("name", py_repr(&json!(board.as_ref().map(|b| b.1.clone())))),
+        ("default_model", py_repr(&json!(board.as_ref().and_then(|b| b.2.clone())))),
+    ]);
+    let category_repr = match &category {
+        Some((id, name, planner_profile_id)) => py_dict(&[
+            ("id", py_repr(&json!(id))),
+            ("name", py_repr(&json!(name))),
+            ("planner_profile_id", py_repr(&json!(planner_profile_id))),
+        ]),
+        None => "None".to_string(),
+    };
+    let profile_repr = match profile {
+        Some(profile) => py_dict(&[
+            ("slug", py_repr(&json!(profile.slug))),
+            ("name", py_repr(&json!(profile.name))),
+            ("requirement_type", py_repr(&json!(profile.requirement_type))),
+        ]),
+        None => "None".to_string(),
+    };
+
+    Ok(py_dict(&[
+        ("item", item_repr),
+        ("board", board_repr),
+        ("category", category_repr),
+        ("planner_profile", profile_repr),
+    ]))
+}
+
+type BoardBrief = Option<(i64, String, Option<String>)>;
+type CategoryBrief = Option<(i64, String, Option<i64>)>;
+
+/// The two lookups both renderings of the item context need.
+async fn item_context_rows(
+    state: &AppState,
+    item: &ItemRow,
+) -> Result<(BoardBrief, CategoryBrief), ApiError> {
+    let board: BoardBrief =
+        sqlx::query_as("SELECT id, name, default_model FROM todo_boards WHERE id = ?")
+            .bind(item.board_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let category: CategoryBrief = match item.category_id {
+        Some(category_id) => {
+            sqlx::query_as("SELECT id, name, planner_profile_id FROM todo_categories WHERE id = ?")
+                .bind(category_id)
+                .fetch_optional(&state.pool)
+                .await?
+        }
+        None => None,
+    };
+    Ok((board, category))
+}
+
+/// The same context as [`build_item_context`], as the JSON `decide_actions`
+/// actually serialises.
+///
+/// `agent/chat` interpolates the dict into an f-string and so needs Python's
+/// `str(dict)`; `action_orchestrator.engine.build_user_message` calls
+/// `json.dumps(…, indent=2)` on it instead. Same fields, different renderer —
+/// which is why only the two queries above are shared.
+async fn build_item_context_json(
+    state: &AppState,
+    item: &ItemRow,
+    profile: &ProfileRow,
+) -> Result<Map<String, Value>, ApiError> {
+    let (board, category) = item_context_rows(state, item).await?;
+    let context = json!({
+        "item": {
+            "id": item.id,
+            "title": item.title,
+            "description": item.description,
+            "status": item.status,
+            "priority": item.priority,
+            "tags": json_array(item.tags_json.clone()),
+            "plan": json_array(item.plan_json.clone()),
+            "metadata": json_object(item.metadata_json.clone()),
+        },
+        "board": {
+            // A missing board keeps the item's own `board_id`.
+            "id": board.as_ref().map_or(item.board_id, |b| b.0),
+            "name": board.as_ref().map(|b| b.1.clone()),
+            "default_model": board.as_ref().and_then(|b| b.2.clone()),
+        },
+        "category": category.as_ref().map(|(id, name, planner_profile_id)| json!({
+            "id": id,
+            "name": name,
+            "planner_profile_id": planner_profile_id,
+        })),
+        "planner_profile": {
+            "slug": profile.slug,
+            "name": profile.name,
+            "requirement_type": profile.requirement_type,
+        },
+    });
+    Ok(context.as_object().cloned().unwrap_or_default())
+}
+
+/// `{'k': v, …}` — Python's dict repr, with the entries in the order given.
+fn py_dict(entries: &[(&str, String)]) -> String {
+    let rendered: Vec<String> =
+        entries.iter().map(|(key, value)| format!("{}: {value}", py_str(key))).collect();
+    format!("{{{}}}", rendered.join(", "))
+}
+
+/// Python's `repr` for a JSON value: `None`/`True`/`False`, single-quoted
+/// strings, `, ` and `: ` separators, `[]`/`{}` for empties.
+///
+/// Nested objects come from a stored JSON column, so their keys are ordered by
+/// serde_json's `BTreeMap` (alphabetical) where Python keeps the order they were
+/// written in. Only `metadata`, `plan` and `tags` can carry one.
+pub(crate) fn py_repr(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => py_str(s),
+        Value::Array(items) => {
+            let rendered: Vec<String> = items.iter().map(py_repr).collect();
+            format!("[{}]", rendered.join(", "))
+        }
+        Value::Object(map) => {
+            let entries: Vec<(&str, String)> =
+                map.iter().map(|(key, value)| (key.as_str(), py_repr(value))).collect();
+            py_dict(&entries)
+        }
+    }
+}
+
+/// Python's `repr` for a `str`: single quotes, unless the string contains a `'`
+/// and no `"` — then double quotes, so the apostrophe needs no backslash.
+///
+/// ponytail: control characters below U+00A0 escape as `\xNN`; Python also
+/// escapes every other non-printable code point (zero-width spaces, unassigned
+/// planes) and that needs a Unicode category table. A todo title with one in it
+/// would render unescaped here.
+fn py_str(value: &str) -> String {
+    let quote = if value.contains('\'') && !value.contains('"') { '"' } else { '\'' };
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push(quote);
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if (c as u32) < 0x20 || (0x7f..0xa0).contains(&(c as u32)) => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// `agent_bridge.resolve_model`: an override wins, then the profile's default,
+/// then the board's, then the hard-coded fallback. Sanitising the override can
+/// blank it, and Python keeps the raw text in that case rather than falling
+/// through — the user asked for that model by name.
+async fn resolve_model(
+    state: &AppState,
+    item: &ItemRow,
+    profile: Option<&ProfileRow>,
+    override_model: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(raw) = override_model.map(str::trim).filter(|m| !m.is_empty()) {
+        return Ok(sanitize_llm_model_alias(raw).unwrap_or_else(|| raw.to_string()));
+    }
+    if let Some(model) = profile.and_then(|p| p.default_model.clone()).filter(|m| !m.is_empty()) {
+        return Ok(model);
+    }
+    let board_model: Option<Option<String>> =
+        sqlx::query_scalar("SELECT default_model FROM todo_boards WHERE id = ?")
+            .bind(item.board_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    match board_model.flatten().filter(|m| !m.is_empty()) {
+        Some(model) => Ok(model),
+        None => Ok("gemma4:31b-cloud".to_string()),
+    }
+}
+
+/// `AgentChatRequest`: `message: str`, `model: str | None`, and a
+/// `list[dict[str, str]]` of prior turns.
+fn parse_chat_request(raw: &[u8]) -> Result<(String, Option<String>, Vec<Value>), ApiError> {
+    let body = serde_json::from_slice::<Value>(raw)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let mut errors = Vec::new();
+
+    // Absent is `missing`; present-but-wrong-type is a type error, which is the
+    // difference pydantic draws.
+    let message = match body.get("message") {
+        None => {
+            errors.push(ApiError::field_error("message", "missing", "Field required"));
+            String::new()
+        }
+        Some(Value::String(text)) => text.clone(),
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                "message",
+                "string_type",
+                "Input should be a valid string",
+            ));
+            String::new()
+        }
+    };
+    let model = match body.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                "model",
+                "string_type",
+                "Input should be a valid string",
+            ));
+            None
+        }
+    };
+    let history = match body.get("history") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(turns)) => {
+            for (i, turn) in turns.iter().enumerate() {
+                let index = i.to_string();
+                match turn.as_object() {
+                    None => errors.push(ApiError::field_error_at(
+                        &["history", &index],
+                        "dict_type",
+                        "Input should be a valid dictionary",
+                    )),
+                    Some(fields) => {
+                        for (key, value) in fields {
+                            if !value.is_string() {
+                                errors.push(ApiError::field_error_at(
+                                    &["history", &index, key],
+                                    "string_type",
+                                    "Input should be a valid string",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            turns.clone()
+        }
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                "history",
+                "list_type",
+                "Input should be a valid list",
+            ));
+            Vec::new()
+        }
+    };
+
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+    Ok((message, model, history))
+}
+
+/// Talk to the planner agent about one item.
+///
+/// The prompt is the contract: two fixed lines, then the profile's system
+/// prompt, then the item context as Python's `str(dict)` — see `py_repr`. The
+/// event is appended only after a successful call, so a failed turn leaves no
+/// trace on the item, exactly like Python.
+async fn agent_chat(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    PathId(item_id): PathId<i64>,
+    raw: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    require_scope(&principal, "todos:write")?;
+    assert_item_access(&state, &principal, item_id).await?;
+    let (message, model_override, history) = parse_chat_request(&raw)?;
+
+    let row: Option<ItemRow> =
+        sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"))
+            .bind(item_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some(item) = row else {
+        return Err(ApiError::not_found("Item not found"));
+    };
+
+    let profile = resolve_profile_for_item(&state, &item).await?;
+    let context = build_item_context(&state, &item, profile.as_ref()).await?;
+    let llm_model = resolve_model(&state, &item, profile.as_ref(), model_override.as_deref()).await?;
+
+    let mut system = String::from(
+        "You are a helpful planning assistant for a personal todo board.\n\n\
+         Guide the user on what to do next. Be concise and actionable.",
+    );
+    if let Some(profile) = &profile {
+        // Appended even when blank, which is what leaves the doubled separator
+        // Python's `"\n\n".join` produces for a profile with no prompt.
+        system.push_str("\n\n");
+        system.push_str(&profile.system_prompt);
+    }
+    system.push_str(&format!("\n\nCurrent task context:\n{context}"));
+
+    let mut messages = vec![json!({ "role": "system", "content": system })];
+    for turn in &history {
+        let role = turn.get("role").and_then(Value::as_str).unwrap_or("user");
+        let content = turn.get("content").and_then(Value::as_str).unwrap_or_default();
+        if !content.is_empty() {
+            messages.push(json!({ "role": role, "content": content }));
+        }
+    }
+    messages.push(json!({ "role": "user", "content": message }));
+
+    // The call below is in-process and needs no credential, but Python's client
+    // does, and a user who never set the key sees this 503 rather than a reply.
+    // Dropping the check would change the status on that machine.
+    if state.master_key.is_none() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AGENT_PLATFORM_MASTER_KEY is not set.",
+        ));
+    }
+
+    let (fitted, _) = crate::context_budget::fit_chat_messages_for_request(messages);
+    let mut payload = Map::new();
+    payload.insert("messages".into(), Value::Array(fitted));
+    payload.insert("max_tokens".into(), json!(crate::context_budget::max_output_tokens_default()));
+    // No `model` at all when sanitising blanked it: the proxy's own default is
+    // better than a slug it cannot resolve.
+    if let Some(model) = sanitize_llm_model_alias(&llm_model) {
+        payload.insert("model".into(), json!(model));
+    }
+
+    // Python POSTs this to its own `/v1/chat/completions` over loopback and maps
+    // every non-200 to a 502 carrying the proxy's status. `complete_internal` is
+    // that route's code without the socket, and its error already carries the
+    // status the route would have answered with — so the mapping is the same one
+    // line. Python's `httpx.RequestError` branch guarded the loopback hop, which
+    // no longer exists: a vendor transport failure is a 502 from the proxy
+    // either way, and reads as `LLM proxy returned HTTP 502` on both servers.
+    let data = crate::llm::complete_internal(&state, payload).await.map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("LLM proxy returned HTTP {}", e.status.as_u16()),
+        )
+    })?;
+
+    let content = data
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let profile_slug = profile.as_ref().map(|p| p.slug.clone());
+    append_item_event(
+        &state,
+        item_id,
+        "agent_chat",
+        // `model` is the resolved name, not the sanitized one — it is what the
+        // user picked, and the reason a reply came back on a different model.
+        json!({ "message": message, "model": llm_model, "profile_slug": profile_slug }),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "content": content,
+        "model": llm_model,
+        "profile_slug": profile_slug,
+    }))
+    .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Agent step
+// ---------------------------------------------------------------------------
+
+/// `AgentStepRequest`. Every field has a default, so a body that is merely
+/// empty is still valid JSON-wise — the only failures are shape ones.
+struct StepRequest {
+    goal: String,
+    model: Option<String>,
+    context: Map<String, Value>,
+    document_paths: Vec<String>,
+}
+
+const DEFAULT_STEP_GOAL: &str = "What should I do next for this task?";
+
+impl StepRequest {
+    /// Would `merge_workspace_documents` read anything?
+    ///
+    /// This is the whole reason the route can still reach Python, so it mirrors
+    /// that function's guard exactly rather than approximating it: the request's
+    /// own `document_paths` is copied into the context by the route, a
+    /// `document_path` is only consulted when `document_paths` is absent or
+    /// null, and any other type there makes Python return without reading a
+    /// file.
+    fn names_documents(&self) -> bool {
+        if !self.document_paths.is_empty() {
+            return true;
+        }
+        match self.context.get("document_paths") {
+            Some(Value::Array(paths)) => !paths.is_empty(),
+            None | Some(Value::Null) => self
+                .context
+                .get("document_path")
+                .is_some_and(crate::action_orchestrator::py_truthy),
+            Some(_) => false,
+        }
+    }
+}
+
+/// FastAPI validates the body before the handler runs, so every error here
+/// comes out ahead of the scope and access checks.
+fn parse_step_request(raw: &[u8]) -> Result<StepRequest, ApiError> {
+    if raw.is_empty() {
+        return Err(ApiError::validation(vec![
+            json!({"type": "missing", "loc": ["body"], "msg": "Field required"}),
+        ]));
+    }
+    let body = match serde_json::from_slice::<Value>(raw) {
+        Ok(Value::Object(body)) => body,
+        Ok(_) => {
+            return Err(ApiError::validation(vec![json!({
+                "type": "model_attributes_type",
+                "loc": ["body"],
+                "msg": "Input should be a valid dictionary or object to extract fields from",
+            })]))
+        }
+        Err(_) => {
+            return Err(ApiError::validation(vec![json!({
+                "type": "json_invalid",
+                "loc": ["body", 0],
+                "msg": "JSON decode error",
+            })]))
+        }
+    };
+
+    let mut errors = Vec::new();
+    // A default does not make a field nullable: an explicit `null` is a type
+    // error for everything except `model`, which is declared `str | None`.
+    let goal = match body.get("goal") {
+        None => DEFAULT_STEP_GOAL.to_string(),
+        Some(Value::String(goal)) => goal.clone(),
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                "goal",
+                "string_type",
+                "Input should be a valid string",
+            ));
+            String::new()
+        }
+    };
+    let model = match body.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(model)) => Some(model.clone()),
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                "model",
+                "string_type",
+                "Input should be a valid string",
+            ));
+            None
+        }
+    };
+    let context = match body.get("context") {
+        None => Map::new(),
+        Some(Value::Object(context)) => context.clone(),
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                "context",
+                "dict_type",
+                "Input should be a valid dictionary",
+            ));
+            Map::new()
+        }
+    };
+    let document_paths = match body.get("document_paths") {
+        None => Vec::new(),
+        Some(Value::Array(paths)) => paths
+            .iter()
+            .enumerate()
+            .filter_map(|(i, path)| match path {
+                Value::String(path) => Some(path.clone()),
+                _ => {
+                    errors.push(ApiError::field_error_at(
+                        &["document_paths", &i.to_string()],
+                        "string_type",
+                        "Input should be a valid string",
+                    ));
+                    None
+                }
+            })
+            .collect(),
+        Some(_) => {
+            errors.push(ApiError::field_error(
+                "document_paths",
+                "list_type",
+                "Input should be a valid list",
+            ));
+            Vec::new()
+        }
+    };
+
+    if !errors.is_empty() {
+        return Err(ApiError::validation(errors));
+    }
+    Ok(StepRequest { goal, model, context, document_paths })
+}
+
+#[derive(Serialize)]
+struct AgentStepResponse {
+    thought: Option<String>,
+    actions: Vec<crate::action_orchestrator::PlannedAction>,
+    profile_slug: String,
+    action_set_id: i64,
+}
+
+/// Ask the planner agent which actions to propose for one item.
+///
+/// Nothing is executed and nothing on the item changes: the proposals come back
+/// for the user to accept through `agent/apply`, and the only write is one
+/// appended `agent_step` event.
+///
+/// **A step that names a workspace document is forwarded to Python whole.**
+/// `merge_workspace_documents` reads through the workspace filesystem — path
+/// normalisation, the traversal guard under the project directory, and for a
+/// PDF with no derived markdown yet, extraction through PyMuPDF, which has no
+/// Rust equivalent at all. The alternatives were both worse: porting the text
+/// half would put a second path-traversal guard in the tree for a domain that
+/// migrates in step 4 anyway, and would leave a request that names a PDF
+/// answering from an error stub where Python answers from the document's text.
+/// Handing the request over keeps Python's answer *exactly* for the case Python
+/// is still needed for, and keeps Rust's for the case — no documents — that is
+/// almost all of them. `health` in `lib.rs` delegates the same way.
+///
+/// The body is parsed before the handover so a malformed request still gets
+/// this server's 422 rather than a round trip, and because Python's own
+/// validation runs first too.
+async fn agent_step(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    PathId(item_id): PathId<i64>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let (parts, body) = request.into_parts();
+    let raw = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|_| ApiError::bad_request("Could not read request body"))?;
+    let req = parse_step_request(&raw)?;
+
+    if req.names_documents() {
+        let forwarded = Request::from_parts(parts, axum::body::Body::from(raw));
+        return Ok(crate::proxy::forward(State(state), forwarded).await);
+    }
+
+    require_scope(&principal, "todos:write")?;
+    assert_item_access(&state, &principal, item_id).await?;
+
+    let row: Option<ItemRow> =
+        sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"))
+            .bind(item_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some(item) = row else {
+        return Err(ApiError::not_found("Item not found"));
+    };
+
+    // `if not profile or not profile.action_set_id` — one message for both, and
+    // a stored `0` is falsy there just like a missing id.
+    let missing = || ApiError::bad_request("No planner profile or action set configured");
+    let Some(profile) = resolve_profile_for_item(&state, &item).await? else {
+        return Err(missing());
+    };
+    let Some(action_set_id) = profile.action_set_id.filter(|id| *id != 0) else {
+        return Err(missing());
+    };
+
+    let actions = crate::action_orchestrator::list_actions(&state, action_set_id).await?;
+    if actions.is_empty() {
+        return Err(ApiError::bad_request("Action set has no actions"));
+    }
+
+    let mut context = build_item_context_json(&state, &item, &profile).await?;
+    // `context.update(extra_context)`: the caller's keys win over the item's.
+    context.extend(req.context);
+    if !profile.system_prompt.is_empty() {
+        context.insert("planner_system_prompt".into(), json!(profile.system_prompt));
+    }
+
+    let llm_model = resolve_model(&state, &item, Some(&profile), req.model.as_deref()).await?;
+    // Infallible by construction: an LLM failure comes back as an empty action
+    // list and a `thought` that explains it, with a 200, exactly as Python's
+    // blanket `except Exception` produces.
+    let (planned, thought, _usage) = crate::action_orchestrator::decide_actions(
+        &state,
+        &req.goal,
+        &context,
+        &actions,
+        &llm_model,
+    )
+    .await;
+
+    append_item_event(
+        &state,
+        item_id,
+        "agent_step",
+        json!({
+            "goal": &req.goal,
+            "thought": &thought,
+            "actions": &planned,
+            "profile_slug": &profile.slug,
+        }),
+    )
+    .await?;
+
+    Ok(Json(AgentStepResponse {
+        thought,
+        actions: planned,
+        profile_slug: profile.slug,
+        action_set_id,
+    })
+    .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1238,10 +3000,86 @@ mod tests {
         );
     }
 
+    // `datetime_to_sql` moved to `wire.rs` and is covered by its tests: the old
+    // one here asserted a shape that dropped `Z` but kept `+02:00`, which is what
+    // the offset bug was.
+
+    /// Both expectations are the literal output of
+    /// `python -c "from team_schema import …; print(repr(build_process_team_snapshot(…)))"`
+    /// run against this repo's `app/`, pasted verbatim.
+    ///
+    /// This string is stored on the process and never recomputed, so every way a
+    /// port can silently drift shows up here: sorted keys instead of pydantic's
+    /// declaration order, an accent emitted raw where `json.dumps` writes
+    /// `\u00e9`, an emoji as one escape instead of a surrogate pair, or a space
+    /// after a separator.
     #[test]
-    fn iso_input_becomes_a_sqlalchemy_timestamp() {
-        assert_eq!(datetime_to_sql("2026-08-05T22:11:22"), "2026-08-05 22:11:22");
-        assert_eq!(datetime_to_sql("2026-08-05T22:11:22Z"), "2026-08-05 22:11:22");
-        assert_eq!(datetime_to_sql("2026-08-05 22:11:22"), "2026-08-05 22:11:22");
+    fn team_snapshot_matches_pythons_json_dumps() {
+        // No stored colour, so the team colour and every missing accent come
+        // from the stable palette keyed by the template id.
+        let stored: TeamRoster = serde_json::from_str(
+            r##"{"roles":[
+                {"id":"lead","name":"Planner"},
+                {"id":"b","name":"Résumé bot","description":"Writes","parent_id":"lead"},
+                {"id":"c","name":"C","accent_color":"  #abcdef  "}
+            ]}"##,
+        )
+        .unwrap();
+        let color = resolved_team_color(None, Some("1"));
+        let roster = with_default_accents(&stored, Some(&color), "1");
+        assert_eq!(
+            build_process_team_snapshot(1, "Research pod", None, &color, &roster),
+            r##"{"team_template_id":1,"name":"Research pod","description":null,"color":"#16a34a","roster":{"roles":[{"id":"lead","name":"Planner","description":"","modality":"text","parent_id":null,"accent_color":"#16a34a"},{"id":"b","name":"R\u00e9sum\u00e9 bot","description":"Writes","modality":"text","parent_id":"lead","accent_color":"#9333ea"},{"id":"c","name":"C","description":"","modality":"text","parent_id":null,"accent_color":"#abcdef"}]}}"##
+        );
+
+        let solo: TeamRoster =
+            serde_json::from_str(r##"{"roles":[{"id":"a","name":"A","accent_color":"#111111"}]}"##)
+                .unwrap();
+        assert_eq!(
+            build_process_team_snapshot(7, "Ops 😀", Some("tab\there"), "#abcdef", &solo),
+            r##"{"team_template_id":7,"name":"Ops \ud83d\ude00","description":"tab\there","color":"#abcdef","roster":{"roles":[{"id":"a","name":"A","description":"","modality":"text","parent_id":null,"accent_color":"#111111"}]}}"##
+        );
+    }
+
+    /// Every expectation below is the output of `str(<the same dict>)` run in
+    /// this repo's Python, pasted verbatim — the point is the prompt the model
+    /// reads, so a plausible-looking repr is not evidence.
+    #[test]
+    fn item_context_renders_as_pythons_dict_repr() {
+        let rendered = py_dict(&[(
+            "item",
+            py_dict(&[
+                ("id", py_repr(&json!(7))),
+                ("title", py_repr(&json!("Ben's plan"))),
+                ("description", py_repr(&Value::Null)),
+                ("status", py_repr(&json!("todo"))),
+                ("priority", py_repr(&json!(2))),
+                ("tags", py_repr(&json!(["a", "b"]))),
+                ("plan", py_repr(&json!([]))),
+                ("metadata", py_repr(&json!({}))),
+            ]),
+        )]);
+        assert_eq!(
+            rendered,
+            r#"{'item': {'id': 7, 'title': "Ben's plan", 'description': None, 'status': 'todo', 'priority': 2, 'tags': ['a', 'b'], 'plan': [], 'metadata': {}}}"#
+        );
+    }
+
+    #[test]
+    fn py_repr_quotes_the_way_python_does() {
+        // Keys are alphabetical here, so serde's `BTreeMap` order happens to be
+        // Python's insertion order too — the one case where the documented
+        // divergence cannot hide a difference.
+        assert_eq!(
+            py_repr(&json!({"a": true, "b": false, "c": null, "d": 1.5, "e": [{"x": "y"}]})),
+            r#"{'a': True, 'b': False, 'c': None, 'd': 1.5, 'e': [{'x': 'y'}]}"#
+        );
+        // A `"` alone keeps single quotes; a `'` alone flips to double; both
+        // together keep single and backslash the apostrophe.
+        assert_eq!(py_repr(&json!("he said \"hi\"")), r#"'he said "hi"'"#);
+        assert_eq!(py_repr(&json!("Ben's plan")), r#""Ben's plan""#);
+        assert_eq!(py_repr(&json!("both ' and \"")), r#"'both \' and "'"#);
+        assert_eq!(py_repr(&json!("tab\there\nnl")), r#"'tab\there\nnl'"#);
+        assert_eq!(py_repr(&json!("back\\slash")), r#"'back\\slash'"#);
     }
 }

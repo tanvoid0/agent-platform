@@ -75,9 +75,58 @@ pub fn sql_now() -> String {
     chrono::Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 
+/// A caller's ISO-8601 timestamp in the text SQLAlchemy would have written.
+///
+/// The column is a naive `DateTime`, and SQLAlchemy's SQLite bind processor
+/// reads only the wall-clock fields — an offset is **dropped, never applied**,
+/// so `09:00Z` and `09:00+02:00` both land as `09:00`. Converting to UTC first
+/// would move every scheduled item by the caller's offset relative to what
+/// Python does with the same request. Pydantic also accepts a space separator,
+/// and the stored text always carries six fractional digits, like `sql_now`.
+pub fn datetime_to_sql(raw: &str) -> String {
+    parse_naive(raw)
+        .map(sql_string)
+        // Pydantic would 422 anything left over; store it as the old helper did.
+        .unwrap_or_else(|| raw.trim().replacen('T', " ", 1))
+}
+
+/// Everything `datetime.fromisoformat` accepts that this codebase can send:
+/// an offset, a `Z`, a space separator, a bare date, and optional fractions.
+/// `None` is a value pydantic would have rejected before the handler saw it.
+pub fn parse_naive(raw: &str) -> Option<NaiveDateTime> {
+    // Only the date/time separator is swapped; a trailing offset keeps its own.
+    let iso = raw.trim().replacen(' ', "T", 1).replace('Z', "+00:00");
+    chrono::DateTime::parse_from_rfc3339(&iso)
+        // `naive_local`, not `naive_utc`: the offset is dropped, never applied.
+        .map(|at| at.naive_local())
+        .or_else(|_| NaiveDateTime::parse_from_str(&iso, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| NaiveDateTime::parse_from_str(&iso, "%Y-%m-%dT%H:%M"))
+        .or_else(|_| {
+            chrono::NaiveDate::parse_from_str(&iso, "%Y-%m-%d")
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default())
+        })
+        .ok()
+}
+
+/// The text SQLAlchemy binds for a naive `DateTime`: space separator, always six
+/// fractional digits.
+pub fn sql_string(at: NaiveDateTime) -> String {
+    at.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::iso_from_sql;
+    use super::{datetime_to_sql, iso_from_sql};
+
+    #[test]
+    fn iso_input_drops_the_offset_and_keeps_the_wall_clock() {
+        assert_eq!(datetime_to_sql("2026-08-06T09:00:00Z"), "2026-08-06 09:00:00.000000");
+        // Not 07:00: converting would move every scheduled item by the offset.
+        assert_eq!(datetime_to_sql("2026-08-06T09:00:00+02:00"), "2026-08-06 09:00:00.000000");
+        assert_eq!(datetime_to_sql("2026-08-06T09:00:00"), "2026-08-06 09:00:00.000000");
+        assert_eq!(datetime_to_sql("2026-08-06T09:00:00.123456"), "2026-08-06 09:00:00.123456");
+        assert_eq!(datetime_to_sql("2026-08-06 09:00:00"), "2026-08-06 09:00:00.000000");
+    }
 
     #[test]
     fn renders_both_stored_shapes() {

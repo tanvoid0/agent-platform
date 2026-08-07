@@ -77,7 +77,14 @@ app = FastAPI(
 register_exception_handlers(app)
 app.add_middleware(RequestIdMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
-app.include_router(llm_proxy_router)
+# ADR 0007: `agent-platformd` serves all nine `/v1` routes itself, so the child it
+# spawns switches this router off (`AGENT_PLATFORM_V1_ROUTER=0`) rather than
+# serving a second copy nothing reaches. Running Python alone — the runbook's
+# uvicorn line, and every pytest that exercises `/v1` — leaves it mounted.
+# The package itself stays imported either way: eight modules outside it use
+# `llm_proxy.core` / `llm_proxy.services` in process.
+if (os.getenv("AGENT_PLATFORM_V1_ROUTER") or "1").strip() != "0":
+    app.include_router(llm_proxy_router)
 
 _api_deps = [Depends(require_valid_token)]
 # The versioned REST surface is the only one; the bare-root mirror was removed

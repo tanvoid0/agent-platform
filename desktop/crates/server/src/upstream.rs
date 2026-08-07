@@ -121,6 +121,18 @@ mod job {
 /// `cfg` is the *public* address; the child gets an ephemeral one and is told the
 /// public pair separately so `/api/v1/system/status` still reports the address
 /// callers actually use.
+/// Our own origin as the child should dial it. `AGENT_PLATFORM_HOST` is a bind
+/// address: `0.0.0.0` means "every interface", which is not a destination — the
+/// child would resolve it to nothing on Windows and to something surprising
+/// elsewhere.
+fn loopback_origin(cfg: &Config) -> String {
+    let host = match cfg.host.as_str() {
+        "0.0.0.0" | "::" | "[::]" | "" => "127.0.0.1",
+        h => h,
+    };
+    format!("http://{}:{}", host, cfg.port)
+}
+
 pub async fn start(cfg: &Config) -> Result<Upstream, BoxError> {
     if let Some(origin) = &cfg.upstream {
         let origin = origin.trim_end_matches('/').to_string();
@@ -145,10 +157,22 @@ pub async fn start(cfg: &Config) -> Result<Upstream, BoxError> {
         .env("AGENT_PLATFORM_PORT", port.to_string())
         .env("AGENT_PLATFORM_PUBLIC_HOST", &cfg.host)
         .env("AGENT_PLATFORM_PUBLIC_PORT", cfg.port.to_string())
-        // Chat, agents, coder and assistant reach the LLM proxy over HTTP. Point
-        // them at the child's own port, not ours: routing back through the proxy
-        // would put two extra hops on every internal call.
-        .env("LLM_ORCHESTRATOR_BASE_URL", format!("{origin}/v1"))
+        // Chat, agents, coder and assistant reach the LLM proxy over HTTP. The
+        // cutover (ADR 0007): point them at *us*, and switch the child's own `/v1`
+        // router off, so there is one implementation of those nine routes rather
+        // than two that can drift. One loopback hop is the price. Reverting is
+        // these two lines — the package stays imported in the child either way,
+        // because eight modules outside it use `llm_proxy.core` in process.
+        .env("LLM_ORCHESTRATOR_BASE_URL", format!("{}/v1", loopback_origin(cfg)))
+        .env("AGENT_PLATFORM_V1_ROUTER", "0")
+        // The workflow engine and its scheduler are ours now. Two pollers on one
+        // `workflows` table would each fire every due workflow, so the child's
+        // loop is switched off rather than left racing this one.
+        .env("AGENT_PLATFORM_WORKFLOW_SCHEDULER", "0")
+        // Same reasoning, same shape: the DAG executor is ours, so the child must
+        // not also requeue what the last shutdown stranded. Both servers running
+        // recovery means every interrupted process gets planned twice.
+        .env("AGENT_PLATFORM_RESUME_ON_STARTUP", "0")
         // Piped, and the handle is then left untouched inside `Child`: `--exit-with-parent`
         // watches fd 0 for EOF, so a null stdin makes the server exit(0) the instant it
         // starts, and closing the pipe is what makes it die with us if we are killed.

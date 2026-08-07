@@ -1,10 +1,10 @@
 //! User-authored workflows, ported from `app/workflows/routes.py`.
 //!
-//! Split the same way todos is: Rust serves the CRUD and the run history,
-//! Python still serves `POST /workflows/{id}/run` (the engine) and
-//! `POST /workflows/assist` (the LLM). Rust owns `workflows`; it only ever
-//! *reads* `workflow_runs`, which the engine writes — except on delete, where
-//! the runs go with their workflow.
+//! Rust serves the whole domain: the CRUD, the run history, the engine, the
+//! interval scheduler and `POST /workflows/assist`. Rust owns both `workflows`
+//! and `workflow_runs` now — the engine that writes runs moved with the
+//! scheduler, because two pollers on one table would each fire every due
+//! workflow.
 //!
 //! Tenancy here is the third kind in the platform: `client_id`, a namespace
 //! rather than a security boundary. A workspace token gets `ws:{id}` derived
@@ -30,17 +30,16 @@ use crate::AppState;
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/workflows", get(list_workflows).post(create_workflow))
-        // Explicitly proxied, and it has to be declared: `assist` would
-        // otherwise match `{workflow_id}` and answer 405 instead of falling
-        // through to Python.
-        .route("/api/v1/workflows/assist", post(crate::proxy::forward))
+        // Declared before `{workflow_id}` for the reader's sake; the router
+        // prefers the literal segment either way.
+        .route("/api/v1/workflows/assist", post(assist))
         .route(
             "/api/v1/workflows/{workflow_id}",
             get(get_workflow).put(update_workflow).delete(delete_workflow),
         )
+        .route("/api/v1/workflows/{workflow_id}/run", post(run_workflow))
         .route("/api/v1/workflows/{workflow_id}/runs", get(list_runs))
         .route("/api/v1/workflows/{workflow_id}/runs/{run_id}", get(get_run))
-    // `{workflow_id}/run` is not declared, so it reaches Python's engine.
 }
 
 const CLIENT_HEADER: &str = "x-agent-platform-client";
@@ -569,6 +568,57 @@ async fn list_runs(
     Ok(Json(json!({ "runs": rows.iter().map(run_out).collect::<Vec<_>>() })).into_response())
 }
 
+/// Run now and return the finished run.
+///
+/// The JSON body — any shape — is exposed to steps as `{{trigger.body.*}}`.
+/// This is the webhook-style trigger external apps call with a workspace token.
+async fn run_workflow(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(workflow_id): PathId<i64>,
+    raw: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let scope = client_scope(&principal, &headers);
+    let workflow = accessible_workflow(&state, scope.as_deref(), workflow_id).await?;
+    if !workflow.enabled {
+        return Err(ApiError::bad_request("Workflow is disabled"));
+    }
+
+    // An absent body is `{}`; a present one must be an object, the way FastAPI
+    // reads `dict[str, Any] | None`.
+    let input = if raw.is_empty() {
+        Value::Object(Map::new())
+    } else {
+        match serde_json::from_slice::<Value>(&raw) {
+            Ok(Value::Object(map)) => Value::Object(map),
+            Ok(Value::Null) => Value::Object(Map::new()),
+            _ => {
+                return Err(ApiError::validation(vec![json!({
+                    "type": "dict_type",
+                    "loc": ["body"],
+                    "msg": "Input should be a valid dictionary",
+                })]))
+            }
+        }
+    };
+
+    let run_id = crate::workflow_engine::execute_workflow(
+        &state,
+        workflow_id,
+        &workflow.steps_json,
+        input,
+        "api",
+    )
+    .await?;
+
+    let row: RunRow = sqlx::query_as(&format!("SELECT {RUN_COLUMNS} FROM workflow_runs WHERE id = ?"))
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await?;
+    Ok(Json(run_out(&row)).into_response())
+}
+
 async fn get_run(
     State(state): State<Arc<AppState>>,
     principal: Principal,
@@ -587,6 +637,214 @@ async fn get_run(
         Some(row) if row.workflow_id == workflow_id => Ok(Json(run_out(&row)).into_response()),
         _ => Err(ApiError::not_found("Run not found")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// POST /workflows/assist — ported from `app/workflows/assist.py`
+// ---------------------------------------------------------------------------
+
+/// `assist.py::SYSTEM_PROMPT`, verbatim.
+const SYSTEM_PROMPT: &str = r#"You help users build and review workflow automations.
+
+A workflow is a JSON array of steps, run strictly top to bottom. Each step:
+  {"id": "<slug>", "type": "http" | "action", "params": {...}}
+
+- "http" params: url (required), method (GET/POST/PUT/PATCH/DELETE/HEAD,
+  default GET), headers (object), body (JSON), timeout_seconds.
+- "action" params: action_set_id (int), action_id (string), arguments (object).
+  Actions are pre-registered server-executed endpoints.
+- Step ids are slugs: lowercase letter first, then [a-z0-9_-], unique.
+- Templates pass data between steps: {{trigger.body.<path>}} is the JSON the
+  caller sent when triggering the run; {{steps.<id>.output.body.<path>}} and
+  {{steps.<id>.output.status}} read earlier http/action responses. Lists index
+  numerically: {{steps.a.output.body.items.0.name}}. A string that is exactly
+  one template keeps the referenced value's type.
+- A failing step (non-2xx, timeout, missing template path) stops the run.
+
+Respond with ONLY a JSON object, no markdown fences:
+  {"reply": "<what you did or found, concise, plain text>",
+   "steps": <full replacement steps array, or null>}
+
+Set "steps" to null when the user asked a question or a review found nothing to
+change. When you do return steps, return the COMPLETE array — it replaces the
+draft wholesale. Never invent action_set_id/action_id values; use "http" steps
+unless the user names a registered action.
+
+Placeholder steps in the draft (e.g. a GET to https://example.com/api) are
+editor boilerplate, not user intent: replace them, never keep them. Only
+reference template paths a response will actually contain — if you do not know
+a response's shape, do not build a step on an invented field; leave it out and
+say so in the reply."#;
+
+#[derive(Deserialize)]
+struct AssistRequest {
+    message: Option<String>,
+    name: Option<String>,
+    steps: Option<Vec<Value>>,
+}
+
+/// Every failure below the route is a 502 with this prefix: the Python handler
+/// wraps its whole body in one `except Exception`.
+fn unavailable(detail: impl std::fmt::Display) -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::BAD_GATEWAY,
+        format!("Assistant unavailable: {detail}"),
+    )
+}
+
+/// `llm_client._default_subagent_model`: `SUBAGENT_MODEL`, else `PLANNER_MODEL`,
+/// else no `model` key at all so the proxy's own default answers.
+///
+/// Only the first variable *set* is consulted — Python sanitises `SUBAGENT_MODEL`
+/// and returns that result, so a slug there does not fall through to the planner.
+fn subagent_model() -> Option<String> {
+    let raw = crate::env_opt("SUBAGENT_MODEL").or_else(|| crate::env_opt("PLANNER_MODEL"))?;
+    crate::dag_schema::sanitize_llm_model_alias(&raw)
+}
+
+/// `_strip_fences`: a reasoning model's think-block preamble, then a markdown
+/// json fence around the whole answer.
+fn strip_fences(text: &str) -> String {
+    // deepseek-r1, qwen3 and friends prefix the JSON with an inline
+    // <think>…</think> block; it is deliberation, not answer.
+    let body = match text.trim_start().strip_prefix("<think>") {
+        Some(rest) => match rest.find("</think>") {
+            Some(at) => &rest[at + "</think>".len()..],
+            None => text,
+        },
+        None => text,
+    };
+
+    let body = body.trim();
+    let Some(rest) = body.strip_prefix("```") else { return body.to_string() };
+    let rest = rest.strip_prefix("json").unwrap_or(rest);
+    match rest.strip_suffix("```") {
+        Some(inner) => inner.trim().to_string(),
+        None => body.to_string(),
+    }
+}
+
+/// `[WorkflowStep(**s) for s in raw_steps]` then `validate_steps`, returning the
+/// text Python's `{e}` carries into the discarded-steps reply.
+fn assist_steps(raw: &Value) -> Result<Vec<Value>, String> {
+    let Some(items) = raw.as_array() else {
+        // Python `**`-unpacks each element of whatever it was handed, so a
+        // non-list raises TypeError before a single field is looked at.
+        return Err("argument after ** must be a mapping".to_string());
+    };
+    for (index, step) in items.iter().enumerate() {
+        let mut errors = Vec::new();
+        validate_step(index, step, &mut errors);
+        // ponytail: pydantic's `str(ValidationError)` wraps this same sentence in
+        // a count header, a loc line, `[type=…, input_value=…]` and a docs URL.
+        // The sentence a user reads matches; the envelope around it does not.
+        if let Some(msg) = errors.first().and_then(|e| e.get("msg")).and_then(Value::as_str) {
+            return Err(msg.to_string());
+        }
+    }
+    // A plain ValueError in Python, so these two texts match exactly.
+    validate_steps(items).map_err(|e| e.message)?;
+    Ok(items.iter().map(step_out).collect())
+}
+
+/// `parse_assist_reply`: model output → response body.
+///
+/// A malformed or invalid answer becomes a plain reply rather than an error —
+/// the user can just rephrase.
+fn parse_assist_reply(content: &str) -> Value {
+    let Ok(Value::Object(data)) = serde_json::from_str::<Value>(&strip_fences(content)) else {
+        // Note the *raw* content, not the fence-stripped one.
+        return json!({ "reply": content.trim(), "steps": Value::Null });
+    };
+
+    // ponytail: Python renders a non-string `reply` with `str()`, which for a
+    // list or dict is a Python repr. Here anything but a string reads as absent.
+    let reply = data.get("reply").and_then(Value::as_str).unwrap_or("").trim();
+    let reply = if reply.is_empty() { "Done." } else { reply };
+
+    match data.get("steps") {
+        None | Some(Value::Null) => json!({ "reply": reply, "steps": Value::Null }),
+        Some(raw) => match assist_steps(raw) {
+            Ok(steps) => json!({ "reply": reply, "steps": steps }),
+            Err(e) => json!({
+                "reply": format!(
+                    "{reply}\n\n(The suggested steps were invalid and were discarded: {e})"
+                ),
+                "steps": Value::Null,
+            }),
+        },
+    }
+}
+
+/// `data["choices"][0]["message"]["content"]`, carrying the text Python's
+/// `KeyError`/`IndexError` would have put in the 502.
+fn completion_content(data: &Value) -> Result<&str, ApiError> {
+    let choices = data.get("choices").ok_or_else(|| unavailable("'choices'"))?;
+    let first = choices.get(0).ok_or_else(|| unavailable("list index out of range"))?;
+    let message = first.get("message").ok_or_else(|| unavailable("'message'"))?;
+    let content = message.get("content").ok_or_else(|| unavailable("'content'"))?;
+    content.as_str().ok_or_else(|| {
+        // A model that answered with tool calls only sends `"content": null`;
+        // Python hands that straight to `re.sub`, which refuses it.
+        unavailable("expected string or bytes-like object, got 'NoneType'")
+    })
+}
+
+/// Chat-style help: generate, review or edit a steps array.
+///
+/// Stateless — the current draft travels in the request, the validated
+/// replacement comes back. No workflow row is read or written, so the namespace
+/// (`action_client_scope`) resolves to nothing this handler can consult; the
+/// Python route takes the same dependency and ignores it too.
+async fn assist(
+    State(state): State<Arc<AppState>>,
+    _principal: Principal,
+    body: Option<Json<AssistRequest>>,
+) -> Result<Response, ApiError> {
+    let missing_message =
+        || ApiError::validation(vec![ApiError::field_error("message", "missing", "Field required")]);
+    let Json(req) = body.ok_or_else(missing_message)?;
+    let message = req.message.ok_or_else(missing_message)?;
+
+    let mut user_parts = vec![message.trim().to_string()];
+    if let Some(name) = req.name.as_deref().filter(|n| !n.is_empty()) {
+        user_parts.push(format!("Workflow name: {name}"));
+    }
+    if let Some(steps) = &req.steps {
+        // `json.dumps(steps, indent=2)`: same two-space layout, but Python's
+        // `ensure_ascii=True` escapes non-ASCII where serde does not, and its
+        // dicts keep the caller's key order where `serde_json::Map` sorts them.
+        // Prompt text only — neither reaches the wire.
+        let pretty = serde_json::to_string_pretty(steps).unwrap_or_default();
+        user_parts.push(format!("Current steps:\n{pretty}"));
+    }
+
+    let (messages, _budget) = crate::context_budget::fit_chat_messages_for_request(vec![
+        json!({ "role": "system", "content": SYSTEM_PROMPT }),
+        json!({ "role": "user", "content": user_parts.join("\n\n") }),
+    ]);
+
+    let mut payload = Map::new();
+    payload.insert("messages".into(), Value::Array(messages));
+    payload.insert("temperature".into(), json!(0.2));
+    if let Some(model) = subagent_model() {
+        payload.insert("model".into(), json!(model));
+    }
+    payload.insert(
+        "max_tokens".into(),
+        json!(crate::context_budget::max_output_tokens_default()),
+    );
+    // `require_json=True`.
+    payload.insert("response_format".into(), json!({ "type": "json_object" }));
+
+    // ponytail: Python prefixes this with "LLM proxy request failed with HTTP
+    // {status}." because it read an HTTP response off its own loopback. There is
+    // no hop here, and `e.message` already says what went wrong.
+    let data = crate::llm::complete_internal(&state, payload)
+        .await
+        .map_err(|e| unavailable(e.message))?;
+
+    Ok(Json(parse_assist_reply(completion_content(&data)?)).into_response())
 }
 
 #[cfg(test)]
@@ -618,6 +876,48 @@ mod tests {
         assert_eq!(
             step_out(&step),
             json!({"id": "a", "type": "http", "params": {"url": "x"}})
+        );
+    }
+
+    /// Nothing a model can answer with is an error here; the four shapes it
+    /// actually produces all have to land as a reply.
+    #[test]
+    fn assist_reply_takes_whatever_the_model_answered() {
+        // A fenced object parses, and its steps render like the CRUD's.
+        let fenced = concat!(
+            "```json\n",
+            r#"{"reply": "added a fetch", "steps": [{"id": "a", "type": "http","#,
+            r#" "params": {"url": "https://x"}, "extra": 1}]}"#,
+            "\n```"
+        );
+        assert_eq!(
+            parse_assist_reply(fenced),
+            json!({
+                "reply": "added a fetch",
+                "steps": [{"id": "a", "type": "http", "params": {"url": "https://x"}}],
+            })
+        );
+
+        // A think-block preamble is deliberation, not answer.
+        assert_eq!(
+            parse_assist_reply("<think>\nweigh it up\n</think>\n{\"reply\": \"hi\"}"),
+            json!({ "reply": "hi", "steps": Value::Null })
+        );
+
+        // Prose is a reply, not a 502 — and it is the raw text that comes back.
+        assert_eq!(
+            parse_assist_reply("  I need the endpoint first.  "),
+            json!({ "reply": "I need the endpoint first.", "steps": Value::Null })
+        );
+
+        // Invalid steps are discarded, with the reason appended to the reply.
+        assert_eq!(
+            parse_assist_reply(r#"{"reply": "here", "steps": [{"id": "a", "type": "http"}]}"#),
+            json!({
+                "reply": "here\n\n(The suggested steps were invalid and were discarded: \
+                          Value error, step 'a': http step requires params.url)",
+                "steps": Value::Null,
+            })
         );
     }
 }

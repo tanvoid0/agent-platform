@@ -58,6 +58,26 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Principal {
     }
 }
 
+/// A caller resolved *at the handler* rather than by the layer.
+///
+/// `require_token` guards `/api/v1/*`, because that is the prefix `app/main.py`
+/// mounts with `_api_deps`. The LLM proxy's `/v1/*` routes are mounted without
+/// it and authenticate per route — two of them not at all — so a handler there
+/// extracts this instead of reading the extensions.
+pub struct ProxyPrincipal(pub Principal);
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for ProxyPrincipal {
+    type Rejection = AuthError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let header = parts.headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+        resolve(state, header).await.map(ProxyPrincipal)
+    }
+}
+
 impl Principal {
     pub fn unrestricted() -> Self {
         Self { workspace_id: None, token_id: None, scopes: vec!["*".into()] }
@@ -65,6 +85,19 @@ impl Principal {
 
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scopes.iter().any(|s| s == "*" || s == scope)
+    }
+
+    /// `app/api_tokens/auth.py::require_scope` — a 403 with a code the caller
+    /// can tell apart from "this token is held".
+    pub fn require_scope(&self, scope: &'static str) -> Result<(), crate::error::ApiError> {
+        if self.has_scope(scope) {
+            return Ok(());
+        }
+        Err(crate::error::ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "INSUFFICIENT_SCOPE",
+            format!("Token lacks required scope '{scope}'."),
+        ))
     }
 }
 
@@ -100,11 +133,12 @@ impl IntoResponse for AuthError {
             "type": ERROR_TYPE,
             "code": self.code,
         });
+        if let Some(request_id) = crate::request_id::current() {
+            err["request_id"] = json!(request_id);
+        }
         if let Some(prefix) = self.token_prefix {
             err["extra"] = json!({ "token_prefix": prefix });
         }
-        // ponytail: no `request_id` — the Python envelope carries one from its
-        // request-id middleware. Add it here when this server grows that middleware.
         (self.status, axum::Json(json!({ "error": err }))).into_response()
     }
 }

@@ -29,6 +29,19 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
+    /// A `LlmProxyError`: same envelope, but the `code` is named by the caller
+    /// instead of derived from the status. `app/llm_proxy` raises these for
+    /// failures a status alone does not identify (`capability_unavailable`,
+    /// `byok_host_not_allowed`, …), and clients branch on them.
+    pub fn coded(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self { status, code, message: message.into(), extra: None }
+    }
+
+    pub fn with_extra(mut self, extra: Value) -> Self {
+        self.extra = Some(extra);
+        self
+    }
+
     /// The 422 shape FastAPI's `RequestValidationError` handler produces.
     ///
     /// ponytail: `extra.errors` carries `{type, loc, msg}` per failure, not
@@ -130,11 +143,12 @@ impl IntoResponse for ApiError {
             "type": ERROR_TYPE,
             "code": self.code,
         });
+        if let Some(request_id) = crate::request_id::current() {
+            err["request_id"] = Value::from(request_id);
+        }
         if let Some(extra) = self.extra {
             err["extra"] = extra;
         }
-        // ponytail: no `request_id` — Python's middleware stamps one and this
-        // server has no such middleware yet. Add both together.
         (self.status, axum::Json(json!({ "error": err }))).into_response()
     }
 }
