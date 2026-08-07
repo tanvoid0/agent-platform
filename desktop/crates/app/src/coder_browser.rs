@@ -31,6 +31,11 @@ pub const WIDTH: f32 = 520.0;
 /// Logical height of the URL bar iced draws above the child window.
 pub const BAR_HEIGHT: f32 = 44.0;
 
+/// What the one-click button in the empty pane opens. A dev server on 3000 is
+/// the common case (Next, CRA, most `npm run dev`); anything else is one edit
+/// of the URL bar away.
+pub const DEFAULT_URL: &str = "http://localhost:3000";
+
 /// What the pane should do. Kept coarse: every arm ends with the child window
 /// in a known position, so a resize and a navigation are the same code path.
 #[derive(Debug, Clone)]

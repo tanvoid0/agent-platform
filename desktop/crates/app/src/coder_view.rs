@@ -246,11 +246,21 @@ fn browser(state: &State) -> Element<'_, Message> {
     .padding(Padding::from([0.0, space::XS]))
     .center_y(coder_browser::BAR_HEIGHT);
 
-    container(column![
-        bar,
-        container(ui::empty_state_icon(Icon::Globe, "Type a URL to preview a running server."))
-            .height(Length::Fill),
-    ])
+    // Only drawn before anything has loaded — once a page is up the child
+    // window covers this entirely. Which is also why the button below is only
+    // ever pressable in exactly this state: no page, no child window over it.
+    let empty = column![
+        ui::empty_state_icon(Icon::Globe, "Preview a running dev server."),
+        container(ui::button_secondary(
+            Icon::Play,
+            "Open localhost:3000",
+            Message::BrowserOpenDefault,
+        ))
+        .center_x(Length::Fill),
+    ]
+    .spacing(space::SM);
+
+    container(column![bar, container(empty).height(Length::Fill)])
     .width(coder_browser::WIDTH)
     .height(Length::Fill)
     .style(ui::theme::sidebar)

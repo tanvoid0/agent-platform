@@ -454,6 +454,8 @@ pub enum Message {
     /// The window moved or resized, or the screen changed — the child window
     /// has to be told where the strip is now.
     BrowserSync,
+    /// The empty pane's one-click default, for the common dev-server port.
+    BrowserOpenDefault,
     /// Take the preview off the screen without forgetting the page: leaving the
     /// Coder screen, or a modal going up over it.
     BrowserHide,
@@ -1184,27 +1186,24 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                     Message::BrowserDone,
                 );
             }
-            // Reopening returns to the page it was on; a first open with a URL
-            // already typed goes straight there rather than to a blank pane.
+            // Nothing to show yet means *no child window at all*, not a blank
+            // one: a webview over the empty pane is transparent until it paints
+            // and still swallows every click, so the pane's own button would be
+            // unpressable. Seen live.
             let url = if state.browser_url.is_empty() {
                 normalize_url(&state.browser_draft)
             } else {
                 Some(state.browser_url.clone())
             };
-            match url {
-                Some(url) => {
-                    state.browser_url = url.clone();
-                    state.browser_draft = url.clone();
-                    crate::coder_browser::run(
-                        crate::coder_browser::Cmd::Load(url),
-                        Message::BrowserDone,
-                    )
-                }
-                None => crate::coder_browser::run(
-                    crate::coder_browser::Cmd::Show,
-                    Message::BrowserDone,
-                ),
-            }
+            // Reopening returns to the page it was on.
+            let Some(url) = url else { return Task::none() };
+            state.browser_url = url.clone();
+            state.browser_draft = url.clone();
+            crate::coder_browser::run(crate::coder_browser::Cmd::Load(url), Message::BrowserDone)
+        }
+        Message::BrowserOpenDefault => {
+            state.browser_draft = crate::coder_browser::DEFAULT_URL.to_string();
+            Task::done(Message::BrowserGo)
         }
         Message::BrowserUrlChanged(v) => {
             state.browser_draft = v;
@@ -1227,7 +1226,8 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             crate::coder_browser::run(crate::coder_browser::Cmd::Reload, Message::BrowserDone)
         }
         Message::BrowserSync => {
-            if !state.browser_open {
+            // No page, no child window to move — see `ToggleBrowser`.
+            if !state.browser_open || state.browser_url.is_empty() {
                 return Task::none();
             }
             crate::coder_browser::run(crate::coder_browser::Cmd::Show, Message::BrowserDone)

@@ -9,7 +9,9 @@
 //! and a fragment shader is where gradients are free.
 //!
 //! Every number in the shader below came from measuring a reference loop frame
-//! by frame rather than from taste; the constants carry what was measured.
+//! by frame rather than from taste; the constants carry what was measured. That
+//! loop is checked in as `docs/images/ev-orb-reference.mp4` — re-measure against
+//! it before changing a constant here.
 //!
 //! This draws through iced's `wgpu` backend. If iced falls back to its
 //! `tiny-skia` software renderer the widget renders nothing, which is what the
