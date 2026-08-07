@@ -25,3 +25,18 @@ def test_parse_leaked_tool_calls_bare_tag():
 
 def test_parse_leaked_tool_calls_ignores_unknown_tools():
     assert parse_leaked_tool_calls("<function=delete_everything>") == []
+
+
+def test_parse_leaked_tool_calls_covers_every_tool_spec():
+    """`KNOWN_TOOLS` drifted behind `TOOL_SPECS` once: `search` and `repo_map`
+    were added to the executors and not here, so those leaked calls were dropped
+    while their markup was stripped from the answer. Assert against the spec list
+    rather than a second hand-written set, so the next tool cannot drift."""
+    from coder.executor import TOOL_SPECS
+    from coder.tool_call_parse import KNOWN_TOOLS
+
+    assert KNOWN_TOOLS == {spec["function"]["name"] for spec in TOOL_SPECS}
+
+    calls = parse_leaked_tool_calls('<function=search>{"pattern": "TODO"}</function>')
+    assert [c["name"] for c in calls] == ["search"]
+    assert calls[0]["arguments"] == {"pattern": "TODO"}

@@ -63,6 +63,9 @@ class CoderChatSendRequest(BaseModel):
     # not stored as user message content.
     mode_instruction: str | None = Field(default=None, max_length=4096)
     agent_mode: str | None = Field(default=None, max_length=32)
+    # One tool-free call before the loop, asking for a plan. Costs an extra
+    # round trip and buys the most on a local model — off unless asked for.
+    plan: bool = False
 
 
 class CoderChatSendResponse(BaseModel):
@@ -87,6 +90,7 @@ class CoderRetryRequest(BaseModel):
     delegate_tools: bool = False
     mode_instruction: str | None = Field(default=None, max_length=4096)
     agent_mode: str | None = Field(default=None, max_length=32)
+    plan: bool = False
 
 
 class CoderApprovalRequest(BaseModel):

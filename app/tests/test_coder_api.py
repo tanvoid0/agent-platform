@@ -70,6 +70,65 @@ def test_executor_rejects_missing_root(tmp_path):
         LocalExecutor(str(tmp_path / "does-not-exist"))
 
 
+def test_executor_search_finds_text_and_skips_what_it_should(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text(
+        "def greet():\n    return 'Hello'\n", encoding="utf-8"
+    )
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "dep.js").write_text("hello there", encoding="utf-8")
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe hello")
+
+    ex = LocalExecutor(str(tmp_path))
+    out = _run(ex.execute("search", {"query": "hello"}))
+    # Case-insensitive, path relative with forward slashes, 1-based line number,
+    # and the hit trimmed — indentation is width the model pays for by the line.
+    assert out == "src/app.py:2: return 'Hello'"
+    # Build output is skipped by name, binaries by their failure to decode.
+    assert "node_modules" not in out and "logo.png" not in out
+
+    assert _run(ex.execute("search", {"query": "nowhere"})) == "no matches for 'nowhere'"
+    assert _run(ex.execute("search", {"query": "  "})).startswith("Error:")
+
+
+def test_executor_repo_map_lists_top_level_definitions(tmp_path):
+    (tmp_path / "a.py").write_text(
+        "import os\n\n\nclass Greeter:\n    def method(self):\n        pass\n\n\n"
+        "async def run(x):\n    pass\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "b.rs").write_text(
+        "use std::fmt;\n\npub struct Thing;\n\npub async fn go(n: u8) {}\n"
+        "impl Thing {\n    fn hidden(&self) {}\n}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "c.ts").write_text(
+        "const private_one = 1;\nexport function shipped() {}\n"
+        "export default class Widget {}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "notes.md").write_text("# not source", encoding="utf-8")
+
+    out = _run(LocalExecutor(str(tmp_path)).execute("repo_map", {}))
+    assert out.splitlines() == [
+        "definitions by file:",
+        "a.py: Greeter, run",
+        "b.rs: Thing, go",
+        "c.ts: shipped, Widget",
+    ]
+    # Nested definitions are detail: a class's methods and an `impl` block's
+    # functions answer "what is in this file", not "where does this name live".
+    assert "method" not in out and "hidden" not in out
+    # JS/TS lists exports only — an unexported const is not a name importers use.
+    assert "private_one" not in out
+
+
+def test_executor_repo_map_on_a_workspace_with_no_source(tmp_path):
+    (tmp_path / "notes.md").write_text("# just notes", encoding="utf-8")
+    out = _run(LocalExecutor(str(tmp_path)).execute("repo_map", {}))
+    assert out.startswith("no definitions found")
+
+
 # ---------------------------------------------------------------------------
 # API tests with a scripted fake LLM
 # ---------------------------------------------------------------------------
@@ -288,6 +347,71 @@ def test_coder_send_multi_step(client, monkeypatch, test_engine, tmp_path):
     assert [m["role"] for m in body["messages"]] == [
         "user", "assistant", "tool", "assistant", "tool", "assistant",
     ]
+
+
+def test_coder_stream_plans_before_it_touches_anything(client, monkeypatch, tmp_path):
+    """The PLAN step: one tool-free call, then the loop, and the plan persists.
+
+    Tool-free is the whole point — a model handed tools uses them — so the first
+    payload is checked for the *absence* of `tools`, not for the prompt wording.
+    """
+    from coder.service import PLAN_ACK, PLAN_PROMPT
+
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "test-key")
+    auth = {"Authorization": "Bearer test-key"}
+
+    payloads = _fake_llm_sequence(
+        monkeypatch,
+        [
+            {"content": "1. read app.py\n2. bump the version"},
+            _tool_call_msg("read_file", {"path": "app.py"}),
+            {"content": "Read it; nothing to change."},
+        ],
+    )
+    (tmp_path / "app.py").write_text("print('v1')\n", encoding="utf-8")
+
+    r = c.post(
+        "/api/v1/coder/chat/stream",
+        json={"message": "Bump version", "workspace_root": str(tmp_path), "plan": True},
+        headers=auth,
+    )
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    assert [e[0] for e in events] == ["plan", "tool_call", "tool_result", "assistant", "done"]
+    assert events[0][1]["content"] == "1. read app.py\n2. bump the version"
+
+    # The plan call goes out without tools; every later step keeps them.
+    assert "tools" not in payloads[0]
+    assert all(p.get("tools") for p in payloads[1:])
+    # …and the loop reads the plan, with the ack after it.
+    planning_turn = [m["content"] for m in payloads[1]["messages"]]
+    assert PLAN_PROMPT in planning_turn
+    assert planning_turn.index(PLAN_ACK) == planning_turn.index(PLAN_PROMPT) + 2
+
+    # Persisted as a plain assistant message and nothing else: the desktop
+    # rebuilds a reopened session from this log, and the prompt that asked for
+    # the plan is scaffolding the user never typed.
+    stored = events[4][1]["messages"]
+    assert [m["role"] for m in stored] == ["user", "assistant", "assistant", "tool", "assistant"]
+    assert stored[1]["content"].startswith("1. read app.py")
+    assert not any(PLAN_PROMPT in str(m["content"]) for m in stored)
+
+
+def test_coder_stream_without_plan_makes_no_extra_call(client, monkeypatch, tmp_path):
+    """Off by default: the flag costs a round trip, so nothing pays for it unasked."""
+    c, _mock_cls, _mock_inst = client
+    monkeypatch.setenv("AGENT_PLATFORM_MASTER_KEY", "test-key")
+
+    payloads = _fake_llm_sequence(monkeypatch, [{"content": "Nothing to do."}])
+    r = c.post(
+        "/api/v1/coder/chat/stream",
+        json={"message": "hello", "workspace_root": str(tmp_path)},
+        headers={"Authorization": "Bearer test-key"},
+    )
+    assert r.status_code == 200
+    assert [e[0] for e in _parse_sse(r.text)] == ["assistant", "done"]
+    assert len(payloads) == 1 and payloads[0].get("tools")
 
 
 def test_coder_stream_pauses_for_command_approval(client, monkeypatch, test_engine, tmp_path):

@@ -69,6 +69,22 @@ CODER_SYSTEM_PROMPT = (
     "- When done, summarize what you changed and why in a short final answer."
 )
 
+# One tool-free call before the loop, ported from hearth's agent, which measures
+# it as the single biggest quality lever for a local model. Tool-free is the
+# point: a model handed tools uses them, and what is wanted here is the thinking
+# that otherwise happens one tool call at a time — and gets re-derived from
+# scratch every time the context window trims. It costs one extra call per turn,
+# which is why it is a switch rather than a law.
+PLAN_PROMPT = (
+    "Before touching anything, write a short numbered plan for this task: which files you "
+    "expect to read or change, what the change is, and what you will check afterwards. "
+    "At most five steps. Do not call any tools yet and do not write out the code — just "
+    "the plan."
+)
+PLAN_ACK = (
+    "Now carry that out with the tools, adjusting the plan if what you read contradicts it."
+)
+
 _LEGACY_MODE_LABELS = ("plan", "debug", "multitask", "ask", "auto")
 
 
@@ -101,13 +117,16 @@ async def _call_llm_step_with_heartbeat(
     *,
     provider: str | None = None,
     max_tokens: int | None = None,
+    tools: bool = True,
 ) -> AsyncIterator[tuple[str, dict[str, Any] | tuple[dict[str, Any], dict[str, Any] | None]]]:
     """Wrap ``_call_llm_step``, yielding ``("heartbeat", {...})`` while it runs.
 
     The final item is always ``("result", (message, usage))``.
     """
     task = asyncio.ensure_future(
-        _call_llm_step(llm_messages, model, provider=provider, max_tokens=max_tokens)
+        _call_llm_step(
+            llm_messages, model, provider=provider, max_tokens=max_tokens, tools=tools
+        )
     )
     interval = _heartbeat_interval_seconds()
     waited = 0.0
@@ -372,8 +391,14 @@ async def _call_llm_step(
     *,
     provider: str | None = None,
     max_tokens: int | None = None,
+    tools: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """One non-streaming chat/completions call with tools; returns (assistant message, usage)."""
+    """One non-streaming chat/completions call with tools; returns (assistant message, usage).
+
+    ``tools=False`` is the PLAN step: the tools are left out of the request
+    entirely rather than discouraged in the prompt, because a model handed tools
+    uses them.
+    """
     key = llm_proxy_master_key()
     if not key:
         raise HTTPException(status_code=503, detail="AGENT_PLATFORM_MASTER_KEY is not set.")
@@ -381,10 +406,11 @@ async def _call_llm_step(
     fitted, _ = fit_chat_messages_for_request(messages)
     payload: dict[str, Any] = {
         "messages": fitted,
-        "tools": TOOL_SPECS,
-        "tool_choice": "auto",
         "max_tokens": max_tokens if max_tokens is not None else max_output_tokens_default(),
     }
+    if tools:
+        payload["tools"] = TOOL_SPECS
+        payload["tool_choice"] = "auto"
     sm = sanitize_llm_model_alias(model) if model else None
     if sm:
         payload["model"] = sm
@@ -431,12 +457,13 @@ async def run_agent_turn(
     pending_out: list[dict[str, Any]] | None = None,
     resume_calls: list[dict[str, Any]] | None = None,
     usage_steps_out: list[LlmStepUsageOut] | None = None,
+    plan: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Run one agent turn; yields (event, data) and appends persisted messages to new_history.
 
-    Events: ``tool_call`` {name, arguments}, ``tool_result`` {name, content},
-    ``approval_required`` {call_id, name, arguments}, ``assistant`` {content, usage?}.
-    The caller owns persistence of new_history.
+    Events: ``plan`` {content}, ``tool_call`` {name, arguments}, ``tool_result``
+    {name, content}, ``approval_required`` {call_id, name, arguments},
+    ``assistant`` {content, usage?}. The caller owns persistence of new_history.
 
     If a tool in ``executor.APPROVAL_REQUIRED_TOOLS`` is hit and
     ``auto_approve_commands`` is False, the turn pauses: the pending call plus
@@ -449,6 +476,38 @@ async def run_agent_turn(
     calls = resume_calls
     usage_steps: list[LlmStepUsageOut] = []
     step_num = 0
+
+    # Never on a resume: either the plan is already in the history this turn is
+    # picking up from, or the turn died before it produced one — and re-planning
+    # after a tool result would plan around work already done.
+    if plan and resume_calls is None:
+        llm_messages.append({"role": "user", "content": PLAN_PROMPT})
+        planned: dict[str, Any] = {}
+        plan_usage: dict[str, Any] | None = None
+        async for kind, payload in _call_llm_step_with_heartbeat(
+            llm_messages, model, provider=provider, max_tokens=max_tokens, tools=False
+        ):
+            if kind == "heartbeat":
+                yield "heartbeat", payload
+            else:
+                planned, plan_usage = payload
+        usage_steps.append(parse_llm_usage_dict(plan_usage, label="plan"))
+        plan_text = str(planned.get("content") or "").strip()
+        if plan_text:
+            # Persisted as a plain assistant message, without the prompt that
+            # asked for it: the desktop rebuilds a reopened session from this
+            # log, and a "write me a plan" line in the transcript is scaffolding
+            # the user never typed.
+            plan_msg = {"role": "assistant", "content": plan_text}
+            llm_messages.append(plan_msg)
+            new_history.append(plan_msg)
+            llm_messages.append({"role": "user", "content": PLAN_ACK})
+            yield "plan", {"content": plan_text}
+        else:
+            # A model that answered nothing gets no ack to answer — leaving the
+            # prompt in would make its own silence the last thing it read.
+            llm_messages.pop()
+
     for _ in range(_max_iterations()):
         if calls is None:
             message: dict[str, Any] = {}
@@ -587,6 +646,7 @@ async def send_message(
     delegate_tools: bool = False,
     mode_instruction: str | None = None,
     agent_mode: str | None = None,
+    plan: bool = False,
 ) -> dict[str, Any]:
     """Non-streaming agent run: executes the full turn, returns the persisted thread.
 
@@ -636,6 +696,7 @@ async def send_message(
         auto_approve_commands=auto_approve_commands,
         pending_out=pending_out,
         usage_steps_out=usage_steps,
+        plan=plan,
     ):
         pass
 
@@ -684,8 +745,9 @@ async def stream_message(
     delegate_tools: bool = False,
     mode_instruction: str | None = None,
     agent_mode: str | None = None,
+    plan: bool = False,
 ) -> AsyncIterator[str]:
-    """Stream one agent turn as SSE: tool_call / tool_result / approval_required / assistant / done / error.
+    """Stream one agent turn as SSE: plan / tool_call / tool_result / approval_required / assistant / done / error.
 
     The user message plus whatever the agent completed before a disconnect is
     committed in ``finally`` so a reload returns consistent history. If the
@@ -781,6 +843,7 @@ async def stream_message(
                     auto_approve_commands=auto_approve_commands,
                     pending_out=pending_out,
                     usage_steps_out=usage_steps,
+                    plan=plan,
                 ):
                     yield _sse(event, data)
                 _persist()
@@ -821,6 +884,7 @@ async def stream_retry(
     delegate_tools: bool = False,
     mode_instruction: str | None = None,
     agent_mode: str | None = None,
+    plan: bool = False,
 ) -> AsyncIterator[str]:
     """Re-run the agent turn after the last user message without appending a new one."""
     key = llm_proxy_master_key()
@@ -905,6 +969,7 @@ async def stream_retry(
                     auto_approve_commands=auto_approve_commands,
                     pending_out=pending_out,
                     usage_steps_out=usage_steps,
+                    plan=plan,
                 ):
                     yield _sse(event, data)
                 _persist()

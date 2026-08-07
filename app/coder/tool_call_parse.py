@@ -13,7 +13,16 @@ LEAKED_TOOL_BLOCK_RE = re.compile(
 )
 LEAKED_TOOL_TAG_RE = re.compile(r"(?is)<function=\w+(?:[^>]*)>.*?(?:</function>|(?=<function=)|$)")
 
-KNOWN_TOOLS = frozenset({"read_file", "write_file", "list_dir", "run_command"})
+# Every tool in `executor.TOOL_SPECS`. `search` and `repo_map` were added there
+# and to both executors without being added here, so a model that leaked
+# `<function=search>` as text had the call dropped while `strip_leaked_tool_syntax`
+# removed the markup from the visible answer — the turn looked like it did
+# nothing. This recovery path exists for exactly the weak local models the Coder
+# screen targets, and those two are the tools they were given to stop reading
+# files one at a time.
+KNOWN_TOOLS = frozenset(
+    {"read_file", "write_file", "list_dir", "search", "repo_map", "run_command"}
+)
 
 
 def strip_leaked_tool_syntax(text: str) -> str:

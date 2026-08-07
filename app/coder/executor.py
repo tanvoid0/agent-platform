@@ -11,10 +11,29 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 MAX_READ_BYTES = 256 * 1024
 MAX_DIR_ENTRIES = 500
+
+# --- search / repo_map limits -------------------------------------------------
+# Mirrored verbatim in `desktop/crates/app/src/coder_tools.rs`; the desktop runs
+# these tools when the Coder screen delegates, and a model that sees one shape
+# locally and another remotely is being asked to learn two tools.
+
+# Past this a file is a bundle, a lockfile or a data dump: a hit in one is never
+# what was meant, and reading them is most of what a search costs.
+SEARCH_MAX_FILE_BYTES = 1_000_000
+SEARCH_MAX_HITS = 100
+# One matching line, clipped — a minified line under the size cap would
+# otherwise be the whole result.
+SEARCH_MAX_HIT_CHARS = 300
+MAP_MAX_FILES = 400
+# Tooling state and build output. Dot-directories are skipped by rule (.git,
+# .venv, .hearth); dot *files* are project config someone may well be after.
+SKIP_DIRS = frozenset(
+    {"node_modules", "target", "dist", "build", "__pycache__", "venv", "site-packages"}
+)
 
 # OpenAI-format tool specs; forwarded verbatim through the LLM proxy so they
 # work with any OpenAI-compatible provider (Ollama, Gemini, LM Studio, ...).
@@ -65,6 +84,35 @@ TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "search",
+            "description": (
+                "Find which files contain a literal string, case-insensitively. "
+                "Use this to locate code instead of reading files one at a time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Literal text to find, e.g. 'def send_message'"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "repo_map",
+            "description": (
+                "List the top-level definitions of every source file in the workspace "
+                "(Python, Rust, JavaScript/TypeScript). Use this to see what exists and "
+                "where a name lives before reading anything."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_command",
             "description": "Run a shell command in the workspace root and return stdout/stderr. Only available when command execution is enabled for the session.",
             "parameters": {
@@ -80,6 +128,68 @@ TOOL_SPECS: list[dict[str, Any]] = [
 
 
 APPROVAL_REQUIRED_TOOLS = {"run_command"}
+
+# --- repo_map: what counts as a definition ------------------------------------
+# A token walk rather than regexes, because the same walk has to exist in Rust
+# (`coder_tools.rs`) and two regex dialects drifting apart is a map that says
+# different things depending on where the agent is running.
+#
+# Only column 0 counts, in every language: a Rust `impl` block's methods and a
+# Python class's methods are detail, and the map answers "where does this name
+# live", not "what is in this file".
+#
+# ponytail: three languages. Add a row when the agent is asked to work in a
+# fourth — Go and Java are one entry each.
+_MAP_LANGUAGES: dict[str, tuple[frozenset[str], bool]] = {
+    ".py": (frozenset({"def", "class"}), False),
+    ".pyi": (frozenset({"def", "class"}), False),
+    ".rs": (
+        frozenset({"fn", "struct", "enum", "trait", "type", "const", "static", "mod", "macro_rules!"}),
+        False,
+    ),
+    **{
+        ext: (
+            frozenset(
+                {"function", "class", "const", "let", "var", "interface", "type", "enum"}
+            ),
+            True,  # JS/TS: only exported names, which are the ones importers use
+        )
+        for ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")
+    },
+}
+
+# Words between the line start and the keyword. `pub(crate)` is matched by prefix.
+_MAP_MODIFIERS = frozenset({"pub", "async", "unsafe", "extern", "default", "declare", "abstract"})
+
+
+def _identifier(token: str) -> str:
+    """The leading identifier of a token — `main()` → `main`, `Foo<T>` → `Foo`."""
+    out: list[str] = []
+    for ch in token:
+        if ch.isalnum() or ch in "_$":
+            out.append(ch)
+        else:
+            break
+    return "".join(out)
+
+
+def definition_name(line: str, keywords: frozenset[str], require_export: bool) -> str | None:
+    """The name a source line declares, or None if it declares nothing."""
+    if not line or line[:1].isspace():
+        return None
+    tokens = line.split()
+    if require_export:
+        if not tokens or tokens[0] != "export":
+            return None
+        tokens = tokens[1:]
+    while tokens and (tokens[0] in _MAP_MODIFIERS or tokens[0].startswith("pub(")):
+        tokens = tokens[1:]
+    if len(tokens) < 2:
+        return None
+    keyword = tokens[0].rstrip("*")  # `function*`
+    if keyword not in keywords:
+        return None
+    return _identifier(tokens[1]) or None
 
 
 class ToolExecutionError(Exception):
@@ -142,6 +252,10 @@ class LocalExecutor:
                 return self._write_file(str(args.get("path", "")), str(args.get("content", "")))
             if tool == "list_dir":
                 return self._list_dir(str(args.get("path", ".")))
+            if tool == "search":
+                return self._search(str(args.get("query", "")))
+            if tool == "repo_map":
+                return self._repo_map()
             if tool == "run_command":
                 return await self._run_command(str(args.get("command", "")))
             return f"Error: unknown tool '{tool}'."
@@ -183,6 +297,98 @@ class LocalExecutor:
                 entries.append(f"...[truncated at {MAX_DIR_ENTRIES} entries]")
                 break
         return "\n".join(entries) if entries else "(empty directory)"
+
+    def _walk_files(self) -> Iterator[Path]:
+        """Every file under the root, in a stable order, skipping build output.
+
+        Stable is the point: the caps below cut a search off part-way, so an
+        arbitrary walk order would return a different hundred hits each call.
+        """
+        stack = [self._root]
+        while stack:
+            try:
+                children = sorted(stack.pop().iterdir(), key=lambda c: c.name)
+            except OSError:
+                continue
+            subdirs: list[Path] = []
+            for child in children:
+                if child.is_dir():
+                    if child.name not in SKIP_DIRS and not child.name.startswith("."):
+                        subdirs.append(child)
+                elif child.is_file():
+                    yield child
+            # Reversed, because the stack pops from the end.
+            stack.extend(reversed(subdirs))
+
+    def _rel(self, path: Path) -> str:
+        return path.relative_to(self._root).as_posix()
+
+    def _search(self, query: str) -> str:
+        needle = query.strip().lower()
+        if not needle:
+            raise ToolExecutionError("search requires a non-empty query")
+        hits: list[str] = []
+        truncated = False
+        for path in self._walk_files():
+            if len(hits) >= SEARCH_MAX_HITS:
+                truncated = True
+                break
+            try:
+                if path.stat().st_size > SEARCH_MAX_FILE_BYTES:
+                    continue
+                # A binary fails to decode here, which is the sniffer.
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            rel = self._rel(path)
+            for i, line in enumerate(text.splitlines(), start=1):
+                if len(hits) >= SEARCH_MAX_HITS:
+                    truncated = True
+                    break
+                if needle in line.lower():
+                    hits.append(f"{rel}:{i}: {line.strip()[:SEARCH_MAX_HIT_CHARS]}")
+        if not hits:
+            return f"no matches for {query.strip()!r}"
+        if truncated:
+            hits.append(f"...[truncated at {SEARCH_MAX_HITS} matches — narrow the query]")
+        return "\n".join(hits)
+
+    def _repo_map(self) -> str:
+        lines: list[str] = []
+        scanned = 0
+        truncated = False
+        for path in self._walk_files():
+            lang = _MAP_LANGUAGES.get(path.suffix.lower())
+            if lang is None:
+                continue
+            if scanned >= MAP_MAX_FILES:
+                truncated = True
+                break
+            scanned += 1
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            keywords, require_export = lang
+            names: list[str] = []
+            for line in text.splitlines():
+                name = definition_name(line, keywords, require_export)
+                if name and name not in names:
+                    names.append(name)
+            # A file with nothing top-level is dropped rather than listed empty:
+            # list_dir already says what exists, and this answers a different
+            # question — where a given name lives.
+            if names:
+                lines.append(f"{self._rel(path)}: {', '.join(names)}")
+        if not lines:
+            return (
+                "no definitions found — this workspace may not be Python, Rust or "
+                "JavaScript/TypeScript, or its code may be somewhere list_dir has not reached"
+            )
+        lines.sort()
+        if truncated:
+            lines.append(f"...[truncated at {MAP_MAX_FILES} files — use search instead]")
+        return "\n".join(["definitions by file:", *lines])
 
     async def _run_command(self, command: str) -> str:
         if not self._allow_commands:
