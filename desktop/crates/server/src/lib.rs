@@ -17,6 +17,7 @@
 
 pub mod action_orchestrator;
 pub mod assistant;
+pub mod coder;
 pub mod assistant_turn;
 pub mod auth;
 pub mod byok;
@@ -205,6 +206,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", axum::routing::get(health))
         .route("/", axum::routing::get(root))
         .merge(assistant::routes())
+        .merge(coder::routes())
         .merge(chat::routes())
         .merge(llm::routes())
         .merge(processes::routes())

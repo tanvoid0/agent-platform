@@ -1083,6 +1083,15 @@ cross-render, so `chat_usage.rs` asserts it directly
 
 #### coder — scope (step 4)
 
+> **Half-landed, 2026-08-07.** The five CRUD routes are Rust
+> ([`coder.rs`](desktop/crates/server/src/coder.rs)); the five loop routes
+> (`send`, `stream`, `retry`, `approve`, `tool-result`) are still proxied and
+> still have to move together. **That split is the short-lived one this note
+> warns about below** — while it holds, a Rust `DELETE` mid-stream leaves
+> Python's `_persist` updating zero rows (a `StaleDataError` 500, loud rather
+> than silent, but a reason not to leave it sitting). Details at the end of
+> this section.
+
 **"Largest and highest-churn" is right about the size and wrong about the risk.**
 `app/coder/` writes one table nobody else touches, so there is no two-writer
 here — the hazard is that this domain holds the **first in-process state shared
@@ -1203,6 +1212,41 @@ recovers.
   auth does not write it and Python's only does for requests that reach Python.
   Every step has this consequence; coder is the first where one screen is most of
   a token's traffic, so a coder-only token will look unused in `GET /api-tokens`.
+
+##### The CRUD half — shipped 2026-08-07
+
+[`coder.rs`](desktop/crates/server/src/coder.rs): `GET`/`POST /chat/threads`,
+`GET /chat/context-usage`, `GET /chat/thread`, `DELETE /chat/thread/{id}`.
+Both oddities this note called out are ported as-is and commented as
+deliberate — **no project scoping anywhere in the domain**, and **the two
+GETs that write** (`_resolve_thread(None)` inserts a `"New session"` row and
+returns it, so answering them as pure reads would diverge on the first call
+against a fresh database). The insert-on-read was driven on an empty DB to
+confirm it.
+
+`TOOL_SPECS` and `CODER_SYSTEM_PROMPT` are embedded byte-exact rather than
+rebuilt from Rust structures, because both are *tokenized into every
+`context_usage` body* — a drifted character is a changed number in a
+response, not a cosmetic difference. Same reasoning as `/profile/forms`.
+
+**The cross-render earned its keep: it found a real bug, and not in the new
+code.** `usage.rs::estimate_messages_tokens` counted a message's `tool_calls`
+as JSON, where Python counts `str(tc)` — a Python repr. Those are different
+strings, so the `conversation` figure came out 68 against Python's 74 (~8%
+low on a transcript with tool calls). **Nothing caught it before because no
+earlier domain's messages carry `tool_calls`**: the assistant's are
+`{role, content, usage, proposed_actions}`. Fixed to use `py_repr`, with a
+test pinning the difference. This is the third time this class — Python's
+`str()`/`json.dumps` shape reproduced or not — has changed a number or a
+prompt; `py_repr`, `PythonJson` and `EnsureAscii` all exist for it.
+
+After that fix, all three read endpoints render **byte-identical** to Python
+off the same seeded row (tool calls, a persisted `usage` blob, unicode and an
+emoji). Create/list/delete round-trip and both 404s match too. The only
+differences left are the documented `input`/`ctx` pydantic envelope fields on
+three validation errors — type, `loc`, `msg` and status all match. And the
+five still-proxied routes were checked to still *fall through* rather than
+405, which is the trap this migration has now hit three times.
 
 #### assistant + chat — scope (step 4)
 
@@ -2234,11 +2278,12 @@ crate-wide now, with a test guarding it) and `KNOWN_TOOLS` had drifted behind
 `TOOL_SPECS`, so leaked `search` and `repo_map` calls were being dropped while
 their markup was stripped from the answer.
 
-**Resume at: coder.** Step 4's assistant half finished 2026-08-07 — sub-step
-7 (apply/reviews, closing `todo_items`' last Python writer), sub-step 8
-(`chat/retry` + `chat/submit-form`) and sub-step 9 (`/reset`, cross-rendered
-against Python on the same database). **The assistant domain is whole**; only
-`POST /chat/threads` proxies, and by choice. What is left of the migration is
-coder — separate, atomic, and the largest single diff in it — then playground
-(step 4½, which is worth deleting rather than porting: no caller) and
-`system_routes` (step 5, the fan-in that can only move last).*
+**Resume at: coder's agent loop** — `send`, `stream`, `retry`, `approve`,
+`tool-result`, which move as **one commit** because the delegated tool call
+parks an in-process future that the unpark has to find in the same process.
+Coder's CRUD half landed 2026-08-07 and the split it leaves is the
+short-lived one flagged in that section, so this is the next thing, not a
+later one. The assistant finished the same day (sub-steps 7-9) and **that
+domain is whole**. After coder: playground (step 4½, worth deleting rather
+than porting — no caller) and `system_routes` (step 5, the fan-in that can
+only move last).*

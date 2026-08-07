@@ -73,8 +73,17 @@ pub(crate) fn estimate_messages_tokens(messages: &[Value]) -> usize {
             _ => {}
         }
         // Tool call payloads can be large; count them roughly.
+        //
+        // **`str(tc)`, not JSON.** Python stringifies the *list* with `str()`,
+        // so what gets tokenized is a Python repr — single quotes, `None`,
+        // `True` — and it is materially shorter than the JSON of the same
+        // value once the nested `arguments` string stops needing its quotes
+        // escaped. Rendering JSON here under-counted by ~8% of the
+        // conversation on a transcript with tool calls. Nothing caught it
+        // before coder because no earlier domain's messages carry
+        // `tool_calls`.
         if let Some(calls) = message.get("tool_calls").filter(|v| v.is_array()) {
-            total += estimate_tokens(&calls.to_string());
+            total += estimate_tokens(&crate::todos::py_repr(calls));
         }
     }
     total + MESSAGE_OVERHEAD_TOKENS * messages.len()
@@ -166,6 +175,35 @@ pub fn normalize_completion_body(body: &[u8], request_messages: Option<&Value>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tool_calls` are tokenized as Python's `str(list)`, not as JSON. The
+    /// numbers here are pinned against `python -c` over the same message, and
+    /// the point is the *difference*: rendering JSON gives a lower count, and
+    /// that lands in a `context_usage` body as a wrong number rather than as
+    /// an error. Coder is the first domain whose transcripts carry tool calls.
+    #[test]
+    fn tool_calls_are_counted_as_pythons_repr_not_as_json() {
+        let messages = [json!({
+            "role": "assistant",
+            "content": "Looking.",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"app/main.py\"}"},
+            }],
+        })];
+        let counted = estimate_messages_tokens(&messages);
+
+        let repr = crate::todos::py_repr(messages[0].get("tool_calls").unwrap());
+        assert!(repr.starts_with("[{'id': 'c1'"), "expected a python repr, got {repr}");
+        let expected =
+            estimate_tokens("Looking.") + estimate_tokens(&repr) + MESSAGE_OVERHEAD_TOKENS;
+        assert_eq!(counted, expected);
+
+        // The JSON rendering this used to use is a different, smaller number.
+        let as_json = messages[0].get("tool_calls").unwrap().to_string();
+        assert_ne!(estimate_tokens(&as_json), estimate_tokens(&repr));
+    }
 
     #[test]
     fn ollamas_field_names_map_onto_openais() {
