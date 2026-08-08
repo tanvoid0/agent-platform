@@ -44,6 +44,16 @@ pub fn sql_time<S: serde::Serializer>(raw: &String, s: S) -> Result<S::Ok, S::Er
     s.serialize_str(&iso_from_sql(raw))
 }
 
+/// Renders an integer flag column as a JSON boolean.
+///
+/// These columns are `INTEGER NOT NULL DEFAULT 0` on both backends, so the row
+/// field has to be `i64` — the `Any` driver refuses to hand a `BIGINT` to a
+/// Rust `bool` (see [`crate::db`]) — while the wire has always carried
+/// `true`/`false` and must keep doing so.
+pub fn sql_flag<S: serde::Serializer>(raw: &i64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_bool(*raw != 0)
+}
+
 pub fn iso_from_sql(raw: &str) -> String {
     let raw = raw.trim();
     // An offset can only start past the date, whose own dashes would match first.

@@ -48,7 +48,7 @@
 //! - **`failure_debug_json` carries no Python traceback** and its
 //!   `exception_type` names the Rust failure kind.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -764,7 +764,9 @@ struct TaskRow {
     instructions: String,
     llm_model: Option<String>,
     dependencies_json: String,
-    requires_review: bool,
+    /// `INTEGER` on both backends; `i64` for the same reason as
+    /// [`crate::processes`]'s copy. Compared against 0 at its three use sites.
+    requires_review: i64,
     draft_output: Option<String>,
     review_feedback: Option<String>,
 }
@@ -783,9 +785,9 @@ fn parse_dependencies(raw: &str) -> Vec<String> {
 }
 
 async fn load_process(state: &AppState, process_id: i64) -> Result<Option<ProcessRow>, sqlx::Error> {
-    sqlx::query_as(&format!("SELECT {PROCESS_COLUMNS} FROM process WHERE id = ?"))
+    sqlx::query_as(&crate::db::sql(&format!("SELECT {PROCESS_COLUMNS} FROM process WHERE id = ?"), state.backend))
         .bind(process_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await
 }
 
@@ -801,16 +803,16 @@ async fn append_event(
     event_type: &str,
     content: &str,
 ) {
-    let result = sqlx::query(
+    let result = sqlx::query(&crate::db::sql(
         "INSERT INTO eventlog (process_id, task_id, event_type, content, created_at) \
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?)", state.backend)
     )
     .bind(process_id)
     .bind(task_id)
     .bind(event_type)
     .bind(content)
     .bind(sql_now())
-    .execute(&state.pool)
+    .execute(&state.any)
     .await;
     if let Err(e) = result {
         logd!("event log write failed for process {process_id}: {e}");
@@ -839,33 +841,33 @@ pub(crate) async fn record_api_token_usage(
     let errors = i64::from(is_error);
     let today = chrono::Utc::now().naive_utc().format("%Y-%m-%d").to_string();
 
-    let updated = sqlx::query(
+    let updated = sqlx::query(&crate::db::sql(
         "UPDATE api_token_usage_daily \
          SET request_count = request_count + 1, error_count = error_count + ?, \
              total_tokens = total_tokens + ?, total_cost = total_cost + ? \
-         WHERE token_id = ? AND usage_date = ?",
+         WHERE token_id = ? AND usage_date = ?", state.backend)
     )
     .bind(errors)
     .bind(tokens)
     .bind(cost)
     .bind(token_id)
     .bind(&today)
-    .execute(&state.pool)
+    .execute(&state.any)
     .await;
 
     match updated {
         Ok(result) if result.rows_affected() == 0 => {
-            let insert = sqlx::query(
+            let insert = sqlx::query(&crate::db::sql(
                 "INSERT INTO api_token_usage_daily \
                  (token_id, usage_date, request_count, error_count, total_tokens, total_cost) \
-                 VALUES (?, ?, 1, ?, ?, ?)",
+                 VALUES (?, ?, 1, ?, ?, ?)", state.backend)
             )
             .bind(token_id)
             .bind(&today)
             .bind(errors)
             .bind(tokens)
             .bind(cost)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await;
             if let Err(e) = insert {
                 logd!("daily usage insert failed for token {token_id}: {e}");
@@ -875,17 +877,17 @@ pub(crate) async fn record_api_token_usage(
         Ok(_) => {}
     }
 
-    let lifetime = sqlx::query(
+    let lifetime = sqlx::query(&crate::db::sql(
         "UPDATE api_tokens \
          SET total_requests = total_requests + 1, total_errors = total_errors + ?, \
              total_tokens = total_tokens + ?, total_cost = total_cost + ? \
-         WHERE id = ?",
+         WHERE id = ?", state.backend)
     )
     .bind(errors)
     .bind(tokens)
     .bind(cost)
     .bind(token_id)
-    .execute(&state.pool)
+    .execute(&state.any)
     .await;
     if let Err(e) = lifetime {
         logd!("token usage update failed for token {token_id}: {e}");
@@ -903,10 +905,10 @@ async fn set_process_status_only(
     process_id: i64,
     status: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE process SET status = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE process SET status = ? WHERE id = ?", state.backend))
         .bind(status)
         .bind(process_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(())
 }
@@ -920,11 +922,11 @@ async fn set_process_status(
     status: &str,
     failure_reason: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE process SET status = ?, failure_reason = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE process SET status = ?, failure_reason = ? WHERE id = ?", state.backend))
         .bind(status)
         .bind(failure_reason)
         .bind(process_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(())
 }
@@ -948,7 +950,7 @@ pub(crate) async fn apply_validated_planner_to_process(
     // `ensure_ascii=False` here and `True` in `apply_planner_success`. Both are
     // stored as-is and echoed back by `GET /processes/{id}`.
     let canonical = planner_dag_to_json(validated, false);
-    let mut tx = state.pool.begin().await?;
+    let mut tx = state.any.begin().await?;
     // Insert **before** delete, which reads backwards from `process_approval.py`
     // and is exactly what it does: SQLAlchemy's unit of work flushes INSERTs
     // ahead of DELETEs, so the replacement rows are numbered while the old ones
@@ -958,19 +960,19 @@ pub(crate) async fn apply_validated_planner_to_process(
     // Python 404s. Found by cross-rendering a retry through both servers: the
     // same twelve rows, ids 1-12 here against 55-66 there.
     let old_max: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM tasknode WHERE process_id = ?")
+        sqlx::query_scalar(&crate::db::sql("SELECT COALESCE(MAX(id), 0) FROM tasknode WHERE process_id = ?", state.backend))
             .bind(process_id)
             .fetch_one(&mut *tx)
             .await?;
     for agent in &validated.subagents {
-        insert_task_node(&mut tx, process_id, agent, None).await?;
+        insert_task_node(&mut tx, state.backend, process_id, agent, None).await?;
     }
-    sqlx::query("DELETE FROM tasknode WHERE process_id = ? AND id <= ?")
+    sqlx::query(&crate::db::sql("DELETE FROM tasknode WHERE process_id = ? AND id <= ?", state.backend))
         .bind(process_id)
         .bind(old_max)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE process SET dag_json = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE process SET dag_json = ? WHERE id = ?", state.backend))
         .bind(&canonical)
         .bind(process_id)
         .execute(&mut *tx)
@@ -979,16 +981,17 @@ pub(crate) async fn apply_validated_planner_to_process(
 }
 
 async fn insert_task_node(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    backend: crate::db::Backend,
     process_id: i64,
     agent: &SubagentSpec,
     parent_client_uuid: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "INSERT INTO tasknode \
          (process_id, client_uuid, parent_client_uuid, role, system_prompt, instructions, \
           llm_model, dependencies_json, status, requires_review, revision_count, tokens_used) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, 0)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, 0)", backend)
     )
     .bind(process_id)
     .bind(&agent.client_uuid)
@@ -1149,19 +1152,19 @@ async fn sync_review_assignments(state: &AppState, process_id: i64) -> Result<()
         return Ok(());
     };
 
-    let tasks: Vec<ReviewTask> = sqlx::query_as(
+    let tasks: Vec<ReviewTask> = sqlx::query_as(&crate::db::sql(
         "SELECT id, client_uuid, status, dependencies_json, reviewer_client_uuid \
-         FROM tasknode WHERE process_id = ?",
+         FROM tasknode WHERE process_id = ?", state.backend)
     )
     .bind(process_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     for (task_id, reviewer) in compute_review_assignments(&tasks, &planner.subagents) {
-        sqlx::query("UPDATE tasknode SET reviewer_client_uuid = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE tasknode SET reviewer_client_uuid = ? WHERE id = ?", state.backend))
             .bind(reviewer)
             .bind(task_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     Ok(())
@@ -1174,6 +1177,7 @@ async fn sync_review_assignments(state: &AppState, process_id: i64) -> Result<()
 #[derive(Debug, Clone, PartialEq)]
 struct PendingTask {
     id: i64,
+    client_uuid: String,
     dependencies: Vec<String>,
 }
 
@@ -1182,6 +1186,10 @@ struct DagSnapshot {
     pending_tasks: Vec<PendingTask>,
     awaiting_review_exists: bool,
     completed_uuids: HashSet<String>,
+    /// Status of every task in the process, by `client_uuid`. Only read to
+    /// explain a deadlock — the wave itself needs nothing but the three fields
+    /// above.
+    status_by_uuid: HashMap<String, String>,
 }
 
 /// What the loop does with one snapshot. Naming the four outcomes is what makes
@@ -1192,8 +1200,8 @@ enum Wave {
     Complete,
     /// Nothing runnable, but a human is holding a task.
     PauseForReview,
-    /// Pending tasks and none of them runnable: a cycle or unsatisfiable deps.
-    Deadlock,
+    /// Pending tasks and none of them runnable, with the blockers named.
+    Deadlock(String),
     /// Task ids to run now, FIFO by id and capped by the concurrency limit.
     Run(Vec<i64>),
 }
@@ -1226,44 +1234,91 @@ fn plan_wave(snapshot: &DagSnapshot, max_concurrent: Option<usize>) -> Wave {
         // A dependent stuck behind an `awaiting_review` upstream is a pause, not
         // a deadlock — that distinction is the whole point of checking the gate
         // before declaring one.
-        return if snapshot.awaiting_review_exists { Wave::PauseForReview } else { Wave::Deadlock };
+        return if snapshot.awaiting_review_exists {
+            Wave::PauseForReview
+        } else {
+            Wave::Deadlock(deadlock_reason(snapshot))
+        };
     }
     Wave::Run(ready)
+}
+
+/// Name the blockers. "cycle or unsatisfied dependencies" is true and useless:
+/// the usual cause is one failed upstream task the user can retry, and the user
+/// cannot tell that from a graph problem without being told which.
+fn deadlock_reason(snapshot: &DagSnapshot) -> String {
+    // Sorted and de-duplicated so the message is stable across runs.
+    let mut failed: BTreeSet<&str> = BTreeSet::new();
+    let mut unknown: BTreeSet<&str> = BTreeSet::new();
+    let mut waiting: BTreeSet<&str> = BTreeSet::new();
+
+    for task in &snapshot.pending_tasks {
+        for dep in &task.dependencies {
+            if snapshot.completed_uuids.contains(dep) {
+                continue;
+            }
+            match snapshot.status_by_uuid.get(dep.as_str()).map(String::as_str) {
+                Some("failed") => failed.insert(dep.as_str()),
+                // A dep that is itself pending here can never start: this task
+                // and that one are in a cycle (or behind one).
+                Some(_) => waiting.insert(task.client_uuid.as_str()),
+                None => unknown.insert(dep.as_str()),
+            };
+        }
+    }
+
+    let list = |set: BTreeSet<&str>| set.into_iter().collect::<Vec<_>>().join(", ");
+    let mut parts: Vec<String> = Vec::new();
+    if !failed.is_empty() {
+        parts.push(format!(
+            "blocked by failed task(s) {} — retry those tasks, or retry the process",
+            list(failed)
+        ));
+    }
+    if !unknown.is_empty() {
+        parts.push(format!("dependencies on task(s) that do not exist: {}", list(unknown)));
+    }
+    if !waiting.is_empty() {
+        parts.push(format!("cyclic dependencies among task(s) {}", list(waiting)));
+    }
+    if parts.is_empty() {
+        // No pending task has an unmet dep, yet none was selected: only a
+        // concurrency cap of zero can do that.
+        parts.push("pending tasks with no runnable step".to_string());
+    }
+    format!("DAG deadlock: {}", parts.join("; "))
 }
 
 async fn load_dag_task_snapshot(
     state: &AppState,
     process_id: i64,
 ) -> Result<DagSnapshot, sqlx::Error> {
-    let pending: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT id, dependencies_json FROM tasknode WHERE process_id = ? AND status = 'pending'",
+    // One read of every task rather than three status-filtered ones: the
+    // deadlock message needs the statuses the other two threw away.
+    let rows: Vec<(i64, String, String, String)> = sqlx::query_as(&crate::db::sql(
+        "SELECT id, client_uuid, status, dependencies_json FROM tasknode WHERE process_id = ?", state.backend)
     )
     .bind(process_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
-    let awaiting: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM tasknode WHERE process_id = ? AND status = 'awaiting_review' LIMIT 1",
-    )
-    .bind(process_id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let completed: Vec<String> = sqlx::query_scalar(
-        "SELECT client_uuid FROM tasknode WHERE process_id = ? AND status = 'completed'",
-    )
-    .bind(process_id)
-    .fetch_all(&state.pool)
-    .await?;
-
-    Ok(DagSnapshot {
-        pending_tasks: pending
-            .into_iter()
-            .map(|(id, deps)| PendingTask { id, dependencies: parse_dependencies(&deps) })
-            .collect(),
-        awaiting_review_exists: awaiting.is_some(),
-        completed_uuids: completed.into_iter().collect(),
-    })
+    let mut snapshot = DagSnapshot::default();
+    for (id, client_uuid, status, deps) in rows {
+        match status.as_str() {
+            "pending" => snapshot.pending_tasks.push(PendingTask {
+                id,
+                client_uuid: client_uuid.clone(),
+                dependencies: parse_dependencies(&deps),
+            }),
+            "awaiting_review" => snapshot.awaiting_review_exists = true,
+            "completed" => {
+                snapshot.completed_uuids.insert(client_uuid.clone());
+            }
+            _ => {}
+        }
+        snapshot.status_by_uuid.insert(client_uuid, status);
+    }
+    Ok(snapshot)
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,11 +1560,11 @@ impl Executor {
         let Some(process) = load_process(&self.state, self.process_id).await? else {
             return Err(sqlx::Error::RowNotFound);
         };
-        let mut tx = self.state.pool.begin().await?;
-        sqlx::query(
+        let mut tx = self.state.any.begin().await?;
+        sqlx::query(&crate::db::sql(
             "UPDATE process SET dag_json = ?, total_tokens = total_tokens + ?, \
              total_cost = total_cost + ?, failure_reason = NULL, status = 'approval_required' \
-             WHERE id = ?",
+             WHERE id = ?", self.state.backend)
         )
         // `json.dumps(dag)` with the default `ensure_ascii=True`.
         .bind(planner_dag_to_json(&outcome.dag, true))
@@ -1519,7 +1574,7 @@ impl Executor {
         .execute(&mut *tx)
         .await?;
         for agent in &outcome.dag.subagents {
-            insert_task_node(&mut tx, self.process_id, agent, None).await?;
+            insert_task_node(&mut tx, self.state.backend, self.process_id, agent, None).await?;
         }
         tx.commit().await?;
 
@@ -1582,11 +1637,13 @@ impl Executor {
     async fn execute_dag(self: Arc<Self>) {
         let deadline = run_max_seconds().map(|s| Instant::now() + duration_from_secs_f64(s));
 
-        let awaiting_left = match sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM tasknode WHERE process_id = ? AND status = 'awaiting_review' LIMIT 1",
+        let awaiting_left = match sqlx::query_scalar::<_, i64>(&crate::db::sql(
+            "SELECT CAST(id AS BIGINT) FROM tasknode WHERE process_id = ? AND status = 'awaiting_review' LIMIT 1",
+            self.state.backend,
+        )
         )
         .bind(self.process_id)
-        .fetch_optional(&self.state.pool)
+        .fetch_optional(&self.state.any)
         .await
         {
             Ok(row) => row.is_some(),
@@ -1662,11 +1719,9 @@ impl Executor {
                     self.log("status_change", "Process execution fully completed", None).await;
                     return;
                 }
-                Wave::Deadlock => {
-                    let reason = "DAG deadlock: pending tasks with no runnable step \
-                                  (cycle or unsatisfied dependencies)";
-                    let _ = fail_process(&self.state, self.process_id, reason).await;
-                    self.log("error", reason, None).await;
+                Wave::Deadlock(reason) => {
+                    let _ = fail_process(&self.state, self.process_id, &reason).await;
+                    self.log("error", &reason, None).await;
                     return;
                 }
                 Wave::Run(task_ids) => {
@@ -1736,21 +1791,21 @@ impl Executor {
         task_id: i64,
     ) -> Result<Option<TaskInputs>, sqlx::Error> {
         let Some(task): Option<TaskRow> =
-            sqlx::query_as(&format!("SELECT {TASK_COLUMNS} FROM tasknode WHERE id = ?"))
+            sqlx::query_as(&crate::db::sql(&format!("SELECT {TASK_COLUMNS} FROM tasknode WHERE id = ?"), self.state.backend))
                 .bind(task_id)
-                .fetch_optional(&self.state.pool)
+                .fetch_optional(&self.state.any)
                 .await?
         else {
             return Ok(None);
         };
 
-        sqlx::query(
+        sqlx::query(&crate::db::sql(
             "UPDATE tasknode SET status = 'running', started_at = ?, failure_debug_json = NULL \
-             WHERE id = ?",
+             WHERE id = ?", self.state.backend)
         )
         .bind(sql_now())
         .bind(task_id)
-        .execute(&self.state.pool)
+        .execute(&self.state.any)
         .await?;
         self.log(
             "status_change",
@@ -1774,7 +1829,7 @@ impl Executor {
             for dep in &dependencies {
                 query = query.bind(dep);
             }
-            for (client_uuid, role, output) in query.fetch_all(&self.state.pool).await? {
+            for (client_uuid, role, output) in query.fetch_all(&self.state.any).await? {
                 deps_texts.push(format!(
                     "Output from {client_uuid} ({role}):\n{}",
                     output.unwrap_or_default()
@@ -1785,12 +1840,12 @@ impl Executor {
         let system_message = task.system_prompt.clone();
         let mut user_message = task.instructions.clone();
         if let Some(parent_uuid) = task.parent_client_uuid.as_deref().filter(|p| !p.is_empty()) {
-            let parent_role: Option<String> = sqlx::query_scalar(
-                "SELECT role FROM tasknode WHERE process_id = ? AND client_uuid = ? LIMIT 1",
+            let parent_role: Option<String> = sqlx::query_scalar(&crate::db::sql(
+                "SELECT role FROM tasknode WHERE process_id = ? AND client_uuid = ? LIMIT 1", self.state.backend)
             )
             .bind(self.process_id)
             .bind(parent_uuid)
-            .fetch_optional(&self.state.pool)
+            .fetch_optional(&self.state.any)
             .await?;
             if let Some(parent_role) = parent_role {
                 user_message = format!(
@@ -1879,16 +1934,16 @@ impl Executor {
             return Err(sqlx::Error::RowNotFound);
         };
 
-        let (status, completed_at, needs_expand) = if task.requires_review {
+        let (status, completed_at, needs_expand) = if task.requires_review != 0 {
             ("awaiting_review", None, false)
         } else {
             ("completed", Some(sql_now()), true)
         };
 
-        let mut tx = self.state.pool.begin().await?;
-        sqlx::query(
+        let mut tx = self.state.any.begin().await?;
+        sqlx::query(&crate::db::sql(
             "UPDATE tasknode SET output = ?, tokens_used = ?, status = ?, completed_at = ? \
-             WHERE id = ?",
+             WHERE id = ?", self.state.backend)
         )
         .bind(&completion.content)
         .bind(completion.tokens)
@@ -1900,7 +1955,7 @@ impl Executor {
 
         // The review branch also moves the process; the completed branch leaves
         // its status alone and lets the wave loop decide.
-        let update = if task.requires_review {
+        let update = if task.requires_review != 0 {
             "UPDATE process SET total_tokens = total_tokens + ?, total_cost = total_cost + ?, \
              tool_invocations_used = tool_invocations_used + ?, status = 'task_review_required' \
              WHERE id = ?"
@@ -1908,7 +1963,7 @@ impl Executor {
             "UPDATE process SET total_tokens = total_tokens + ?, total_cost = total_cost + ?, \
              tool_invocations_used = tool_invocations_used + ? WHERE id = ?"
         };
-        sqlx::query(update)
+        sqlx::query(&crate::db::sql(update, self.state.backend))
             .bind(completion.tokens)
             .bind(completion.cost)
             .bind(tool_calls)
@@ -1929,7 +1984,7 @@ impl Executor {
 
         self.log(
             "status_change",
-            &if task.requires_review {
+            &if task.requires_review != 0 {
                 format!("Task {} awaiting review", task.client_uuid)
             } else {
                 format!("Task {} completed", task.client_uuid)
@@ -1980,13 +2035,13 @@ impl Executor {
         failure: &LlmFailure,
         reason: &str,
     ) -> Result<(), sqlx::Error> {
-        let mut tx = self.state.pool.begin().await?;
-        sqlx::query("UPDATE tasknode SET status = 'failed', failure_debug_json = ? WHERE id = ?")
+        let mut tx = self.state.any.begin().await?;
+        sqlx::query(&crate::db::sql("UPDATE tasknode SET status = 'failed', failure_debug_json = ? WHERE id = ?", self.state.backend))
             .bind(task_failure_debug_json(failure))
             .bind(task_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE process SET status = 'failed', failure_reason = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE process SET status = 'failed', failure_reason = ? WHERE id = ?", self.state.backend))
             .bind(reason)
             .bind(self.process_id)
             .execute(&mut *tx)
@@ -2008,9 +2063,9 @@ impl Executor {
         let mut subdecomp = self.subdecomp.lock().await;
 
         let task: Option<TaskRow> =
-            match sqlx::query_as(&format!("SELECT {TASK_COLUMNS} FROM tasknode WHERE id = ?"))
+            match sqlx::query_as(&crate::db::sql(&format!("SELECT {TASK_COLUMNS} FROM tasknode WHERE id = ?"), self.state.backend))
                 .bind(task_id)
-                .fetch_optional(&self.state.pool)
+                .fetch_optional(&self.state.any)
                 .await
             {
                 Ok(row) => row,
@@ -2051,9 +2106,9 @@ impl Executor {
 
         let existing_uuids: HashSet<String> = planner.uuids().into_iter().collect();
         let parent_output: Option<String> =
-            sqlx::query_scalar("SELECT output FROM tasknode WHERE id = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT output FROM tasknode WHERE id = ?", self.state.backend))
                 .bind(task_id)
-                .fetch_optional(&self.state.pool)
+                .fetch_optional(&self.state.any)
                 .await
                 .ok()
                 .flatten()
@@ -2132,9 +2187,9 @@ impl Executor {
         let merged_json = planner_dag_to_json(&merged, true);
 
         let status: Option<String> =
-            sqlx::query_scalar("SELECT status FROM process WHERE id = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT status FROM process WHERE id = ?", self.state.backend))
                 .bind(self.process_id)
-                .fetch_optional(&self.state.pool)
+                .fetch_optional(&self.state.any)
                 .await
                 .map_err(|e| e.to_string())?;
         if status.as_deref() != Some("running") {
@@ -2142,17 +2197,17 @@ impl Executor {
         }
 
         let existing: Vec<String> =
-            sqlx::query_scalar("SELECT client_uuid FROM tasknode WHERE process_id = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT client_uuid FROM tasknode WHERE process_id = ?", self.state.backend))
                 .bind(self.process_id)
-                .fetch_all(&self.state.pool)
+                .fetch_all(&self.state.any)
                 .await
                 .map_err(|e| e.to_string())?;
         let existing: HashSet<String> = existing.into_iter().collect();
 
-        let mut tx = self.state.pool.begin().await.map_err(|e| e.to_string())?;
-        sqlx::query(
+        let mut tx = self.state.any.begin().await.map_err(|e| e.to_string())?;
+        sqlx::query(&crate::db::sql(
             "UPDATE process SET dag_json = ?, total_tokens = total_tokens + ?, \
-             total_cost = total_cost + ? WHERE id = ?",
+             total_cost = total_cost + ? WHERE id = ?", self.state.backend)
         )
         .bind(&merged_json)
         .bind(add_tokens)
@@ -2167,7 +2222,7 @@ impl Executor {
             if existing.contains(&spec.client_uuid) {
                 continue;
             }
-            insert_task_node(&mut tx, self.process_id, spec, Some(parent_uuid))
+            insert_task_node(&mut tx, self.state.backend, self.process_id, spec, Some(parent_uuid))
                 .await
                 .map_err(|e| e.to_string())?;
             created += 1;
@@ -2338,22 +2393,25 @@ async fn recover_interrupted_processes(
         "SELECT id, goal, status, dag_json, team_snapshot_json FROM process \
          WHERE status IN ({placeholders})"
     );
+    // Bound to a local: the query borrows the rewritten string while the binds
+    // are added one at a time.
+    let sql = crate::db::sql(&sql, state.backend).into_owned();
     let mut query = sqlx::query_as::<_, RecoveryRow>(&sql);
     for status in RECOVERABLE_STATUSES {
         query = query.bind(status);
     }
-    let rows = query.fetch_all(&state.pool).await?;
+    let rows = query.fetch_all(&state.any).await?;
 
     let mut counts = RecoveryCounts::default();
     let mut plans: Vec<(i64, String, Option<String>)> = Vec::new();
     let mut executions: Vec<i64> = Vec::new();
 
     for row in rows {
-        let awaiting_review: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM tasknode WHERE process_id = ? AND status = 'awaiting_review'",
+        let awaiting_review: i64 = sqlx::query_scalar(&crate::db::sql(
+            "SELECT COUNT(*) FROM tasknode WHERE process_id = ? AND status = 'awaiting_review'", state.backend)
         )
         .bind(row.id)
-        .fetch_one(&state.pool)
+        .fetch_one(&state.any)
         .await?;
 
         let action =
@@ -2397,12 +2455,12 @@ async fn recover_interrupted_processes(
                 counts.requeued += 1;
             }
             Some(Recovery::AlignReview) => {
-                sqlx::query(
+                sqlx::query(&crate::db::sql(
                     "UPDATE process SET status = 'task_review_required', failure_reason = NULL \
-                     WHERE id = ?",
+                     WHERE id = ?", state.backend)
                 )
                 .bind(row.id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await?;
                 append_event(
                     &state,
@@ -2415,19 +2473,19 @@ async fn recover_interrupted_processes(
                 counts.aligned_review += 1;
             }
             Some(Recovery::RequeueRunning) => {
-                let reset = sqlx::query(
+                let reset = sqlx::query(&crate::db::sql(
                     "UPDATE tasknode SET status = 'pending', output = NULL, draft_output = NULL, \
                      review_feedback = NULL, reviewer_client_uuid = NULL, \
                      failure_debug_json = NULL, started_at = NULL, completed_at = NULL, \
-                     tokens_used = 0 WHERE process_id = ? AND status = 'running'",
+                     tokens_used = 0 WHERE process_id = ? AND status = 'running'", state.backend)
                 )
                 .bind(row.id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await?
                 .rows_affected();
-                sqlx::query("UPDATE process SET failure_reason = NULL WHERE id = ?")
+                sqlx::query(&crate::db::sql("UPDATE process SET failure_reason = NULL WHERE id = ?", state.backend))
                     .bind(row.id)
-                    .execute(&state.pool)
+                    .execute(&state.any)
                     .await?;
                 executions.push(row.id);
                 append_event(
@@ -2478,7 +2536,15 @@ mod tests {
     }
 
     fn pending(id: i64, deps: &[&str]) -> PendingTask {
-        PendingTask { id, dependencies: deps.iter().map(|d| d.to_string()).collect() }
+        PendingTask {
+            id,
+            client_uuid: format!("t{id}"),
+            dependencies: deps.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    fn statuses(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(u, s)| (u.to_string(), s.to_string())).collect()
     }
 
     fn completed(uuids: &[&str]) -> HashSet<String> {
@@ -2542,7 +2608,7 @@ mod tests {
         let blocked = DagSnapshot {
             pending_tasks: vec![pending(2, &["a"])],
             awaiting_review_exists: true,
-            completed_uuids: completed(&[]),
+            ..Default::default()
         };
         assert_eq!(plan_wave(&blocked, None), Wave::PauseForReview);
     }
@@ -2552,26 +2618,39 @@ mod tests {
     #[test]
     fn unsatisfiable_dependencies_are_a_deadlock_not_a_hang() {
         let cycle = DagSnapshot {
-            pending_tasks: vec![pending(1, &["b"]), pending(2, &["a"])],
-            awaiting_review_exists: false,
-            completed_uuids: completed(&[]),
-        };
-        assert_eq!(plan_wave(&cycle, None), Wave::Deadlock);
-
-        // A dependency on a task that failed is the same shape.
-        let orphaned = DagSnapshot {
-            pending_tasks: vec![pending(1, &["gone"])],
+            pending_tasks: vec![pending(1, &["t2"]), pending(2, &["t1"])],
+            status_by_uuid: statuses(&[("t1", "pending"), ("t2", "pending")]),
             ..Default::default()
         };
-        assert_eq!(plan_wave(&orphaned, None), Wave::Deadlock);
+        let Wave::Deadlock(reason) = plan_wave(&cycle, None) else { panic!("expected deadlock") };
+        assert!(reason.contains("cyclic dependencies among task(s) t1, t2"), "{reason}");
+
+        // A dependency on a task that failed is the same shape, but a different
+        // fix: the user retries that task, not the graph.
+        let orphaned = DagSnapshot {
+            pending_tasks: vec![pending(1, &["a"])],
+            status_by_uuid: statuses(&[("a", "failed"), ("t1", "pending")]),
+            ..Default::default()
+        };
+        let Wave::Deadlock(reason) = plan_wave(&orphaned, None) else { panic!("expected deadlock") };
+        assert!(reason.contains("blocked by failed task(s) a"), "{reason}");
+
+        // A dependency on a uuid that is not a task at all.
+        let missing = DagSnapshot {
+            pending_tasks: vec![pending(1, &["gone"])],
+            status_by_uuid: statuses(&[("t1", "pending")]),
+            ..Default::default()
+        };
+        let Wave::Deadlock(reason) = plan_wave(&missing, None) else { panic!("expected deadlock") };
+        assert!(reason.contains("do not exist: gone"), "{reason}");
     }
 
     #[test]
     fn a_runnable_wave_is_the_capped_ready_list() {
         let snapshot = DagSnapshot {
             pending_tasks: vec![pending(5, &[]), pending(2, &[]), pending(8, &["a"])],
-            awaiting_review_exists: false,
             completed_uuids: completed(&["a"]),
+            ..Default::default()
         };
         assert_eq!(plan_wave(&snapshot, None), Wave::Run(vec![2, 5, 8]));
         assert_eq!(plan_wave(&snapshot, Some(2)), Wave::Run(vec![2, 5]));

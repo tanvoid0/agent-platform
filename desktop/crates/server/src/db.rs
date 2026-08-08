@@ -12,10 +12,16 @@
 //! 2. **Types the `Any` driver will not decode.** It refuses a timestamp column
 //!    on *both* backends (`Any driver does not support the SQLite type
 //!    SqliteTypeInfo(Datetime)` / `the Postgres type PgTypeInfo(Timestamp)`),
-//!    and a Postgres `integer` is int4 where this code wants `i64`. The fix is
+//!    it refuses a **boolean** the same way (`SqliteTypeInfo(Bool)`), and a
+//!    Postgres `integer` is int4 where this code wants `i64`. The fix is
 //!    in the SQL, not here: select ids as `CAST(x AS BIGINT)` and timestamps as
 //!    `CAST(x AS TEXT)`. Both backends accept that syntax, and on SQLite the
 //!    cast is a no-op over text it already stores — the same string comes back.
+//!
+//!    A boolean cannot be cast the same way — Postgres rejects
+//!    `CAST(bool AS BIGINT)` outright — so it goes through [`BOOL`], which
+//!    expands to a `CASE` both backends read, and the field is an `i64` that
+//!    the row mapper compares against 0.
 //!
 //! So a query written for this module reads:
 //!
@@ -25,6 +31,11 @@
 //! ```
 //!
 //! and runs unchanged on either backend.
+//!
+//! **This bites at runtime, not at compile time.** Nothing here is checked
+//! against the schema, so a `bool` field on a `FromRow` struct builds fine and
+//! 500s on the first request that reads it. That is what took out
+//! `GET /api/v1/workflows` after `workflows` moved onto this pool.
 
 use sqlx::any::{AnyPoolOptions, install_default_drivers};
 use sqlx::AnyPool;
@@ -50,6 +61,27 @@ impl Backend {
             Backend::Sqlite
         }
     }
+}
+
+/// Select a boolean column in a form the `Any` driver will decode, aliased back
+/// to its own name. Read it into an `i64` and compare against 0.
+///
+/// A plain `enabled` fails on SQLite (`Any driver does not support the SQLite
+/// type SqliteTypeInfo(Bool)`), and the `CAST(… AS BIGINT)` used for ids fails
+/// on Postgres, which will not cast boolean to a number at all. `CASE` is the
+/// one spelling both accept.
+///
+/// ```ignore
+/// let cols = format!("CAST(id AS BIGINT) AS id, {}", db::BOOL!("enabled"));
+/// ```
+/// The `CAST(… AS BIGINT)` around the `CASE` is not decoration: on Postgres a
+/// bare `THEN 1` is `int4`, and this module's fields are `i64`, which is the
+/// other half of the same "types `Any` will not decode" problem.
+#[macro_export]
+macro_rules! BOOL {
+    ($col:literal) => {
+        concat!("CAST(CASE WHEN ", $col, " THEN 1 ELSE 0 END AS BIGINT) AS ", $col)
+    };
 }
 
 /// Rewrite `?` placeholders to `$1..$n` for Postgres; leave SQLite alone.

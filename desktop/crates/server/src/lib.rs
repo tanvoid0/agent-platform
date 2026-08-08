@@ -105,8 +105,6 @@ use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use serde_json::json;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -121,22 +119,18 @@ pub struct Config {
     /// never set the variable still works.
     pub master_key: Option<String>,
     pub db_path: PathBuf,
+    /// A Postgres DSN, which takes precedence over `db_path`. Unset is the
+    /// desktop's SQLite file.
+    ///
+    /// This used to be a refusal: half the domains queried a `SqlitePool`
+    /// directly, so a DSN would have been honoured by some queries and ignored
+    /// by others, and a server answering from two databases is worse than one
+    /// that will not start. Every query site reads the `Any` pool now.
+    pub database_url: Option<String>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, BoxError> {
-        // SQLite-only until the `sqlx::Any` conversion finishes (see `AppState`):
-        // half the domains still query `pool`, which is a `SqlitePool`, so a
-        // Postgres DSN would be honoured by some queries and ignored by others.
-        // Refusing beats a server answering from two databases.
-        // The value is not echoed: a DSN carries the password, and this line goes
-        // to stderr and into the log ring.
-        if env_opt("DATABASE_URL").is_some() {
-            return Err("DATABASE_URL is set, but agent-platformd supports SQLite only. \
-                        Run the Python server directly, or unset DATABASE_URL."
-                .into());
-        }
-
         let host = env_opt("AGENT_PLATFORM_HOST").unwrap_or_else(|| "127.0.0.1".into());
         let master_key = env_opt("AGENT_PLATFORM_MASTER_KEY");
 
@@ -162,6 +156,9 @@ impl Config {
             db_path: env_opt("AGENT_PLATFORM_DB_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("data/agent_platform.db")),
+            // Never echoed: a DSN carries a password, and every line here goes
+            // to stderr and into the ring `GET /system/logs` serves.
+            database_url: env_opt("DATABASE_URL"),
         })
     }
 }
@@ -188,16 +185,10 @@ pub fn env_opt(name: &str) -> Option<String> {
 }
 
 pub struct AppState {
-    pub pool: SqlitePool,
-    /// The backend-agnostic pool the domains are being moved onto, one at a
-    /// time. Both are open at once *on purpose*: switching `pool`'s type breaks
-    /// all 166 query sites in the same commit, and this repo has another
-    /// migration in flight through the same files. A converted domain reads
-    /// `any`; an unconverted one still reads `pool`; the day the last one moves,
-    /// `pool` is deleted and `Config::from_env` stops refusing `DATABASE_URL`.
-    ///
-    /// Until then Postgres stays refused, so there is never a half-ported server
-    /// answering from two databases.
+    /// The one pool. It was `sqlx::Any` alongside a `SqlitePool` while the
+    /// domains moved across one at a time; the SQLite pool is gone now that
+    /// every query site reads this, which is what let `Config::from_env` stop
+    /// refusing `DATABASE_URL`.
     pub any: sqlx::AnyPool,
     pub backend: db::Backend,
     pub master_key: Option<String>,
@@ -232,27 +223,19 @@ impl AppState {
     /// no way to notice. Nothing else creates it now — `serve` calls
     /// [`db::ensure_schema`] straight after this — so refusing would mean a
     /// fresh install has no database at all.
-    pub fn new(
+    pub fn new(db_path: &std::path::Path, master_key: Option<String>) -> Self {
+        Self::with_url(db_path, None, master_key)
+    }
+
+    /// The same, with a DSN that wins over the path when there is one.
+    pub fn with_url(
         db_path: &std::path::Path,
+        database_url: Option<&str>,
         master_key: Option<String>,
     ) -> Self {
-        let opts = SqliteConnectOptions::new()
-            .filename(db_path)
-            .create_if_missing(true)
-            // sqlx turns foreign keys ON per connection; SQLAlchemy left SQLite's
-            // default OFF, so this data has never been FK-enforced in its life
-            // and does not satisfy the constraints the schema declares.
-            // Measured, not assumed: `PRAGMA foreign_key_check` on a real user
-            // database returns 55 violations, all `eventlog.task_id` pointing at
-            // tasknodes a finished DAG deleted. Turning this on is a migration
-            // that has to rebuild those tables with `ON DELETE` actions and
-            // clean the orphans first — see `db::connect_lazy`.
-            .foreign_keys(false)
-            .busy_timeout(std::time::Duration::from_secs(30));
-        let url = db::url_for(db_path, None);
+        let url = db::url_for(db_path, database_url);
         let backend = db::Backend::from_url(&url);
         Self {
-            pool: SqlitePoolOptions::new().connect_lazy_with(opts),
             any: db::connect_lazy(&url, backend),
             backend,
             master_key,
@@ -286,7 +269,7 @@ impl AppState {
 /// immediately would read as "that server is dead" and spawn a second one
 /// against the same file.
 async fn health(State(state): State<Arc<AppState>>) -> Response {
-    match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.pool).await {
+    match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.any).await {
         Ok(_) => Json(json!({"status": "ok", "service": "agent-platform"})).into_response(),
         Err(e) => {
             logd!("health check could not reach the database: {e}");
@@ -544,7 +527,11 @@ pub async fn serve(cfg: Config) -> Result<(), BoxError> {
     // Before anything slow, so `uptime_seconds` measures the server and not the
     // time it spent waiting for a backend to answer.
     system::mark_started();
-    let state = Arc::new(AppState::new(&cfg.db_path, cfg.master_key.clone()));
+    let state = Arc::new(AppState::with_url(
+        &cfg.db_path,
+        cfg.database_url.as_deref(),
+        cfg.master_key.clone(),
+    ));
     // Before anything queries: Alembic used to do this from the Python child,
     // and there is no child. See `db::ensure_schema` for what it can and cannot
     // do (it creates; it does not migrate).

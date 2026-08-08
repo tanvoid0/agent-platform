@@ -46,7 +46,7 @@ use sqlx::FromRow;
 use crate::auth::Principal;
 use crate::error::{ApiError, PathId};
 use crate::teams::{parse_roster, resolved_team_color, with_default_accents, TeamRoster};
-use crate::wire::{iso_from_sql, parse_body_or_default, sql_now, sql_time, sql_time_opt};
+use crate::wire::{iso_from_sql, parse_body_or_default, sql_flag, sql_now, sql_time, sql_time_opt};
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -138,7 +138,11 @@ struct TaskNodeOut {
     llm_model: Option<String>,
     dependencies_json: String,
     status: String,
-    requires_review: bool,
+    /// `INTEGER` on both backends, so `i64` here — the `Any` driver will not
+    /// hand a `BIGINT` to a Rust `bool`, and this 500'd every task-detail read
+    /// once `processes` moved onto that pool. The wire keeps its boolean.
+    #[serde(serialize_with = "sql_flag")]
+    requires_review: i64,
     reviewer_client_uuid: Option<String>,
     review_feedback: Option<String>,
     revision_count: i64,

@@ -211,7 +211,9 @@ struct WorkflowRow {
     name: String,
     description: Option<String>,
     steps_json: String,
-    enabled: bool,
+    /// 0/1, not `bool` — see [`crate::db`]: the `Any` driver will not decode a
+    /// SQLite boolean, and `BOOL!` selects it as an integer.
+    enabled: i64,
     interval_seconds: Option<i64>,
     next_run_at: Option<String>,
     created_at: String,
@@ -221,10 +223,16 @@ struct WorkflowRow {
 /// Every id is `CAST(… AS BIGINT)` and every timestamp `CAST(… AS TEXT)`: the
 /// `Any` driver refuses a timestamp column on either backend, and a Postgres
 /// `integer` is int4 where these fields are `i64`. See [`crate::db`].
-pub const WORKFLOW_COLUMNS: &str = "CAST(id AS BIGINT) AS id, client_id, name, description, \
-     steps_json, enabled, CAST(interval_seconds AS BIGINT) AS interval_seconds, \
+pub const WORKFLOW_COLUMNS: &str = concat!(
+    "CAST(id AS BIGINT) AS id, client_id, name, description, steps_json, ",
+    // Plain `enabled` here 500'd every list and detail read the moment this
+    // module moved onto the `Any` pool: SQLite hands back a Bool the driver
+    // will not decode.
+    crate::BOOL!("enabled"),
+    ", CAST(interval_seconds AS BIGINT) AS interval_seconds, \
      CAST(next_run_at AS TEXT) AS next_run_at, CAST(created_at AS TEXT) AS created_at, \
-     CAST(updated_at AS TEXT) AS updated_at";
+     CAST(updated_at AS TEXT) AS updated_at"
+);
 
 fn workflow_out(row: &WorkflowRow) -> Value {
     json!({
@@ -232,7 +240,7 @@ fn workflow_out(row: &WorkflowRow) -> Value {
         "name": row.name,
         "description": row.description,
         "steps": json_array(&row.steps_json).iter().map(step_out).collect::<Vec<_>>(),
-        "enabled": row.enabled,
+        "enabled": row.enabled != 0,
         "interval_seconds": row.interval_seconds,
         "next_run_at": row.next_run_at.as_deref().map(iso_from_sql),
         "created_at": iso_from_sql(&row.created_at),
@@ -614,7 +622,7 @@ async fn run_workflow(
 ) -> Result<Response, ApiError> {
     let scope = client_scope(&principal, &headers);
     let workflow = accessible_workflow(&state, scope.as_deref(), workflow_id).await?;
-    if !workflow.enabled {
+    if workflow.enabled == 0 {
         return Err(ApiError::bad_request("Workflow is disabled"));
     }
 

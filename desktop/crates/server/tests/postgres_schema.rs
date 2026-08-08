@@ -23,6 +23,12 @@
 use agent_platform_server::db::{self, Backend};
 use sqlx::{Executor, Row};
 
+/// The two Postgres tests share one database, and `sqlx::migrate!` takes a
+/// session advisory lock while it applies. Run them at the same time and the
+/// second reports `deadlock detected` — a scratch *schema* isolates the tables,
+/// not the migrator's lock. Cargo runs tests in threads, so they serialise here.
+static POSTGRES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Deliberately not a name anything else would choose — this schema gets a
 /// `DROP … CASCADE`, so a collision with a real one would be expensive.
 const SCRATCH_SCHEMA: &str = "agent_platform_migration_test";
@@ -54,6 +60,7 @@ async fn the_postgres_schema_applies_and_ids_generate() {
         return;
     };
 
+    let _serialised = POSTGRES.lock().await;
     let admin = sqlx::PgPool::connect(&dsn).await.expect("connect");
 
     // **Refuse to run if the name is already taken.** The cleanup below is a
@@ -100,7 +107,7 @@ async fn exercise(url: &str) -> Result<(), String> {
     //    a null-violation on every create the server does.
     let row = sqlx::query(
         "INSERT INTO project (name, created_at, updated_at) \
-         VALUES ('generated', NOW(), NOW()) RETURNING id",
+         VALUES ('generated', '2026-01-01 00:00:00.000000', '2026-01-01 00:00:00.000000') \n         RETURNING id",
     )
     .fetch_one(&pool)
     .await
@@ -112,7 +119,7 @@ async fn exercise(url: &str) -> Result<(), String> {
     //    this repo's own tests insert ids.
     sqlx::query(
         "INSERT INTO project (id, name, created_at, updated_at) \
-         VALUES (4242, 'explicit', NOW(), NOW())",
+         VALUES (4242, 'explicit', '2026-01-01 00:00:00.000000', '2026-01-01 00:00:00.000000')",
     )
     .execute(&pool)
     .await
@@ -347,6 +354,94 @@ async fn exercise(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The whole server, answering from Postgres.
+///
+/// The query-shape checks above prove each column list parses; this proves the
+/// thing they were for. `AppState::with_url` takes the DSN, every domain reads
+/// the one `Any` pool, and the router answers — a write, then a read of what was
+/// written, through the same handlers the desktop calls.
+#[tokio::test]
+async fn the_server_answers_from_postgres() {
+    use tower::ServiceExt;
+
+    let Some(dsn) = dsn() else {
+        eprintln!("skipped: no Postgres DSN");
+        return;
+    };
+    let schema = "agent_platform_server_test";
+
+    let _serialised = POSTGRES.lock().await;
+    let admin = sqlx::PgPool::connect(&dsn).await.expect("connect");
+    // Reclaim the schema if a previous run left it behind — a panic inside the
+    // driver skips the cleanup below — but only when everything in it is a
+    // table this migration creates. Anything else is somebody's data and this
+    // test has no business dropping it.
+    reclaim(&admin, schema).await;
+    admin.execute(format!("CREATE SCHEMA {schema}").as_str()).await.expect("create schema");
+
+    let result = drive(&with_schema(&dsn, schema)).await;
+
+    let _ = admin.execute(format!("DROP SCHEMA {schema} CASCADE").as_str()).await;
+    admin.close().await;
+    result.expect("the server on postgres");
+
+    async fn drive(url: &str) -> Result<(), String> {
+        use serde_json::Value;
+        // The path is unused when a DSN is given, and no SQLite file is created.
+        let state = std::sync::Arc::new(agent_platform_server::AppState::with_url(
+            std::path::Path::new("unused.db"),
+            Some(url),
+            None,
+        ));
+        db::ensure_schema(&state.any).await.map_err(|e| format!("schema: {e}"))?;
+
+        // `create_project` resolves the default workspace and 400s without one.
+        // A fresh schema has no rows at all, so seed the tenant Alembic's own
+        // seed data would have created.
+        sqlx::query(
+            "INSERT INTO workspace (name, slug, created_at, updated_at) \
+             VALUES ('Default', 'default', '2026-01-01 00:00:00.000000', '2026-01-01 00:00:00.000000')",
+        )
+        .execute(&state.any)
+        .await
+        .map_err(|e| format!("seed workspace: {e}"))?;
+
+        let app = agent_platform_server::router(state);
+
+        let post = axum::http::Request::post("/api/v1/projects")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"name":"from postgres"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(post).await.map_err(|e| format!("post: {e}"))?;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let created: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if status != 200 && status != 201 {
+            return Err(format!("create returned {status}: {}", String::from_utf8_lossy(&body)));
+        }
+        // The id came back through `RETURNING CAST(id AS BIGINT)`, which is the
+        // rewrite Postgres needed and SQLite never did.
+        let id = created["id"].as_i64().ok_or_else(|| format!("no id in {created}"))?;
+        assert!(id > 0);
+
+        let get = axum::http::Request::get(format!("/api/v1/projects/{id}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(get).await.map_err(|e| format!("get: {e}"))?;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        if status != 200 {
+            return Err(format!("read back returned {status}: {}", String::from_utf8_lossy(&body)));
+        }
+        let read: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(read["name"], "from postgres");
+        // Timestamps arrive as `CAST(… AS TEXT)` and are rendered by `wire`;
+        // a bare timestamp column would not have decoded at all.
+        assert!(read["created_at"].as_str().is_some_and(|s: &str| s.contains('T')), "{read}");
+        Ok(())
+    }
+}
+
 #[test]
 fn the_search_path_is_appended_to_whatever_the_dsn_already_carries() {
     assert_eq!(
@@ -357,4 +452,36 @@ fn the_search_path_is_appended_to_whatever_the_dsn_already_carries() {
         with_schema("postgresql://u:p@localhost/agent_platform?sslmode=require", "scratch"),
         "postgresql://u:p@localhost/agent_platform?sslmode=require&options=-c%20search_path%3Dscratch,public"
     );
+}
+
+
+/// Drop `schema` if it exists and holds nothing this test did not create.
+///
+/// The guard is the point: the cleanup is a `DROP … CASCADE`, and the one way
+/// it destroys real data is finding a schema someone else owns. A table that is
+/// not in `migrations/postgres/` is exactly that signal.
+async fn reclaim(admin: &sqlx::PgPool, schema: &str) {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = $1",
+    )
+    .bind(schema)
+    .fetch_all(admin)
+    .await
+    .expect("list the schema's tables");
+
+    let migration = agent_platform_server::db::migrator(Backend::Postgres)
+        .migrations
+        .iter()
+        .map(|m| m.sql.to_string())
+        .collect::<String>();
+    let foreign: Vec<&String> = tables
+        .iter()
+        .filter(|t| t.as_str() != "_sqlx_migrations" && !migration.contains(t.as_str()))
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "schema {schema} holds tables this test did not create ({foreign:?}); refusing to drop it"
+    );
+
+    let _ = admin.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str()).await;
 }

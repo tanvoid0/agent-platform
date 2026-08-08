@@ -233,8 +233,19 @@ struct RegistryRow {
     ollama_tag: String,
     base_model: Option<String>,
     eval_score: Option<f64>,
-    is_active: bool,
+    /// 0/1, not `bool` — the `Any` driver will not decode a SQLite boolean.
+    /// Always selected through [`REGISTRY_COLUMNS`]; see [`crate::db`].
+    is_active: i64,
 }
+
+/// Every column [`RegistryRow`] reads, with `is_active` in the one form both
+/// backends decode. Shared by the three readers so a fourth cannot be written
+/// with a plain `is_active` that builds and then 500s on first request.
+const REGISTRY_COLUMNS: &str = concat!(
+    "SELECT id, project_id, version, ollama_tag, base_model, eval_score, ",
+    crate::BOOL!("is_active"),
+    " FROM model_registry_entries "
+);
 
 #[derive(FromRow)]
 struct JobRow {
@@ -279,7 +290,7 @@ impl RegistryRow {
             "ollama_tag": self.ollama_tag,
             "base_model": self.base_model,
             "eval_score": self.eval_score,
-            "is_active": self.is_active,
+            "is_active": self.is_active != 0,
         })
     }
 }
@@ -290,8 +301,7 @@ async fn registry_entries_for_project(
     project_name: Option<&str>,
 ) -> Result<Vec<Value>, ApiError> {
     let rows: Vec<RegistryRow> = sqlx::query_as(&crate::db::sql(
-        "SELECT id, project_id, version, ollama_tag, base_model, eval_score, is_active \
-         FROM model_registry_entries WHERE project_id = ? ORDER BY created_at DESC", state.backend)
+        &format!("{REGISTRY_COLUMNS} WHERE project_id = ? ORDER BY created_at DESC"), state.backend)
     )
     .bind(project_id)
     .fetch_all(&state.any)
@@ -1278,8 +1288,7 @@ async fn registry_list(
 ) -> Result<Response, ApiError> {
     principal.require_scope("model:read")?;
     let rows: Vec<RegistryRow> = sqlx::query_as(&crate::db::sql(
-        "SELECT id, project_id, version, ollama_tag, base_model, eval_score, is_active \
-         FROM model_registry_entries ORDER BY created_at DESC", state.backend)
+        &format!("{REGISTRY_COLUMNS} ORDER BY created_at DESC"), state.backend)
     )
     .fetch_all(&state.any)
     .await?;
@@ -1303,8 +1312,7 @@ async fn registry_activate(
 ) -> Result<Response, ApiError> {
     principal.require_scope("model:write")?;
     let row: RegistryRow = sqlx::query_as(&crate::db::sql(
-        "SELECT id, project_id, version, ollama_tag, base_model, eval_score, is_active \
-         FROM model_registry_entries WHERE id = ?", state.backend)
+        &format!("{REGISTRY_COLUMNS} WHERE id = ?"), state.backend)
     )
     .bind(entry_id)
     .fetch_optional(&state.any)
