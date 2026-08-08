@@ -55,6 +55,7 @@ mod stt;
 mod ui;
 mod todos;
 mod todos_view;
+mod update_check;
 mod workflows;
 mod workflows_view;
 
@@ -219,6 +220,10 @@ pub struct App {
     pub agenda: agenda::State,
     pub coder: coder::State,
     pub apidocs: apidocs::State,
+    /// Whether a newer build has been published. Only ever filled by the user
+    /// pressing the button in Settings → Status — nothing here phones home on
+    /// its own.
+    pub update_check: update_check::State,
 }
 
 impl App {
@@ -312,6 +317,9 @@ pub enum Message {
     RestartServer,
     RestartApp,
     RevealPath(String),
+    /// "Check for updates" in Settings → Status, and its answer.
+    CheckForUpdate,
+    UpdateChecked(Result<Option<String>, String>),
     Quit,
     Processes(processes::Message),
     Library(library::Message),
@@ -616,6 +624,7 @@ fn boot() -> (App, Task<Message>) {
         agenda: agenda::State::default(),
         coder: coder::State::restored(&coder_workspace, coder_provider, coder_model, coder_plan),
         apidocs: apidocs::State::default(),
+        update_check: update_check::State::default(),
     };
     let task = if minimized { Task::none() } else { open_window() };
     let bootstrap = Task::batch([
@@ -1081,6 +1090,30 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::RevealPath(path) => {
             shell::reveal_path(&path);
+            Task::none()
+        }
+        Message::CheckForUpdate => {
+            if app.update_check.checking {
+                return Task::none();
+            }
+            app.update_check.checking = true;
+            app.update_check.error = None;
+            // `newer_release` is a blocking call; off the UI thread it goes, or
+            // a GitHub that is merely slow freezes the window for ten seconds.
+            Task::perform(
+                async { tokio::task::spawn_blocking(update_check::newer_release).await },
+                |joined| {
+                    Message::UpdateChecked(joined.unwrap_or_else(|e| Err(e.to_string())))
+                },
+            )
+        }
+        Message::UpdateChecked(result) => {
+            app.update_check.checking = false;
+            app.update_check.checked = true;
+            match result {
+                Ok(newer) => app.update_check.newer = newer,
+                Err(message) => app.update_check.error = Some(message),
+            }
             Task::none()
         }
         Message::Quit => quit(app),

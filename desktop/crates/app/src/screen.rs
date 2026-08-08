@@ -684,6 +684,7 @@ fn status_view(app: &App) -> Element<'_, Message> {
     #[cfg(feature = "local-llm")]
     blocks.push(local_llm_card(app));
     blocks.push(api_card(app));
+    blocks.push(version_card(app));
 
     if let Some(status) = &app.status {
         blocks.push(
@@ -894,6 +895,52 @@ fn api_card(app: &App) -> Element<'_, Message> {
                 "curl -H \"Authorization: Bearer <key>\" {origin}/api/v1/system/status"
             ))),
         ]),
+    )
+}
+
+/// This build's version, and whether a newer one has been published.
+///
+/// The check is a button, never a poll: an app that phones GitHub on every
+/// launch is one the user did not ask for, and this one runs offline by design.
+/// There is no install button — see [`crate::update_check`] for why.
+fn version_card(app: &App) -> Element<'_, Message> {
+    let state = &app.update_check;
+    let mut rows: Vec<Element<'_, Message>> =
+        vec![ui::field("This build", ui::mono(crate::update_check::current()))];
+
+    if let Some(error) = &state.error {
+        rows.push(ui::alert_warning(error.clone()));
+    } else if let Some(newer) = &state.newer {
+        rows.push(ui::alert(
+            Tone::Info,
+            format!("Version {newer} is available"),
+            Some(ui::muted("Download it from the releases page and unzip over this install.")),
+        ));
+    } else if state.checked {
+        rows.push(ui::muted("Up to date."));
+    }
+
+    rows.push(
+        ui::cluster(vec![
+            ui::button_secondary(
+                Icon::Refresh,
+                if state.checking { "Checking…" } else { "Check for updates" },
+                Message::CheckForUpdate,
+            ),
+            ui::button_ghost(
+                Icon::FolderOpen,
+                "Open releases",
+                Message::RevealPath(crate::update_check::RELEASES_PAGE.to_string()),
+            ),
+        ])
+        .into(),
+    );
+
+    ui::card_with_header(
+        "Version",
+        Some(ui::muted("Checked only when you ask; nothing here contacts GitHub on its own.")),
+        None,
+        ui::stack(rows),
     )
 }
 

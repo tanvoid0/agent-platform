@@ -4,6 +4,12 @@ version = "0.2.0"
 edition = "2021"
 description = "Native desktop app for agent-platform (iced), owning the Python server sidecar"
 
+# Kept out of `dist`'s release: it links whisper.cpp through bindgen and has
+# only ever been built on Windows, and `dist` has no per-package target list.
+# Windows packaging is `.github/workflows/release-desktop.yml`.
+[package.metadata.dist]
+dist = false
+
 [[bin]]
 name = "agent-platform"
 path = "src/main.rs"
@@ -76,6 +82,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_Security",
+    # WS_CLIPCHILDREN on the app window, so the preview's child window survives
+    # iced's swapchain present — see src/coder_browser.rs.
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(windows)'.build-dependencies]

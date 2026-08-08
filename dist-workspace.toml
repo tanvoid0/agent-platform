@@ -1,0 +1,35 @@
+# Release packaging for `agent-platformd`, generated into
+# `.github/workflows/release.yml` by `dist generate`.
+#
+# This file is at the repo root and the Cargo workspace is not: GitHub only
+# reads `.github/workflows/` from the root, and `dist`'s own config has to live
+# beside the thing it writes. `members` is what bridges the two.
+#
+# **Only the server is packaged here.** `agent-platform-desktop` is
+# `dist = false` in its own manifest: it links whisper.cpp through bindgen and
+# has only ever been built on Windows, and `dist` has no per-package target
+# list — so including it would mean a release that reliably fails on three of
+# the four platforms. Its Windows build ships from
+# `.github/workflows/release-desktop.yml` instead, onto the same release.
+
+[workspace]
+members = ["cargo:desktop"]
+
+[dist]
+cargo-dist-version = "0.32.0"
+ci = ["github"]
+packages = ["agent-platform-server"]
+# `shell` and `powershell` are the two that need no package manager and no
+# signing story. The daemon is a single file with its migrations embedded, so
+# an installer is a download and a PATH entry.
+installers = ["shell", "powershell"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+# Tag pushes only. `dist plan` still runs on PRs so a config that cannot
+# release is caught before the tag, not after it.
+pr-run-mode = "plan"
+install-updater = true

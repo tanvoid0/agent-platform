@@ -4,3 +4,10 @@ members = ["crates/client", "crates/app", "crates/server"]
 # Throwaway ADR 0006 spike. Excluded so a plain `cargo build` here never drags
 # llama.cpp — or a CUDA toolchain — into the app's build.
 exclude = ["spike-llama"]
+
+# What `dist` builds release artifacts with. `release` plus thin LTO: the
+# daemon is the deployable artifact and it is downloaded far more often than it
+# is compiled. Config for `dist` itself is `../dist-workspace.toml`.
+[profile.dist]
+inherits = "release"
+lto = "thin"
