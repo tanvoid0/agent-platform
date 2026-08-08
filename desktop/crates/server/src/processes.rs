@@ -117,9 +117,14 @@ struct ProcessOut {
     updated_at: String,
 }
 
-const PROCESS_COLUMNS: &str = "id, goal, status, dag_json, failure_reason, total_tokens, \
-     total_cost, tool_invocations_used, team_template_id, team_snapshot_json, project_id, \
-     client_id, token_id, model_build_job_id, created_at, updated_at";
+pub const PROCESS_COLUMNS: &str = "CAST(id AS BIGINT) AS id, goal, status, dag_json, \
+     failure_reason, CAST(total_tokens AS BIGINT) AS total_tokens, total_cost, \
+     CAST(tool_invocations_used AS BIGINT) AS tool_invocations_used, \
+     CAST(team_template_id AS BIGINT) AS team_template_id, team_snapshot_json, \
+     CAST(project_id AS BIGINT) AS project_id, client_id, \
+     CAST(token_id AS BIGINT) AS token_id, \
+     CAST(model_build_job_id AS BIGINT) AS model_build_job_id, \
+     CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at";
 
 #[derive(Debug, FromRow, Serialize)]
 struct TaskNodeOut {
@@ -147,10 +152,13 @@ struct TaskNodeOut {
     completed_at: Option<String>,
 }
 
-const TASK_COLUMNS: &str = "id, process_id, client_uuid, parent_client_uuid, role, \
+pub const TASK_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \
+     CAST(process_id AS BIGINT) AS process_id, client_uuid, parent_client_uuid, role, \
      system_prompt, instructions, llm_model, dependencies_json, status, requires_review, \
-     reviewer_client_uuid, review_feedback, revision_count, draft_output, output, \
-     failure_debug_json, tokens_used, started_at, completed_at";
+     reviewer_client_uuid, review_feedback, \
+     CAST(revision_count AS BIGINT) AS revision_count, draft_output, output, \
+     failure_debug_json, CAST(tokens_used AS BIGINT) AS tokens_used, \
+     CAST(started_at AS TEXT) AS started_at, CAST(completed_at AS TEXT) AS completed_at";
 
 #[derive(Debug, FromRow, Serialize)]
 struct EventOut {
@@ -163,16 +171,16 @@ struct EventOut {
     created_at: String,
 }
 
-const EVENT_COLUMNS: &str = "id, process_id, task_id, event_type, content, created_at";
+pub const EVENT_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \n     CAST(process_id AS BIGINT) AS process_id, CAST(task_id AS BIGINT) AS task_id, event_type, \n     content, CAST(created_at AS TEXT) AS created_at";
 
 // ---------------------------------------------------------------------------
 // Access
 // ---------------------------------------------------------------------------
 
 async fn load_process(state: &AppState, process_id: i64) -> Result<ProcessOut, ApiError> {
-    sqlx::query_as(&format!("SELECT {PROCESS_COLUMNS} FROM process WHERE id = ?"))
+    sqlx::query_as(&crate::db::sql(&format!("SELECT {PROCESS_COLUMNS} FROM process WHERE id = ?"), state.backend))
         .bind(process_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await?
         .ok_or_else(|| ApiError::not_found("Process not found"))
 }
@@ -328,6 +336,7 @@ async fn list_processes(
     }
     sql.push_str(" ORDER BY id DESC LIMIT ?");
 
+    let sql = crate::db::sql(&sql, state.backend).into_owned();
     let mut query = sqlx::query_as::<_, ProcessOut>(&sql);
     if let Some(client_id) = &filters.client_id {
         query = query.bind(client_id.as_str());
@@ -339,7 +348,7 @@ async fn list_processes(
     }
     // A negative `limit` reaches SQLite as `LIMIT -n`, which means no limit —
     // exactly what `min(limit, 200)` lets through on the Python side.
-    let rows = query.bind(q.limit.min(200)).fetch_all(&state.pool).await?;
+    let rows = query.bind(q.limit.min(200)).fetch_all(&state.any).await?;
 
     Ok(Json(json!({ "processes": rows })).into_response())
 }
@@ -367,12 +376,12 @@ async fn list_project_processes(
 ) -> Result<Response, ApiError> {
     crate::projects::assert_access(&state, &principal, project_id).await?;
 
-    let rows: Vec<ProcessOut> = sqlx::query_as(&format!(
+    let rows: Vec<ProcessOut> = sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {PROCESS_COLUMNS} FROM process WHERE project_id = ? ORDER BY id DESC LIMIT ?"
-    ))
+    ), state.backend))
     .bind(project_id)
     .bind(q.limit.min(200))
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     Ok(Json(json!({ "processes": rows })).into_response())
@@ -394,9 +403,9 @@ async fn get_process(
     // No ORDER BY, like Python: the rows come back in rowid order, which is
     // insertion order, and the DAG's own edges are what the UI sorts on.
     let tasks: Vec<TaskNodeOut> =
-        sqlx::query_as(&format!("SELECT {TASK_COLUMNS} FROM tasknode WHERE process_id = ?"))
+        sqlx::query_as(&crate::db::sql(&format!("SELECT {TASK_COLUMNS} FROM tasknode WHERE process_id = ?"), state.backend))
             .bind(process_id)
-            .fetch_all(&state.pool)
+            .fetch_all(&state.any)
             .await?;
 
     Ok(Json(json!({ "process": proc, "tasks": tasks })).into_response())
@@ -435,13 +444,14 @@ async fn list_events(
     }
     sql.push_str(" ORDER BY id ASC LIMIT ?");
 
+    let sql = crate::db::sql(&sql, state.backend).into_owned();
     let mut query = sqlx::query_as::<_, EventOut>(&sql)
         .bind(process_id)
         .bind(q.after_id.max(0));
     if let Some(event_type) = event_type {
         query = query.bind(event_type.to_string());
     }
-    let rows = query.bind(q.limit.max(1).min(2000)).fetch_all(&state.pool).await?;
+    let rows = query.bind(q.limit.max(1).min(2000)).fetch_all(&state.any).await?;
 
     Ok(Json(json!({ "events": rows })).into_response())
 }
@@ -472,9 +482,9 @@ async fn cancel_process(
     // One column. The other writers of this table each assign a different
     // attribute, so none of them can be reverted by this statement — and Python
     // does not touch `updated_at` here either.
-    sqlx::query("UPDATE process SET status = 'cancelled' WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE process SET status = 'cancelled' WHERE id = ?", state.backend))
         .bind(process_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     Ok(Json(json!({ "status": "cancelled" })).into_response())
@@ -494,15 +504,15 @@ async fn append_event(
     task_id: Option<i64>,
     content: &str,
 ) -> Result<(), ApiError> {
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "INSERT INTO eventlog (process_id, task_id, event_type, content, created_at) \
-         VALUES (?, ?, 'status_change', ?, ?)",
+         VALUES (?, ?, 'status_change', ?, ?)", state.backend)
     )
     .bind(process_id)
     .bind(task_id)
     .bind(content)
     .bind(sql_now())
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
     Ok(())
 }
@@ -532,11 +542,11 @@ struct TaskRow {
 }
 
 async fn load_task(state: &AppState, process_id: i64, task_id: i64) -> Result<TaskRow, ApiError> {
-    let task: TaskRow = sqlx::query_as(
-        "SELECT process_id, client_uuid, status, revision_count FROM tasknode WHERE id = ?",
+    let task: TaskRow = sqlx::query_as(&crate::db::sql(
+        "SELECT process_id, client_uuid, status, revision_count FROM tasknode WHERE id = ?", state.backend)
     )
     .bind(task_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?
     .ok_or_else(|| ApiError::not_found("Task not found"))?;
     // A task of another process is hidden, not misattributed.
@@ -555,11 +565,11 @@ async fn set_process_status(
     status: &str,
     failure_reason: Option<&str>,
 ) -> Result<(), ApiError> {
-    sqlx::query("UPDATE process SET status = ?, failure_reason = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE process SET status = ?, failure_reason = ? WHERE id = ?", state.backend))
         .bind(status)
         .bind(failure_reason)
         .bind(process_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(())
 }
@@ -762,12 +772,12 @@ async fn start_process(
         ));
     }
 
-    let template: TemplateRow = sqlx::query_as(
+    let template: TemplateRow = sqlx::query_as(&crate::db::sql(
         "SELECT id, workspace_id, name, description, color, roster_json \
-         FROM teamtemplate WHERE id = ?",
+         FROM teamtemplate WHERE id = ?", state.backend)
     )
     .bind(team_template_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?
     .ok_or_else(|| ApiError::not_found("Team template not found"))?;
     // A workspace token may plan with a global (NULL) template or its own, never
@@ -778,9 +788,9 @@ async fn start_process(
         }
     }
     if let Some(project_id) = req.project_id {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM project WHERE id = ?")
+        let exists: Option<i64> = sqlx::query_scalar(&crate::db::sql("SELECT id FROM project WHERE id = ?", state.backend))
             .bind(project_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
         if exists.is_none() {
             return Err(ApiError::not_found("Project not found"));
@@ -810,11 +820,11 @@ async fn start_process(
     // `failure_reason` and `model_build_job_id` are left NULL. `token_id` *is*
     // set here — this is the path plan.md flags for the token-counter hazard.
     let now = sql_now();
-    let process_id: i64 = sqlx::query_scalar(
+    let process_id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO process \
          (goal, status, total_tokens, total_cost, tool_invocations_used, team_template_id, \
           team_snapshot_json, project_id, client_id, token_id, created_at, updated_at) \
-         VALUES (?, 'pending', 0, 0.0, 0, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         VALUES (?, 'pending', 0, 0.0, 0, ?, ?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(&goal)
     .bind(team_template_id)
@@ -824,7 +834,7 @@ async fn start_process(
     .bind(principal.token_id)
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     crate::executor::spawn_plan(
@@ -984,23 +994,23 @@ async fn review_task(
         let revision_count = task.revision_count + 1;
         // `draft_output = output` reads the pre-update row, which is what
         // `task.draft_output = task.output` does before the flush.
-        sqlx::query(
+        sqlx::query(&crate::db::sql(
             "UPDATE tasknode SET draft_output = output, output = NULL, review_feedback = ?, \
              reviewer_client_uuid = NULL, revision_count = revision_count + 1, \
              status = 'pending', failure_debug_json = NULL, started_at = NULL, \
-             completed_at = NULL, tokens_used = 0 WHERE id = ?",
+             completed_at = NULL, tokens_used = 0 WHERE id = ?", state.backend)
         )
         .bind(&feedback)
         .bind(task_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
         // Only when the reviewer sent one: `instructions` is not nullable, and
         // omitting it must leave the planner's text alone.
         if let Some(instructions) = req.instructions.as_deref() {
-            sqlx::query("UPDATE tasknode SET instructions = ? WHERE id = ?")
+            sqlx::query(&crate::db::sql("UPDATE tasknode SET instructions = ? WHERE id = ?", state.backend))
                 .bind(instructions)
                 .bind(task_id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await?;
         }
         set_process_status(&state, process_id, "running", None).await?;
@@ -1022,13 +1032,13 @@ async fn review_task(
     }
 
     if decision == "reject" {
-        sqlx::query(
+        sqlx::query(&crate::db::sql(
             "UPDATE tasknode SET reviewer_client_uuid = NULL, status = 'failed', \
-             failure_debug_json = ? WHERE id = ?",
+             failure_debug_json = ? WHERE id = ?", state.backend)
         )
         .bind(REVIEW_REJECT_DEBUG_JSON)
         .bind(task_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
         let reason = format!("Task {} rejected at review", task.client_uuid);
         set_process_status(&state, process_id, "failed", Some(&reason)).await?;
@@ -1039,19 +1049,19 @@ async fn review_task(
 
     // Approve. An omitted `output` keeps whatever the agent produced.
     if let Some(output) = req.output.as_deref() {
-        sqlx::query("UPDATE tasknode SET output = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE tasknode SET output = ? WHERE id = ?", state.backend))
             .bind(output)
             .bind(task_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "UPDATE tasknode SET reviewer_client_uuid = NULL, status = 'completed', \
-         completed_at = ?, draft_output = NULL, review_feedback = NULL WHERE id = ?",
+         completed_at = ?, draft_output = NULL, review_feedback = NULL WHERE id = ?", state.backend)
     )
     .bind(sql_now())
     .bind(task_id)
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
     set_process_status(&state, process_id, "running", None).await?;
     append_event(
@@ -1173,9 +1183,9 @@ async fn sync_process(
     let proc = accessible_process(&state, &principal, &headers, process_id).await?;
 
     let statuses: Vec<String> =
-        sqlx::query_scalar("SELECT status FROM tasknode WHERE process_id = ?")
+        sqlx::query_scalar(&crate::db::sql("SELECT status FROM tasknode WHERE process_id = ?", state.backend))
             .bind(process_id)
-            .fetch_all(&state.pool)
+            .fetch_all(&state.any)
             .await?;
     let counts = task_status_counts(&statuses);
     let sync = SyncState {
@@ -1271,20 +1281,20 @@ async fn sync_process(
             // One statement over the matched set is what N per-task flushes come
             // to. Any in-flight work the server no longer tracks is abandoned —
             // that is the documented cost of this branch.
-            let reset = sqlx::query(
+            let reset = sqlx::query(&crate::db::sql(
                 "UPDATE tasknode SET status = 'pending', output = NULL, draft_output = NULL, \
                  review_feedback = NULL, reviewer_client_uuid = NULL, failure_debug_json = NULL, \
                  started_at = NULL, completed_at = NULL, tokens_used = 0 \
-                 WHERE process_id = ? AND status = 'running'",
+                 WHERE process_id = ? AND status = 'running'", state.backend)
             )
             .bind(process_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?
             .rows_affected() as i64;
             // `revision_count` is deliberately not reset here, unlike task retry.
-            sqlx::query("UPDATE process SET failure_reason = NULL WHERE id = ?")
+            sqlx::query(&crate::db::sql("UPDATE process SET failure_reason = NULL WHERE id = ?", state.backend))
                 .bind(process_id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await?;
             append_event(
                 &state,
@@ -1370,9 +1380,9 @@ async fn retry_process(
     let proc = accessible_process(&state, &principal, &headers, process_id).await?;
 
     let has_tasks: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM tasknode WHERE process_id = ? LIMIT 1")
+        sqlx::query_scalar(&crate::db::sql("SELECT 1 FROM tasknode WHERE process_id = ? LIMIT 1", state.backend))
             .bind(process_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
 
     match retry_plan(&proc.status, has_tasks.is_some(), proc.dag_json.as_deref()) {
@@ -1457,14 +1467,14 @@ async fn retry_failed_task(
 
     // Unlike `sync`'s reset, this one clears `revision_count` as well: the task
     // is starting over, not resuming.
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "UPDATE tasknode SET status = 'pending', output = NULL, draft_output = NULL, \
          review_feedback = NULL, reviewer_client_uuid = NULL, failure_debug_json = NULL, \
          revision_count = 0, started_at = NULL, completed_at = NULL, tokens_used = 0 \
-         WHERE id = ?",
+         WHERE id = ?", state.backend)
     )
     .bind(task_id)
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
     set_process_status(&state, process_id, "approved", None).await?;
     append_event(
@@ -1573,9 +1583,12 @@ async fn stream_events(
             }
 
             let status: Option<String> =
-                match sqlx::query_scalar("SELECT status FROM process WHERE id = ?")
+                match sqlx::query_scalar(&crate::db::sql(
+                    "SELECT status FROM process WHERE id = ?",
+                    tail.state.backend,
+                ))
                     .bind(tail.process_id)
-                    .fetch_optional(&tail.state.pool)
+                    .fetch_optional(&tail.state.any)
                     .await
                 {
                     Ok(status) => status,
@@ -1593,13 +1606,13 @@ async fn stream_events(
             };
 
             // No limit, exactly as in Python: a backlog is replayed in one pass.
-            let rows: Vec<EventOut> = match sqlx::query_as(&format!(
+            let rows: Vec<EventOut> = match sqlx::query_as(&crate::db::sql(&format!(
                 "SELECT {EVENT_COLUMNS} FROM eventlog \
                  WHERE process_id = ? AND id > ? ORDER BY id ASC"
-            ))
+            ), tail.state.backend))
             .bind(tail.process_id)
             .bind(tail.last_log_id)
-            .fetch_all(&tail.state.pool)
+            .fetch_all(&tail.state.any)
             .await
             {
                 Ok(rows) => rows,

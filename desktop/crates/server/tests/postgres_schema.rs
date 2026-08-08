@@ -236,6 +236,34 @@ async fn exercise(url: &str) -> Result<(), String> {
                 agent_platform_server::workspaces::COLUMNS
             ),
         ),
+        (
+            "assistant::CHAT_THREAD_COLUMNS",
+            format!(
+                "SELECT {} FROM assistant_chat_threads WHERE id = ?",
+                agent_platform_server::assistant::CHAT_THREAD_COLUMNS
+            ),
+        ),
+        (
+            "processes::PROCESS_COLUMNS",
+            format!(
+                "SELECT {} FROM process WHERE id = ?",
+                agent_platform_server::processes::PROCESS_COLUMNS
+            ),
+        ),
+        (
+            "processes::TASK_COLUMNS",
+            format!(
+                "SELECT {} FROM tasknode WHERE id = ?",
+                agent_platform_server::processes::TASK_COLUMNS
+            ),
+        ),
+        (
+            "processes::EVENT_COLUMNS",
+            format!(
+                "SELECT {} FROM eventlog WHERE id = ?",
+                agent_platform_server::processes::EVENT_COLUMNS
+            ),
+        ),
     ] {
         sqlx::query(&db::sql(&query, Backend::Postgres))
             .bind(4242_i64)
