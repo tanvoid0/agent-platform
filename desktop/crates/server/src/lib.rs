@@ -415,6 +415,74 @@ fn megabytes(var: &str, default_mb: usize) -> usize {
         .saturating_mul(1024 * 1024)
 }
 
+/// Reject a request whose `Host` names something other than this machine, when
+/// the server is bound to the loopback.
+///
+/// **This closes DNS rebinding, and the payload here is a shell.** The default
+/// install binds `127.0.0.1` with no master key, and `POST /api/v1/coder/…`
+/// runs `run_command` — `cmd /C` or `sh -c` with whatever string it is given —
+/// with `allow_commands` defaulting to true on that route. CORS is off by
+/// default and a JSON body forces a preflight, so an ordinary page cannot
+/// reach it. Rebinding is the case those two do not cover: an attacker's page
+/// re-resolves its *own* domain to 127.0.0.1, the browser then treats the
+/// request as same-origin, and no CORS check applies. `Host` is the one header
+/// that still says which name the browser thought it was talking to.
+///
+/// **Only for loopback binds.** A server on `0.0.0.0` is reached by container
+/// name, LAN address or a proxy's own `Host`, and there is no list of those to
+/// check against; that case is covered instead by `Config::from_env`, which
+/// refuses a non-loopback bind without a master key — and a credential is
+/// exactly what a rebinding attacker does not have.
+///
+/// A missing `Host` passes. Every browser sends one, and the requests that do
+/// not are HTTP/1.0 clients and this crate's own tests.
+async fn host_guard(req: Request, next: axum::middleware::Next) -> Response {
+    let bind = env_opt("AGENT_PLATFORM_HOST").unwrap_or_else(|| "127.0.0.1".into());
+    if !is_loopback(&bind) {
+        return next.run(req).await;
+    }
+    let Some(host) = req.headers().get(axum::http::header::HOST).and_then(|v| v.to_str().ok())
+    else {
+        return next.run(req).await;
+    };
+    if host_is_local(host) {
+        return next.run(req).await;
+    }
+    logd!("[host-guard] rejected Host {host:?} on a loopback bind");
+    error::ApiError::coded(
+        axum::http::StatusCode::MISDIRECTED_REQUEST,
+        "host_not_allowed",
+        format!(
+            "This server is bound to the loopback and does not answer for host {host:?}. \
+             Add it to AGENT_PLATFORM_ALLOWED_HOSTS if that is deliberate."
+        ),
+    )
+    .into_response()
+}
+
+/// The `Host` values a loopback-bound server answers for.
+///
+/// The port is dropped before the comparison: `Host` carries it and the name is
+/// the only part that matters. An IPv6 literal arrives bracketed, and the
+/// brackets go with it.
+fn host_is_local(host: &str) -> bool {
+    let name = host.rsplit_once(':').map_or(host, |(name, port)| {
+        // `[::1]:18410` splits correctly; `[::1]` must not lose its tail to a
+        // colon that is part of the address.
+        if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() { name } else { host }
+    });
+    let name = name.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    if name == "localhost" || name.ends_with(".localhost") {
+        return true;
+    }
+    if name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+        return true;
+    }
+    env_opt("AGENT_PLATFORM_ALLOWED_HOSTS").is_some_and(|allowed| {
+        allowed.split(',').map(str::trim).any(|a| !a.is_empty() && a.eq_ignore_ascii_case(&name))
+    })
+}
+
 /// The whole surface. There is no fallback any more — an unknown path is a 404
 /// from [`not_found`], where it used to be forwarded to Python.
 ///
@@ -458,6 +526,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
             std::time::Duration::from_secs(60),
         ))
+        // Before auth, because the attack it stops does not need a credential.
+        .layer(axum::middleware::from_fn(host_guard))
         // Outermost, so an auth rejection carries a correlation id too.
         .layer(axum::middleware::from_fn(request_id::middleware))
         .with_state(state);
@@ -564,6 +634,36 @@ mod tests {
         }
         for host in ["0.0.0.0", "192.168.1.10", "::", "[::]", "example.com", "10.0.0.1"] {
             assert!(!is_loopback(host), "{host:?} is not loopback");
+        }
+    }
+
+    /// The rebinding guard. A false pass here is a shell on the user's machine
+    /// from a web page, so the interesting cases are the ones that *look* local.
+    #[test]
+    fn only_this_machines_names_pass_the_host_guard() {
+        for host in [
+            "127.0.0.1:18410",
+            "127.0.0.1",
+            "localhost:18410",
+            "LOCALHOST",
+            "app.localhost:3000",
+            "[::1]:18410",
+            "[::1]",
+            "127.9.9.9:18410",
+        ] {
+            assert!(host_is_local(host), "{host:?} should pass");
+        }
+        for host in [
+            // The rebinding shape: an attacker's own name, resolved to 127.0.0.1.
+            "evil.example:18410",
+            "example.com",
+            // A suffix that only looks like the real thing.
+            "notlocalhost",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example",
+            "192.168.1.10:18410",
+        ] {
+            assert!(!host_is_local(host), "{host:?} must be rejected");
         }
     }
 }

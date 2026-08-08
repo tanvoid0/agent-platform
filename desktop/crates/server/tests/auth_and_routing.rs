@@ -363,6 +363,33 @@ async fn oversized_json_is_refused_and_uploads_are_not() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// DNS rebinding, over a real connection.
+///
+/// The default install is a loopback bind with no master key, and the coder
+/// routes run shell commands — so a page that re-resolves its own domain to
+/// 127.0.0.1 would be same-origin, past CORS, and holding a shell. `Host` is
+/// what still names the domain the browser thought it was reaching.
+#[tokio::test]
+async fn a_foreign_host_header_is_refused_on_a_loopback_bind() {
+    let db = temp_db_path();
+    seed_db(&db).await;
+    let origin = start_server(&db, None).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{origin}/health"))
+        .header("host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 421, "rebound Host must not reach a handler");
+    assert_eq!(code_of(&resp.text().await.unwrap()), "host_not_allowed");
+
+    // The desktop's own requests carry `127.0.0.1:<port>` and are unaffected.
+    assert_eq!(get(&origin, "/health", None).await.0, 200);
+
+    let _ = std::fs::remove_file(&db);
+}
+
 #[tokio::test]
 async fn no_master_key_leaves_auth_open() {
     // The Python server's dev convenience: unset master key means no auth at all.
