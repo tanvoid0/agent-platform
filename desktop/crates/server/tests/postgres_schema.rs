@@ -215,6 +215,27 @@ async fn exercise(url: &str) -> Result<(), String> {
                 agent_platform_server::api_tokens::TOKEN_COLUMNS
             ),
         ),
+        (
+            "coder::THREAD_COLUMNS",
+            format!(
+                "SELECT {} FROM coder_chat_threads WHERE id = ?",
+                agent_platform_server::coder::THREAD_COLUMNS
+            ),
+        ),
+        (
+            "teams::TEAM_COLUMNS",
+            format!(
+                "SELECT {} FROM teamtemplate WHERE id = ?",
+                agent_platform_server::teams::TEAM_COLUMNS
+            ),
+        ),
+        (
+            "workspaces::COLUMNS",
+            format!(
+                "SELECT {} FROM workspace WHERE id = ?",
+                agent_platform_server::workspaces::COLUMNS
+            ),
+        ),
     ] {
         sqlx::query(&db::sql(&query, Backend::Postgres))
             .bind(4242_i64)

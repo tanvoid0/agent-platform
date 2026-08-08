@@ -11,7 +11,8 @@
 //! That is three tables Python was the only writer of, and the token half is
 //! the one that matters — `auth.rs` reads `api_tokens` on every request.
 //!
-//! ponytail: `state.pool`, like every domain but `projects`.
+//! On the `sqlx::Any` pool: every query goes through `db::sql` and ids are
+//! selected as `CAST(… AS BIGINT)`, because a Postgres `integer` is int4.
 
 use std::sync::Arc;
 
@@ -66,7 +67,7 @@ struct WorkspaceRow {
     updated_at: String,
 }
 
-const COLUMNS: &str = "id, name, slug, description, CAST(archived_at AS TEXT) AS archived_at, \
+pub const COLUMNS: &str = "CAST(id AS BIGINT) AS id, name, slug, description, CAST(archived_at AS TEXT) AS archived_at, \
      CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at";
 
 impl WorkspaceRow {
@@ -87,9 +88,9 @@ impl WorkspaceRow {
 /// hidden rather than refused.
 async fn require_active(state: &AppState, workspace_id: i64) -> Result<WorkspaceRow, ApiError> {
     let row: Option<WorkspaceRow> =
-        sqlx::query_as(&format!("SELECT {COLUMNS} FROM workspace WHERE id = ?"))
+        sqlx::query_as(&crate::db::sql(&format!("SELECT {COLUMNS} FROM workspace WHERE id = ?"), state.backend))
             .bind(workspace_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     match row {
         Some(row) if row.archived_at.is_none() => Ok(row),
@@ -134,7 +135,7 @@ async fn list_workspaces(
     } else {
         format!("SELECT {COLUMNS} FROM workspace WHERE archived_at IS NULL ORDER BY id ASC")
     };
-    let rows: Vec<WorkspaceRow> = sqlx::query_as(&sql).fetch_all(&state.pool).await?;
+    let rows: Vec<WorkspaceRow> = sqlx::query_as(&crate::db::sql(&sql, state.backend)).fetch_all(&state.any).await?;
     let out: Vec<Value> = rows.iter().map(WorkspaceRow::to_out).collect();
     Ok(Json(json!({ "workspaces": out })).into_response())
 }
@@ -186,9 +187,9 @@ async fn create_workspace(
     }
 
     let slug = slugify(slug.as_deref().filter(|s| !s.is_empty()).unwrap_or(&name));
-    let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM workspace WHERE slug = ?")
+    let taken: Option<i64> = sqlx::query_scalar(&crate::db::sql("SELECT id FROM workspace WHERE slug = ?", state.backend))
         .bind(&slug)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await?;
     if taken.is_some() {
         return Err(ApiError::new(
@@ -198,9 +199,9 @@ async fn create_workspace(
     }
 
     let now = sql_now();
-    let id: i64 = sqlx::query_scalar(
+    let id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO workspace (name, slug, description, archived_at, created_at, updated_at) \
-         VALUES (?, ?, ?, NULL, ?, ?) RETURNING id",
+         VALUES (?, ?, ?, NULL, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(name.trim())
     .bind(&slug)
@@ -209,7 +210,7 @@ async fn create_workspace(
     .bind(description.filter(|d| !d.is_empty()).map(|d| d.trim().to_string()))
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     let row = require_active(&state, id).await?;
@@ -254,24 +255,24 @@ async fn update_workspace(
     require_active(&state, workspace_id).await?;
 
     if let Some(name) = name {
-        sqlx::query("UPDATE workspace SET name = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE workspace SET name = ? WHERE id = ?", state.backend))
             .bind(name.trim())
             .bind(workspace_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(description) = description {
-        sqlx::query("UPDATE workspace SET description = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE workspace SET description = ? WHERE id = ?", state.backend))
             .bind((!description.is_empty()).then(|| description.trim().to_string()))
             .bind(workspace_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     // Stamped on every PATCH, including one that changed nothing.
-    sqlx::query("UPDATE workspace SET updated_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE workspace SET updated_at = ? WHERE id = ?", state.backend))
         .bind(sql_now())
         .bind(workspace_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     let row = require_active(&state, workspace_id).await?;
@@ -297,46 +298,46 @@ async fn delete_workspace(
     }
 
     let now = sql_now();
-    let tokens: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM api_tokens WHERE workspace_id = ? AND status != 'revoked'",
+    let tokens: Vec<i64> = sqlx::query_scalar(&crate::db::sql(
+        "SELECT id FROM api_tokens WHERE workspace_id = ? AND status != 'revoked'", state.backend)
     )
     .bind(workspace_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
     for token_id in &tokens {
-        sqlx::query(
+        sqlx::query(&crate::db::sql(
             "UPDATE api_tokens SET status = 'revoked', revoked_at = ?, revoked_reason = ?, \
-             updated_at = ? WHERE id = ?",
+             updated_at = ? WHERE id = ?", state.backend)
         )
         .bind(&now)
         .bind(ARCHIVE_REASON)
         .bind(&now)
         .bind(token_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     }
 
     let teams: Vec<i64> =
-        sqlx::query_scalar("SELECT id FROM teamtemplate WHERE workspace_id = ?")
+        sqlx::query_scalar(&crate::db::sql("SELECT id FROM teamtemplate WHERE workspace_id = ?", state.backend))
             .bind(workspace_id)
-            .fetch_all(&state.pool)
+            .fetch_all(&state.any)
             .await?;
     for team_id in &teams {
-        sqlx::query("UPDATE process SET team_template_id = NULL WHERE team_template_id = ?")
+        sqlx::query(&crate::db::sql("UPDATE process SET team_template_id = NULL WHERE team_template_id = ?", state.backend))
             .bind(team_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
-        sqlx::query("DELETE FROM teamtemplate WHERE id = ?")
+        sqlx::query(&crate::db::sql("DELETE FROM teamtemplate WHERE id = ?", state.backend))
             .bind(team_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
 
-    sqlx::query("UPDATE workspace SET archived_at = ?, updated_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE workspace SET archived_at = ?, updated_at = ? WHERE id = ?", state.backend))
         .bind(&now)
         .bind(&now)
         .bind(workspace_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     Ok(Json(json!({

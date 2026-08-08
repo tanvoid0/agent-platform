@@ -18,7 +18,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -301,8 +300,7 @@ struct TeamRow {
     updated_at: String,
 }
 
-const TEAM_COLUMNS: &str =
-    "id, workspace_id, name, description, color, category, roster_json, created_at, updated_at";
+pub const TEAM_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \n     CAST(workspace_id AS BIGINT) AS workspace_id, name, description, color, category, \n     roster_json, CAST(created_at AS TEXT) AS created_at, \n     CAST(updated_at AS TEXT) AS updated_at";
 
 #[derive(Serialize)]
 struct TeamOut {
@@ -388,9 +386,9 @@ fn assert_owned(principal: &Principal, row: &TeamRow) -> Result<(), ApiError> {
 }
 
 async fn load_row(state: &AppState, team_id: i64) -> Result<TeamRow, ApiError> {
-    sqlx::query_as(&format!("SELECT {TEAM_COLUMNS} FROM teamtemplate WHERE id = ?"))
+    sqlx::query_as(&crate::db::sql(&format!("SELECT {TEAM_COLUMNS} FROM teamtemplate WHERE id = ?"), state.backend))
         .bind(team_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await?
         .ok_or_else(|| ApiError::not_found("Team template not found"))
 }
@@ -419,17 +417,17 @@ async fn list_teams(
     principal: Principal,
 ) -> Result<Response, ApiError> {
     let rows: Vec<TeamRow> = match principal.workspace_id {
-        Some(ws) => sqlx::query_as(&format!(
+        Some(ws) => sqlx::query_as(&crate::db::sql(&format!(
             "SELECT {TEAM_COLUMNS} FROM teamtemplate \
              WHERE workspace_id IS NULL OR workspace_id = ? ORDER BY id ASC"
-        ))
+        ), state.backend))
         .bind(ws)
-        .fetch_all(&state.pool)
+        .fetch_all(&state.any)
         .await?,
-        None => sqlx::query_as(&format!(
+        None => sqlx::query_as(&crate::db::sql(&format!(
             "SELECT {TEAM_COLUMNS} FROM teamtemplate ORDER BY id ASC"
-        ))
-        .fetch_all(&state.pool)
+        ), state.backend))
+        .fetch_all(&state.any)
         .await?,
     };
 
@@ -497,10 +495,14 @@ async fn create_team(
         Some(ws) => Some(ws),
         None => {
             if let Some(ws) = req.workspace_id {
-                let archived: Option<Option<NaiveDateTime>> =
-                    sqlx::query_scalar("SELECT archived_at FROM workspace WHERE id = ?")
+                // Text, not `NaiveDateTime`: the `Any` driver decodes no
+                // timestamp column on either backend. Only its presence is read.
+                let archived: Option<Option<String>> = sqlx::query_scalar(&crate::db::sql(
+                    "SELECT CAST(archived_at AS TEXT) FROM workspace WHERE id = ?",
+                    state.backend,
+                ))
                         .bind(ws)
-                        .fetch_optional(&state.pool)
+                        .fetch_optional(&state.any)
                         .await?;
                 if !matches!(archived, Some(None)) {
                     return Err(ApiError::not_found("Workspace not found"));
@@ -512,10 +514,10 @@ async fn create_team(
 
     let (roster, team_color) = assign_missing_accents(&roster, req.color.as_deref());
     let now = sql_now();
-    let id: i64 = sqlx::query_scalar(
+    let id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO teamtemplate \
          (workspace_id, name, description, color, category, roster_json, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(workspace_id)
     .bind(req.name.unwrap_or_default().trim())
@@ -525,7 +527,7 @@ async fn create_team(
     .bind(serde_json::to_string(&roster).unwrap_or_else(|_| "{\"roles\":[]}".into()))
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     Ok((StatusCode::CREATED, Json(row_to_out(load_row(&state, id).await?)?)).into_response())
@@ -598,17 +600,17 @@ async fn update_team(
 
     let mut color = row.color.clone();
     if let Some(name) = field("name") {
-        sqlx::query("UPDATE teamtemplate SET name = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE teamtemplate SET name = ? WHERE id = ?", state.backend))
             .bind(name.trim())
             .bind(team_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if patch.get("description").is_some_and(|v| !v.is_null()) {
-        sqlx::query("UPDATE teamtemplate SET description = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE teamtemplate SET description = ? WHERE id = ?", state.backend))
             .bind(trimmed(field("description")))
             .bind(team_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if patch.get("color").is_some_and(|v| !v.is_null()) {
@@ -618,34 +620,34 @@ async fn update_team(
             "" => random_palette_color(&[]),
             explicit => explicit.to_string(),
         });
-        sqlx::query("UPDATE teamtemplate SET color = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE teamtemplate SET color = ? WHERE id = ?", state.backend))
             .bind(color.as_deref())
             .bind(team_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     // Category is the one field where an explicit `null` clears rather than
     // being ignored — presence in the body is what counts.
     if patch.contains_key("category") {
-        sqlx::query("UPDATE teamtemplate SET category = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE teamtemplate SET category = ? WHERE id = ?", state.backend))
             .bind(trimmed(field("category")))
             .bind(team_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(roster) = roster {
         let (roster, team_color) = assign_missing_accents(&roster, color.as_deref());
-        sqlx::query("UPDATE teamtemplate SET roster_json = ?, color = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE teamtemplate SET roster_json = ?, color = ? WHERE id = ?", state.backend))
             .bind(serde_json::to_string(&roster).unwrap_or_else(|_| "{\"roles\":[]}".into()))
             .bind(&team_color)
             .bind(team_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
-    sqlx::query("UPDATE teamtemplate SET updated_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE teamtemplate SET updated_at = ? WHERE id = ?", state.backend))
         .bind(sql_now())
         .bind(team_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     Ok(Json(row_to_out(load_row(&state, team_id).await?)?).into_response())
@@ -659,14 +661,14 @@ async fn delete_team(
     let row = load_row(&state, team_id).await?;
     assert_owned(&principal, &row)?;
 
-    let mut tx = state.pool.begin().await?;
+    let mut tx = state.any.begin().await?;
     // The snapshot on each process keeps the roster readable after the template
     // is gone, so only the pointer is cleared.
-    sqlx::query("UPDATE process SET team_template_id = NULL WHERE team_template_id = ?")
+    sqlx::query(&crate::db::sql("UPDATE process SET team_template_id = NULL WHERE team_template_id = ?", state.backend))
         .bind(team_id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM teamtemplate WHERE id = ?")
+    sqlx::query(&crate::db::sql("DELETE FROM teamtemplate WHERE id = ?", state.backend))
         .bind(team_id)
         .execute(&mut *tx)
         .await?;

@@ -142,7 +142,7 @@ struct ThreadRow {
     updated_at: String,
 }
 
-const THREAD_COLUMNS: &str = "id, title, workspace_root, messages_json, pending_call_json, model, \
+pub const THREAD_COLUMNS: &str = "CAST(id AS BIGINT) AS id, title, workspace_root, messages_json, pending_call_json, model, \
      CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at";
 
 impl ThreadRow {
@@ -185,15 +185,15 @@ async fn create_thread_row(
 ) -> Result<ThreadRow, ApiError> {
     let now = sql_now();
     let title = title.unwrap_or(DEFAULT_TITLE);
-    let id: i64 = sqlx::query_scalar(
+    let id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO coder_chat_threads (title, workspace_root, created_at, updated_at) \
-         VALUES (?, ?, ?, ?) RETURNING id",
+         VALUES (?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(title)
     .bind(workspace_root)
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
     Ok(ThreadRow {
         id,
@@ -209,9 +209,9 @@ async fn create_thread_row(
 }
 
 async fn get_thread_by_id(state: &AppState, thread_id: i64) -> Result<ThreadRow, ApiError> {
-    sqlx::query_as(&format!("SELECT {THREAD_COLUMNS} FROM coder_chat_threads WHERE id = ?"))
+    sqlx::query_as(&crate::db::sql(&format!("SELECT {THREAD_COLUMNS} FROM coder_chat_threads WHERE id = ?"), state.backend))
         .bind(thread_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await?
         .ok_or_else(|| ApiError::not_found("Coder thread not found"))
 }
@@ -222,10 +222,10 @@ async fn resolve_thread(state: &AppState, thread_id: Option<i64>) -> Result<Thre
     if let Some(thread_id) = thread_id {
         return get_thread_by_id(state, thread_id).await;
     }
-    let row: Option<ThreadRow> = sqlx::query_as(&format!(
+    let row: Option<ThreadRow> = sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {THREAD_COLUMNS} FROM coder_chat_threads ORDER BY updated_at DESC LIMIT 1"
-    ))
-    .fetch_optional(&state.pool)
+    ), state.backend))
+    .fetch_optional(&state.any)
     .await?;
     match row {
         Some(row) => Ok(row),
@@ -311,10 +311,10 @@ async fn threads_list(
     principal: Principal,
 ) -> Result<Response, ApiError> {
     require_chat_write(&principal)?;
-    let rows: Vec<ThreadRow> = sqlx::query_as(&format!(
+    let rows: Vec<ThreadRow> = sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {THREAD_COLUMNS} FROM coder_chat_threads ORDER BY updated_at DESC"
-    ))
-    .fetch_all(&state.pool)
+    ), state.backend))
+    .fetch_all(&state.any)
     .await?;
 
     let threads: Vec<Value> = rows
@@ -474,9 +474,9 @@ async fn thread_delete(
     require_chat_write(&principal)?;
     // 404s a missing row before deleting, the way `_get_thread_by_id` does.
     get_thread_by_id(&state, thread_id).await?;
-    sqlx::query("DELETE FROM coder_chat_threads WHERE id = ?")
+    sqlx::query(&crate::db::sql("DELETE FROM coder_chat_threads WHERE id = ?", state.backend))
         .bind(thread_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(Json(json!({ "thread_id": thread_id, "deleted": true })).into_response())
 }
@@ -606,10 +606,10 @@ impl Persisted {
         let messages_json =
             (!self.messages.is_empty()).then(|| python_json(&self.messages, false));
         let pending_json = self.pending.as_ref().map(|p| python_json(p, false));
-        sqlx::query(
+        sqlx::query(&crate::db::sql(
             "UPDATE coder_chat_threads \
              SET title = ?, workspace_root = ?, messages_json = ?, pending_call_json = ?, \
-                 model = ?, updated_at = ? WHERE id = ?",
+                 model = ?, updated_at = ? WHERE id = ?", state.backend)
         )
         .bind(&self.title)
         .bind(&self.workspace_root)
@@ -618,7 +618,7 @@ impl Persisted {
         .bind(&self.model)
         .bind(sql_now())
         .bind(self.thread_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await
         .map(|_| ())
     }
@@ -715,18 +715,18 @@ fn spawn_title_worker(
         // may already have written; reading the row is the same comparison
         // against whichever of the two got there first.
         let current: Option<String> =
-            sqlx::query_scalar("SELECT title FROM coder_chat_threads WHERE id = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT title FROM coder_chat_threads WHERE id = ?", state.backend))
                 .bind(thread_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await
                 .ok()
                 .flatten();
         if current.unwrap_or_default() != final_title {
-            let _ = sqlx::query("UPDATE coder_chat_threads SET title = ?, updated_at = ? WHERE id = ?")
+            let _ = sqlx::query(&crate::db::sql("UPDATE coder_chat_threads SET title = ?, updated_at = ? WHERE id = ?", state.backend))
                 .bind(&final_title)
                 .bind(sql_now())
                 .bind(thread_id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await;
         }
         let _ = tx.send(sse("title", &json!({ "thread_id": thread_id, "title": final_title })));
@@ -1013,11 +1013,11 @@ async fn chat_send(
 
     let final_title = await_smart_title(title_task, &fallback_title).await;
     if persisted.display_title() != final_title {
-        sqlx::query("UPDATE coder_chat_threads SET title = ?, updated_at = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE coder_chat_threads SET title = ?, updated_at = ? WHERE id = ?", state.backend))
             .bind(&final_title)
             .bind(sql_now())
             .bind(thread.id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
 
