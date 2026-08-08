@@ -12,7 +12,7 @@ use crate::assistant::{Message, Mode, State, BANDS, WAVE};
 use crate::shell::HudStyle;
 use crate::ui::{self, space, theme, Icon, Tone};
 use iced::widget::canvas::{self, Frame, Geometry, LineCap, Path, Stroke, Text};
-use iced::widget::{canvas as canvas_widget, column, container, markdown, scrollable};
+use iced::widget::{canvas as canvas_widget, column, container, markdown};
 use iced::{mouse, Color, Element, Length, Point, Radians, Rectangle, Renderer, Theme};
 
 /// The live HUD canvas alone, for embedding outside this screen (the
@@ -80,7 +80,11 @@ pub fn mode_label(mode: Mode) -> &'static str {
     }
 }
 
-pub fn view<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Element<'a, Message> {
+/// The conversation itself: HUD, error banner, transcript, composer — everything
+/// except the provider/model header. Split out from [`view`] so the floating
+/// panel ([`crate::screen::assistant_overlay`]) is the same widget tree rather
+/// than a second copy that drifts: one composer, one mic button, one transcript.
+pub fn panel<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Element<'a, Message> {
     let mode = state.mode();
 
     // Only meaningful in voice mode: every line of it reports the mic.
@@ -111,21 +115,28 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Elemen
             (true, _) => ui::caption("Voice ID locked".to_string()),
             _ => ui::caption(String::new()),
         },
-        // Hands-free answers whatever it hears, so say out loud what gets it to
+        // Voice mode answers whatever it hears, so say out loud what gets it to
         // answer: being named, or replying inside the follow-up window.
         ui::caption(if state.armed() {
-            "Say “E.V., …” — or just talk right after a reply".to_string()
+            format!("Say “{}, …” — or just talk right after a reply", crate::assistant::name())
         } else {
-            "Hands-free is off".to_string()
+            "Mic closed".to_string()
         }),
+        // Repair, not a mode — it belongs beside the voice-ID readout it
+        // undoes, and only once there is something to forget.
+        if state.voice_enrolled() {
+            ui::button_ghost(Icon::XCircle, "Forget voice", Message::ForgetVoice)
+        } else {
+            ui::caption(String::new())
+        },
     ])
     .into() };
 
     let transcript: Element<'_, Message> = if state.messages.is_empty() {
         ui::empty_state(if state.voice {
-            "Web-shooters primed. What do you need?"
+            "Web-shooters primed. What do you need?".to_string()
         } else {
-            "Ask E.V. anything."
+            format!("Ask {} anything.", crate::assistant::name())
         })
     } else {
         // Open flow, not boxes: role tag over content, markdown for E.V.
@@ -139,9 +150,11 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Elemen
                 let is_user = m.role == "user";
                 let (label, tone) = match m.role.as_str() {
                     "user" => ("YOU", Tone::Neutral),
-                    // The terminal's answer to a run_command call — fenced output.
-                    "tool" => ("TERMINAL", Tone::Info),
-                    _ => ("E.V.", Tone::Danger),
+                    // What a tool answered — fenced output. Not "TERMINAL": most
+                    // of these are an API read or a screen change now, and the
+                    // call row directly above already names which tool it was.
+                    "tool" => ("TOOL", Tone::Info),
+                    _ => (crate::assistant::name(), Tone::Danger),
                 };
                 let mut parts: Vec<Element<'_, Message>> = Vec::new();
                 // A reasoning model's chain-of-thought: open while it streams
@@ -161,43 +174,50 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Elemen
                 ui::turn(label, tone, is_user, column(parts).spacing(space::XS).into())
             })
             .collect();
-        scrollable(
-            ui::stack_lg(turns)
-                .padding(iced::Padding { right: 12.0, ..Default::default() }),
-        )
-        .id(crate::assistant::transcript_id())
-        .height(Length::Fill)
-        .into()
+        ui::transcript(crate::assistant::transcript_id(), turns)
     };
 
-    let mut composer_row: Vec<Element<'_, Message>> = vec![container(ui::input_submit(
-        if state.voice { "Talk to E.V.…" } else { "Message…" },
+    let composer = ui::card(ui::composer(
+        if state.voice { crate::assistant::composer_hint() } else { "Message…" },
         &state.draft,
         Message::DraftChanged,
         Message::Send,
-    ))
-    .width(Length::Fill)
-    .into()];
-    // The mic and the voice print only exist in voice mode — in text mode they
-    // would be controls for a thing that is not running.
-    if state.voice {
-        composer_row.push(if state.armed() {
-            ui::button_destructive(Icon::MicOff, "Mic off", Message::Listen)
-        } else {
-            ui::button_secondary(Icon::Mic, "Hands-free", Message::Listen)
-        });
-        // Only offered once there is something to forget — wrong person
-        // enrolled, or a new mic that changed how you sound.
-        if state.voice_enrolled() {
-            composer_row.push(ui::button_ghost(Icon::XCircle, "Forget voice", Message::ForgetVoice));
+        vec![
+            // One control for the whole mode. The mic button is the wake signal,
+            // the way it is in every other assistant: press to hand the thread
+            // to the voice, press again to get the keyboard back.
+            if state.voice {
+                ui::button_destructive(Icon::MicOff, "Exit voice", Message::Listen)
+            } else {
+                ui::button_secondary(Icon::Mic, "Voice", Message::Listen)
+            },
+            if state.sending {
+                ui::badge("thinking…", Tone::Info)
+            } else {
+                ui::button_default(Icon::Send, "Send", Message::Send)
+            },
+        ],
+    ));
+    // Standby is the one state with an open mic and no HUD over it. It does not
+    // get to be invisible: this row is the whole disclosure.
+    let composer = match state.standby && !state.voice && state.armed() {
+        false => composer,
+        true => {
+            let note: Element<'_, Message> = ui::cluster(vec![
+                ui::badge_icon(
+                    Icon::Mic,
+                    format!(
+                        "MIC LIVE · WAITING FOR “{}”",
+                        crate::assistant::name().to_uppercase()
+                    ),
+                    Tone::Warning,
+                ),
+                ui::caption("Anything else it hears is dropped.".to_string()),
+            ])
+            .into();
+            ui::card(column![composer, note].spacing(space::XS))
         }
-    }
-    composer_row.push(if state.sending {
-        ui::badge("thinking…", Tone::Info)
-    } else {
-        ui::button_default(Icon::Send, "Send", Message::Send)
-    });
-    let composer = ui::card(ui::cluster(composer_row));
+    };
 
     // Text mode is the same conversation without the theatre: no HUD canvas, no
     // mic telemetry, so nothing on screen implies audio is running.
@@ -207,59 +227,64 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Elemen
         blocks.push(status());
     }
     if let Some(err) = &state.error {
-        let mut row =
-            vec![container(ui::alert_error_traced(err, Message::TraceLogs)).width(Length::Fill).into()];
-        if err.contains("Privacy → Microphone") {
-            row.push(ui::button_secondary(Icon::Settings, "Open Settings", Message::OpenMicSettings));
-        }
-        row.push(ui::button_ghost(Icon::X, "Dismiss", Message::DismissError));
-        blocks.push(ui::cluster(row).into());
+        let extra: Vec<Element<'_, Message>> = if err.contains("Privacy → Microphone") {
+            vec![ui::button_secondary(Icon::Settings, "Open Settings", Message::OpenMicSettings)]
+        } else {
+            Vec::new()
+        };
+        blocks.push(ui::error_bar(err, Message::TraceLogs, Message::DismissError, extra));
     }
     blocks.push(container(transcript).height(Length::Fill).into());
+    // Between the transcript and the composer, where Coder puts its own: the
+    // change is the thing to read before typing anything else.
+    if let Some(write) = &state.pending {
+        blocks.push(approval(write));
+    }
     blocks.push(composer);
+    column(blocks).spacing(space::MD).height(Length::Fill).into()
+}
 
+/// The one gate between a model and anything outside this app — the user's data
+/// through the API, or their whole machine through the shell.
+fn approval<'a>(proposal: &'a crate::assistant_tools::Pending) -> Element<'a, Message> {
+    let mut body: Vec<Element<'_, Message>> = vec![ui::code(ui::mono(proposal.summary()))];
+    body.extend(proposal.detail().map(|d| ui::code(ui::mono(d))));
+    ui::approval(
+        proposal.heading(),
+        Tone::Warning,
+        body,
+        "No",
+        Message::Decide(false),
+        Some(Message::Decide(true)),
+    )
+}
+
+pub fn view<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Element<'a, Message> {
     // Who is answering leads the page. The old header put a 24px "E.V." title and
     // a line of flavour text here and pushed these two into a trailing cluster of
     // five equal-weight widgets — but the tab strip above already names the
-    // assistant, and the Text/Voice control already says which mode it is in.
-    // Both were repeating something on screen; the model was not.
-    let mut head: Vec<Element<'_, Message>> = vec![
-        container(ui::select(
-            "Provider (default)",
-            state.provider_ids(),
-            (!state.provider.is_empty()).then(|| state.provider.clone()),
-            Message::ProviderChanged,
-        ))
-        .width(180)
-        .into(),
-        container(ui::select(
-            "Model (default)",
-            state.model_options(),
-            (!state.model.is_empty()).then(|| state.model.clone()),
-            Message::ModelChanged,
-        ))
-        .width(260)
-        .into(),
-    ];
+    // assistant, and the HUD says which mode it is in. Both were repeating
+    // something on screen; the model was not.
+    let mut head: Vec<Element<'_, Message>> = vec![ui::model_pickers(
+        state.provider_ids(),
+        &state.provider,
+        Message::ProviderChanged,
+        state.model_options(),
+        &state.model,
+        Message::ModelChanged,
+    )
+    .into()];
     // pick_list cannot deselect, so going back to the server default needs its
     // own button — shown only while an override is active.
     if !state.provider.is_empty() || !state.model.is_empty() {
         head.push(ui::button_ghost(Icon::X, "Default", Message::UseDefaults));
     }
-    // Everything past the spacer recedes: one thread, two skins — Text is the
-    // plain transcript, Voice adds the HUD, the mic and the spoken reply.
+    // No mode segment up here: the composer's mic button is the mode, and two
+    // controls for one state is how you end up in voice mode with a shut mic.
     head.push(ui::spacer());
-    head.push(ui::segmented([
-        ("Text", !state.voice, Message::ToggleVoice),
-        ("Voice", state.voice, Message::ToggleVoice),
-    ]));
     head.push(ui::button_ghost(Icon::Trash, "Clear", Message::Clear));
 
-    ui::page_custom(ui::cluster(head), {
-        let body: Element<'_, Message> =
-            column(blocks).spacing(space::MD).height(Length::Fill).into();
-        body
-    })
+    ui::page_custom(ui::cluster(head), panel(state, iced_theme, style))
 }
 
 // ---------------------------------------------------------------------------
@@ -888,13 +913,17 @@ impl Hud<'_> {
         ));
 
         frame.fill_text(mono(
-            match self.mode {
-                Mode::Idle => "E.V. // STANDING BY".to_string(),
-                Mode::Armed => "E.V. // MIC LIVE · GATE SHUT".to_string(),
-                Mode::Listening => "E.V. // LISTENING".to_string(),
-                Mode::Thinking => "E.V. // ANALYZING…".to_string(),
-                Mode::Speaking => "E.V. // TRANSMITTING".to_string(),
-            },
+            format!(
+                "{} // {}",
+                crate::assistant::name().to_uppercase(),
+                match self.mode {
+                    Mode::Idle => "STANDING BY",
+                    Mode::Armed => "MIC LIVE · GATE SHUT",
+                    Mode::Listening => "LISTENING",
+                    Mode::Thinking => "ANALYZING…",
+                    Mode::Speaking => "TRANSMITTING",
+                }
+            ),
             // Above the ribbon: the status line is the one thing that must stay
             // readable at a glance.
             Point::new(m + 6.0, h - m - 38.0),

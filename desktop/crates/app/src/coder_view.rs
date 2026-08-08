@@ -277,23 +277,17 @@ fn header(state: &State) -> Element<'_, Message> {
     } else {
         ui::badge_icon(Icon::Folder, "No folder open", Tone::Warning)
     };
-    let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
     // The model belongs in the header rather than in Settings: it is the
     // single biggest determinant of whether a turn works at all, and the
     // server's default cannot hold a tool loop.
-    let pickers = ui::cluster(vec![
-        container(ui::select(
-            "Provider",
-            state.provider_ids(),
-            some(&state.provider),
-            Message::ProviderChanged,
-        ))
-        .width(160)
-        .into(),
-        container(ui::select("Model", state.model_options(), some(&state.model), Message::ModelChanged))
-            .width(240)
-            .into(),
-    ]);
+    let pickers = ui::model_pickers(
+        state.provider_ids(),
+        &state.provider,
+        Message::ProviderChanged,
+        state.model_options(),
+        &state.model,
+        Message::ModelChanged,
+    );
     // Identity and the one workspace-changing action, alone on their own line:
     // a spacer safely pushes "Open folder" to the right here (`Length::Fill` is
     // fine in a plain row — see the wrap note below) and nothing here competes
@@ -343,24 +337,15 @@ fn body<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
             "Ask for a change. The agent explores the folder itself before it edits.",
         )
     } else {
-        scrollable(
-            ui::stack_lg(state.turns.iter().enumerate().map(|(i, t)| turn(state, i, t, iced_theme)).collect())
-                .padding(Padding { right: 12.0, ..Default::default() }),
+        ui::transcript(
+            crate::coder::transcript_id(),
+            state.turns.iter().enumerate().map(|(i, t)| turn(state, i, t, iced_theme)).collect(),
         )
-        .id(crate::coder::transcript_id())
-        .height(Length::Fill)
-        .into()
     };
 
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
     if let Some(err) = &state.error {
-        blocks.push(
-            ui::cluster(vec![
-                container(ui::alert_error_traced(err, Message::TraceLogs)).width(Length::Fill).into(),
-                ui::button_ghost(Icon::X, "Dismiss", Message::DismissError),
-            ])
-            .into(),
-        );
+        blocks.push(ui::error_bar(err, Message::TraceLogs, Message::DismissError, Vec::new()));
     }
     blocks.push(container(transcript).height(Length::Fill).into());
     // `pending` outlives the decision being sent (so a failed send can put the
@@ -494,19 +479,6 @@ fn review<'a>(state: &'a State, sha: &'a str, diff: Option<&'a String>) -> Eleme
 /// button, which is the one thing this card must never be.
 fn approval(command: &str) -> Element<'_, Message> {
     let unreadable = command.is_empty();
-    let mut actions = vec![
-        ui::badge_icon(
-            Icon::Alert,
-            if unreadable { "Unreadable command" } else { "Run this command?" },
-            if unreadable { Tone::Danger } else { Tone::Warning },
-        ),
-        space_widget::horizontal().into(),
-        ui::button_ghost(Icon::X, if unreadable { "Dismiss" } else { "No" }, Message::Decide(false)),
-    ];
-    if !unreadable {
-        actions.push(ui::button_default(Icon::Play, "Run", Message::Decide(true)));
-    }
-    let head: Element<'_, Message> = ui::cluster(actions).into();
     let body: Element<'_, Message> = if unreadable {
         ui::muted(
             "The model asked to run a command but did not say what. Nothing will be run.",
@@ -514,28 +486,33 @@ fn approval(command: &str) -> Element<'_, Message> {
     } else {
         ui::code(ui::mono(command.to_string()))
     };
-    ui::card(column![head, body].spacing(space::SM))
+    ui::approval(
+        if unreadable { "Unreadable command" } else { "Run this command?" },
+        if unreadable { Tone::Danger } else { Tone::Warning },
+        vec![body],
+        if unreadable { "Dismiss" } else { "No" },
+        Message::Decide(false),
+        (!unreadable).then_some(Message::Decide(true)),
+    )
 }
 
 fn composer(state: &State) -> Element<'_, Message> {
     let can_send = state.root.is_some() && !state.sending && state.pending.is_none();
-    let input = ui::cluster(vec![
-        container(ui::input_submit(
-            if state.root.is_some() { "What should change?" } else { "Open a folder first…" },
-            &state.draft,
-            Message::DraftChanged,
-            Message::Send,
-        ))
-        .width(Length::Fill)
-        .into(),
-        if state.sending {
+    // Same composer as E.V.'s, with a different trailing control: this one can
+    // also be waiting on a folder or on an approval, which "Send" would lie about.
+    let input = ui::composer(
+        if state.root.is_some() { "What should change?" } else { "Open a folder first…" },
+        &state.draft,
+        Message::DraftChanged,
+        Message::Send,
+        vec![if state.sending {
             ui::badge_spinner(state.frame, "working…", Tone::Info)
         } else if can_send {
             ui::button_default(Icon::Send, "Send", Message::Send)
         } else {
             ui::badge("waiting", Tone::Neutral)
-        },
-    ]);
+        }],
+    );
     if !state.sending && state.pending.is_none() {
         return ui::card(input);
     }

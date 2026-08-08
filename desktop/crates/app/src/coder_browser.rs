@@ -75,6 +75,11 @@ mod imp {
     use iced::Size;
     use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
     use std::cell::RefCell;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CLIPCHILDREN,
+    };
     use wry::dpi::{LogicalPosition, LogicalSize};
     use wry::{Rect, WebView, WebViewBuilder};
 
@@ -92,6 +97,36 @@ mod imp {
     impl HasWindowHandle for Parent {
         fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
             Ok(unsafe { WindowHandle::borrow_raw(self.0.clone()) })
+        }
+    }
+
+    /// Add `WS_CLIPCHILDREN` to the app window.
+    ///
+    /// Without it the parent paints its whole client area, and iced's DXGI
+    /// swapchain present goes straight over the child window every frame: the
+    /// webview is created, visible, correctly positioned — and invisible.
+    /// Measured exactly that way before this call existed. `WS_CLIPCHILDREN`
+    /// excludes child regions from the parent's painting, which is what makes
+    /// the two surfaces coexist.
+    fn clip_children(raw: RawWindowHandle) {
+        let RawWindowHandle::Win32(w) = raw else { return };
+        let hwnd = w.hwnd.get() as isize as HWND;
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            if style & WS_CLIPCHILDREN as isize == 0 {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style | WS_CLIPCHILDREN as isize);
+                // The style cache is per-window and only re-read on a frame
+                // change, so say so or the next present ignores it.
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+                );
+            }
         }
     }
 
@@ -138,6 +173,7 @@ mod imp {
                     .with_bounds(bounds(size))
                     .build_as_child(&Parent(raw))
                     .map_err(|e| format!("could not start the preview: {e}"))?;
+                clip_children(raw);
                 *slot = Some(view);
             }
             let view = slot.as_ref().expect("just built");

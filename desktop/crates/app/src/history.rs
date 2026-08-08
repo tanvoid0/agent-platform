@@ -31,6 +31,13 @@ pub struct Conversation {
     /// Display-only chain-of-thought, same indices as `messages`.
     #[serde(default)]
     pub reasoning: Vec<String>,
+    /// Provider/model the thread was answered on, so reopening it answers the
+    /// same way. `None` is a conversation saved before this was recorded —
+    /// distinct from `Some("")`, which is an explicit "the server's default".
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// The persisted half of [`Store`] — which conversation each tab is on is
@@ -99,7 +106,14 @@ impl Store {
 
     /// Write the tab's live thread into its conversation, creating one on the
     /// first turn. No-op for an empty thread.
-    pub fn autosave(&mut self, source: &str, messages: &[ChatMessage], reasoning: &[String]) {
+    pub fn autosave(
+        &mut self,
+        source: &str,
+        messages: &[ChatMessage],
+        reasoning: &[String],
+        provider: &str,
+        model: &str,
+    ) {
         if messages.is_empty() {
             return;
         }
@@ -114,6 +128,8 @@ impl Store {
                 c.updated = updated;
                 c.messages = messages.to_vec();
                 c.reasoning = reasoning.to_vec();
+                c.provider = Some(provider.to_string());
+                c.model = Some(model.to_string());
             }
             None => {
                 let id = self.next_id;
@@ -125,6 +141,8 @@ impl Store {
                     updated,
                     messages: messages.to_vec(),
                     reasoning: reasoning.to_vec(),
+                    provider: Some(provider.to_string()),
+                    model: Some(model.to_string()),
                 });
                 self.current.insert(source.to_string(), id);
                 while self.items.len() > MAX_ITEMS {
@@ -199,26 +217,26 @@ mod tests {
     #[test]
     fn autosave_creates_then_updates_one_conversation() {
         let mut s = store();
-        s.autosave("Chat", &thread("first question"), &[String::new(), String::new()]);
+        s.autosave("Chat", &thread("first question"), &[String::new(), String::new()], "", "");
         assert_eq!(s.items.len(), 1);
         let id = s.current("Chat").expect("the new conversation is the open one");
 
         let mut longer = thread("first question");
         longer.push(ChatMessage::text("user", "and another"));
-        s.autosave("Chat", &longer, &[]);
+        s.autosave("Chat", &longer, &[], "", "");
         assert_eq!(s.items.len(), 1, "same conversation, not a second one");
         assert_eq!(s.items[0].messages.len(), 3);
         assert_eq!(s.current("Chat"), Some(id));
 
         // A fresh thread after New lands in a new conversation.
         s.close("Chat");
-        s.autosave("Chat", &thread("something else"), &[]);
+        s.autosave("Chat", &thread("something else"), &[], "", "");
         assert_eq!(s.items.len(), 2);
         assert_ne!(s.current("Chat"), Some(id));
 
         // Empty threads are never saved.
         s.close("Chat");
-        s.autosave("Chat", &[], &[]);
+        s.autosave("Chat", &[], &[], "", "");
         assert_eq!(s.items.len(), 2);
     }
 
@@ -229,7 +247,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ev-history-migrate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = Store::load(&dir);
-        s.autosave("Chat", &thread("plain chat"), &[]);
+        s.autosave("Chat", &thread("plain chat"), &[], "", "");
 
         let reopened = Store::load(&dir);
         assert!(reopened.visible("Chat").is_empty());
@@ -243,8 +261,8 @@ mod tests {
             .join(format!("ev-history-persist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = Store::load(&dir);
-        s.autosave("run 7", &thread("plain chat"), &[]);
-        s.autosave("E.V.", &thread("suit check"), &[]);
+        s.autosave("run 7", &thread("plain chat"), &[], "ollama", "qwen2.5:7b");
+        s.autosave("E.V.", &thread("suit check"), &[], "", "");
 
         let mut reopened = Store::load(&dir);
         assert_eq!(reopened.items.len(), 2);
@@ -255,6 +273,8 @@ mod tests {
         let id = reopened.visible("run 7")[0].id;
         let loaded = reopened.open("run 7", id).expect("saved conversation loads");
         assert_eq!(loaded.messages[0].content, "plain chat");
+        assert_eq!(loaded.provider.as_deref(), Some("ollama"), "the pair reopens with the thread");
+        assert_eq!(loaded.model.as_deref(), Some("qwen2.5:7b"));
         assert_eq!(reopened.current("run 7"), Some(id));
 
         reopened.delete(id);

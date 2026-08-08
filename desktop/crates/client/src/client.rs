@@ -308,6 +308,62 @@ impl Client {
         self.get_json(&format!("/api/v1/system/logs?after={after}")).await
     }
 
+    /// One read of an arbitrary REST route, returned as raw JSON. This is what
+    /// backs the assistant's `api_get` tool, so the path comes from a language
+    /// model rather than from this codebase — it is a trust boundary, and the
+    /// guard below is the whole of it:
+    ///
+    /// * `/api/v1/` prefix only, so the LLM proxy on `/v1/*` and the local file
+    ///   scheme are both out of reach;
+    /// * GET only — the method is not a parameter, so no amount of prompting
+    ///   turns a read tool into a delete.
+    ///
+    /// Reads are unrestricted *within* `/api/v1/`: everything there is already
+    /// this user's own data, shown on one screen or another.
+    pub async fn api_get(&self, path: &str) -> Result<Value> {
+        if !path.starts_with("/api/v1/") || path.contains("..") {
+            return Err(Error::Api {
+                status: 400,
+                message: format!("path must start with /api/v1/ and may not contain '..': {path:?}"),
+                body: None,
+                trace: None,
+            });
+        }
+        self.get_json(path).await
+    }
+
+    /// One write to an arbitrary REST route. Backs the assistant's `api_write`
+    /// tool, and carries the same `/api/v1/` guard as [`Client::api_get`] plus a
+    /// method allowlist.
+    ///
+    /// The guard here is *not* what makes this safe — a POST that creates a team
+    /// and a DELETE that drops a project both pass it. What makes it safe is that
+    /// the caller never reaches this without the user having read the method, the
+    /// path and the body on a confirm card and pressed Run. Keep it that way: a
+    /// path from a model plus an unattended write is the whole risk.
+    pub async fn api_write(&self, method: &str, path: &str, body: &Value) -> Result<Value> {
+        if !path.starts_with("/api/v1/") || path.contains("..") {
+            return Err(Error::Api {
+                status: 400,
+                message: format!("path must start with /api/v1/ and may not contain '..': {path:?}"),
+                body: None,
+                trace: None,
+            });
+        }
+        match method.to_ascii_uppercase().as_str() {
+            "POST" => self.post_json(path, body).await,
+            "PATCH" => self.patch_json(path, body).await,
+            "PUT" => self.put_json(path, body).await,
+            "DELETE" => self.delete_json(path).await,
+            other => Err(Error::Api {
+                status: 400,
+                message: format!("method must be POST, PATCH, PUT or DELETE, got {other:?}"),
+                body: None,
+                trace: None,
+            }),
+        }
+    }
+
     /// Unauthenticated readiness probe.
     pub async fn health(&self) -> Result<Value> {
         let resp = self.http.get(self.url("/health")).send().await?;
@@ -387,12 +443,14 @@ impl Client {
     ///
     /// A 501 means no speech backend is configured — the caller is expected to
     /// fall back to a local engine rather than treat it as a failure.
-    pub async fn speech(&self, text: &str) -> Result<Vec<u8>> {
+    /// `voice` is the backend's own voice id — a trained Piper model, say. Empty
+    /// leaves the choice to `SPEECH_DEFAULT_VOICE` on the server.
+    pub async fn speech(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
         let resp = self
             .authed(
                 self.http
                     .post(self.url("/v1/audio/speech"))
-                    .json(&serde_json::json!({ "input": text })),
+                    .json(&serde_json::json!({ "input": text, "voice": voice })),
             )
             .send()
             .await?;

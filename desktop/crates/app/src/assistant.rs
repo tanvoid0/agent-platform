@@ -16,11 +16,119 @@ use std::collections::VecDeque;
 use std::io::Cursor;
 use tts::Tts;
 
-/// What the assistant is called, everywhere the user can see it — window
-/// labels, the HUD readout, and the byline on a memory it contributed.
+/// The stored identity of this assistant: the `source` on a chat it owns and on
+/// a memory it contributed. Stays "E.V." whatever the user renames it to — it
+/// is a key, and renaming it would orphan every chat and memory already filed
+/// under it. `name()` is the display name.
 pub const NAME: &str = "E.V.";
 
-const PERSONA: &str = "You are E.V. (Extra-Vehicular Assistant), the onboard \
+/// What the assistant is called until the user says otherwise.
+pub const DEFAULT_NAME: &str = "E.V.";
+
+/// The display name — window labels, the HUD readout, the composer hint. Set
+/// from `shell::Settings::assistant_name` at boot and on every edit.
+///
+/// `&'static str` because every view wants one; `set_identity` leaks the name,
+/// which costs a few bytes per rename and saves threading a `String` through
+/// every screen.
+static NAME_CELL: std::sync::RwLock<&'static str> = std::sync::RwLock::new(DEFAULT_NAME);
+
+/// The wake word's accepted spellings, resolved from the user's settings.
+/// Empty means "nobody has configured this" — `addressed` then falls back to
+/// the built-in `NAMES`.
+static WAKE_NAMES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// The TTS voice id, e.g. `en-US-AriaNeural` (Edge) or whatever a trained
+/// Piper/Kokoro model is called on the speech backend. Empty = each engine's
+/// own default.
+static VOICE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+pub fn name() -> &'static str {
+    *NAME_CELL.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn wake_names() -> std::sync::RwLockReadGuard<'static, Vec<String>> {
+    WAKE_NAMES.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn voice() -> String {
+    VOICE.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Apply the user's name and wake-word settings. Both at once because the
+/// spellings default from the name: an empty `spellings` means "whatever the
+/// name sounds like", which is only knowable here.
+///
+/// ponytail: one word per spelling — `addressed` matches a single token, so a
+/// two-word name needs its spellings written as one ("ironman"). Multi-word
+/// matching if anyone asks for it.
+pub fn set_identity(name: &str, spellings: &str) {
+    let name = name.trim();
+    let display: &'static str = if name.is_empty() {
+        DEFAULT_NAME
+    } else {
+        Box::leak(name.to_string().into_boxed_str())
+    };
+    *NAME_CELL.write().unwrap_or_else(|e| e.into_inner()) = display;
+
+    *WAKE_NAMES.write().unwrap_or_else(|e| e.into_inner()) = resolve_wake(display, spellings);
+
+    *COMPOSER_HINT.write().unwrap_or_else(|e| e.into_inner()) =
+        Box::leak(format!("Talk to {display}…").into_boxed_str());
+    *TALK_LABEL.write().unwrap_or_else(|e| e.into_inner()) =
+        Box::leak(format!("Talk to {display}").into_boxed_str());
+}
+
+/// `"Talk to E.V.…"` — the composer's placeholder, composed once per name and
+/// leaked, because iced's `text_input` placeholder is a borrow that has to
+/// outlive the view and there is nowhere in the view to keep it.
+static COMPOSER_HINT: std::sync::RwLock<&'static str> = std::sync::RwLock::new("Talk to E.V.…");
+
+/// The same, without the ellipsis: the tray item and the dashboard button, both
+/// of which want a borrow too.
+static TALK_LABEL: std::sync::RwLock<&'static str> = std::sync::RwLock::new("Talk to E.V.");
+
+pub fn composer_hint() -> &'static str {
+    *COMPOSER_HINT.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn talk_label() -> &'static str {
+    *TALK_LABEL.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn set_voice(id: &str) {
+    *VOICE.write().unwrap_or_else(|e| e.into_inner()) = id.trim().to_string();
+}
+
+/// What the wake word listens for. Empty means "the built-in `NAMES`" — which
+/// is what an unconfigured install and the default name both get, so the dozen
+/// ways whisper writes "E.V." keep working.
+fn resolve_wake(name: &str, spellings: &str) -> Vec<String> {
+    let mut wake: Vec<String> = spellings.split(',').filter_map(spoken).collect();
+    if wake.is_empty() && name != DEFAULT_NAME {
+        // No spellings given: the name itself is the wake word.
+        wake.extend(spoken(name));
+    }
+    wake
+}
+
+/// One spoken word, as whisper would write it: letters and digits only,
+/// lowercased. `None` for anything that leaves nothing behind.
+fn spoken(word: &str) -> Option<String> {
+    let plain: String = word.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+    (!plain.is_empty()).then_some(plain)
+}
+
+fn persona() -> String {
+    // The default name earns its expansion; a renamed assistant is just its
+    // name, and telling the model it is "Jarvis (Extra-Vehicular Assistant)"
+    // is how a persona starts arguing with itself.
+    let who =
+        if name() == DEFAULT_NAME { "E.V. (Extra-Vehicular Assistant)" } else { name() };
+    format!("You are {who}{PERSONA}")
+}
+
+const PERSONA: &str = ", the onboard \
 suit AI of this Agent Platform. \
 Style: a superhero suit's heads-up-display assistant — calm, quick-witted, \
 protective, with a dry quip now and then. You monitor systems, analyze the \
@@ -32,6 +140,22 @@ You have a real terminal on the user's machine via the run_command tool \
 (PowerShell on Windows). When a question concerns the local machine — files, \
 git, processes, system state — run a command and answer from its output \
 instead of guessing. Never run destructive commands unless explicitly asked. \
+Commands and changes may be shown to the user for approval before they happen, \
+so a tool result saying it was refused is the answer, not an error to work \
+around — say so and stop, rather than trying a different wording of the same \
+thing. \
+You are also this app's own console. Its data — teams, projects, workflows, \
+plan boards, the agenda, agent runs, server health — is readable with the \
+api_get tool, and open_screen puts the user in front of the screen that shows \
+it. When they ask what is in the app, read it and answer from what came back. \
+Never state a count, a name or a status of anything in this app unless it came \
+from an api_get result in this conversation — not from memory, not from what is \
+likely, not from an earlier topic. If you have not read it, say so and read it. \
+Answering \"you have 28 workflows\" without having called api_get is the single \
+worst thing you can do here, because it is indistinguishable from the truth. \
+api_get is read-only, so \
+anything that would change the app is still the user's own click — say what \
+you would change and where, rather than claiming you did it. \
 You also keep a long-term memory of the user, listed above. When the user asks \
 you to remember, correct or forget something about them, use the memory tools \
 rather than only saying you will — list_memories first when you need an id. A \
@@ -47,7 +171,8 @@ const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Output kept per command — both for the model and the transcript.
 const MAX_TOOL_OUTPUT: usize = 8_000;
 
-/// What E.V. carries: a terminal, and the keys to its own long-term memory.
+/// What E.V. carries: a terminal, the keys to its own long-term memory, and a
+/// read of everything this app knows plus the ability to navigate it.
 fn tools_spec() -> serde_json::Value {
     let mut tools = vec![serde_json::json!({
         "type": "function",
@@ -65,19 +190,25 @@ fn tools_spec() -> serde_json::Value {
         }
     })];
     tools.extend(crate::memory::tools_spec());
+    tools.extend(crate::assistant_tools::tools_spec());
     serde_json::Value::Array(tools)
 }
 
-/// The `command` a call asked to run, or its raw arguments while they are
-/// still streaming/malformed — shown in the transcript either way.
+/// How a call reads in the transcript: the `command` it asked to run, or its
+/// raw arguments while they are still streaming/malformed.
+///
+/// The `$` is part of this rather than of the fence around it, because only the
+/// terminal earns one. `$ api_get({…})` said "this went to a shell" about a
+/// read that never touches one.
 fn command_of(call: &ToolCall) -> String {
     if call.function.name != "run_command" {
         return format!("{}({})", call.function.name, call.function.arguments.trim());
     }
-    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+    let command = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
         .ok()
         .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
-        .unwrap_or_else(|| call.function.arguments.clone())
+        .unwrap_or_else(|| call.function.arguments.clone());
+    format!("$ {command}")
 }
 
 /// A reply that *is* a tool call written out as text, rather than a reply that
@@ -96,7 +227,10 @@ fn salvage_calls(content: &str) -> Option<Vec<ToolCall>> {
     let mut calls = Vec::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
         let name = item.get("name")?.as_str()?;
-        if name != "run_command" && !crate::memory::TOOLS.contains(&name) {
+        if name != "run_command"
+            && !crate::memory::TOOLS.contains(&name)
+            && !crate::assistant_tools::TOOLS.contains(&name)
+        {
             return None;
         }
         let arguments = match item.get("arguments") {
@@ -170,44 +304,94 @@ pub(crate) async fn run_command(
     if text.trim().is_empty() {
         text = "(no output)".into();
     }
-    if text.len() > MAX_TOOL_OUTPUT {
-        let mut cut = MAX_TOOL_OUTPUT;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
+    cap_output(text)
+}
+
+/// Run something the user agreed to on the confirm card. Errors come back as
+/// text, like every other tool result — a 422 or a non-zero exit is something
+/// the model can correct, not a crash.
+async fn run_pending(client: &Client, proposal: &crate::assistant_tools::Pending) -> String {
+    use crate::assistant_tools::Pending;
+    match proposal {
+        Pending::Write { method, path, body, .. } => {
+            match client.api_write(method, path, body).await {
+                Ok(value) => cap_output(format!("{} ok: {value}", proposal.summary())),
+                Err(e) => format!("error: {e}"),
+            }
         }
-        text.truncate(cut);
-        text.push_str("\n… (truncated)");
+        Pending::Command { command, .. } => run_command(command.clone(), None, TOOL_TIMEOUT).await,
     }
+}
+
+/// Cut a tool result down to what is worth spending context on. Shared by the
+/// terminal and `api_get`: both can return a megabyte, and the model reads the
+/// same "there was more" either way.
+fn cap_output(mut text: String) -> String {
+    if text.len() <= MAX_TOOL_OUTPUT {
+        return text;
+    }
+    let mut cut = MAX_TOOL_OUTPUT;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push_str("\n… (truncated)");
     text
 }
 
-/// Run every terminal call of one round, in order. Sequential on purpose: the
-/// calls in a round often depend on the same working state (cd, files just
-/// written). `results` carries the memory calls of the same round, already
-/// answered against the live store before this task was spawned.
-async fn run_tools(calls: Vec<ToolCall>, mut results: Vec<ToolOutcome>) -> Vec<ToolOutcome> {
+/// Run every call of one round that needed to leave the update loop — the
+/// terminal and the app's own REST API. Sequential on purpose: the calls in a
+/// round often depend on the same working state (cd, files just written).
+/// `results` carries the memory and navigation calls of the same round, already
+/// answered against live app state before this task was spawned.
+async fn run_tools(
+    client: Client,
+    calls: Vec<ToolCall>,
+    mut results: Vec<ToolOutcome>,
+) -> Vec<ToolOutcome> {
     results.reserve(calls.len());
     for call in calls {
-        let output = if call.function.name == "run_command" {
-            match serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-                .ok()
-                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
-            {
-                Some(cmd) => run_command(cmd, None, TOOL_TIMEOUT).await,
-                None => format!(
-                    "error: run_command needs {{\"command\": \"…\"}}, got: {}",
-                    call.function.arguments
-                ),
+        let output = match call.function.name.as_str() {
+            "run_command" => {
+                match serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                    .ok()
+                    .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
+                {
+                    Some(cmd) => run_command(cmd, None, TOOL_TIMEOUT).await,
+                    None => format!(
+                        "error: run_command needs {{\"command\": \"…\"}}, got: {}",
+                        call.function.arguments
+                    ),
+                }
             }
-        } else {
-            format!("error: unknown tool {:?}", call.function.name)
+            // A board with a year of items is a bigger answer than the model
+            // can use, so it gets the same cap the terminal does.
+            "api_get" => cap_output(
+                crate::assistant_tools::run_api_get(&client, &call.function.arguments).await,
+            ),
+            other => format!("error: unknown tool {other:?}"),
         };
         results.push(ToolOutcome { id: call.id, output });
     }
     results
 }
 
-const EDGE_VOICE: &str = "Microsoft Server Speech Text to Speech Voice (en-US, AriaNeural)";
+/// The voice Edge speaks in until the user picks another, as a short id.
+pub const DEFAULT_VOICE: &str = "en-US-AriaNeural";
+
+/// Edge wants the long form of a voice id. Everything else — the speech backend
+/// behind `SPEECH_API_BASE`, including a trained Piper model — wants the short
+/// one, so the short one is what is stored and this expands it here.
+///
+/// Anything that is not `<locale>-<Voice>` falls back to the default: a typo
+/// reaching Edge comes back as a socket error in front of every sentence.
+fn edge_voice(short: &str) -> String {
+    let short = if short.is_empty() { DEFAULT_VOICE } else { short };
+    let Some((locale, voice)) = short.rsplit_once('-') else {
+        return edge_voice(DEFAULT_VOICE);
+    };
+    format!("Microsoft Server Speech Text to Speech Voice ({locale}, {voice})")
+}
 
 /// Speech rates the settings screen offers, as Edge's percent-of-normal.
 pub const VOICE_RATES: [(&str, i32); 5] =
@@ -284,10 +468,10 @@ const BARGE_SNR: f32 = 3.0;
 /// than `ONSET_FRAMES`, because cutting a reply off by mistake is worse than
 /// stopping a beat late.
 const BARGE_FRAMES: u32 = 12;
-/// After E.V. replies you can just talk. Long enough to read the reply and
-/// think before answering it. Outside this window an utterance has to name
-/// E.V. to be sent on its own — and while the mic is armed there is no
-/// window at all, `armed` keeps it open.
+/// After E.V. replies — or after you open voice mode — you can just talk. Long
+/// enough to read the reply and think before answering it. Outside this window
+/// an utterance has to name E.V. to be sent on its own: that is the wake word,
+/// and `addressed` is what checks it.
 const FOLLOW_UP: f32 = 45.0;
 /// How much louder than the floor an utterance's peak must be to read as
 /// close-talk rather than someone else's conversation across the room.
@@ -366,7 +550,8 @@ fn is_ghost(text: &str) -> bool {
     GHOSTS.contains(&plain.split_whitespace().collect::<Vec<_>>().join(" ").as_str())
 }
 
-/// Whitelist of how whisper spells "E.V." when someone says it out loud. The
+/// Whitelist of how whisper spells "E.V." when someone says it out loud — the
+/// default name's spellings, used until the user configures their own. The
 /// three-letter spellings stay: people who used to say "E.V.A." still do, and
 /// a name the assistant no longer answers to is a bug report.
 const NAMES: [&str; 12] = [
@@ -375,16 +560,20 @@ const NAMES: [&str; 12] = [
 /// Words allowed to precede the name.
 const OPENERS: [&str; 6] = ["hey", "ok", "okay", "yo", "hi", "hello"];
 
-/// Does this transcript open by addressing E.V.? Returns what was said *after*
-/// the name. Matching is on sounds rather than spelling — whisper writes the
-/// same two letters a dozen different ways.
+/// Does this transcript open by addressing the assistant? Returns what was said
+/// *after* the name. Matching is on sounds rather than spelling — whisper
+/// writes the same two letters a dozen different ways.
 fn addressed(text: &str) -> Option<&str> {
+    let custom = wake_names();
+    let is_name = |plain: &str| {
+        if custom.is_empty() { NAMES.contains(&plain) } else { custom.iter().any(|n| n == plain) }
+    };
     let mut rest = text.trim_start();
     for step in 0..2 {
         let (word, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         let plain: String =
             word.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
-        if NAMES.contains(&plain.as_str()) {
+        if is_name(&plain) {
             return Some(tail.trim_start_matches([',', '.', '!', '?', ' ']));
         }
         // One opener ("hey", "ok") may come first; anything else means the
@@ -418,9 +607,18 @@ pub struct State {
     pub draft: String,
     pub sending: bool,
     pub error: Option<String>,
-    /// Voice mode: the HUD is on screen, the mic can be armed and replies are
-    /// spoken. Off is the same thread as plain text.
+    /// Voice mode: the HUD is on screen, the mic is open and replies are
+    /// spoken. Off is the same thread as plain text. `Message::Listen` moves it
+    /// together with the recorder, and the wake word moves it on its own.
     pub voice: bool,
+    /// Wake-word standby: the mic stays open with the HUD down and replies
+    /// unspoken, waiting to hear "E.V.". The user's setting, mirrored from
+    /// `shell::Settings::wake_word` so this module needs no access to it.
+    ///
+    /// This is the one state where the mic is open and no HUD reports it, so
+    /// the composer says so instead — an open mic nobody can see is the one
+    /// thing this screen must never do.
+    pub standby: bool,
     /// Provider/model override for this thread; empty = the server's default.
     /// Persisted in `shell::Settings`, like every other screen preference.
     pub provider: String,
@@ -483,13 +681,9 @@ pub struct State {
     voiced: f32,
     /// Loudest frame of the current utterance, for the close-talk check.
     peak: f32,
-    /// `phase` when E.V. last finished a reply, or when you armed it: inside the
-    /// follow-up window you don't have to say its name.
+    /// `phase` when E.V. last finished a reply, or when you opened voice mode:
+    /// inside the follow-up window you don't have to say its name.
     last_reply: f32,
-    /// The mic button is on. Pressing it is intent enough on its own, so every
-    /// utterance that clears the gate while it is on gets sent — no wake word,
-    /// no clock. Cleared wherever the recorder is dropped.
-    armed: bool,
     /// `phase` while E.V.'s own voice is playing — the mic hears the speakers,
     /// so capture stays shut until a beat after it stops.
     spoke_at: f32,
@@ -514,6 +708,35 @@ pub struct State {
     /// An assistant turn is open and collecting deltas. Public so the view can
     /// keep the live turn's thinking section open while it streams.
     pub streaming: bool,
+    /// Screen an `open_screen` call asked for, waiting for the shell to pick it
+    /// up — this module has no way to change `App::screen` itself. Drained in
+    /// `main.rs` after every assistant message.
+    pub nav: Option<crate::Screen>,
+    /// A change the model proposed, waiting on the user. While this is set the
+    /// turn is stalled on purpose: no follow-up request goes out until it is
+    /// run or refused, so the model cannot talk its way past the card by
+    /// filling the transcript with more calls.
+    pub pending: Option<Box<crate::assistant_tools::Pending>>,
+    /// Ask before running a shell command. On by default: `run_command` is an
+    /// unrestricted terminal on the user's machine, and the persona asking the
+    /// model not to be destructive is a request, not a guard. Mirrored from
+    /// `shell::Settings::confirm_commands` — off is a choice the user makes
+    /// knowing what it means, not the default they never saw.
+    pub confirm_commands: bool,
+    /// Tool results of the round in progress, accumulated until every batch it
+    /// is waiting on has landed. A round's results must reach the model
+    /// together: the assistant turn carries N `tool_calls`, and a request that
+    /// answers only some of them is malformed.
+    held: Vec<ToolOutcome>,
+    /// Batches of `held` still outstanding for this round — one for the task
+    /// running the terminal and the REST reads, plus one for a parked proposal
+    /// waiting on the user. The next request goes out when this reaches zero,
+    /// and *only* then.
+    ///
+    /// Without it, deciding a card before the read task lands sent two
+    /// requests for one turn, the first of them missing the tool result the
+    /// model was still owed.
+    tool_waits: u8,
     /// Tool calls of the round in flight, assembled from streamed fragments.
     tool_buf: Vec<ToolCall>,
     /// Tool rounds taken since the user last spoke; capped by MAX_TOOL_ROUNDS.
@@ -535,13 +758,20 @@ pub struct State {
 }
 
 impl State {
+    /// Text, because voice mode now opens the mic and nothing should do that
+    /// before the user asks. Command confirmation on, for the same reason.
     pub fn new() -> Self {
-        Self { voice: true, voice_rate: DEFAULT_VOICE_RATE, ..Self::default() }
+        Self { voice_rate: DEFAULT_VOICE_RATE, confirm_commands: true, ..Self::default() }
     }
 
-    /// The screen's thread, opened on the persisted provider/model pair.
-    pub fn with_defaults(provider: String, model: String, voice_rate: i32) -> Self {
-        Self { provider, model, voice_rate, ..Self::new() }
+    /// The screen's thread, opened on the persisted settings.
+    pub fn with_defaults(
+        provider: String,
+        model: String,
+        voice_rate: i32,
+        confirm_commands: bool,
+    ) -> Self {
+        Self { provider, model, voice_rate, confirm_commands, ..Self::new() }
     }
 
     pub fn provider_ids(&self) -> Vec<String> {
@@ -565,8 +795,12 @@ impl State {
     }
 
     /// Whatever was just said counts as aimed at E.V. even though nobody named
-    /// it: either the mic button is on, or E.V. only just stopped talking and
-    /// this is the other half of the exchange.
+    /// it, because E.V. only just stopped talking and this is the other half of
+    /// the exchange. Outside it, the name is the wake word.
+    ///
+    /// The mic being open is deliberately *not* enough on its own. It used to
+    /// be, which meant an open mic answered the room — every phone call and
+    /// every conversation with someone else became a turn.
     ///
     /// Measured from `spoke_at` — the last frame E.V.'s voice was playing — and
     /// not from when its text finished. The gate is held shut while E.V. speaks,
@@ -574,7 +808,7 @@ impl State {
     /// the time you are physically able to answer, and a long spoken reply eats
     /// all of it.
     fn follow_up_open(&self) -> bool {
-        self.armed || since(self.phase, self.last_reply.max(self.spoke_at)) < FOLLOW_UP
+        since(self.phase, self.last_reply.max(self.spoke_at)) < FOLLOW_UP
     }
 
     /// Fold an accepted utterance into the enrolled voice. The first few carry
@@ -606,6 +840,27 @@ impl State {
         self.enrolled += 1;
     }
 
+    /// Open the mic, or leave it open if it already is. Idempotent on purpose:
+    /// voice mode and standby both want it, and restarting a live stream would
+    /// drop the frames of whatever is being said at that moment.
+    fn open_mic(&mut self) -> Result<(), String> {
+        if self.armed() {
+            return Ok(());
+        }
+        self.recorder = Some(crate::stt::Recorder::start()?);
+        self.capture = None;
+        self.onset = 0;
+        self.floor = ABS_FLOOR;
+        Ok(())
+    }
+
+    /// Drop the stream. The only honest way to say the mic is not on.
+    fn close_mic(&mut self) {
+        self.recorder = None;
+        self.capture = None;
+        self.onset = 0;
+    }
+
     /// Forget the enrolled voice — wrong person enrolled, or a new mic.
     pub fn forget_voice(&mut self) {
         self.voice_print = None;
@@ -633,7 +888,7 @@ impl State {
                     m.content.clone()
                 };
                 for c in m.tool_calls.iter().flatten() {
-                    shown.push_str(&format!("\n\n```\n$ {}\n```", command_of(c)));
+                    shown.push_str(&format!("\n\n```\n{}\n```", command_of(c)));
                 }
                 iced::widget::markdown::parse(&shown).collect()
             })
@@ -649,6 +904,23 @@ impl State {
         self.tool_buf.clear();
         self.tool_rounds = 0;
         self.error = None;
+    }
+
+    /// Fold a round's tool results into the thread. Wire content is the raw
+    /// output; the transcript shows it fenced.
+    fn push_tool_results(&mut self, results: Vec<ToolOutcome>) {
+        for r in results {
+            self.md.push(
+                iced::widget::markdown::parse(&format!("````text\n{}\n````", r.output)).collect(),
+            );
+            self.reasoning.push(String::new());
+            self.messages.push(ChatMessage {
+                role: "tool".into(),
+                content: r.output,
+                tool_calls: None,
+                tool_call_id: Some(r.id),
+            });
+        }
     }
 
     fn push_turn(&mut self, role: &str, content: String) {
@@ -678,7 +950,7 @@ impl State {
     /// Fire the chat request for the current history: persona, recall, then
     /// every visible turn (including tool calls and their results).
     fn request(&mut self, client: &Client) -> Task<Message> {
-        let mut messages = vec![ChatMessage::text("system", PERSONA)];
+        let mut messages = vec![ChatMessage::text("system", persona())];
         // Recall after the persona: who E.V. is comes first, then who it
         // is talking to.
         if let Some(recall) = &self.memory {
@@ -720,6 +992,13 @@ impl State {
         self.sending = false;
         self.streaming = false;
         self.tool_buf.clear();
+        // A card left on screen after the turn behind it was killed is a button
+        // that would send a change nothing is waiting for.
+        self.pending = None;
+        self.held.clear();
+        // A late `ToolResults` from the killed round must not decrement its way
+        // to zero and fire a request for a turn that is over.
+        self.tool_waits = 0;
     }
 
     /// Append a streamed delta to the assistant turn in flight, opening one if
@@ -782,6 +1061,7 @@ impl State {
         self.synthesizing = true;
         self.speaking = Some(text.clone());
         let rate = self.speech_rate();
+        let voice = voice();
         let client = client.clone();
         Task::perform(
             async move {
@@ -791,7 +1071,7 @@ impl State {
                 // every sentence, for an answer that will not change until the
                 // app is restarted.
                 if SERVER_SPEECH.load(std::sync::atomic::Ordering::Relaxed) {
-                    match client.speech(&text).await {
+                    match client.speech(&text, &voice).await {
                         Ok(bytes) => return Ok(bytes),
                         // The server answered and refused; only that is settled.
                         // A transport error is the server being down, and it
@@ -802,7 +1082,7 @@ impl State {
                         Err(_) => {}
                     }
                 }
-                tokio::task::spawn_blocking(move || synthesize(&text, rate))
+                tokio::task::spawn_blocking(move || synthesize(&text, rate, &voice))
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()))
             },
@@ -843,6 +1123,10 @@ impl State {
             || self.speaking()
             || !self.speech_queue.is_empty()
             || !self.audio_queue.is_empty()
+            // Standby listening runs off this beat too. The gate, the analyzer
+            // and the utterance capture all step in `Tick`, so without it the
+            // mic is open and nothing is reading it.
+            || (self.standby && self.armed())
     }
 
     pub fn mode(&self) -> Mode {
@@ -1097,10 +1381,10 @@ fn warm_voice() -> Task<Message> {
 
 /// Neural synthesis over Edge's websocket. Blocking, so callers wrap it in
 /// `spawn_blocking`; MP3 bytes come back for rodio to decode.
-fn synthesize(text: &str, rate: i32) -> Result<Vec<u8>, String> {
+fn synthesize(text: &str, rate: i32, voice: &str) -> Result<Vec<u8>, String> {
     use msedge_tts::tts::SpeechConfig;
     let config = SpeechConfig {
-        voice_name: EDGE_VOICE.into(),
+        voice_name: edge_voice(voice),
         audio_format: "audio-24khz-96kbitrate-mono-mp3".into(),
         pitch: 0,
         rate,
@@ -1155,8 +1439,12 @@ pub enum Message {
     Send,
     /// Stop the turn in flight — Esc, or the mic button while it is talking.
     Abort,
-    /// Toggle: first press starts the mic, second press stops and transcribes.
+    /// Enter or leave voice mode. One control, because the two halves were
+    /// never independently useful: voice mode with the mic shut is a HUD
+    /// reporting on nothing, and an open mic without it is unwitnessed.
     Listen,
+    /// Wake-word standby on or off — the Settings toggle, mirrored here.
+    SetStandby(bool),
     /// A finished utterance: what was said, and the voice that said it.
     Heard(Result<(String, Option<crate::stt::VoicePrint>), String>),
     OpenMicSettings,
@@ -1168,7 +1456,8 @@ pub enum Message {
     /// The terminal finished a round of tool calls; results go back to the model.
     ToolResults(Vec<ToolOutcome>),
     Synthesized(Result<Vec<u8>, String>),
-    ToggleVoice,
+    /// The confirm card: run the proposed change, or refuse it.
+    Decide(bool),
     Clear,
     /// Drop the enrolled voice and learn the next speaker from scratch.
     ForgetVoice,
@@ -1251,22 +1540,58 @@ pub fn update(
             Task::none()
         }
         Message::ToolResults(results) => {
-            for r in results {
-                // Wire content is the raw output; the transcript shows it fenced.
-                state
-                    .md
-                    .push(iced::widget::markdown::parse(&format!("````text\n{}\n````", r.output)).collect());
-                state.reasoning.push(String::new());
-                state.messages.push(ChatMessage {
-                    role: "tool".into(),
-                    content: r.output,
-                    tool_calls: None,
-                    tool_call_id: Some(r.id),
-                });
+            // Nothing is waiting on this: the round was aborted or cleared while
+            // the task was still running. Its results answer a request that is
+            // never going out, and folding them in would open a turn nobody
+            // asked for.
+            if state.tool_waits == 0 {
+                return Task::none();
             }
+            state.held.extend(results);
+            state.tool_waits -= 1;
+            // Another batch of this same round is still out — a card the user
+            // has not answered, or the read task. Sending now would answer only
+            // some of the turn's tool calls.
+            if state.tool_waits > 0 {
+                return Task::none();
+            }
+            let all = std::mem::take(&mut state.held);
+            state.push_tool_results(all);
             state.tool_rounds += 1;
             // Still `sending`: the reply continues with the results in hand.
             state.request(client)
+        }
+        Message::Decide(run) => {
+            let Some(proposal) = state.pending.take() else { return Task::none() };
+            if !run {
+                let summary = proposal.summary();
+                // Straight into the same accumulator the read task feeds, so a
+                // refusal decided while that task is still running waits for it
+                // rather than racing it.
+                return update(
+                    state,
+                    client,
+                    memory,
+                    Message::ToolResults(vec![ToolOutcome {
+                        id: proposal.id().to_string(),
+                        // Said plainly so the model stops rather than rephrasing
+                        // the same thing and asking again.
+                        output: format!(
+                            "The user refused this ({summary}). Nothing ran and nothing was \
+                             sent. Do not retry it unless they ask."
+                        ),
+                    }]),
+                );
+            }
+            let client = client.clone();
+            Task::perform(
+                async move {
+                    let id = proposal.id().to_string();
+                    let output = run_pending(&client, &proposal).await;
+                    vec![ToolOutcome { id, output }]
+                },
+                Message::ToolResults,
+            )
         }
         Message::Chunk(ChatChunk::Reasoning(text)) => {
             // Shown in the transcript, never spoken: E.V. reading its own
@@ -1324,31 +1649,87 @@ pub fn update(
                 state.messages[last].tool_calls = Some(calls.clone());
                 let mut shown = state.messages[last].content.clone();
                 for c in &calls {
-                    shown.push_str(&format!("\n\n```\n$ {}\n```", command_of(c)));
+                    shown.push_str(&format!("\n\n```\n{}\n```", command_of(c)));
                 }
                 state.md[last] = iced::widget::markdown::parse(&shown).collect();
-                // Memory calls are answered here and now, against the live store
-                // the dashboard shows; only the terminal ones need a task.
-                let (mem_calls, shell_calls): (Vec<_>, Vec<_>) = calls
-                    .into_iter()
-                    .partition(|c| crate::memory::TOOLS.contains(&c.function.name.as_str()));
-                let done: Vec<ToolOutcome> = mem_calls
-                    .into_iter()
-                    .filter_map(|c| {
-                        crate::memory::run_tool(memory, &c.function.name, &c.function.arguments)
-                            .map(|output| ToolOutcome { id: c.id, output })
-                    })
-                    .collect();
-                if !done.is_empty() {
+                // Memory and navigation are answered here and now, against live
+                // app state; the terminal and the REST reads need a task.
+                let confirm_commands = state.confirm_commands;
+                let (local, remote): (Vec<_>, Vec<_>) = calls.into_iter().partition(|c| {
+                    let name = c.function.name.as_str();
+                    crate::memory::TOOLS.contains(&name)
+                        || crate::assistant_tools::SYNC_TOOLS.contains(&name)
+                        // With confirmation on the terminal is parked like any
+                        // other proposal; with it off it goes straight out, as
+                        // it always did.
+                        || (confirm_commands && name == "run_command")
+                });
+                let mut done: Vec<ToolOutcome> = Vec::with_capacity(local.len());
+                let mut wrote_memory = false;
+                for c in local {
+                    use crate::assistant_tools::Sync;
+                    let name = c.function.name.clone();
+                    if let Some(out) =
+                        crate::assistant_tools::run_sync_tool(&c.id, &name, &c.function.arguments)
+                    {
+                        match out {
+                            Sync::Answered(output) => done.push(ToolOutcome { id: c.id, output }),
+                            // The shell does the moving; see `nav`. Last one
+                            // wins — a round asking for two screens can only
+                            // land on one.
+                            Sync::Navigated(output, screen) => {
+                                state.nav = Some(screen);
+                                done.push(ToolOutcome { id: c.id, output });
+                            }
+                            // One card at a time. A round proposing two changes
+                            // gets the first and an answer for the rest — a
+                            // queue of confirmations is a queue of things the
+                            // user stops reading.
+                            Sync::Parked(w) if state.pending.is_none() => state.pending = Some(w),
+                            Sync::Parked(_) => done.push(ToolOutcome {
+                                id: c.id,
+                                output: "error: one change at a time — this one was not \
+                                         proposed. Ask again after the first is decided."
+                                    .into(),
+                            }),
+                        }
+                        continue;
+                    }
+                    if let Some(output) =
+                        crate::memory::run_tool(memory, &name, &c.function.arguments)
+                    {
+                        wrote_memory = true;
+                        done.push(ToolOutcome { id: c.id, output });
+                    }
+                }
+                if wrote_memory {
                     // The next request in this same turn must recall what was
                     // just written, not what was remembered before it.
                     state.memory = memory.system_block();
                 }
-                return Task::batch([
+                // What this round is waiting on: the task below when there is
+                // anything for it to carry, and the user's answer when a
+                // proposal was parked. The request goes out when both have
+                // landed and not before — see `tool_waits`.
+                //
+                // A round whose only call was parked spawns no task at all: an
+                // empty batch would be a message round-trip whose whole content
+                // is "nothing happened".
+                let task_needed = !(remote.is_empty() && done.is_empty());
+                state.held.clear();
+                state.tool_waits =
+                    u8::from(task_needed) + u8::from(state.pending.is_some());
+                let mut tasks = vec![
                     iced::widget::operation::snap_to_end(transcript_id()),
                     state.next_synthesis(client),
-                    Task::perform(run_tools(shell_calls, done), Message::ToolResults),
-                ]);
+                ];
+                if task_needed {
+                    tasks.push(Task::perform(
+                        run_tools(client.clone(), remote, done),
+                        Message::ToolResults,
+                    ));
+                }
+                return Task::batch(tasks);
             }
             state.sending = false;
             // A turn that produced neither a word nor a tool call: some models
@@ -1384,28 +1765,48 @@ pub fn update(
             Task::none()
         }
         Message::Listen => {
-            // Toggle hands-free listening. Off drops the stream, which is the
-            // only honest way to say "the mic is not on".
-            if state.recorder.take().is_some() {
-                state.capture = None;
-                state.onset = 0;
-                state.armed = false;
+            // Leaving drops the stream, which is the only honest way to say
+            // "the mic is not on", and takes the HUD and the spoken replies
+            // with it — unless standby wants the mic anyway, in which case it
+            // stays open and the composer says so.
+            if state.voice {
+                state.hush();
+                state.voice = false;
+                if !state.standby {
+                    state.close_mic();
+                }
                 return Task::none();
             }
             state.hush();
-            match crate::stt::Recorder::start() {
-                Ok(rec) => {
-                    state.recorder = Some(rec);
-                    state.capture = None;
-                    state.onset = 0;
-                    state.floor = ABS_FLOOR;
-                    // You pressed the button, so anything you say while it is on
-                    // is obviously for E.V. — no need to name it, and no
-                    // deadline to say it by.
-                    state.last_reply = state.phase;
-                    state.armed = true;
+            // Standby already has the mic; coming up into voice mode is not a
+            // second recorder, and restarting the stream would drop the frames
+            // of whatever is being said right now.
+            if let Err(e) = state.open_mic() {
+                // No mic, no voice mode: entering it anyway would put a HUD on
+                // screen that can never hear anything.
+                state.error = Some(e);
+                return Task::none();
+            }
+            // You pressed the button, so the first thing you say is obviously
+            // for E.V. — the follow-up window opens here so it needs no name.
+            // After that the name is the wake word.
+            state.last_reply = state.phase;
+            state.voice = true;
+            Task::none()
+        }
+        Message::SetStandby(on) => {
+            state.standby = on;
+            match (on, state.voice) {
+                // Voice mode owns the mic while it is up; standby inherits it
+                // when the user leaves, and gives it back here.
+                (true, false) => {
+                    if let Err(e) = state.open_mic() {
+                        state.error = Some(e);
+                        state.standby = false;
+                    }
                 }
-                Err(e) => state.error = Some(e),
+                (false, false) => state.close_mic(),
+                _ => {}
             }
             Task::none()
         }
@@ -1438,10 +1839,23 @@ pub fn update(
                     }
                     // Addressed by name, or spoken inside the follow-up window
                     // after E.V.'s last reply → it was meant for E.V.
-                    let follow_up = state.follow_up_open() && mine;
+                    //
+                    // Standby is the exception: the mic is open across the whole
+                    // app with nothing on screen reporting a conversation, so
+                    // the name is the *only* way in. No follow-up window, or a
+                    // wake would leave the room answered for the next 45s.
+                    let waking = state.standby && !state.voice;
+                    let follow_up = state.follow_up_open() && mine && !waking;
                     // Another voice never auto-sends, however it phrased itself:
                     // it lands in the composer for you to send or discard.
                     let addressed = if mine { addressed(&text) } else { None };
+                    if addressed.is_some() && waking {
+                        // Heard its name from standby: come up into voice mode
+                        // so the answer is spoken and the HUD says who is
+                        // listening. The mic is already open — this is the same
+                        // recorder, not a second one.
+                        state.voice = true;
+                    }
                     match (addressed, follow_up) {
                         (Some(body), _) if !body.trim().is_empty() => {
                             state.draft = body.to_string();
@@ -1456,6 +1870,15 @@ pub fn update(
                             state.draft = text;
                             update(state, client, memory, Message::Send)
                         }
+                        // Heard, but nothing said it was for E.V. — park it in
+                        // the composer rather than answering the room. Appended,
+                        // not assigned: overwriting would eat what you typed, and
+                        // eat the first half of a sentence the gate split in two.
+                        // Standby heard the room, not its name. Dropped on the
+                        // floor: filling a composer nobody is looking at with a
+                        // transcript of everything said near the machine is a
+                        // recording, not a feature.
+                        (None, false) if waking => Task::none(),
                         // Heard, but nothing said it was for E.V. — park it in
                         // the composer rather than answering the room. Appended,
                         // not assigned: overwriting would eat what you typed, and
@@ -1501,20 +1924,6 @@ pub fn update(
             crate::shell::reveal_path("ms-settings:privacy-microphone");
             Task::none()
         }
-        Message::ToggleVoice => {
-            state.voice = !state.voice;
-            if !state.voice {
-                // Leaving voice mode closes the mic too — the HUD it was
-                // reported on is gone, and a live mic nobody can see is the one
-                // thing this screen must never do.
-                state.hush();
-                state.recorder = None;
-                state.capture = None;
-                state.onset = 0;
-                state.armed = false;
-            }
-            Task::none()
-        }
         Message::Clear => {
             state.hush();
             state.messages.clear();
@@ -1524,6 +1933,9 @@ pub fn update(
             state.streaming = false;
             state.tool_buf.clear();
             state.tool_rounds = 0;
+            state.pending = None;
+            state.held.clear();
+            state.tool_waits = 0;
             state.error = None;
             Task::none()
         }
@@ -1821,19 +2233,141 @@ mod tests {
 
     #[test]
     fn muted_reply_skips_synthesis() {
-        let mut s = State { voice: false, ..State::new() };
+        let mut s = State::new();
         reply(&mut s, "hello");
         assert_eq!(s.messages.len(), 1);
         assert!(!s.synthesizing);
         assert_eq!(s.mode(), Mode::Idle);
+    }
 
-        let _ = update(&mut s, &client(), &mut mem(), Message::ToggleVoice);
-        assert!(s.voice);
+    /// Standby has the mic open with nothing on screen reporting a
+    /// conversation, so the name is the only way in — the follow-up window does
+    /// not apply, or one wake would leave the room answered for 45 seconds.
+    #[test]
+    fn standby_wakes_on_its_name_and_drops_everything_else() {
+        // `last_reply` is now, so the follow-up window would be wide open. It
+        // must not be what decides this.
+        let mut s = State { standby: true, phase: 300.0, last_reply: 300.0, ..State::new() };
+        assert!(s.follow_up_open(), "the window is open, and standby ignores it anyway");
+
+        heard(&mut s, "so anyway I told him no");
+        assert!(s.messages.is_empty(), "the room does not get answered");
+        assert!(s.draft.is_empty(), "and does not get transcribed into the composer either");
+        assert!(!s.voice);
+
+        heard(&mut s, "hey E.V., run diagnostics");
+        assert!(s.voice, "its name brings the HUD up, so the answer is spoken and visible");
+        assert_eq!(s.messages.last().unwrap().content, "run diagnostics");
+        assert!(s.sending);
+
+        // Awake now, so the ordinary follow-up rules are back: no second name.
+        s.sending = false;
+        s.last_reply = s.phase;
+        heard(&mut s, "and the disk too");
+        assert_eq!(s.messages.last().unwrap().content, "and the disk too");
+    }
+
+    /// The confirm card is load-bearing: while one is up nothing may reach the
+    /// model, and refusing must not put a request on the wire.
+    #[test]
+    fn a_proposed_change_stalls_the_turn_until_it_is_decided() {
+        use crate::assistant_tools::Pending;
+        let mut s = State { sending: true, ..State::new() };
+        s.pending = Some(Box::new(Pending::Write {
+            id: "call_1".into(),
+            method: "DELETE".into(),
+            path: "/api/v1/projects/3".into(),
+            body: serde_json::json!({}),
+        }));
+        // The read task, and the card: two batches before the round is whole.
+        s.tool_waits = 2;
+
+        // The rest of the round arrives and is held, not forwarded.
+        let _ = update(
+            &mut s,
+            &client(),
+            &mut mem(),
+            Message::ToolResults(vec![ToolOutcome { id: "call_0".into(), output: "[]".into() }]),
+        );
+        assert!(s.messages.is_empty(), "nothing reaches the model with a card still up");
+        assert_eq!(s.held.len(), 1, "and it is kept, not dropped");
+
+        let _ = update(&mut s, &client(), &mut mem(), Message::Decide(false));
+        assert!(s.pending.is_none(), "the card is spent either way");
+        assert!(s.held.is_empty());
+        // Both the held result and the refusal reach the model together.
+        assert_eq!(s.messages.len(), 2);
+        assert!(
+            s.messages.last().unwrap().content.contains("refused"),
+            "the model must be told plainly, or it rephrases and asks again: {:?}",
+            s.messages.last().unwrap().content
+        );
+        assert_eq!(s.messages.last().unwrap().tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(s.tool_waits, 0, "the round is whole");
+    }
+
+    /// Deciding the card before the read task lands used to send two requests
+    /// for one turn — the first of them answering only some of the assistant
+    /// turn's `tool_calls`, which is a malformed thread.
+    #[test]
+    fn deciding_before_the_read_lands_still_sends_one_whole_round() {
+        use crate::assistant_tools::Pending;
+        let mut s = State { sending: true, ..State::new() };
+        s.pending = Some(Box::new(Pending::Command {
+            id: "call_1".into(),
+            command: "rm -rf build".into(),
+        }));
+        s.tool_waits = 2;
+
+        // Refused first, while the read is still out.
+        let _ = update(&mut s, &client(), &mut mem(), Message::Decide(false));
+        assert!(s.messages.is_empty(), "the turn cannot go out yet — a batch is missing");
+        assert_eq!(s.tool_waits, 1);
+        assert_eq!(s.held.len(), 1, "the refusal waits with the rest");
+
+        // The read lands second and completes the round.
+        let _ = update(
+            &mut s,
+            &client(),
+            &mut mem(),
+            Message::ToolResults(vec![ToolOutcome { id: "call_0".into(), output: "[]".into() }]),
+        );
+        assert_eq!(s.messages.len(), 2, "both tool calls answered, in one request");
+        assert_eq!(s.tool_waits, 0);
+        assert!(s.held.is_empty());
+    }
+
+    /// A batch that outlives the turn it belonged to must be dropped, not folded
+    /// into the thread — Esc kills the round, and its read task lands anyway.
+    #[test]
+    fn results_from_an_aborted_round_are_dropped() {
+        let mut s = State { sending: true, ..State::new() };
+        s.tool_waits = 1;
+        s.abort_turn();
+        let _ = update(
+            &mut s,
+            &client(),
+            &mut mem(),
+            Message::ToolResults(vec![ToolOutcome { id: "call_0".into(), output: "[]".into() }]),
+        );
+        assert!(s.messages.is_empty(), "an aborted round does not re-open itself");
+        assert!(s.held.is_empty());
+        assert_eq!(s.tool_waits, 0);
+    }
+
+    /// Voice mode and the mic are one state now, so leaving takes both — a HUD
+    /// on screen with no recorder behind it is the bug this merge removes.
+    #[test]
+    fn leaving_voice_mode_closes_the_mic() {
+        let mut s = State { voice: true, ..State::new() };
+        let _ = update(&mut s, &client(), &mut mem(), Message::Listen);
+        assert!(!s.voice);
+        assert!(!s.armed());
     }
 
     #[test]
     fn reasoning_is_shown_but_never_spoken() {
-        let mut s = State::new(); // voice on
+        let mut s = State { voice: true, ..State::new() };
         let _ = update(
             &mut s,
             &client(),
@@ -2021,6 +2555,34 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_assistant_answers_to_its_own_name() {
+        // Default name: the built-in spellings still apply, so `addressed`
+        // keeps its fallback (empty list) rather than being pinned to "ev".
+        assert!(resolve_wake(DEFAULT_NAME, "").is_empty());
+        // Renamed with nothing else said: the name is the wake word.
+        assert_eq!(resolve_wake("Jarvis", ""), vec!["jarvis"]);
+        // Spellings win, whatever the name — punctuation, case and blanks out.
+        assert_eq!(
+            resolve_wake("Jarvis", " Jarvis, jar-vis , , JARVIZ "),
+            vec!["jarvis", "jarvis", "jarviz"]
+        );
+        assert_eq!(resolve_wake(DEFAULT_NAME, "eva,evie"), vec!["eva", "evie"]);
+    }
+
+    #[test]
+    fn a_voice_id_reaches_edge_in_the_form_it_wants() {
+        assert_eq!(
+            edge_voice("en-GB-RyanNeural"),
+            "Microsoft Server Speech Text to Speech Voice (en-GB, RyanNeural)"
+        );
+        // Empty and malformed both fall back rather than reaching Edge as a
+        // voice it will refuse in front of every sentence.
+        let default = edge_voice(DEFAULT_VOICE);
+        assert_eq!(edge_voice(""), default);
+        assert_eq!(edge_voice("mytrainedvoice"), default);
+    }
+
+    #[test]
     fn the_gate_ignores_noise_that_is_not_voice_shaped() {
         // Flat broadband hiss and low rumble both fail the speech-band test;
         // a voice-shaped frame passes it.
@@ -2077,13 +2639,13 @@ mod tests {
     #[test]
     #[ignore = "network: hits Edge's TTS endpoint"]
     fn live_edge_synthesis() {
-        let bytes = synthesize("Systems online. Good to see you.", DEFAULT_VOICE_RATE).unwrap();
+        let bytes = synthesize("Systems online. Good to see you.", DEFAULT_VOICE_RATE, DEFAULT_VOICE).unwrap();
         assert!(bytes.len() > 1000, "suspiciously small audio: {} bytes", bytes.len());
         // The whole point of keeping the socket: sentence two must not need a
         // second handshake. If Edge closed the turn, the retry inside
         // `synthesize` still answers — but silently, and the latency win is
         // gone, so assert the connection itself survived.
-        let again = synthesize("Second sentence, same socket.", DEFAULT_VOICE_RATE).unwrap();
+        let again = synthesize("Second sentence, same socket.", DEFAULT_VOICE_RATE, DEFAULT_VOICE).unwrap();
         assert!(again.len() > 1000);
         assert!(edge_lock().is_some(), "the socket was thrown away between sentences");
     }
@@ -2092,7 +2654,7 @@ mod tests {
     #[ignore = "network + model download: full TTS→STT round trip"]
     fn live_voice_round_trip() {
         use rodio::Source;
-        let bytes = synthesize("Hello Peter, systems are online.", DEFAULT_VOICE_RATE).unwrap();
+        let bytes = synthesize("Hello Peter, systems are online.", DEFAULT_VOICE_RATE, DEFAULT_VOICE).unwrap();
         let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes)).unwrap();
         let (channels, rate) = (decoder.channels(), decoder.sample_rate());
         let raw: Vec<f32> = decoder.convert_samples().collect();
@@ -2103,7 +2665,7 @@ mod tests {
 
     #[test]
     fn voiced_reply_enters_synthesis() {
-        let mut s = State::new();
+        let mut s = State { voice: true, ..State::new() };
         reply(&mut s, "hi");
         assert!(s.synthesizing);
         assert_eq!(s.mode(), Mode::Thinking);
@@ -2111,7 +2673,7 @@ mod tests {
 
     #[test]
     fn the_first_sentence_is_synthesized_before_the_reply_ends() {
-        let mut s = State { draft: "status".into(), ..State::new() };
+        let mut s = State { draft: "status".into(), voice: true, ..State::new() };
         let _ = update(&mut s, &client(), &mut mem(), Message::Send);
         // Mid-stream: one closed sentence, one still arriving.
         let _ = update(
@@ -2140,7 +2702,14 @@ mod tests {
     #[test]
     fn a_tool_round_runs_the_terminal_and_keeps_the_turn_open() {
         use agent_platform_client::sse::ToolCallDelta;
-        let mut s = State { draft: "how much disk is free?".into(), voice: false, ..State::new() };
+        // Confirmation off: this is the straight-through path, still the one
+        // the round-plumbing has to get right. The card is the test below.
+        let mut s = State {
+            draft: "how much disk is free?".into(),
+            voice: false,
+            confirm_commands: false,
+            ..State::new()
+        };
         let _ = update(&mut s, &client(), &mut mem(), Message::Send);
 
         // The model narrates, then asks for the terminal in streamed fragments.
@@ -2162,7 +2731,9 @@ mod tests {
         let calls = turn.tool_calls.as_ref().expect("calls attached to the assistant turn");
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].function.arguments, "{\"command\": \"Get-PSDrive C\"}");
-        assert_eq!(command_of(&calls[0]), "Get-PSDrive C");
+        // The prompt marker belongs to the terminal alone — an `api_get` row
+        // carrying one claimed it had been through a shell.
+        assert_eq!(command_of(&calls[0]), "$ Get-PSDrive C");
         assert!(s.sending, "the turn stays open while the terminal works");
         assert!(s.tool_buf.is_empty());
 
@@ -2181,6 +2752,42 @@ mod tests {
         assert_eq!(s.tool_rounds, 1);
         assert!(s.sending);
         assert_eq!(s.messages.len(), s.md.len(), "transcript and markdown stay aligned");
+    }
+
+    /// The default. A shell command is the largest thing E.V. can reach, so it
+    /// stops at the card like any other proposal — and refusing it must leave
+    /// nothing run.
+    #[test]
+    fn the_terminal_stops_at_the_card_by_default() {
+        use agent_platform_client::sse::ToolCallDelta;
+        let mut s = State { draft: "delete the build folder".into(), ..State::new() };
+        assert!(s.confirm_commands, "the guard is on unless the user turned it off");
+        let _ = update(&mut s, &client(), &mut mem(), Message::Send);
+        for d in [
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("run_command".into()),
+                arguments: r#"{"command": "rm -rf "#.into(),
+            },
+            ToolCallDelta { index: 0, arguments: r#"build"}"#.into(), ..Default::default() },
+        ] {
+            let _ = update(&mut s, &client(), &mut mem(), Message::Chunk(ChatChunk::ToolCall(d)));
+        }
+        let _ = update(&mut s, &client(), &mut mem(), Message::Chunk(ChatChunk::Done));
+
+        let card = s.pending.as_ref().expect("a command must not run itself");
+        assert_eq!(card.summary(), "$ rm -rf build");
+        assert_eq!(card.heading(), "Run this on your machine?");
+        assert!(s.messages.iter().all(|m| m.role != "tool"), "nothing ran, so nothing answered");
+
+        let _ = update(&mut s, &client(), &mut mem(), Message::Decide(false));
+        assert!(s.pending.is_none());
+        let answer = s.messages.last().unwrap();
+        assert_eq!(answer.role, "tool");
+        assert_eq!(answer.tool_call_id.as_deref(), Some("call_1"));
+        assert!(answer.content.contains("refused"), "{:?}", answer.content);
+        assert!(answer.content.contains("rm -rf build"), "it must name what was refused");
     }
 
     /// A memory call is answered against the store the dashboard shows, and the
@@ -2290,7 +2897,7 @@ mod tests {
 
     #[test]
     fn hush_drops_queued_speech() {
-        let mut s = State::new();
+        let mut s = State { voice: true, ..State::new() };
         reply(&mut s, "One thing and another thing. Then a second sentence here.");
         s.audio_queue.push_back(vec![0u8; 4]);
         s.hush();
@@ -2324,36 +2931,36 @@ mod tests {
     }
 
     #[test]
-    fn everything_said_while_armed_sends_however_long_you_took() {
-        // Pressed the mic button, then thought about it for a minute.
-        let mut s = State { phase: 300.0, last_reply: 0.0, armed: true, ..State::new() };
+    fn an_open_mic_goes_back_to_needing_the_name() {
+        // Opening voice mode opens the window, so the first thing said needs no
+        // name — you just pressed the button, it is obviously for E.V.
+        let mut s = State { phase: 300.0, last_reply: 300.0, ..State::new() };
         assert!(s.follow_up_open());
         heard(&mut s, "run diagnostics");
         assert_eq!(s.messages.last().unwrap().content, "run diagnostics");
         assert!(s.sending);
 
-        // ...and so does the second one, long after and unaddressed. The button
-        // is still on, so it is still being talked to.
+        // A minute later, with no reply in between, the window has shut. An open
+        // mic is not consent to answer the room: unaddressed speech parks.
         s.sending = false;
         s.phase = 400.0;
-        heard(&mut s, "and the second one?");
-        assert_eq!(s.messages.last().unwrap().content, "and the second one?");
-        assert!(s.sending, "armed means armed until you press it again");
-
-        // Pressing it again ends that: unaddressed speech parks in the composer.
-        s.armed = false;
-        s.sending = false;
-        s.phase = 500.0;
         heard(&mut s, "so anyway I told him no");
-        assert_eq!(s.messages.len(), 2, "no new turn");
+        assert_eq!(s.messages.len(), 1, "no new turn");
         assert_eq!(s.draft, "so anyway I told him no");
+
+        // Naming it is what wakes it, however long the mic has been open.
+        s.draft.clear();
+        s.phase = 500.0;
+        heard(&mut s, "hey E.V., run diagnostics again");
+        assert_eq!(s.messages.last().unwrap().content, "run diagnostics again");
+        assert!(s.sending);
     }
 
     #[test]
     fn whispers_stock_captions_for_silence_never_reach_the_model() {
-        // A cough with the mic armed: whisper captions it "Thank you." and the
-        // armed path would send that as a turn.
-        let mut s = State { armed: true, phase: 300.0, voice: false, ..State::new() };
+        // A cough inside the follow-up window: whisper captions it "Thank you."
+        // and the window would send that as a turn.
+        let mut s = State { phase: 300.0, last_reply: 300.0, voice: false, ..State::new() };
         heard(&mut s, "Thank you.");
         heard(&mut s, " you ");
         heard(&mut s, "Thanks for watching!");

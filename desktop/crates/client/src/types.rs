@@ -673,6 +673,10 @@ pub struct CoderThreadOut {
     pub title: String,
     #[serde(default)]
     pub workspace_root: Option<String>,
+    /// The model the thread was answered on. The server pins it per thread and
+    /// falls back to it whenever a turn does not name one.
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub messages: Vec<Value>,
 }

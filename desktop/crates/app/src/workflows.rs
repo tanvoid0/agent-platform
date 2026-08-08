@@ -95,6 +95,8 @@ pub enum Message {
     Save,
     Saved(Result<Box<WorkflowInfo>, String>),
     Dismiss,
+    /// "View logs" on a traced error banner — intercepted in `main::update`
+    TraceLogs(String),
 }
 
 fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
@@ -414,6 +416,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.notice.clear();
             Task::none()
         }
+        Message::TraceLogs(_) => Task::none(),
     }
 }
 

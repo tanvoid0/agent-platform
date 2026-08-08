@@ -288,6 +288,30 @@ pub fn badge(tone: Tone) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// [`badge`] that is a button — a trace id in a log row, which filters to its
+/// request when clicked.
+pub fn badge_button(tone: Tone) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let t = tokens(theme);
+        let color = tone_color(&t, tone);
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: Some(Background::Color(alpha(
+                color,
+                match (t.dark, hovered) {
+                    (true, false) => 0.18,
+                    (true, true) => 0.32,
+                    (false, false) => 0.12,
+                    (false, true) => 0.24,
+                },
+            ))),
+            text_color: color,
+            border: Border { color: alpha(color, 0.35), width: 1.0, radius: radius::PILL.into() },
+            ..button::Style::default()
+        }
+    }
+}
+
 /// shadcn `Alert` variants.
 pub fn alert(tone: Tone) -> impl Fn(&Theme) -> container::Style {
     move |theme| {

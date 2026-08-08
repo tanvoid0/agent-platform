@@ -136,8 +136,39 @@ pub struct Settings {
     /// pace. See `assistant::VOICE_RATES`.
     #[serde(default = "default_voice_rate")]
     pub voice_rate: i32,
-    /// Chat screen's provider/model override, kept across restarts.
-    /// Empty = the server's default.
+    /// What the assistant is called, everywhere the user sees it. Empty = the
+    /// default ("E.V."). Display only: the `source` filed on its chats and
+    /// memories stays `assistant::NAME`.
+    #[serde(default)]
+    pub assistant_name: String,
+    /// How the wake word may be spelled, comma-separated, because whisper
+    /// writes a spoken name a dozen ways ("eva", "ava", "evie"). Empty = the
+    /// name itself, or the built-in list while the name is the default one.
+    #[serde(default)]
+    pub wake_names: String,
+    /// TTS voice id — `en-US-AriaNeural` for Edge, or whatever a trained model
+    /// is called on the `SPEECH_API_BASE` backend. Empty = each engine's own
+    /// default.
+    #[serde(default)]
+    pub voice_name: String,
+    /// Keep the mic open across the whole app, waiting to hear its name. Off by
+    /// default and never turned on by anything but the user: it is the one
+    /// setting that opens a microphone they did not just click a button for.
+    #[serde(default)]
+    pub wake_word: bool,
+    /// Show a confirm card before E.V. runs a shell command. On by default, and
+    /// `default = true` rather than `#[serde(default)]` on purpose: a settings
+    /// file written before this existed must come back with the terminal
+    /// guarded, not silently open.
+    #[serde(default = "default_true")]
+    pub confirm_commands: bool,
+    /// The app-wide provider/model default, kept across restarts. Empty = the
+    /// server's default. Set from the Chat header, and what every screen
+    /// without a picker of its own opens a new conversation on — the embedded
+    /// chats on Processes, and the Coder screen when its own pair is unset.
+    /// A conversation already under way keeps the pair it started on: E.V.'s in
+    /// `chats.json`, Coder's on the server's thread row, the embedded chats' in
+    /// memory for as long as the thread lives.
     pub chat_provider: String,
     pub chat_model: String,
     /// GGUF to answer chat with in-process (ADR 0006). Empty — the default —
@@ -194,6 +225,11 @@ impl Default for Settings {
             theme: ThemeMode::default(),
             hud_style: HudStyle::default(),
             voice_rate: default_voice_rate(),
+            assistant_name: String::new(),
+            wake_names: String::new(),
+            voice_name: String::new(),
+            wake_word: false,
+            confirm_commands: true,
             chat_provider: String::new(),
             chat_model: String::new(),
             local_model_path: String::new(),

@@ -493,6 +493,17 @@ pub fn load_catalog(client: &Client) -> Task<Message> {
     )
 }
 
+/// Which provider offers `model`, for putting the header back on a reopened
+/// thread. Empty when the catalog has not loaded or does not list it — which
+/// costs nothing, since an empty provider offers every model in the dropdown.
+fn provider_of(catalog: &[ProviderEntry], model: &str) -> String {
+    catalog
+        .iter()
+        .find(|p| p.models.options.iter().any(|m| m == model))
+        .map(|p| p.id.clone())
+        .unwrap_or_default()
+}
+
 /// Human-readable summary of a call, for the transcript row. `run_command`
 /// shows the command itself — a row reading "run_command" is one the user
 /// learns to approve without reading.
@@ -850,6 +861,14 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             // one project while the transcript describes another.
             if let Some(root) = thread.workspace_root.as_deref().filter(|r| !r.trim().is_empty()) {
                 state.root = Some(PathBuf::from(root));
+            }
+            // So does the model. The server pins it on the thread and falls back
+            // to it, so leaving the header on the last session's pick would send
+            // that instead — a reopened session answering on a different model
+            // than the one that wrote the rest of it.
+            if let Some(model) = thread.model.as_deref().filter(|m| !m.trim().is_empty()) {
+                state.provider = provider_of(&state.catalog, model);
+                state.model = model.to_string();
             }
             state.thread_id = Some(thread.thread_id);
             state.turns = rebuild_turns(&thread.messages);
@@ -1746,6 +1765,60 @@ mod tests {
         assert_eq!(s.model_options(), vec!["qwen/qwen3-coder-30b"]);
     }
 
+    /// The server pins a model on the thread and falls back to it, so a
+    /// reopened session must put the header back on it — otherwise the next
+    /// turn sends the last session's pick and the conversation changes model
+    /// halfway through.
+    #[test]
+    fn reopening_a_session_restores_the_model_it_was_answered_on() {
+        use agent_platform_client::types::*;
+        let mut s = State {
+            provider: "ollama".into(),
+            model: "gemma4:latest".into(),
+            catalog: vec![ProviderEntry {
+                id: "lm_studio".into(),
+                label: "LM Studio".into(),
+                configured: true,
+                local: true,
+                models: ProviderModels {
+                    options: vec!["qwen/qwen3-coder-30b".into()],
+                    selected_model: String::new(),
+                    source: "discovery".into(),
+                    warning: None,
+                    fallback_note: None,
+                },
+            }],
+            ..open_state()
+        };
+        let _ = update(
+            &mut s,
+            &client(),
+            Message::ThreadLoaded(Ok(Box::new(CoderThreadOut {
+                thread_id: 7,
+                title: "older".into(),
+                workspace_root: None,
+                model: Some("qwen/qwen3-coder-30b".into()),
+                messages: vec![],
+            }))),
+        );
+        assert_eq!(s.model, "qwen/qwen3-coder-30b");
+        assert_eq!(s.provider, "lm_studio", "the provider comes back off the catalog");
+
+        // A thread that never pinned one keeps whatever is selected now.
+        let _ = update(
+            &mut s,
+            &client(),
+            Message::ThreadLoaded(Ok(Box::new(CoderThreadOut {
+                thread_id: 8,
+                title: "unpinned".into(),
+                workspace_root: None,
+                model: None,
+                messages: vec![],
+            }))),
+        );
+        assert_eq!(s.model, "qwen/qwen3-coder-30b");
+    }
+
     /// The approve route returns as soon as it pauses, so `Done` arrives right
     /// behind `approval_required`. That must not be read as a turn that ended
     /// badly — it is a turn waiting on a human.
@@ -2053,6 +2126,7 @@ mod tests {
                 thread_id: 42,
                 title: "old one".into(),
                 workspace_root: Some("D:/work/second".into()),
+                model: None,
                 messages: vec![serde_json::json!({ "role": "user", "content": "hi" })],
             }))),
         );

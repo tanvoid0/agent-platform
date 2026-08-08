@@ -35,6 +35,11 @@ pub struct State {
     /// callers that chat *about* something (a run, a subagent); `None` for the
     /// plain screen. Refreshed per send, so it follows the live record.
     pub system: Option<String>,
+    /// Provider/model this thread answers on, pinned at its first turn from the
+    /// app-wide default. A conversation keeps the pair it started on, so
+    /// changing the default while it is open does not switch models mid-thread.
+    /// Empty strings are a real value: "whatever the server defaults to".
+    pub pinned: Option<(String, String)>,
     /// Each thread needs its own scrollable identity — several can be alive at
     /// once and a reply must snap the right one.
     scroll: iced::widget::Id,
@@ -52,6 +57,7 @@ impl Default for State {
             streaming: false,
             error: None,
             system: None,
+            pinned: None,
             scroll: transcript_id(),
         }
     }
@@ -147,7 +153,14 @@ pub enum Message {
     DismissError,
 }
 
-pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
+/// `default` is the app-wide provider/model pair from `shell::Settings`; it is
+/// only consulted for a thread that has not sent anything yet.
+pub fn update(
+    state: &mut State,
+    client: &Client,
+    default: (&str, &str),
+    message: Message,
+) -> Task<Message> {
     match message {
         Message::TraceLogs(_) => Task::none(),
         Message::DraftChanged(v) => {
@@ -163,10 +176,14 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.draft.clear();
             state.sending = true;
 
+            let (provider, model) = state
+                .pinned
+                .get_or_insert_with(|| (default.0.to_string(), default.1.to_string()))
+                .clone();
             let body = ChatCompletionBody {
                 messages: state.wire_messages(),
-                model: None,
-                provider: None,
+                model: Some(model).filter(|m| !m.is_empty()),
+                provider: Some(provider).filter(|p| !p.is_empty()),
                 temperature: None,
                 max_tokens: None,
                 tools: None,
@@ -214,6 +231,9 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.reasoning_open.clear();
             state.streaming = false;
             state.error = None;
+            // A cleared thread is a new conversation, so it re-reads the
+            // default rather than keeping the pair the old one started on.
+            state.pinned = None;
             Task::none()
         }
         Message::LinkClicked(url) => {
@@ -242,7 +262,7 @@ mod tests {
     #[test]
     fn sending_appends_the_user_turn_and_clears_the_draft() {
         let mut s = State { draft: "  hello  ".into(), ..State::default() };
-        let _ = update(&mut s, &client(), Message::Send);
+        let _ = update(&mut s, &client(), ("", ""), Message::Send);
         assert_eq!(s.messages.len(), 1);
         assert_eq!(s.messages[0].content, "hello");
         assert_eq!(s.messages[0].role, "user");
@@ -250,21 +270,39 @@ mod tests {
         assert!(s.sending);
     }
 
+    /// A thread takes the app-wide pair on its first turn and keeps it: changing
+    /// the default in Chat must not move a conversation already under way onto
+    /// another model. Clearing it starts a new one, which reads the default again.
+    #[test]
+    fn the_pair_is_pinned_at_the_first_turn_and_reset_by_clear() {
+        let mut s = State { draft: "hi".into(), ..State::default() };
+        let _ = update(&mut s, &client(), ("ollama", "qwen2.5:7b"), Message::Send);
+        assert_eq!(s.pinned, Some(("ollama".into(), "qwen2.5:7b".into())));
+
+        s.sending = false;
+        s.draft = "again".into();
+        let _ = update(&mut s, &client(), ("lm_studio", "other"), Message::Send);
+        assert_eq!(s.pinned, Some(("ollama".into(), "qwen2.5:7b".into())));
+
+        let _ = update(&mut s, &client(), ("lm_studio", "other"), Message::Clear);
+        assert_eq!(s.pinned, None);
+    }
+
     #[test]
     fn blank_and_in_flight_sends_are_ignored() {
         let mut s = State { draft: "   ".into(), ..State::default() };
-        let _ = update(&mut s, &client(), Message::Send);
+        let _ = update(&mut s, &client(), ("", ""), Message::Send);
         assert!(s.messages.is_empty());
 
         let mut s = State { draft: "hi".into(), sending: true, ..State::default() };
-        let _ = update(&mut s, &client(), Message::Send);
+        let _ = update(&mut s, &client(), ("", ""), Message::Send);
         assert!(s.messages.is_empty());
     }
 
     #[test]
     fn scope_context_leads_the_wire_history_but_not_the_transcript() {
         let mut s = State { draft: "hi".into(), system: Some("run 7".into()), ..State::default() };
-        let _ = update(&mut s, &client(), Message::Send);
+        let _ = update(&mut s, &client(), ("", ""), Message::Send);
         let wire = s.wire_messages();
         assert_eq!(wire.len(), 2);
         assert_eq!(wire[0].role, "system");
@@ -277,8 +315,8 @@ mod tests {
     #[test]
     fn a_failed_turn_stays_in_the_thread() {
         let mut s = State { draft: "hi".into(), ..State::default() };
-        let _ = update(&mut s, &client(), Message::Send);
-        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Failed("boom".into())));
+        let _ = update(&mut s, &client(), ("", ""), Message::Send);
+        let _ = update(&mut s, &client(), ("", ""), Message::Chunk(ChatChunk::Failed("boom".into())));
         assert_eq!(s.messages.len(), 1);
         assert!(!s.sending);
         assert_eq!(s.error.as_deref(), Some("boom"));
@@ -287,11 +325,11 @@ mod tests {
     #[test]
     fn deltas_accumulate_into_one_assistant_turn() {
         let mut s = State { draft: "hi".into(), ..State::default() };
-        let _ = update(&mut s, &client(), Message::Send);
+        let _ = update(&mut s, &client(), ("", ""), Message::Send);
         for part in ["He", "llo", " there"] {
-            let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Delta(part.into())));
+            let _ = update(&mut s, &client(), ("", ""), Message::Chunk(ChatChunk::Delta(part.into())));
         }
-        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Done));
+        let _ = update(&mut s, &client(), ("", ""), Message::Chunk(ChatChunk::Done));
         assert_eq!(s.messages.len(), 2, "one user turn, one assistant turn");
         assert_eq!(s.messages[1].role, "assistant");
         assert_eq!(s.messages[1].content, "Hello there");
@@ -302,32 +340,32 @@ mod tests {
     #[test]
     fn reasoning_collects_apart_from_the_reply_and_stays_off_the_wire() {
         let mut s = State { draft: "hi".into(), ..State::default() };
-        let _ = update(&mut s, &client(), Message::Send);
-        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Reasoning("hmm, ".into())));
+        let _ = update(&mut s, &client(), ("", ""), Message::Send);
+        let _ = update(&mut s, &client(), ("", ""), Message::Chunk(ChatChunk::Reasoning("hmm, ".into())));
         // Reasoning alone opens the turn — the bubble exists while it thinks.
         assert_eq!(s.messages.len(), 2);
         assert!(s.reasoning_live(1));
-        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Reasoning("ok".into())));
-        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Delta("Answer".into())));
-        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Done));
+        let _ = update(&mut s, &client(), ("", ""), Message::Chunk(ChatChunk::Reasoning("ok".into())));
+        let _ = update(&mut s, &client(), ("", ""), Message::Chunk(ChatChunk::Delta("Answer".into())));
+        let _ = update(&mut s, &client(), ("", ""), Message::Chunk(ChatChunk::Done));
         assert_eq!(s.reasoning[1], "hmm, ok");
         assert_eq!(s.messages[1].content, "Answer");
         assert!(!s.reasoning_live(1));
         // The wire history carries the answer only.
         assert!(s.wire_messages().iter().all(|m| !m.content.contains("hmm")));
 
-        let _ = update(&mut s, &client(), Message::ToggleReasoning(1));
+        let _ = update(&mut s, &client(), ("", ""), Message::ToggleReasoning(1));
         assert!(s.reasoning_open.contains(&1));
-        let _ = update(&mut s, &client(), Message::ToggleReasoning(1));
+        let _ = update(&mut s, &client(), ("", ""), Message::ToggleReasoning(1));
         assert!(!s.reasoning_open.contains(&1));
     }
 
     #[test]
     fn partial_text_survives_a_mid_stream_failure() {
         let mut s = State { draft: "hi".into(), ..State::default() };
-        let _ = update(&mut s, &client(), Message::Send);
-        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Delta("half".into())));
-        let _ = update(&mut s, &client(), Message::Chunk(ChatChunk::Failed("boom".into())));
+        let _ = update(&mut s, &client(), ("", ""), Message::Send);
+        let _ = update(&mut s, &client(), ("", ""), Message::Chunk(ChatChunk::Delta("half".into())));
+        let _ = update(&mut s, &client(), ("", ""), Message::Chunk(ChatChunk::Failed("boom".into())));
         assert_eq!(s.messages[1].content, "half");
         assert_eq!(s.error.as_deref(), Some("boom"));
         // A retry must open a new bubble rather than append to the dead one.

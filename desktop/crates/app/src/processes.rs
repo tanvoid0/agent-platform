@@ -80,6 +80,9 @@ pub struct State {
     /// In memory only — the server's chat endpoint is stateless either way.
     pub chats: std::collections::HashMap<String, crate::chat::State>,
     pub chat_open: bool,
+    /// The app-wide provider/model default, refreshed by `main` before every
+    /// message. Each thread copies it on its first turn and keeps that pair.
+    pub chat_default: (String, String),
 }
 
 impl Default for State {
@@ -106,6 +109,7 @@ impl Default for State {
             busy: false,
             chats: std::collections::HashMap::new(),
             chat_open: false,
+            chat_default: (String::new(), String::new()),
         }
     }
 }
@@ -400,12 +404,14 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         },
         Message::Detailed(Ok(detail)) => {
             let previous = state.selected_process().map(|p| p.status);
-            if became_terminal(previous, detail.process.status) {
-                crate::notify::away(
-                    "processes",
-                    &format!("Run #{}", detail.process.id),
-                    &format!("{}: {}", detail.process.goal, detail.process.status.as_str()),
-                );
+            if let Some(kind) = settled(previous, detail.process.status) {
+                let title = format!("Run #{}", detail.process.id);
+                let body =
+                    format!("{}: {}", detail.process.goal, detail.process.status.as_str());
+                match kind {
+                    crate::notify::Kind::Review => crate::notify::review("processes", &title, &body),
+                    crate::notify::Kind::Done => crate::notify::away("processes", &title, &body),
+                }
             }
             state.detail = Some(*detail);
             state.error = None;
@@ -661,10 +667,11 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Chat(msg) => {
             let Some(key) = state.chat_key() else { return Task::none() };
             let system = state.scope_system();
+            let (provider, model) = state.chat_default.clone();
             let thread =
                 state.chats.entry(key.clone()).or_insert_with(|| crate::chat::State::scoped(&key));
             thread.system = system;
-            crate::chat::update(thread, client, msg).map(Message::Chat)
+            crate::chat::update(thread, client, (&provider, &model), msg).map(Message::Chat)
         }
     }
 }
@@ -678,11 +685,31 @@ fn is_terminal_status(status: ProcessStatus) -> bool {
     matches!(status, ProcessStatus::Completed | ProcessStatus::Failed | ProcessStatus::Cancelled)
 }
 
-/// True only on the poll where the run first reaches a terminal status, so
-/// re-polling an already-terminal run does not re-fire the notification.
-fn became_terminal(previous: Option<ProcessStatus>, current: ProcessStatus) -> bool {
-    let was_terminal = previous.is_some_and(is_terminal_status);
-    !was_terminal && is_terminal_status(current)
+/// The run stopped moving on its own and is waiting for a human — the two
+/// states where the engine will not take another step until someone answers.
+fn needs_user(status: ProcessStatus) -> bool {
+    matches!(status, ProcessStatus::ApprovalRequired | ProcessStatus::TaskReviewRequired)
+}
+
+/// What to announce, on the one poll where the run first stops moving: `Done`
+/// when it ended, `Review` when it is blocked on the user.
+///
+/// `None` while it is still running, on every later poll of the same status
+/// (a finished run would otherwise re-notify every four seconds), and when
+/// there is no previous status at all — that is the detail landing for a run
+/// the user just picked, which is not news about anything.
+fn settled(
+    previous: Option<ProcessStatus>,
+    current: ProcessStatus,
+) -> Option<crate::notify::Kind> {
+    let resting = is_terminal_status(current) || needs_user(current);
+    if !resting || previous.is_none_or(|p| p == current) {
+        return None;
+    }
+    Some(match needs_user(current) {
+        true => crate::notify::Kind::Review,
+        false => crate::notify::Kind::Done,
+    })
 }
 
 /// Run a process-scoped action against the selected run.
@@ -796,13 +823,23 @@ mod tests {
     }
 
     #[test]
-    fn notification_fires_once_on_the_terminal_transition() {
+    fn notification_fires_once_when_the_run_stops_moving() {
+        use crate::notify::Kind;
         use ProcessStatus::*;
-        assert!(!became_terminal(None, Running));
-        assert!(became_terminal(None, Completed));
-        assert!(became_terminal(Some(Running), Failed));
-        assert!(!became_terminal(Some(Completed), Completed));
-        assert!(!became_terminal(Some(Cancelled), Cancelled));
+        // Still moving, or the first detail of a run just selected: not news.
+        assert_eq!(settled(Some(Running), Running), None);
+        assert_eq!(settled(None, Completed), None);
+        // Ended.
+        assert_eq!(settled(Some(Running), Failed), Some(Kind::Done));
+        assert_eq!(settled(Some(Approved), Completed), Some(Kind::Done));
+        // Blocked on the user — the one worth interrupting for.
+        assert_eq!(settled(Some(Planning), ApprovalRequired), Some(Kind::Review));
+        assert_eq!(settled(Some(Running), TaskReviewRequired), Some(Kind::Review));
+        // Answering the approval and finishing later still announces the end.
+        assert_eq!(settled(Some(ApprovalRequired), Completed), Some(Kind::Done));
+        // Re-polling the same resting status does not re-fire.
+        assert_eq!(settled(Some(Completed), Completed), None);
+        assert_eq!(settled(Some(ApprovalRequired), ApprovalRequired), None);
     }
 
     #[test]

@@ -14,11 +14,15 @@ pub fn view(state: &State) -> Element<'_, Message> {
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
 
     if let Some(err) = &state.error {
-        blocks.push(ui::alert(
-            Tone::Danger,
-            err.clone(),
-            Some(ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss)),
-        ));
+        blocks.push(
+            ui::cluster(vec![
+                container(ui::alert_error_traced(err, Message::TraceLogs))
+                    .width(Length::Fill)
+                    .into(),
+                ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss),
+            ])
+            .into(),
+        );
     }
 
     if let Some(editor) = &state.editor {

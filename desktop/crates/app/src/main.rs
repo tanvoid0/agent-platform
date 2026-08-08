@@ -17,6 +17,7 @@ mod agenda_view;
 mod apidocs;
 mod apidocs_view;
 mod assistant;
+mod assistant_tools;
 mod assistant_view;
 mod bubble_shader;
 mod chat;
@@ -161,6 +162,9 @@ pub struct LogsState {
     pub ring_cursor: u64,
     pub api_cursor: i64,
     pub filter: String,
+    /// Show this level and above. `None` shows everything, including the lines
+    /// that carry no level at all (startup notes, uvicorn's raw output).
+    pub level: Option<logs::Level>,
     pub paused: bool,
     pub dropped: u64,
     /// Absolute id of `lines[0]`. Rows are selected by absolute id, so trimming
@@ -178,6 +182,14 @@ pub struct App {
     /// Set while the in-app quit-or-tray prompt is up; holds the window whose
     /// close was intercepted so "Minimize to tray" knows what to hide.
     pub close_prompt: Option<window::Id>,
+    /// The floating E.V. panel is up over whatever screen is open. Ctrl+K
+    /// toggles it; it renders `assistant`'s own state, so there is one thread
+    /// whichever surface you reach it through.
+    pub assistant_open: bool,
+    /// The notification panel is up over whatever screen is open. The notes
+    /// themselves live in [`notify`], not here — they are posted from module
+    /// `update`s that have no `App` to write into.
+    pub notifications_open: bool,
     /// Whether the window has the OS focus. Work that finishes behind another
     /// app is work the user did not see finish — see [`watching_key`].
     pub focused: bool,
@@ -279,8 +291,19 @@ pub enum Message {
     CloseCancelled,
     /// Esc while a modal is up; routed to whichever modal is open.
     EscapePressed,
+    /// Ctrl+K, the overlay's close button, or the sidebar: show or hide the
+    /// floating E.V. panel.
+    ToggleAssistant,
     /// A toast's time is up (or its close button was pressed).
     NoticeExpired,
+    /// The sidebar bell: show or hide the notification panel.
+    ToggleNotifications,
+    /// A row in that panel: go to the screen the note came from. Arriving there
+    /// is what marks it (and the rest of that screen's) seen.
+    OpenNote(u64),
+    /// Throw one note away without going anywhere.
+    DismissNote(u64),
+    ClearNotifications,
     WindowClosed(window::Id),
     Nav(Screen),
     NavSettings(SettingsTab),
@@ -292,6 +315,10 @@ pub enum Message {
     /// "View logs" on a traced error banner: jump to the Logs screen filtered
     /// to the request that failed.
     TraceLogs(String),
+    /// Level filter: show this level and above, `None` for everything.
+    SetLogLevel(Option<logs::Level>),
+    /// Drop both halves of the filter at once — the way back from a trace jump.
+    ClearLogFilter,
     ToggleLogsPaused,
     ClearLogs,
     /// Click a log row: toggle it in the selection.
@@ -306,6 +333,17 @@ pub enum Message {
     SetHudStyle(HudStyle),
     /// How fast E.V. reads aloud, as percent of the voice's normal pace.
     SetVoiceRate(i32),
+    /// Wake-word standby on or off. Persisted, and the only thing that opens
+    /// the mic without a button press.
+    SetWakeWord(bool),
+    /// What the assistant is called. Persisted.
+    SetAssistantName(String),
+    /// Comma-separated spellings the wake word answers to. Persisted.
+    SetWakeNames(String),
+    /// The TTS voice id. Persisted.
+    SetVoiceName(String),
+    /// Confirm card before E.V. runs a shell command. Persisted.
+    SetConfirmCommands(bool),
     PickLocalModel,
     /// The GGUF for in-process inference: `None` is a cancelled picker, and an
     /// empty string clears the setting (back to server-answered turns).
@@ -424,7 +462,7 @@ fn build_tray(port: u16) -> Option<(TrayIcon, MenuItem)> {
     let items: [&dyn tray_icon::menu::IsMenuItem; 9] = [
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id("show", "Show Agent Platform", true, None),
-        &MenuItem::with_id("assistant", "Talk to E.V.", true, None),
+        &MenuItem::with_id("assistant", assistant::talk_label(), true, None),
         &MenuItem::with_id("logs", "Open logs", true, None),
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id("restart", "Restart server", true, None),
@@ -540,6 +578,11 @@ fn boot() -> (App, Task<Message>) {
     }
 
     let client = Client::new(sh.origin(), key);
+    // Before the tray is built and before anything renders or speaks: the name
+    // is read by every view and by the tray item, the voice by the first
+    // sentence synthesized.
+    assistant::set_identity(&settings.assistant_name, &settings.wake_names);
+    assistant::set_voice(&settings.voice_name);
     let (tray, tray_status) = match build_tray(port) {
         Some((tray, status)) => (Some(tray), Some(status)),
         None => {
@@ -553,9 +596,15 @@ fn boot() -> (App, Task<Message>) {
     let (chat_provider, chat_model) =
         (settings.chat_provider.clone(), settings.chat_model.clone());
     let voice_rate = settings.voice_rate;
+    let confirm_commands = settings.confirm_commands;
     let coder_workspace = settings.coder_workspace.clone();
-    let (coder_provider, coder_model) =
-        (settings.coder_provider.clone(), settings.coder_model.clone());
+    // Coder keeps its own pair because it needs a model that can hold a tool
+    // loop, but an unset one follows the app-wide default rather than dropping
+    // to the server's `llama3`, which cannot.
+    let (coder_provider, coder_model) = match settings.coder_model.is_empty() {
+        true => (chat_provider.clone(), chat_model.clone()),
+        false => (settings.coder_provider.clone(), settings.coder_model.clone()),
+    };
     let coder_plan = settings.coder_plan;
     let local_n_ctx = settings.local_n_ctx;
     let local_server_port = settings.local_server_port;
@@ -581,6 +630,8 @@ fn boot() -> (App, Task<Message>) {
         client,
         window: None,
         close_prompt: None,
+        assistant_open: false,
+        notifications_open: false,
         // Corrected by the first focus event; a window that opens is focused,
         // and one that never opens is covered by `window: None`.
         focused: true,
@@ -607,6 +658,7 @@ fn boot() -> (App, Task<Message>) {
             ring_cursor: 0,
             api_cursor: 0,
             filter: String::new(),
+            level: None,
             paused: false,
             dropped: 0,
             base: 0,
@@ -615,7 +667,12 @@ fn boot() -> (App, Task<Message>) {
         processes: processes::State::default(),
         library: library::State::default(),
         modelops: modelops::State::default(),
-        assistant: assistant::State::with_defaults(chat_provider, chat_model, voice_rate),
+        assistant: assistant::State::with_defaults(
+            chat_provider,
+            chat_model,
+            voice_rate,
+            confirm_commands,
+        ),
         memory: memory::Store::load(&app_dir),
         history: history::Store::load(&app_dir),
         providers: providers::State::default(),
@@ -627,11 +684,19 @@ fn boot() -> (App, Task<Message>) {
         update_check: update_check::State::default(),
     };
     let task = if minimized { Task::none() } else { open_window() };
-    let bootstrap = Task::batch([
+    let mut bootstrap = vec![
         Task::done(Message::StatusTick),
         processes::load_lists(&app.client).map(Message::Processes),
         Task::done(Message::Processes(processes::Message::ListTick)),
-    ]);
+    ];
+    // The wake word survives a restart, so the mic has to come back up with it.
+    // Routed through the message rather than set on the struct: opening the mic
+    // is the half that can fail, and this way a missing device turns the setting
+    // back off with an error instead of leaving a state that claims to listen.
+    if app.settings.wake_word {
+        bootstrap.push(Task::done(Message::SetWakeWord(true)));
+    }
+    let bootstrap = Task::batch(bootstrap);
     (app, task.chain(bootstrap))
 }
 
@@ -648,6 +713,20 @@ fn ctx_digits(raw: &str) -> String {
 fn save_settings(app: &mut App) {
     if let Err(e) = app.settings.save(&app.shell.data_dir) {
         app.shell.log_line(format!("[shell] could not save settings: {e}"));
+    }
+}
+
+/// The chat provider/model override survives restarts: any change lands in
+/// `settings.json` the moment it is made, so a fresh thread on the next launch
+/// opens on the same pair. Reopening a saved conversation goes through here too
+/// — the thread's own pair becomes the new default.
+fn persist_chat_model(app: &mut App) {
+    if app.settings.chat_provider != app.assistant.provider
+        || app.settings.chat_model != app.assistant.model
+    {
+        app.settings.chat_provider = app.assistant.provider.clone();
+        app.settings.chat_model = app.assistant.model.clone();
+        save_settings(app);
     }
 }
 
@@ -753,6 +832,18 @@ fn fetch_status(client: &Client) -> Task<Message> {
     )
 }
 
+/// Every surface that runs work in the background, as the key it passes to
+/// [`notify::away`] and the destination a note about it navigates to. One table
+/// in both directions, so a badge can never point somewhere the note did not
+/// come from.
+const NOTIFY_KEYS: &[(&str, Screen, Option<SettingsTab>)] = &[
+    ("processes", Screen::Processes, None),
+    ("coder", Screen::Coder, None),
+    ("assistant", Screen::Assistant, None),
+    ("workflows", Screen::Workflows, None),
+    ("modelops", Screen::Settings, Some(SettingsTab::ModelOps)),
+];
+
 /// Which surface's key the user is looking at, for [`notify::away`]. `None`
 /// stands for a window that is hidden or behind another app: nothing is being
 /// watched there, so everything that finishes gets a toast.
@@ -760,14 +851,40 @@ fn fetch_status(client: &Client) -> Task<Message> {
 /// Screens with no background work of their own share the empty key with that
 /// case — it matches nothing, which is exactly right for them too.
 fn watching_key(on_screen: Option<(Screen, SettingsTab)>) -> &'static str {
-    match on_screen {
-        Some((Screen::Processes, _)) => "processes",
-        Some((Screen::Coder, _)) => "coder",
-        Some((Screen::Assistant, _)) => "assistant",
-        Some((Screen::Workflows, _)) => "workflows",
-        Some((Screen::Settings, SettingsTab::ModelOps)) => "modelops",
-        _ => "",
+    let Some((screen, tab)) = on_screen else { return "" };
+    NOTIFY_KEYS
+        .iter()
+        .find(|(_, s, t)| *s == screen && t.map_or(true, |want| want == tab))
+        .map(|(key, _, _)| *key)
+        .unwrap_or("")
+}
+
+/// The badge on a sidebar entry: how much happened there while the user was
+/// elsewhere, and whether any of it is *waiting* on them rather than done.
+pub fn screen_notes(screen: Screen) -> (usize, ui::Tone) {
+    let key = NOTIFY_KEYS
+        .iter()
+        .find(|(_, s, t)| *s == screen && t.is_none())
+        .map(|(key, _, _)| *key)
+        .unwrap_or("");
+    (notify::count(key), note_tone(key))
+}
+
+/// Warning when something is blocked on the user, Info when it merely finished.
+pub fn note_tone(key: &str) -> ui::Tone {
+    if notify::review_waiting(key) {
+        ui::Tone::Warning
+    } else {
+        ui::Tone::Info
     }
+}
+
+/// Where a note's key says to go.
+fn note_destination(key: &str) -> Option<Message> {
+    NOTIFY_KEYS.iter().find(|(k, _, _)| *k == key).map(|(_, screen, tab)| match tab {
+        Some(tab) => Message::NavSettings(*tab),
+        None => Message::Nav(*screen),
+    })
 }
 
 /// One line of a finished turn, for its toast: the error if it failed, else the
@@ -786,7 +903,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     // Rewritten after every message rather than in the handful of arms that
     // move the user: one write cannot drift from the screen that is actually
     // on, and five of them can.
-    notify::watching(watching_key(app.on_screen()));
+    let key = watching_key(app.on_screen());
+    notify::watching(key);
+    // Arriving on a screen is seeing what happened there. The same one write:
+    // a badge that outlives the visit it was about is worse than no badge.
+    notify::seen(key);
     task
 }
 
@@ -840,14 +961,59 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.close_prompt = None;
             Task::none()
         }
+        Message::ToggleNotifications => {
+            app.notifications_open = !app.notifications_open;
+            Task::none()
+        }
+        Message::OpenNote(id) => {
+            app.notifications_open = false;
+            // The note is gone either way — clicking it is seeing it — but a key
+            // with no destination (a screen since removed) must not navigate.
+            match notify::take(id).and_then(note_destination) {
+                Some(nav) => update(app, nav),
+                None => Task::none(),
+            }
+        }
+        Message::DismissNote(id) => {
+            notify::take(id);
+            Task::none()
+        }
+        Message::ClearNotifications => {
+            notify::clear();
+            app.notifications_open = false;
+            Task::none()
+        }
+        Message::ToggleAssistant => {
+            // On a chat screen the panel is suppressed anyway — it would sit
+            // beside the same conversation — so the shortcut just goes there.
+            // `assistant_open` stays *off*: flipping it here left the panel
+            // primed to appear on its own the next time the user navigated
+            // somewhere else, which is not what pressing it on this screen
+            // asked for.
+            if app.screen.is_chat() {
+                return update(app, Message::Nav(Screen::Assistant));
+            }
+            app.assistant_open = !app.assistant_open;
+            Task::none()
+        }
         Message::EscapePressed => {
             if app.close_prompt.is_some() {
                 app.close_prompt = None;
+                Task::none()
+            } else if app.notifications_open {
+                // Above Abort: the panel is what Esc most obviously means while
+                // it is covering the screen, and it stops nothing to close it.
+                app.notifications_open = false;
                 Task::none()
             } else if app.assistant.sending || app.assistant.speaking() {
                 // A reply that is still arriving or still being read out loud is
                 // the most urgent thing Esc could mean.
                 update(app, Message::Assistant(assistant::Message::Abort))
+            } else if app.assistant_open {
+                // Below Abort on purpose: a turn in flight is the more urgent
+                // thing to stop, and the panel is one more Esc away.
+                app.assistant_open = false;
+                Task::none()
             } else {
                 update(
                     app,
@@ -962,6 +1128,15 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::TraceLogs(trace_id) => trace_logs_task(app, trace_id),
+        Message::ClearLogFilter => {
+            app.logs.filter.clear();
+            app.logs.level = None;
+            Task::none()
+        }
+        Message::SetLogLevel(level) => {
+            app.logs.level = level;
+            Task::none()
+        }
         Message::ToggleLogsPaused => {
             app.logs.paused = !app.logs.paused;
             Task::none()
@@ -1000,6 +1175,47 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SetHudStyle(style) => {
             app.settings.hud_style = style;
+            save_settings(app);
+            Task::none()
+        }
+        Message::SetConfirmCommands(on) => {
+            app.settings.confirm_commands = on;
+            app.assistant.confirm_commands = on;
+            save_settings(app);
+            Task::none()
+        }
+        Message::SetWakeWord(on) => {
+            // The assistant owns the recorder, so it does the opening and the
+            // closing — and opening is the half that can fail.
+            let task = update(app, Message::Assistant(assistant::Message::SetStandby(on)));
+            // Mirror what actually happened, not what was asked for. A missing
+            // or refused microphone leaves `standby` false, and a setting that
+            // still said `true` would show "Listening for E.V." next to a mic
+            // that is shut — and would try again, failing, on every launch.
+            app.settings.wake_word = app.assistant.standby;
+            save_settings(app);
+            task
+        }
+        Message::SetAssistantName(name) => {
+            app.settings.assistant_name = name;
+            // ponytail: the tray item keeps the name it was built with until the
+            // app restarts — the menu is created once in `boot` and only the
+            // status line is held for updating.
+            assistant::set_identity(&app.settings.assistant_name, &app.settings.wake_names);
+            save_settings(app);
+            Task::none()
+        }
+        Message::SetWakeNames(spellings) => {
+            app.settings.wake_names = spellings;
+            assistant::set_identity(&app.settings.assistant_name, &app.settings.wake_names);
+            save_settings(app);
+            Task::none()
+        }
+        Message::SetVoiceName(id) => {
+            app.settings.voice_name = id;
+            // Takes effect on the next sentence synthesized; whatever is already
+            // queued keeps the old voice rather than switching mid-answer.
+            assistant::set_voice(&app.settings.voice_name);
             save_settings(app);
             Task::none()
         }
@@ -1122,6 +1338,11 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             trace_logs_task(app, id)
         }
         Message::Processes(msg) => {
+            // Embedded chats have no picker of their own, so they run on the
+            // app-wide pair — read here rather than copied at boot, so a change
+            // in Chat reaches the next thread opened on any screen.
+            app.processes.chat_default =
+                (app.settings.chat_provider.clone(), app.settings.chat_model.clone());
             processes::update(&mut app.processes, &app.client, msg).map(Message::Processes)
         }
         Message::Library(library::Message::TraceLogs(id)) => trace_logs_task(app, id),
@@ -1162,6 +1383,8 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                     assistant::NAME,
                     &app.assistant.messages,
                     &app.assistant.reasoning,
+                    &app.assistant.provider,
+                    &app.assistant.model,
                 );
             }
             // Stopping it yourself is not news.
@@ -1175,24 +1398,22 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                     ),
                 );
             }
-            // The provider/model override survives restarts: any change lands
-            // in settings.json the moment it is made.
-            if app.settings.chat_provider != app.assistant.provider
-                || app.settings.chat_model != app.assistant.model
-            {
-                app.settings.chat_provider = app.assistant.provider.clone();
-                app.settings.chat_model = app.assistant.model.clone();
-                save_settings(app);
-            }
-            match closed {
-                false => turn,
-                true => Task::batch([
-                    turn,
+            persist_chat_model(app);
+            // `open_screen` parks its answer here rather than navigating from
+            // inside the assistant, which has no reach into `App`. Routed
+            // through `Message::Nav` like a sidebar click, so the screen it
+            // lands on gets its own refresh.
+            let go = app.assistant.nav.take().map(|s| Task::done(Message::Nav(s)));
+            let mut tasks = vec![turn];
+            tasks.extend(go);
+            if closed {
+                tasks.push(
                     app.memory
                         .harvest(&app.client, &app.assistant.messages, assistant::NAME)
                         .map(Message::Memory),
-                ]),
+                );
             }
+            Task::batch(tasks)
         }
         Message::Memory(msg) => memory::update(&mut app.memory, msg).map(Message::Memory),
         Message::History(msg) => {
@@ -1215,6 +1436,14 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                         return Task::none();
                     }
                     if let Some(c) = app.history.open(source, id) {
+                        // A thread answers on the pair it was answered on. Only
+                        // for conversations that recorded one — the ones saved
+                        // before that keep whatever is selected now.
+                        if let (Some(p), Some(m)) = (c.provider, c.model) {
+                            app.assistant.provider = p;
+                            app.assistant.model = m;
+                            persist_chat_model(app);
+                        }
                         load(app, c.messages, c.reasoning);
                     }
                 }
@@ -1263,11 +1492,18 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             // An approval pause counts as finishing — that one is *waiting* on
             // the user, so it is the toast that matters most.
             if was_sending && !app.coder.sending {
-                let body = match &app.coder.pending {
-                    Some(p) => format!("Waiting for approval: {}", p.command),
-                    None => preview(app.coder.error.as_deref(), app.coder.last_reply()),
-                };
-                notify::away("coder", "Coder", &body);
+                match &app.coder.pending {
+                    Some(p) => notify::review(
+                        "coder",
+                        "Coder",
+                        &format!("Waiting for approval: {}", p.command),
+                    ),
+                    None => notify::away(
+                        "coder",
+                        "Coder",
+                        &preview(app.coder.error.as_deref(), app.coder.last_reply()),
+                    ),
+                }
             }
             if persist {
                 app.settings.coder_workspace =
@@ -1279,6 +1515,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             }
             task
         }
+        Message::Workflows(workflows::Message::TraceLogs(id)) => trace_logs_task(app, id),
         Message::Workflows(msg) => {
             workflows::update(&mut app.workflows, &app.client, msg).map(Message::Workflows)
         }
@@ -1298,12 +1535,36 @@ fn trim_log_view(logs: &mut LogsState) {
     }
 }
 
+impl LogsState {
+    /// The one place that decides whether a line is on screen, so "Copy shown",
+    /// "Select all" and the rendered tail cannot drift apart.
+    ///
+    /// ponytail: the level filter parses each line per frame, as `log_entry`
+    /// already does for the rendered tail. Parse at ingest if frame time shows.
+    pub fn shows(&self, line: &str) -> bool {
+        if !self.filter.is_empty()
+            && !line.to_lowercase().contains(&self.filter.to_lowercase())
+        {
+            return false;
+        }
+        match self.level {
+            None => true,
+            Some(min) => logs::parse(line).severity().is_some_and(|l| l >= min),
+        }
+    }
+
+    /// True while anything is hiding lines — what the "N of M" badge is for.
+    pub fn filtering(&self) -> bool {
+        !self.filter.is_empty() || self.level.is_some()
+    }
+}
+
 /// Absolute ids of the lines the filter currently shows, oldest first.
 fn visible_log_ids(logs: &LogsState) -> impl Iterator<Item = u64> + '_ {
-    let filter = logs.filter.to_lowercase();
-    logs.lines.iter().enumerate().filter_map(move |(i, l)| {
-        (filter.is_empty() || l.to_lowercase().contains(&filter)).then(|| logs.base + i as u64)
-    })
+    logs.lines
+        .iter()
+        .enumerate()
+        .filter_map(move |(i, l)| logs.shows(l).then(|| logs.base + i as u64))
 }
 
 /// What Copy puts on the clipboard: the selection if there is one, otherwise
@@ -1316,8 +1577,7 @@ fn copy_text(logs: &LogsState) -> String {
         .filter(|(i, l)| {
             let id = logs.base + *i as u64;
             if logs.selected.is_empty() {
-                let f = logs.filter.to_lowercase();
-                f.is_empty() || l.to_lowercase().contains(&f)
+                logs.shows(l)
             } else {
                 logs.selected.contains(&id)
             }
@@ -1498,9 +1758,24 @@ fn subscription(app: &App) -> Subscription<Message> {
             })
         }));
     }
-    // Esc dismisses the in-app modals, as the OS dialogs they replaced did. The
-    // filter_map closure has to stay non-capturing, so update() picks the modal.
-    if app.close_prompt.is_some() || app.library.confirm.is_some() {
+    // Ctrl+K summons E.V. from any screen, and Esc dismisses the in-app modals
+    // as the OS dialogs they replaced did. One listener for both: the closure
+    // has to stay non-capturing, so update() decides what Esc meant.
+    // Two listeners, not one with a flag in it: these closures must stay
+    // non-capturing (iced checks at compile time), so the condition lives out
+    // here in whether the subscription exists at all.
+    subs.push(iced::keyboard::listen().filter_map(|event| {
+        matches!(
+            event,
+            iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Character(ref c),
+                modifiers,
+                ..
+            } if c.as_str() == "k" && modifiers.command()
+        )
+        .then_some(Message::ToggleAssistant)
+    }));
+    if app.close_prompt.is_some() || app.library.confirm.is_some() || app.assistant_open {
         subs.push(iced::keyboard::listen().filter_map(|event| {
             matches!(
                 event,
@@ -1619,6 +1894,7 @@ mod tests {
             ring_cursor: 0,
             api_cursor: 0,
             filter: String::new(),
+            level: None,
             paused: false,
             dropped: 0,
             base: 0,
@@ -1637,6 +1913,50 @@ line 2");
         logs.filter = "line 2".into();
         assert_eq!(copy_text(&logs), "line 2", "no selection copies what the filter shows");
         assert_eq!(visible_log_ids(&logs).collect::<Vec<_>>(), vec![2]);
+    }
+
+    /// The level filter is "this and above", and it must not silently keep the
+    /// lines that carry no level — those are the bulk of the buffer.
+    #[test]
+    fn the_level_filter_keeps_that_level_and_worse() {
+        let mut logs = LogsState {
+            lines: Vec::new(),
+            ring_cursor: 0,
+            api_cursor: 0,
+            filter: String::new(),
+            level: None,
+            paused: false,
+            dropped: 0,
+            base: 0,
+            selected: Default::default(),
+        };
+        let err = r#"{"level": "ERROR", "message": "boom", "trace_id": "abc"}"#;
+        let info = r#"{"level": "INFO", "message": "request completed"}"#;
+        let bare = "Application startup complete.";
+
+        assert!(logs.shows(err) && logs.shows(info) && logs.shows(bare), "unfiltered shows all");
+        assert!(!logs.filtering());
+
+        logs.level = Some(logs::Level::Warn);
+        assert!(logs.shows(err), "ERROR is above WARN");
+        assert!(!logs.shows(info));
+        assert!(!logs.shows(bare), "a line with no level is not a warning");
+        assert!(logs.filtering());
+
+        // The line the whole feature exists for: a failed request is logged at
+        // INFO. If the level filter read `level` instead of `severity` it would
+        // hide a row the screen paints red, which is worse than no filter.
+        let five_hundred =
+            r#"{"level": "INFO", "message": "request completed", "status_code": 500}"#;
+        logs.level = Some(logs::Level::Error);
+        assert!(logs.shows(five_hundred), "\"Errors\" must not hide a 5xx");
+        assert!(!logs.shows(info));
+
+        // Both halves apply: the text filter still narrows within the level.
+        logs.filter = "abc".into();
+        assert!(logs.shows(err));
+        logs.filter = "nothing".into();
+        assert!(!logs.shows(err));
     }
 
     /// The guard is only useful if it leaves a way out. Settings must open with

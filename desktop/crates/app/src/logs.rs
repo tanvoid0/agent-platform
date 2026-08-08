@@ -7,7 +7,9 @@
 
 use serde_json::{Map, Value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Ordered least to most severe: the Logs screen's level filter is "this and
+/// above", which is a comparison, not a set membership test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Debug,
     Info,
@@ -45,6 +47,28 @@ pub struct Entry {
     pub source: Option<String>,
     pub message: String,
     pub fields: Vec<(String, String)>,
+}
+
+impl Entry {
+    /// How bad the line actually is, which is not always what it was logged at:
+    /// a failed request logs at INFO with a 5xx in its fields. The level filter
+    /// and the row's color both ask this, or "Errors" hides a red row.
+    ///
+    /// The worse of the two wins — a 404 on a line logged at ERROR is still an
+    /// error.
+    pub fn severity(&self) -> Option<Level> {
+        let from_status = self
+            .fields
+            .iter()
+            .find(|(k, _)| k == "status_code" || k == "status")
+            .and_then(|(_, v)| v.parse::<u16>().ok())
+            .and_then(|s| match s {
+                500.. => Some(Level::Error),
+                400..=499 => Some(Level::Warn),
+                _ => None,
+            });
+        self.level.max(from_status)
+    }
 }
 
 pub fn parse(line: &str) -> Entry {

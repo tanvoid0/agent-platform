@@ -107,6 +107,7 @@ icons! {
     Clock => clock_four,
     Terminal => terminal,
     Inbox => inbox,
+    Bell => bell,
 }
 
 /// Icon inheriting the surrounding widget's text color (buttons, nav items).

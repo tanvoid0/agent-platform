@@ -206,7 +206,9 @@ pub fn nav_icon_button<'a, M: 'a + Clone>(
 /// action the way [`button_ghost`] does.
 pub fn toggle<'a, M: 'a + Clone>(
     glyph: Icon,
-    label: &'a str,
+    // Owned as well as borrowed: a label that names the assistant is built per
+    // frame, and the caller has nowhere to keep it.
+    label: impl text::IntoFragment<'a>,
     selected: bool,
     on_press: M,
 ) -> Element<'a, M> {
@@ -247,6 +249,55 @@ pub fn nav_item<'a, M: 'a + Clone>(
     .style(theme::nav_item(selected))
     .on_press(on_press)
     .into()
+}
+
+/// [`nav_item`] carrying a count of what happened on that screen while the user
+/// was elsewhere. A count of zero renders the plain item — an empty inbox shows
+/// no badges at all.
+pub fn nav_item_counted<'a, M: 'a + Clone>(
+    glyph: Icon,
+    label: &'a str,
+    selected: bool,
+    count: usize,
+    tone: Tone,
+    on_press: M,
+) -> Element<'a, M> {
+    if count == 0 {
+        return nav_item(glyph, label, selected, on_press);
+    }
+    button(
+        row![
+            icon::glyph(glyph),
+            text(label).size(font::SM).width(Length::Fill),
+            badge(count.to_string(), tone),
+        ]
+        .spacing(space::SM)
+        .align_y(iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([8.0, 12.0]))
+    .style(theme::nav_item(selected))
+    .on_press(on_press)
+    .into()
+}
+
+/// The notification bell and its unseen count. Zero renders the bell alone, so
+/// an empty inbox is quiet; the tone is the caller's, because "waiting on you"
+/// and "finished" are not the same news.
+pub fn bell<'a, M: 'a + Clone>(count: usize, tone: Tone, on_press: M) -> Element<'a, M> {
+    let mut children: Vec<Element<'a, M>> = vec![icon::glyph(Icon::Bell)];
+    if count > 0 {
+        children.push(badge(count.to_string(), tone));
+    }
+    let btn = button(Row::with_children(children).spacing(space::XS).align_y(iced::Alignment::Center))
+        .height(28)
+        .padding(Padding::from([0.0, space::XS]))
+        .style(theme::nav_item(count > 0))
+        .on_press(on_press);
+    tooltip(
+        btn.into(),
+        if count > 0 { "Notifications" } else { "Notifications (nothing waiting)" },
+    )
 }
 
 /// Heading above a run of [`nav_item`]s, so nine destinations read as three
@@ -466,8 +517,14 @@ pub fn modal<'a, M: 'a>(
 }
 
 /// `<Toaster>` — pins `toast` to the bottom-right corner over `base`. Unlike
-/// [`modal`] it lays no scrim and consumes no clicks, so the page underneath
-/// stays usable while the message is up.
+/// [`modal`] it lays no scrim, so the page underneath stays *readable* while
+/// the message is up.
+///
+/// It does not stay *clickable*: the positioning container fills the window,
+/// and a click anywhere over it is swallowed rather than reaching the widget
+/// beneath — measured, not assumed. That is survivable for a toast that
+/// disappears on a timer, and it is why the E.V. panel is a real column in the
+/// shell row instead of a layer (see `screen::view`).
 pub fn toast_layer<'a, M: 'a>(
     base: impl Into<Element<'a, M>>,
     toast: impl Into<Element<'a, M>>,
@@ -549,6 +606,21 @@ pub fn badge<'a, M: 'a>(label: impl text::IntoFragment<'a>, tone: Tone) -> Eleme
 }
 
 /// `<Badge>` with a leading glyph — state that reads faster as a shape.
+/// [`badge`] that is a button. The label is owned, not `&'a str` like the
+/// `button_*` family: these are built from data (a trace id off a log line),
+/// not from a literal in the view.
+pub fn badge_button<'a, M: 'a + Clone>(
+    label: impl text::IntoFragment<'a>,
+    tone: Tone,
+    on_press: M,
+) -> Element<'a, M> {
+    button(text(label).size(font::XS).font(iced::Font::MONOSPACE))
+        .padding(Padding::from([2.0, space::SM]))
+        .style(theme::badge_button(tone))
+        .on_press(on_press)
+        .into()
+}
+
 pub fn badge_icon<'a, M: 'a>(
     glyph: Icon,
     label: impl text::IntoFragment<'a>,
@@ -668,16 +740,17 @@ pub fn alert_error<'a, M: 'a>(message: impl text::IntoFragment<'a>) -> Element<'
 /// [`alert_error`], but for a message the client may have suffixed with
 /// `" · trace {id}"` ([`agent_platform_client::Error`]'s `Display`) — the
 /// trace id a failed request's server-side log line carries. When present, a
-/// "View logs" button is offered instead of leaving the id as inert text the
-/// user has no way to act on.
+/// "View logs" button jumps to that request's log lines. The id stays in the
+/// text: it is what goes in a bug report, and the Logs screen may no longer
+/// hold the line if the ring has wrapped.
 pub fn alert_error_traced<'a, M: 'a + Clone>(
     message: &str,
     on_view_logs: impl Fn(String) -> M + 'a,
 ) -> Element<'a, M> {
     match message.rsplit_once(" · trace ") {
-        Some((text, trace_id)) => alert(
+        Some((_, trace_id)) => alert(
             Tone::Danger,
-            text.to_string(),
+            message.to_string(),
             Some(button_ghost(Icon::Scroll, "View logs", on_view_logs(trace_id.to_string()))),
         ),
         None => alert(Tone::Danger, message.to_string(), None),
@@ -729,6 +802,105 @@ pub fn turn<'a, M: 'a>(
     let inner = Column::with_children(vec![badge(label, tone), content]).spacing(space::XS);
     let c = container(inner).padding(space::SM).width(Length::Fill);
     if is_user { c.style(theme::code_block).into() } else { c.into() }
+}
+
+/// The scrolling half of a chat surface: a thread of [`turn`]s that snaps to the
+/// end as it grows. `id` is what `operation::snap_to_end` addresses, so each
+/// surface passes its own.
+///
+/// The right padding is not decoration — iced 0.14's scrollbar floats over the
+/// content and clips the trailing edge of every card without it (see
+/// `desktop/CLAUDE.md`). Getting that wrong twice is why this is one function.
+pub fn transcript<'a, M: 'a>(
+    id: iced::widget::Id,
+    turns: Vec<Element<'a, M>>,
+) -> Element<'a, M> {
+    scrollable(stack_lg(turns).padding(Padding { right: 12.0, ..Default::default() }))
+        .id(id)
+        .height(Length::Fill)
+        .into()
+}
+
+/// The typing half: one submitting input, plus whatever trailing controls say
+/// what happens next — Send, a spinner, a mic. Returned uncarded, because
+/// callers differ on what goes *under* the row (E.V. nothing, Coder a clock).
+pub fn composer<'a, M: 'a + Clone>(
+    placeholder: &'a str,
+    value: &'a str,
+    on_input: impl Fn(String) -> M + 'a,
+    on_submit: M,
+    trailing: Vec<Element<'a, M>>,
+) -> Row<'a, M> {
+    let mut children: Vec<Element<'a, M>> =
+        vec![container(input_submit(placeholder, value, on_input, on_submit))
+            .width(Length::Fill)
+            .into()];
+    children.extend(trailing);
+    cluster(children)
+}
+
+/// The gate between a model and anything outside the app — a write through the
+/// API, or a command on the machine. Shows what will happen verbatim (a
+/// friendlier summary would mean agreeing to something other than what runs)
+/// and defaults to nothing happening.
+///
+/// `run` is `None` when there is nothing runnable to approve: a model that
+/// leaks its tool syntax as prose gets salvaged with whatever arguments
+/// survived, and an empty command under a live Run button is the one thing this
+/// card must never be.
+pub fn approval<'a, M: 'a + Clone>(
+    heading: impl text::IntoFragment<'a>,
+    tone: Tone,
+    body: Vec<Element<'a, M>>,
+    no_label: &'a str,
+    on_no: M,
+    run: Option<M>,
+) -> Element<'a, M> {
+    let mut head: Vec<Element<'a, M>> = vec![
+        badge_icon(Icon::Alert, heading, tone),
+        spacer(),
+        button_ghost(Icon::X, no_label, on_no),
+    ];
+    if let Some(run) = run {
+        head.push(button_default(Icon::Play, "Run", run));
+    }
+    let mut lines: Vec<Element<'a, M>> = vec![cluster(head).into()];
+    lines.extend(body);
+    card(Column::with_children(lines).spacing(space::SM))
+}
+
+/// The provider + model pair every chat surface puts in its header. Empty means
+/// the server's default, which is why neither picker gets a required marker —
+/// and why deselecting needs its own button beside this (`pick_list` cannot).
+pub fn model_pickers<'a, M: 'a + Clone>(
+    providers: Vec<String>,
+    provider: &str,
+    on_provider: impl Fn(String) -> M + 'a,
+    models: Vec<String>,
+    model: &str,
+    on_model: impl Fn(String) -> M + 'a,
+) -> Row<'a, M> {
+    let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    cluster(vec![
+        container(select("Provider", providers, some(provider), on_provider)).width(180).into(),
+        container(select("Model", models, some(model), on_model)).width(260).into(),
+    ])
+}
+
+/// A turn's error, over the composer that will retry it: the message, the way
+/// into the logs behind it, and the way to dismiss it. `extra` is for repairs
+/// specific to one error (opening mic settings, say) and is usually empty.
+pub fn error_bar<'a, M: 'a + Clone>(
+    message: &'a str,
+    on_trace: impl Fn(String) -> M + 'a,
+    on_dismiss: M,
+    extra: Vec<Element<'a, M>>,
+) -> Element<'a, M> {
+    let mut row: Vec<Element<'a, M>> =
+        vec![container(alert_error_traced(message, on_trace)).width(Length::Fill).into()];
+    row.extend(extra);
+    row.push(button_ghost(Icon::X, "Dismiss", on_dismiss));
+    cluster(row).into()
 }
 
 /// Collapsible chain-of-thought section above a reasoning model's reply: a

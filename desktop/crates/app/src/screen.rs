@@ -30,8 +30,11 @@ const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
 
 /// The chat tab strip: the assistant, and what it remembers about you. Text and
 /// voice are one screen — the toggle lives in its header, not out here.
-const CHAT_TABS: [(Screen, &str); 2] =
-    [(Screen::Assistant, crate::assistant::NAME), (Screen::Memory, "Memory")];
+/// A function rather than a const because the first label is the assistant's
+/// name, which the user can change.
+fn chat_tabs() -> [(Screen, &'static str); 2] {
+    [(Screen::Assistant, crate::assistant::name()), (Screen::Memory, "Memory")]
+}
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = match app.screen {
@@ -57,17 +60,45 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Screen::Assistant | Screen::Memory => chat_view(app),
     };
 
-    let shell = row![
+    let mut shell = row![
         sidebar(app),
         ui::separator_vertical(),
         container(content).width(Length::Fill).height(Length::Fill),
     ];
+
+    // E.V. from anywhere: the Assistant screen's own panel, docked beside
+    // whatever the user is working in. Not a second chat — same `State`, same
+    // thread, same mic, so a conversation started here is waiting on the
+    // Assistant screen and the other way round.
+    //
+    // A **column of the shell row**, not a layer over it. It was `ui::modal`
+    // first, which put a scrim over the app and made the sidebar unclickable;
+    // moving it to a scrim-less `stack` layer changed nothing, because the
+    // full-window container that positions such a layer swallows the click
+    // either way (measured — see [`ui::toast_layer`]). You summon E.V. *while*
+    // working, so the page it sits next to has to stay live, and the only way
+    // to get that is to not cover it.
+    //
+    // Suppressed on the chat screens themselves, where it would sit beside the
+    // transcript it is a copy of.
+    if app.assistant_open && !app.screen.is_chat() {
+        shell = shell
+            .push(ui::separator_vertical())
+            .push(container(assistant_panel(app)).width(460).height(Length::Fill));
+    }
 
     let shell: Element<'_, Message> = match notice(app) {
         Some((text, _)) => {
             ui::toast_layer(shell, ui::toast(text, Tone::Success, Message::NoticeExpired))
         }
         None => shell.into(),
+    };
+
+    // Over the E.V. panel: the bell is how you leave whatever is on screen for
+    // the thing that finished behind it.
+    let shell = match app.notifications_open {
+        false => shell,
+        true => ui::modal(shell, notifications_panel(), 560.0),
     };
 
     // Close-button prompt: drawn in-app so quitting looks like the rest of the
@@ -104,6 +135,30 @@ pub fn view(app: &App) -> Element<'_, Message> {
     )
 }
 
+/// The docked E.V. panel: the Assistant screen's own transcript and composer in
+/// a column of their own. Fills its column's height — it is a real region of
+/// the layout now, so there is nothing to clamp it against.
+fn assistant_panel(app: &App) -> Element<'_, Message> {
+    let head = ui::cluster(vec![
+        ui::badge(crate::assistant::name(), Tone::Danger),
+        ui::spacer(),
+        // The panel is the quick answer; the screen is where the header,
+        // provider pickers and full history live.
+        ui::button_ghost(Icon::Message, "Open screen", Message::Nav(Screen::Assistant)),
+        ui::button_ghost(Icon::X, "Close", Message::ToggleAssistant),
+    ]);
+    let body = crate::assistant_view::panel(
+        &app.assistant,
+        &app.settings.theme.resolve(),
+        app.settings.hud_style,
+    )
+    .map(Message::Assistant);
+    container(column![head, container(body).height(Length::Fill)].spacing(space::MD))
+        .padding(space::MD)
+        .height(Length::Fill)
+        .into()
+}
+
 /// The transient message of whatever screen is open, with the generation
 /// counter the toast timer keys on. Screens keep their own `notice`; this is
 /// the one place that turns them into a toast.
@@ -136,11 +191,31 @@ fn sidebar(app: &App) -> Element<'_, Message> {
                 // open. Never locked — Memory is a local file, so the page has
                 // something to show even with the server down (the two tabs that
                 // need it are guarded individually, as in Settings).
-                ui::nav_item(*glyph, label, app.screen.is_chat(), Message::Nav(app.chat_tab))
+                {
+                    // The count is E.V.'s, not the page's: Memory has nothing
+                    // running behind it.
+                    let (count, tone) = crate::screen_notes(Screen::Assistant);
+                    ui::nav_item_counted(
+                        *glyph,
+                        label,
+                        app.screen.is_chat(),
+                        count,
+                        tone,
+                        Message::Nav(app.chat_tab),
+                    )
+                }
             } else if screen.needs_server() && !ready {
                 ui::nav_item_locked(*glyph, label)
             } else {
-                ui::nav_item(*glyph, label, app.screen == *screen, Message::Nav(*screen))
+                let (count, tone) = crate::screen_notes(*screen);
+                ui::nav_item_counted(
+                    *glyph,
+                    label,
+                    app.screen == *screen,
+                    count,
+                    tone,
+                    Message::Nav(*screen),
+                )
             });
         }
     }
@@ -157,7 +232,44 @@ fn sidebar(app: &App) -> Element<'_, Message> {
             // locks — Status and Logs live inside it. Icon-only like its two
             // neighbors, so the row reads as one utility strip; each gets a
             // tooltip since none of the three carry a visible label.
-            ui::cluster(vec![
+            ui::cluster(footer_controls(app)).width(Length::Fill),
+        ]
+        .spacing(space::SM),
+    )
+    .width(208)
+    .padding(space::MD)
+    .height(Length::Fill)
+    .style(ui::theme::sidebar)
+    .into()
+}
+
+/// The utility strip under the separator. A `Vec` rather than a literal because
+/// the mic indicator is conditional, and an always-present placeholder would
+/// leave its gap in the row on every launch that never turns the mic on.
+fn footer_controls(app: &App) -> Vec<Element<'_, Message>> {
+    let mut controls: Vec<Element<'_, Message>> = Vec::with_capacity(6);
+    // Wake-word standby holds the mic open across every screen, with no HUD
+    // anywhere reporting it. The composer says so on the one screen that has a
+    // composer; this says so on all of them, and clicking it is the off switch
+    // — a live mic the user did not ask for must never be more than one click
+    // from off. Leftmost, so it is the first thing in the strip.
+    if app.assistant.standby && app.assistant.armed() {
+        controls.push(ui::nav_icon_button(
+            Icon::Mic,
+            "Mic live — listening for its name. Click to stop.",
+            true,
+            Message::SetWakeWord(false),
+        ));
+    }
+    controls.extend([
+        // E.V. anywhere. Ctrl+K does the same thing; this is the half
+        // of it that is discoverable without knowing the shortcut.
+        ui::nav_icon_button(
+            Icon::Sparkles,
+            "Ask the assistant (Ctrl+K)",
+            app.assistant_open,
+            Message::ToggleAssistant,
+        ),
                 ui::nav_icon_button(
                     Icon::Settings,
                     "Settings",
@@ -177,17 +289,9 @@ fn sidebar(app: &App) -> Element<'_, Message> {
                     ),
                     "Toggle theme",
                 ),
-                ui::tooltip(ui::icon_button(Icon::Refresh, Message::RestartApp), "Restart app"),
-            ])
-            .width(Length::Fill),
-        ]
-        .spacing(space::SM),
-    )
-    .width(208)
-    .padding(space::MD)
-    .height(Length::Fill)
-    .style(ui::theme::sidebar)
-    .into()
+        ui::tooltip(ui::icon_button(Icon::Refresh, Message::RestartApp), "Restart app"),
+    ]);
+    controls
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +328,11 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
             ui::badge(mode_label, mode_tone),
             ui::badge(srv_label, srv_tone),
             ui::spacer(),
-            ui::button_default(Icon::Message, "Talk to E.V.", Message::Nav(Screen::Assistant)),
+            ui::button_default(
+                Icon::Message,
+                crate::assistant::talk_label(),
+                Message::Nav(Screen::Assistant),
+            ),
         ])
         .into(),
     ];
@@ -280,7 +388,10 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
 
     ui::page(
         "Dashboard",
-        Some(ui::muted("E.V. and the platform's vitals at a glance.")),
+        Some(ui::muted(format!(
+            "{} and the platform's vitals at a glance.",
+            crate::assistant::name()
+        ))),
         None,
         ui::stack_lg(blocks),
     )
@@ -344,7 +455,7 @@ fn settings_view(app: &App) -> Element<'_, Message> {
 /// whether or not the server is answering.
 fn chat_view(app: &App) -> Element<'_, Message> {
     let tabs = ui::segmented(
-        CHAT_TABS.map(|(screen, label)| (label, app.screen == screen, Message::Nav(screen))),
+        chat_tabs().map(|(screen, label)| (label, app.screen == screen, Message::Nav(screen))),
     );
     let body = match app.screen {
         _ if app.screen.needs_server() && !app.server_ready() => {
@@ -491,8 +602,82 @@ fn brand(app: &App) -> Element<'_, Message> {
     let mark = iced::widget::image(crate::logo_handle(dark)).width(24).height(24);
     ui::stack(vec![
         ui::cluster(vec![mark.into(), ui::body("Agent Platform")]).into(),
-        ui::badge(label, tone),
+        // The bell shares the status line rather than the name's: at 208px the
+        // sidebar has no room for both, and the name wrapped onto two lines to
+        // make it. What it counts is everything the sidebar badges count, from
+        // every screen at once — including the Settings tabs that have no badge
+        // of their own.
+        ui::cluster(vec![
+            ui::badge(label, tone),
+            ui::spacer(),
+            ui::bell(crate::notify::total(), crate::note_tone(""), Message::ToggleNotifications),
+        ])
+        .into(),
     ])
+    .into()
+}
+
+/// The bell's panel: everything that happened while the user was on another
+/// screen, newest first. A row is a way back to the work — pressing it goes to
+/// the screen the note came from, which is also what marks the rest of that
+/// screen's notes seen.
+fn notifications_panel<'a>() -> Element<'a, Message> {
+    let notes = crate::notify::notes();
+    let mut head = vec![
+        ui::badge(
+            ui::count(notes.len(), "notification", "notifications"),
+            crate::note_tone(""),
+        ),
+        ui::spacer(),
+    ];
+    if !notes.is_empty() {
+        head.push(ui::button_ghost(Icon::Check, "Clear all", Message::ClearNotifications));
+    }
+    head.push(ui::button_ghost(Icon::X, "Close", Message::ToggleNotifications));
+
+    let body: Element<'_, Message> = if notes.is_empty() {
+        ui::empty_state_icon(
+            Icon::Bell,
+            "Nothing waiting. Work that finishes while you are on another screen shows up here.",
+        )
+    } else {
+        let rows: Vec<Element<'_, Message>> = notes
+            .iter()
+            .map(|note| {
+                let (label, tone) = match note.kind {
+                    crate::notify::Kind::Review => ("needs you", Tone::Warning),
+                    crate::notify::Kind::Done => ("finished", Tone::Info),
+                };
+                ui::cluster(vec![
+                    container(ui::list_item(
+                        ui::cluster(vec![
+                            ui::badge(label, tone),
+                            container(ui::stack(vec![
+                                ui::body(note.title.clone()),
+                                ui::muted(note.body.clone()),
+                            ]))
+                            .width(Length::Fill)
+                            .into(),
+                        ]),
+                        false,
+                        Message::OpenNote(note.id),
+                    ))
+                    .width(Length::Fill)
+                    .into(),
+                    ui::icon_button(Icon::X, Message::DismissNote(note.id)),
+                ])
+                .into()
+            })
+            .collect();
+        scrollable(ui::stack(rows)).spacing(space::SM).height(Length::Fill).into()
+    };
+
+    container(ui::card(
+        column![ui::cluster(head), container(body).height(Length::Fill)]
+            .spacing(space::MD)
+            .height(Length::Fill),
+    ))
+    .height(460)
     .into()
 }
 
@@ -575,7 +760,7 @@ fn screen_title(screen: Screen) -> &'static str {
         return "Logs";
     }
     if screen.is_chat() {
-        return CHAT_TABS.iter().find(|(s, _)| *s == screen).map(|(_, l)| *l).unwrap_or("Chat");
+        return chat_tabs().iter().find(|(s, _)| *s == screen).map(|(_, l)| *l).unwrap_or("Chat");
     }
     NAV.iter()
         .flat_map(|(_, entries)| entries.iter())
@@ -595,9 +780,10 @@ fn screen_title(screen: Screen) -> &'static str {
 fn appearance_view(app: &App) -> Element<'_, Message> {
     let style = app.settings.hud_style;
     let rate = app.settings.voice_rate;
+    let name = crate::assistant::name();
     ui::page(
         "Appearance",
-        Some(ui::muted("How the app and E.V. look and sound.")),
+        Some(ui::muted(format!("How the app and {name} look and sound."))),
         None,
         ui::stack_lg(vec![
             ui::card_with_header(
@@ -611,7 +797,7 @@ fn appearance_view(app: &App) -> Element<'_, Message> {
                 ]),
             ),
             ui::card_with_header(
-                "E.V. animation",
+                format!("{name} animation"),
                 Some(ui::muted(match style {
                     HudStyle::Bubble => "A soft orb drawn on the GPU — the smoothest of the three.",
                     HudStyle::BubbleCanvas => {
@@ -630,18 +816,124 @@ fn appearance_view(app: &App) -> Element<'_, Message> {
                 ]),
             ),
             ui::card_with_header(
+                "Terminal",
+                Some(ui::muted(format!(
+                    "{name} can run shell commands on this machine. With this on it shows you \
+                     the command and waits; with it off it runs whatever it decides to."
+                ))),
+                None,
+                ui::stack(vec![
+                    ui::toggle(
+                        if app.settings.confirm_commands { Icon::Check } else { Icon::Alert },
+                        if app.settings.confirm_commands {
+                            "Ask before running a command"
+                        } else {
+                            "Run commands without asking"
+                        },
+                        app.settings.confirm_commands,
+                        Message::SetConfirmCommands(!app.settings.confirm_commands),
+                    ),
+                    ui::caption(
+                        "Turning this off gives a language model an unattended terminal with \
+                         your account's permissions. There is no allowlist behind it — the \
+                         card is the only check.",
+                    ),
+                ]),
+            ),
+            ui::card_with_header(
+                "Name",
+                Some(ui::muted(
+                    "What this assistant is called — on screen, in its persona, and as \
+                     the wake word. Chats and memories it already filed keep their byline.",
+                )),
+                None,
+                ui::stack(vec![
+                    ui::field(
+                        "Name",
+                        ui::input(
+                            crate::assistant::DEFAULT_NAME,
+                            &app.settings.assistant_name,
+                            Message::SetAssistantName,
+                        ),
+                    ),
+                    ui::field(
+                        "Heard as",
+                        ui::input(
+                            "eva, ava, evie",
+                            &app.settings.wake_names,
+                            Message::SetWakeNames,
+                        ),
+                    ),
+                    ui::caption(
+                        "Speech-to-text writes a spoken name however it likes, so the wake \
+                         word matches spellings rather than the name: list them separated \
+                         by commas, one word each. Left empty it listens for the name as \
+                         written.",
+                    ),
+                ]),
+            ),
+            ui::card_with_header(
+                "Wake word",
+                Some(ui::muted(format!(
+                    "Keeps the mic open across the whole app, listening for its name. \
+                     Nothing is sent unless you say “{name}, …” — everything else it hears \
+                     is dropped, not saved and not typed anywhere."
+                ))),
+                None,
+                ui::stack(vec![
+                    ui::toggle(
+                        if app.settings.wake_word { Icon::Mic } else { Icon::MicOff },
+                        if app.settings.wake_word {
+                            format!("Listening for “{name}”")
+                        } else {
+                            "Off".to_string()
+                        },
+                        app.settings.wake_word,
+                        Message::SetWakeWord(!app.settings.wake_word),
+                    ),
+                    ui::caption(
+                        "Transcription is local (whisper). Saying its name brings up voice \
+                         mode, so the answer is spoken and the HUD shows what it heard.",
+                    ),
+                ]),
+            ),
+            ui::card_with_header(
+                "Voice",
+                Some(ui::muted(
+                    "Which voice reads a reply aloud. Any Microsoft Edge neural voice id \
+                     works offline of a speech backend — en-US-AriaNeural, en-GB-RyanNeural, \
+                     en-AU-NatashaNeural.",
+                )),
+                None,
+                ui::stack(vec![
+                    ui::field(
+                        "Voice id",
+                        ui::input(
+                            crate::assistant::DEFAULT_VOICE,
+                            &app.settings.voice_name,
+                            Message::SetVoiceName,
+                        ),
+                    ),
+                    ui::caption(
+                        "With a speech backend configured on the server (SPEECH_API_BASE — \
+                         Piper, Kokoro, a hosted provider) this is that backend's voice id \
+                         instead, which is where a voice you trained yourself goes.",
+                    ),
+                ]),
+            ),
+            ui::card_with_header(
                 "Voice speed",
-                Some(ui::muted("How fast E.V. reads a reply aloud, in voice mode.")),
+                Some(ui::muted(format!("How fast {name} reads a reply aloud, in voice mode."))),
                 None,
                 ui::stack(vec![
                     ui::segmented(crate::assistant::VOICE_RATES.map(|(label, r)| {
                         (label, rate == r, Message::SetVoiceRate(r))
                     })),
-                    ui::caption(
-                        "E.V. reads while the answer is still being written, so it also \
+                    ui::caption(format!(
+                        "{name} reads while the answer is still being written, so it also \
                          eases off when the model falls behind and picks the pace back up \
-                         when text is waiting.",
-                    ),
+                         when text is waiting."
+                    )),
                 ]),
             ),
         ]),
@@ -988,10 +1280,26 @@ fn path_field<'a>(label: &'a str, value: Option<&str>) -> Element<'a, Message> {
 
 fn logs_view(app: &App) -> Element<'_, Message> {
     let selected = app.logs.selected.len();
+    let matched: Vec<(u64, &String)> = app
+        .logs
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| app.logs.shows(l))
+        .map(|(i, l)| (app.logs.base + i as u64, l))
+        .collect();
+
+    use crate::logs::Level;
     let mut toolbar = vec![
         container(ui::input_icon(Icon::Search, "Filter lines…", &app.logs.filter, Message::LogFilterChanged))
             .width(320)
             .into(),
+        ui::chips(vec![
+            ("All", app.logs.level.is_none(), Message::SetLogLevel(None)),
+            ("Info+", app.logs.level == Some(Level::Info), Message::SetLogLevel(Some(Level::Info))),
+            ("Warn+", app.logs.level == Some(Level::Warn), Message::SetLogLevel(Some(Level::Warn))),
+            ("Errors", app.logs.level == Some(Level::Error), Message::SetLogLevel(Some(Level::Error))),
+        ]),
         ui::button_secondary(
             if app.logs.paused { Icon::Play } else { Icon::Pause },
             if app.logs.paused { "Resume" } else { "Pause" },
@@ -1013,31 +1321,44 @@ fn logs_view(app: &App) -> Element<'_, Message> {
     }
     toolbar.push(ui::button_ghost(Icon::Trash, "Clear", Message::ClearLogs));
     toolbar.push(ui::spacer());
+    // A trace jump lands here with a filter the user did not type — say how much
+    // is hidden, and offer the way back out.
+    if app.logs.filtering() {
+        toolbar.push(ui::badge(
+            format!("{} of {}", matched.len(), app.logs.lines.len()),
+            Tone::Info,
+        ));
+        toolbar.push(ui::button_ghost(Icon::XCircle, "Clear filter", Message::ClearLogFilter));
+    }
     toolbar.push(ui::badge(
         if app.shell.attached { "server log" } else { "process output" },
         Tone::Neutral,
     ));
-    let toolbar = ui::cluster(toolbar);
+    // Wraps: the filter chips and the "N of M" badge push this past the window
+    // width, and the clipped item is the one that says what is hidden.
+    let toolbar = ui::cluster(toolbar).wrap();
 
-    let filter = app.logs.filter.to_lowercase();
-    let matched: Vec<(u64, &String)> = app
-        .logs
-        .lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| filter.is_empty() || l.to_lowercase().contains(&filter))
-        .map(|(i, l)| (app.logs.base + i as u64, l))
-        .collect();
     // Only the tail is rendered: iced lays out every child, and the ring holds
     // thousands of lines.
     let tail = &matched[matched.len().saturating_sub(500)..];
 
     let body: Element<'_, Message> = if tail.is_empty() {
-        ui::empty_state_icon(Icon::Scroll, if app.logs.lines.is_empty() {
-            "No output yet."
-        } else {
-            "No lines match the filter."
-        })
+        ui::empty_state_icon(
+            Icon::Scroll,
+            if app.logs.lines.is_empty() {
+                "No output yet.".to_string()
+            } else if app.logs.dropped > 0 {
+                // The common miss after a trace jump: the request logged, then
+                // scrolled out of the ring. "No match" alone reads as "never
+                // happened", which sends people looking in the wrong place.
+                format!(
+                    "No lines match — {} earlier lines were dropped when the buffer wrapped.",
+                    app.logs.dropped
+                )
+            } else {
+                "No lines match the filter.".to_string()
+            },
+        )
     } else {
         let mut lines = column![].spacing(1);
         if app.logs.dropped > 0 {
@@ -1083,9 +1404,10 @@ const FIELD_INDENT: f32 = LEVEL_W + TIME_W + SOURCE_W + 3.0 * space::XS;
 /// tail (500 lines) pays for it. Parse into `LogsState` if the frame time shows.
 fn log_entry<'a>(line: &str) -> Element<'a, Message> {
     let entry = crate::logs::parse(line);
+    let tone = row_tone(&entry);
     let head = row![
         container(match entry.level {
-            Some(level) => ui::badge_icon(level_icon(level), level.label(), level_tone(level)),
+            Some(level) => ui::badge_icon(level_icon(level), level.label(), tone),
             None => ui::caption(""),
         })
         .width(LEVEL_W),
@@ -1095,11 +1417,9 @@ fn log_entry<'a>(line: &str) -> Element<'a, Message> {
             None => ui::caption(""),
         })
         .width(SOURCE_W),
-        match entry.level {
-            Some(level @ (crate::logs::Level::Error | crate::logs::Level::Warn)) => {
-                ui::mono_toned(entry.message, level_tone(level))
-            }
-            _ => ui::mono(entry.message),
+        match tone {
+            Tone::Neutral => ui::mono(entry.message),
+            t => ui::mono_toned(entry.message, t),
         },
     ]
     .spacing(space::XS)
@@ -1108,11 +1428,44 @@ fn log_entry<'a>(line: &str) -> Element<'a, Message> {
     if entry.fields.is_empty() {
         return head.into();
     }
-    let fields =
-        entry.fields.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("    ");
-    column![head, container(ui::caption(fields)).padding(Padding::default().left(FIELD_INDENT))]
-        .spacing(2)
-        .into()
+    // A trace id is the one field worth clicking: it collapses the whole log to
+    // the one request, which is the same thing "View logs" does from an error
+    // banner — reached from a line instead of from a failure.
+    let mut chips: Vec<Element<'a, Message>> = Vec::new();
+    let mut plain: Vec<String> = Vec::new();
+    for (k, v) in &entry.fields {
+        if is_trace_key(k) {
+            chips.push(ui::badge_button(
+                format!("{k} {v}"),
+                Tone::Info,
+                Message::LogFilterChanged(v.clone()),
+            ));
+        } else {
+            plain.push(format!("{k}: {v}"));
+        }
+    }
+    if !plain.is_empty() {
+        chips.push(ui::caption(plain.join("    ")));
+    }
+    column![
+        head,
+        container(ui::cluster(chips)).padding(Padding::default().left(FIELD_INDENT))
+    ]
+    .spacing(2)
+    .into()
+}
+
+/// Field names that identify a request rather than describe it — the ones worth
+/// a click. Both servers write `trace_id`; `request_id` is what the older
+/// Python-side middleware called the same value.
+fn is_trace_key(key: &str) -> bool {
+    matches!(key, "trace_id" | "request_id" | "trace")
+}
+
+/// The row's color says what the level filter says — one notion of severity, so
+/// "Errors" can never hide a row painted red.
+fn row_tone(entry: &crate::logs::Entry) -> Tone {
+    entry.severity().map_or(Tone::Neutral, level_tone)
 }
 
 fn level_icon(level: crate::logs::Level) -> Icon {
@@ -1130,5 +1483,53 @@ fn level_tone(level: crate::logs::Level) -> Tone {
         crate::logs::Level::Error => Tone::Danger,
         crate::logs::Level::Warn => Tone::Warning,
         _ => Tone::Neutral,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logs::parse;
+
+    /// The whole point of `row_tone`: the line that says a request failed is
+    /// logged at INFO, so the level alone would paint it the same grey as a
+    /// health check.
+    #[test]
+    fn a_failed_request_is_toned_by_its_status_not_its_level() {
+        let five_hundred = parse(
+            r#"{"level": "INFO", "message": "request completed", "status_code": 500, "trace_id": "abc"}"#,
+        );
+        assert_eq!(row_tone(&five_hundred), Tone::Danger);
+
+        let four_oh_four =
+            parse(r#"{"level": "INFO", "message": "request completed", "status_code": 404}"#);
+        assert_eq!(row_tone(&four_oh_four), Tone::Warning);
+
+        let ok = parse(r#"{"level": "INFO", "message": "request completed", "status_code": 200}"#);
+        assert_eq!(row_tone(&ok), Tone::Neutral, "a 200 stays quiet");
+
+        // No status to go on: the level still decides.
+        assert_eq!(row_tone(&parse(r#"{"level": "ERROR", "message": "boom"}"#)), Tone::Danger);
+        assert_eq!(row_tone(&parse("Application startup complete.")), Tone::Neutral);
+
+        // A non-numeric status must not panic or swallow the level.
+        let odd = parse(r#"{"level": "ERROR", "message": "boom", "status": "pending"}"#);
+        assert_eq!(row_tone(&odd), Tone::Danger);
+    }
+
+    /// A trace id gets a chip, everything else stays in the muted field line.
+    /// Splitting them wrong is how a row ends up with no way to pivot.
+    #[test]
+    fn only_trace_ids_become_chips() {
+        let entry = parse(
+            r#"{"level": "INFO", "message": "request completed", "trace_id": "abc", "request_id": "def", "duration_ms": 2}"#,
+        );
+        let (chips, plain): (Vec<_>, Vec<_>) =
+            entry.fields.iter().partition(|(k, _)| is_trace_key(k));
+        assert_eq!(
+            chips.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(),
+            vec![("request_id", "def"), ("trace_id", "abc")]
+        );
+        assert_eq!(plain.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec!["duration_ms"]);
     }
 }
