@@ -1160,6 +1160,11 @@ async fn chat_retry(
     check_len(&mut errors, "workspace_root", body.common.workspace_root.as_deref(), 1024);
     check_len(&mut errors, "mode_instruction", body.common.mode_instruction.as_deref(), 4096);
     check_len(&mut errors, "agent_mode", body.common.agent_mode.as_deref(), 32);
+    // This route validates field by field rather than calling
+    // `SendRequest::validate` — it has no `message` to require. `tools` still
+    // reaches the turn through `body.common`, so its caps have to be repeated
+    // here or the limit only exists on `/send` and `/stream`.
+    body.common.validate_tools(&mut errors);
     if !errors.is_empty() {
         return Err(ApiError::validation(errors));
     }
@@ -1284,6 +1289,9 @@ async fn chat_approve(
     }
     check_len(&mut errors, "mode_instruction", body.common.mode_instruction.as_deref(), 4096);
     check_len(&mut errors, "agent_mode", body.common.agent_mode.as_deref(), 32);
+    // Same as `chat_retry`: the caps live on `validate_tools`, and this route
+    // does not go through `SendRequest::validate`.
+    body.common.validate_tools(&mut errors);
     if !errors.is_empty() {
         return Err(ApiError::validation(errors));
     }

@@ -13987,6 +13987,22 @@
       "title": "Delegate Tools",
       "default": false
      },
+     "tools": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "object"
+        },
+        "type": "array",
+        "maxItems": 64
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Tools",
+      "description": "Tool specs for this turn, replacing the server's own. Absent uses the server's six; an empty list is a tool-free turn. Only meaningful to a delegating client — the server can execute only the tools it implements. At most 64 entries and 64 KiB serialized."
+     },
      "mode_instruction": {
       "anyOf": [
        {
@@ -14098,6 +14114,22 @@
       "type": "boolean",
       "title": "Delegate Tools",
       "default": false
+     },
+     "tools": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "object"
+        },
+        "type": "array",
+        "maxItems": 64
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Tools",
+      "description": "Tool specs for this turn, replacing the server's own. Absent uses the server's six; an empty list is a tool-free turn. Only meaningful to a delegating client — the server can execute only the tools it implements. At most 64 entries and 64 KiB serialized."
      },
      "mode_instruction": {
       "anyOf": [
@@ -14275,6 +14307,22 @@
       "type": "boolean",
       "title": "Delegate Tools",
       "default": false
+     },
+     "tools": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "object"
+        },
+        "type": "array",
+        "maxItems": 64
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Tools",
+      "description": "Tool specs for this turn, replacing the server's own. Absent uses the server's six; an empty list is a tool-free turn. Only meaningful to a delegating client — the server can execute only the tools it implements. At most 64 entries and 64 KiB serialized."
      },
      "mode_instruction": {
       "anyOf": [
