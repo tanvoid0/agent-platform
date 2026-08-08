@@ -311,6 +311,58 @@ async fn health_fails_when_the_database_cannot_be_opened() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// The general body cap holds, and an upload route's own cap overrides it.
+///
+/// The override is the part worth a test: both layers write the same request
+/// extension and the *inner* one wins, so moving the route-level layer outward
+/// by one line silently reverts every upload to 16 MB. axum's default was 2 MB
+/// and applied to the upload routes too, which is the regression this pins.
+/// Driven through the router as a `Service` rather than over a socket. A body
+/// limit is rejected *while the client is still writing*, so over a real
+/// connection reqwest reports the reset rather than the 413 the server sent,
+/// and which of the two it sees depends on socket buffer sizes.
+#[tokio::test]
+async fn oversized_json_is_refused_and_uploads_are_not() {
+    use tower::ServiceExt;
+
+    let db = temp_db_path();
+    seed_db(&db).await;
+    let app = agent_platform_server::router(Arc::new(AppState::new(&db, None)));
+
+    async fn post(
+        app: &axum::Router,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> u16 {
+        let req = axum::http::Request::post(path)
+            .header("content-type", content_type)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap().status().as_u16()
+    }
+
+    // Past the 16 MB general cap, under the 512 MB upload one.
+    let big = vec![b'x'; 17 * 1024 * 1024];
+
+    let status = post(&app, "/api/v1/projects", "application/json", big.clone()).await;
+    assert_eq!(status, 413, "a 17 MB JSON body must not be buffered");
+
+    // The upload route reads the same body. It is not valid multipart, so the
+    // assertion is only that it got *past* the limit and into the handler —
+    // a 413 here would mean the route-level layer is not winning.
+    let status = post(
+        &app,
+        "/api/v1/projects/1/workspace/upload",
+        "multipart/form-data; boundary=nope",
+        big,
+    )
+    .await;
+    assert_ne!(status, 413, "the upload route sets its own, larger cap");
+
+    let _ = std::fs::remove_file(&db);
+}
+
 #[tokio::test]
 async fn no_master_key_leaves_auth_open() {
     // The Python server's dev convenience: unset master key means no auth at all.

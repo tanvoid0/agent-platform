@@ -313,6 +313,14 @@ fn check_and_increment(state: &AppState, token_id: i64, limit: Option<i64>) -> R
 
     let count = {
         let mut windows = state.windows.lock().unwrap();
+        // Entries are only ever added, and a token that stops calling leaves
+        // one behind forever. Harmless at any realistic token count, which is
+        // why this is a size trigger and not a timer: a sweep of stale minutes
+        // costs less than the map that made it necessary. Nothing here is
+        // per-request work in the normal case.
+        if windows.len() > 1024 {
+            windows.retain(|_, (m, _)| *m == minute);
+        }
         let entry = windows.entry(token_id).or_insert((minute, 0));
         if entry.0 != minute {
             *entry = (minute, 0);

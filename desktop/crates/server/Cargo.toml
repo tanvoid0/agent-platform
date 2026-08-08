@@ -18,7 +18,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # `json` is used by the lib itself; without it here only `cargo test` builds,
 # because the dev-dependency below unifies the feature back in.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "any", "chrono", "macros"] }
+# `migrate` is what `db::ensure_schema` runs — the versioned runner that
+# replaced Alembic. It embeds `migrations/` into the binary, so the deployed
+# artifact is still one file.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "any", "chrono", "macros", "migrate"] }
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` because a Python dict renders in insertion order and a
 # `serde_json::Map` is a `BTreeMap`, which renders sorted. That is not cosmetic:
@@ -57,9 +60,11 @@ bytes = "1"
 regex = "1"
 pdf-extract = "0.12"
 async-stream = "0.3.6"
-# CORS only. Hand-rolling preflight is where people quietly get `Vary` wrong and
-# poison a shared cache; this is the crate axum's own examples use.
-tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+# CORS, plus `timeout` for `RequestBodyTimeoutLayer` — a slow request body is
+# the one hang the per-call reqwest timeouts elsewhere cannot cover. Hand-rolling
+# preflight is where people quietly get `Vary` wrong and poison a shared cache;
+# this is the crate axum's own examples use.
+tower-http = { version = "0.6", default-features = false, features = ["cors", "timeout"] }
 
 [target.'cfg(windows)'.dependencies]
 # Job object with kill-on-close: the only thing that reaps the Python child when
@@ -76,3 +81,8 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `oneshot`, to call the router as a `Service` with no socket in between. A body
+# limit is rejected *while the client is still writing*, so over a real
+# connection the client sees a reset rather than the 413 the server sent, and
+# which of the two it sees depends on buffer sizes. Already in the tree via axum.
+tower = { version = "0.5", features = ["util"] }

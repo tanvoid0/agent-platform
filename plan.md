@@ -32,7 +32,7 @@ than died, is the section below.
 | Area | Path |
 |------|------|
 | Router, startup, the 404 fallback | `desktop/crates/server/src/lib.rs` |
-| Schema (replaced Alembic) | `desktop/crates/server/src/schema.sql` + `db::ensure_schema`; `db.rs` is also the SQLite/Postgres choke point (placeholder rewriting, pool construction) |
+| Schema (replaced Alembic) | `desktop/crates/server/migrations/` + `db::ensure_schema` (`sqlx::migrate!`); `db.rs` is also the SQLite/Postgres choke point (placeholder rewriting, pool construction) |
 | Auth, tokens | `auth.rs` (verification, `last_used_at`), `api_tokens.rs` (the CRUD) — see `docs/workspace-tenancy-plan.md` |
 | Processes / orchestrator | `{processes,executor,dag_schema}.rs` — the DAG executor and all eleven process routes |
 | LLM proxy, BYOK, providers | `llm.rs` (routes), `llm_config.rs`, `byok.rs`, `provider_catalog.rs`, `model_capabilities.rs`, `model_catalog.rs`, `upstream_http.rs`, `usage.rs`; admin surface in `llm_admin.rs`, `config.yaml` validation in `config_schema.rs` |
@@ -60,8 +60,9 @@ cd desktop && cargo run -p agent-platform-desktop               # the app (spawn
 ```
 
 `agent-platformd` is self-contained: no child process, no interpreter. It
-creates its own SQLite file and applies `schema.sql` on startup. It is
-SQLite-only and refuses to start with `DATABASE_URL` set.
+creates its own SQLite file and runs `migrations/` on startup. It is
+SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
+`.env` sets one, so a checkout run needs `AGENT_PLATFORM_ROOT` pointed elsewhere.
 
 - Desktop dev needs cmake + libclang (machine paths in
   `desktop/.cargo/config.toml`). The app spawns `agent-platformd` from its own
@@ -76,9 +77,10 @@ SQLite-only and refuses to start with `DATABASE_URL` set.
   `.gitignore` pins `desktop/target/` exactly, so a sibling dir shows up
   untracked.
 - Hygiene: `python scripts/check_repo_hygiene.py`.
-- **Schema changes**: `schema.sql` + `db::ensure_schema` replaced Alembic, and
-  it **creates rather than migrates** — a new column needs a versioned runner
-  built first. Read the doc comment before touching a table.
+- **Schema changes**: add a new `desktop/crates/server/migrations/000N_*.sql`.
+  `sqlx::migrate!` replaced Alembic; `0001_initial.sql` is the squashed head and
+  is checksummed, so editing an applied migration stops every existing database
+  from starting. Forward-only, no `down` scripts.
 - **Build jobs** need `MODEL_OPS_PYTHON` pointing at an interpreter with torch;
   `worker/requirements.txt` lists the rest. Without it a job fails on the first
   stage with the spawn error, naming the interpreter it tried.
@@ -252,16 +254,33 @@ babysat by a developer.
    "dead", and an instant `SQLITE_BUSY` would have it start a second server
    against the same file.
 
+5. **Inbound limits.** axum's 2 MB extractor default was the only cap, and it
+   applied to the *upload* routes too — Starlette had no limit, so the port
+   quietly introduced a ceiling nothing documents. Now a 16 MB general cap
+   (`AGENT_PLATFORM_MAX_BODY_MB`) with the four multipart routes raising it to
+   512 MB for themselves (`AGENT_PLATFORM_MAX_UPLOAD_MB`); a cap has to exist
+   because every handler reads the body into memory before it looks at it. Plus
+   `RequestBodyTimeoutLayer` at 60s for the slow-body hold, which the per-call
+   reqwest timeouts cannot cover. **Request body only** — a response timeout
+   here would cut every SSE stream this server serves at the same mark. The
+   test drives the router through `tower::oneshot` rather than a socket: a body
+   limit is rejected while the client is still writing, so over a real
+   connection reqwest reports the reset instead of the 413 and which one you
+   see depends on buffer sizes.
+6. **A real migration runner.** `schema.sql` became
+   `migrations/0001_initial.sql` under `sqlx::migrate!`, embedded in the binary
+   so the artifact is still one file. The squash is not a replay: the thirty
+   Alembic revisions are not carried, because every database in existence was
+   at head the day Python was deleted. Verified against a **copy of the real
+   user database** — 29 tables and no `_sqlx_migrations` before, 30 and one
+   after, every row count identical, `/health` 200 and `GET /projects` still
+   returning the real row. A schema change is a new `000N_*.sql` from here;
+   editing an applied one stops every existing database from starting.
+7. **The rate-limit window map is pruned** at 1024 entries. Size-triggered, not
+   timed: a sweep of stale minutes costs less than the map that made it needed.
+
 **Not done, in the order worth doing:**
 
-- **No inbound limits.** No request timeout, no body cap past axum's 2 MB
-  extractor default, no global concurrency cap (only `chat` has one, via
-  `AGENT_PLATFORM_CHAT_MAX_CONCURRENT`). `tower-http` is already a dependency —
-  its `timeout` and `limit` features are the whole fix.
-- **`schema.sql` creates but does not migrate** — see `db::ensure_schema`. The
-  first column change needs `sqlx::migrate!` (sqlx is already in the tree) or a
-  `schema_version` table. The thirty historical Alembic revisions are not worth
-  carrying: every database in existence is at head.
 - **`openapi.json` drifts silently** — see the note on `lib.rs::openapi`.
 - **The parity tax outlived its counterparty.** The Python server is deleted,
   but the crate still declines foreign keys ("matching Python is the
@@ -271,9 +290,11 @@ babysat by a developer.
   shapes errors like pydantic's. Each is now deletion, not maintenance.
 - **`AppState.pool` + `AppState.any`** — finishing the `sqlx::Any` conversion
   deletes a field and lets `Config::from_env` stop refusing `DATABASE_URL`.
-- **Rate limiting is per-token and in-process**; the master key is unlimited and
-  `state.windows` is never pruned.
+- **Rate limiting is per-token and in-process**; the master key is unlimited,
+  and an N-up deployment would need a shared store.
 - **No backup or vacuum story** for the SQLite file.
+- **No global concurrency cap** — only `chat` has one, via
+  `AGENT_PLATFORM_CHAT_MAX_CONCURRENT`.
 
 ### Rust server migration — **closed 2026-08-07**
 

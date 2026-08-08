@@ -41,7 +41,13 @@ pub fn routes() -> Router<Arc<AppState>> {
                 get(read_file).put(write_file).delete(delete_file),
             )
             .route(&format!("{base}/mkdir"), post(make_dir))
-            .route(&format!("{base}/upload"), post(upload_file));
+            // The one multipart route here: a document a user drops on a
+            // workspace is not bound by what a JSON body ought to weigh.
+            .route(
+                &format!("{base}/upload"),
+                post(upload_file)
+                    .layer(axum::extract::DefaultBodyLimit::max(crate::upload_body_limit())),
+            );
     }
     router
 }

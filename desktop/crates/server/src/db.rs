@@ -117,49 +117,36 @@ pub fn connect_lazy(url: &str, backend: Backend) -> AnyPool {
     opts.connect_lazy(url).expect("connection string was validated at startup")
 }
 
-/// The schema Alembic used to create, applied at startup.
+/// Bring the database up to head, applied at startup.
 ///
-/// **This replaces Alembic, and the replacement is deliberately dumber than it
-/// was.** ADR 0007 rule 2 made Alembic the only migration owner for as long as
-/// two servers shared the database — a second migration tool would have raced
-/// it. There is no second server now, and Alembic cannot stay: it is
-/// `app/alembic/`, which went with the rest of the Python package.
+/// **This replaces Alembic.** ADR 0007 rule 2 made Alembic the only migration
+/// owner for as long as two servers shared the database — a second migration
+/// tool would have raced it. There is no second server now, and Alembic cannot
+/// stay: it is `app/alembic/`, which went with the rest of the Python package.
 ///
-/// What ships instead is one `schema.sql`, generated from the final Alembic
-/// head (`e0f1a2b3c4d5`) as `CREATE TABLE IF NOT EXISTS` plus its indexes. An
-/// existing database already has every one of those tables, so applying it is a
-/// no-op there; a fresh one gets the schema in a single pass instead of
-/// replaying thirty revisions.
+/// What ships instead is `crates/server/migrations/`, run by `sqlx::migrate!`,
+/// which is embedded in the binary at compile time — the deployed artifact is
+/// still one file with no directory to ship beside it.
 ///
-/// ponytail: **this creates, it does not migrate.** A future column change has
-/// nowhere to go — the honest upgrade is a versioned migration runner
-/// (`sqlx::migrate!`, or a `schema_version` table and a list of steps), and it
-/// should be built the first time a column actually has to change rather than
-/// speculatively now. The thirty historical revisions are not worth carrying
-/// into it: every database in existence is already at head.
+/// **The first migration is a squash, not a replay.** `0001_initial.sql` is the
+/// final Alembic head (`e0f1a2b3c4d5`) written as `CREATE TABLE IF NOT EXISTS`
+/// plus its indexes; the thirty historical revisions are not carried, because
+/// every database in existence was already at head the day Python was deleted.
+/// So it is a no-op against an existing database and a one-pass create against
+/// an empty one, and either way sqlx records it in `_sqlx_migrations` and never
+/// runs it again.
+///
+/// **A schema change is now a new file**, `000N_what_it_does.sql`, and nothing
+/// else. Do not edit an applied one: sqlx stores each file's checksum and
+/// refuses to start against a modified copy, which is the guarantee that makes
+/// this a migration runner rather than the create-only bootstrap it replaced.
+///
+/// ponytail: forward-only, no `down` scripts. Rolling back means writing the
+/// next migration — worth adding reversibility the first time a release
+/// actually has to be undone, not before.
 pub async fn ensure_schema(pool: &AnyPool) -> Result<(), sqlx::Error> {
-    // Comment lines are dropped **before** splitting, not after. Splitting
-    // first glues the file's header comment onto the first `CREATE`, and a
-    // filter on "starts with `--`" then silently discards both — which showed
-    // up as one missing table, not as an error.
-    let sql: String = SCHEMA_SQL
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("--"))
-        .collect::<Vec<_>>()
-        .join("
-");
-
-    for statement in sql.split(';') {
-        let statement = statement.trim();
-        if statement.is_empty() {
-            continue;
-        }
-        sqlx::query(statement).execute(pool).await?;
-    }
-    Ok(())
+    sqlx::migrate!("./migrations").run(pool).await.map_err(sqlx::Error::from)
 }
-
-const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 #[cfg(test)]
 mod schema_tests {
@@ -167,10 +154,10 @@ mod schema_tests {
 
     /// The whole file has to execute against a real SQLite, twice.
     ///
-    /// Once because a statement the splitter mangles is a server that starts
-    /// and then 500s on the first query; twice because every install after the
-    /// first runs this against a database that already has the tables, and an
-    /// `IF NOT EXISTS` that was missed would fail there and nowhere else.
+    /// Once because a broken statement is a server that starts and then 500s on
+    /// the first query; twice because every install after the first runs this
+    /// against a database that already has the tables, and an `IF NOT EXISTS`
+    /// that was missed would fail there and nowhere else.
     #[tokio::test]
     async fn the_schema_applies_to_an_empty_database_and_again_to_a_full_one() {
         let path = std::env::temp_dir().join(format!("agp-schema-{}.db", std::process::id()));
@@ -210,6 +197,61 @@ mod schema_tests {
         .await
         .unwrap();
         assert!(indexes > 20, "only {indexes} named indexes");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every database in the field was built by Alembic and has no
+    /// `_sqlx_migrations` table, so the runner sees an unmigrated database that
+    /// already holds every table `0001_initial.sql` creates.
+    ///
+    /// **This is the one way the switch from create-only to a migration runner
+    /// could destroy a user's data**, and it fails silently in the good
+    /// direction only because the squash is `IF NOT EXISTS` throughout. A
+    /// `DROP`/`CREATE` slipped into that file would take the user's rows with
+    /// it, and no other test in this crate would notice.
+    #[tokio::test]
+    async fn an_alembic_built_database_is_adopted_without_losing_rows() {
+        let path =
+            std::env::temp_dir().join(format!("agp-adopt-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let url = url_for(&path, None);
+        let pool = connect_lazy(&url, Backend::Sqlite);
+
+        // Stand in for what Alembic left behind: the table, with a row in it,
+        // and nothing recording that a migration ever ran. `workspace_id` is
+        // here because `ix_project_workspace_id` indexes it and `CREATE INDEX
+        // IF NOT EXISTS` still resolves the column — a stub without it fails
+        // the whole migration, which is what an existing database missing a
+        // column would also do.
+        sqlx::query(
+            "CREATE TABLE project (id INTEGER PRIMARY KEY, name TEXT, workspace_id INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO project (id, name) VALUES (1, 'existing')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        ensure_schema(&pool).await.expect("adopting an existing database");
+
+        let name: Option<String> = sqlx::query_scalar("SELECT name FROM project WHERE id = 1")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("existing"), "the runner dropped a populated table");
+
+        // And the tables the old database did *not* have were created anyway.
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'api_tokens'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("api_tokens"));
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);

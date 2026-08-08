@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Multipart, State};
+use axum::extract::{DefaultBodyLimit, Multipart, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -80,8 +80,18 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(&format!("{BASE}/operations/build"), post(build_operation))
         .route(&format!("{BASE}/projects"), get(projects_list).post(projects_create))
         .route(&format!("{BASE}/projects/{{name}}"), get(projects_get))
-        .route(&format!("{BASE}/projects/{{name}}/knowledge"), post(upload_knowledge))
-        .route(&format!("{BASE}/projects/{{name}}/files"), post(upload_files))
+        // Both take multipart, and a training set or an adapter is legitimately
+        // bigger than the general body cap. Applied per route rather than to the
+        // whole module, so a mistyped JSON body to `/projects` is still refused
+        // at 16 MB instead of buffering half a gigabyte first.
+        .route(
+            &format!("{BASE}/projects/{{name}}/knowledge"),
+            post(upload_knowledge).layer(DefaultBodyLimit::max(crate::upload_body_limit())),
+        )
+        .route(
+            &format!("{BASE}/projects/{{name}}/files"),
+            post(upload_files).layer(DefaultBodyLimit::max(crate::upload_body_limit())),
+        )
         .route(&format!("{BASE}/registry"), get(registry_list))
         .route(&format!("{BASE}/registry/{{entry_id}}/activate"), post(registry_activate))
 }

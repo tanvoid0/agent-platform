@@ -378,6 +378,40 @@ fn cors_layer() -> Option<tower_http::cors::CorsLayer> {
     )
 }
 
+/// How many bytes a request body may carry before the route decides otherwise.
+///
+/// **axum's own default is 2 MB, and it was the only cap this server had.**
+/// Starlette had none, so the port quietly introduced a ceiling nothing
+/// documents: a chat turn carrying a large document context, or any upload past
+/// 2 MB, gets a 413 with no hint that a limit exists. This raises the general
+/// cap to something a JSON body will never reach honestly, and the upload
+/// routes raise it again for themselves (see [`upload_body_limit`]).
+///
+/// A cap has to exist because every handler here reads the body into memory
+/// before it looks at it — `Json<T>`, and `read_multipart`'s `Vec<u8>` per
+/// part. Unlimited means one request can decide how much RAM this process uses.
+pub fn json_body_limit() -> usize {
+    megabytes("AGENT_PLATFORM_MAX_BODY_MB", 16)
+}
+
+/// The cap for the four multipart upload routes, which is the same ceiling for
+/// a different reason: a LoRA adapter or a training set is legitimately large,
+/// and `read_multipart` still buffers every part.
+///
+/// ponytail: one number for all of them, and it is a whole-body limit rather
+/// than a per-file one. Split it if a route ever needs its own.
+pub fn upload_body_limit() -> usize {
+    megabytes("AGENT_PLATFORM_MAX_UPLOAD_MB", 512)
+}
+
+fn megabytes(var: &str, default_mb: usize) -> usize {
+    env_opt(var)
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .unwrap_or(default_mb)
+        .saturating_mul(1024 * 1024)
+}
+
 /// The whole surface. There is no fallback any more — an unknown path is a 404
 /// from [`not_found`], where it used to be forwarded to Python.
 ///
@@ -409,6 +443,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_token,
+        ))
+        // The general cap. A route that needs more sets its own *closer to the
+        // handler*, which is what makes it win: both layers write the same
+        // request extension, and the inner one writes last.
+        .layer(axum::extract::DefaultBodyLimit::max(json_body_limit()))
+        // A body that arrives one byte at a time holds a connection and a task
+        // open for as long as the sender likes, and the body-size cap does not
+        // help — the bytes never add up. Request body only: a response timeout
+        // here would cut every SSE stream this server serves at the same mark.
+        .layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
+            std::time::Duration::from_secs(60),
         ))
         // Outermost, so an auth rejection carries a correlation id too.
         .layer(axum::middleware::from_fn(request_id::middleware))

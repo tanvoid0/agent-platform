@@ -48,11 +48,11 @@ claiming a change works; CI is the backstop, not the loop.
   (`scripts/sync_contract_enums.py`) are gone with the Python server. The values
   are the wire contract — the server writes them as strings, so changing a
   variant does not change what the server emits. Grep for the string first.
-- **The schema is `desktop/crates/server/src/schema.sql`**, applied by
-  `db::ensure_schema` at startup. It replaced Alembic, and it **creates rather
-  than migrates**: a new column has nowhere to go until someone builds a
-  versioned runner. Read the doc comment on `ensure_schema` before changing a
-  table.
+- **The schema lives in `desktop/crates/server/migrations/`**, run by
+  `db::ensure_schema` (`sqlx::migrate!`) at startup. It replaced Alembic.
+  `0001_initial.sql` is the squashed final Alembic head and **must not be
+  edited** — sqlx checksums an applied migration and refuses to start against a
+  changed copy. A schema change is a new `000N_*.sql` beside it, forward-only.
 - **Desktop screens split by file**: state + `update` in `x.rs`, rendering in
   `x_view.rs`. Widgets and tokens come from `desktop/crates/app/src/ui/` —
   screens compose kit functions, they do not style ad hoc.
