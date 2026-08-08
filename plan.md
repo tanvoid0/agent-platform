@@ -291,10 +291,34 @@ runs offline by design and should not phone GitHub on launch. The daemon has
 the real thing already, from `dist`. Add `self_update`/`axoupdater` to the app
 once a `desktop-v*` tag exists to point it at.
 
+Both halves were **driven, not only unit-tested**:
+
+- **The Version card**, on a second app instance launched with
+  `AGENT_PLATFORM_PORT=18499` so it never touched the running one: Settings →
+  Status renders it under the API-server card, "This build 0.2.0" in mono, and
+  pressing *Check for updates* reaches GitHub and settles on "Up to date." — a
+  real call against a repo with zero releases, which is the answer it should
+  give. Two things worth knowing for the next person who drives this app:
+  **`CopyFromScreen` reads the screen, not the window**, so a shot taken
+  without foregrounding first captured a *second instance of the same app*
+  sitting in front and looked like a rendering bug; and **the first click after
+  the ALT-tap is eaten often enough to matter** — clicking twice is the cheap
+  remedy, and the calibration click that proved the coordinates were right is
+  what separated "wrong offset" from "dropped event".
+- **Caller-supplied tools reach the model.** One turn against `devstral:24b`
+  with a single tool named `portal_delegate_task` in the body — a name this
+  crate does not implement and never advertises. The stream answered
+  `event: tool_call {"name": "portal_delegate_task", …}`, which it can only do
+  if the list was forwarded. That is also the whole protocol working: the turn
+  then parked, waiting for a `tool-result` that was never sent.
+
 Borrowed from portal_desktop's pipeline and worth keeping in mind if this grows:
 its release gates a four-platform matrix behind one cheap smoke job on a single
 runner, which `dist`'s generated `plan` job already does, and it sets
 `fail-fast: false` so one platform's break does not cancel three good builds.
+
+**Neither workflow has ever run.** The first `v*` / `desktop-v*` tag is the
+real test, and pushing one publishes a public release — a decision, not a step.
 
 ### Deployment hardening — 2026-08-08
 
