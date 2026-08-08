@@ -271,25 +271,45 @@ workflows now, deliberately not one:
   - **`agent-platform-desktop` is `dist = false`.** `dist` has no per-package
     target list, so including it would mean a release that reliably fails on
     three platforms of the four.
-- **`.github/workflows/release-desktop.yml` — hand-written, Windows only.**
-  Its own tag namespace, `desktop-v*`, because two workflows on one tag race to
-  create the same GitHub Release and the two components version independently
-  anyway (server 0.1.x, app 0.2.x). The zip carries **both** exes: the app
-  spawns the daemon from its own directory, so shipping one without the other
-  produces an app that starts and cannot reach a server. `LIBCLANG_PATH` is set
-  for the same bindgen reason as in `ci.yml`. Verified locally by building both
-  `--release` (the packaging step's paths are real), not only by reading.
+- **`.github/workflows/release-desktop.yml` — the app's Windows build, as a
+  `dist` custom job rather than a release of its own.** `local-artifacts-jobs`
+  makes `dist` call it during build-local-artifacts and fold what it uploads
+  into the same release, so **one tag, `v<version>`, ships both**. The zip
+  carries **both** exes: the app spawns the daemon from its own directory, so
+  shipping one without the other produces an app that starts and cannot reach a
+  server. `LIBCLANG_PATH` is set for the same bindgen reason as in `ci.yml`, and
+  it builds `--profile dist` so both halves of a release are built the same way.
+  - **This was two tag series first, and that was wrong twice over.** A
+    separate `desktop-v*` workflow meant two workflows racing to create one
+    release — and worse, `dist`'s generated trigger is a *prefix glob*
+    (`**[0-9]+.[0-9]+.[0-9]+*`), so `desktop-v0.2.0` matched it too: tagging the
+    app would have started a *daemon* release hunting for a package at version
+    0.2.0 and finding only the one that is `dist = false`. Namespacing the
+    daemon's tags fixed the collision and left the race; one job inside one
+    workflow fixes both.
+  - **The two crates are versioned in lockstep** (server moved 0.1.0 → 0.2.0 to
+    meet the app), because `dist` derives the tag from the version and a skew is
+    two tags for one product.
+  - The contract with `dist` is the artifact *name*: anything uploaded as
+    `artifacts-*` is collected into `target/distrib/`, and a zip must have its
+    files at the root rather than nested.
 
 **The app's updater is the check half only** — `update_check.rs` plus a Version
-card in Settings → Status. It asks the releases API for the newest
-`desktop-v*`, compares numerically (so `0.10.0` beats `0.9.0`, and the daemon's
-`v*` series is filtered out rather than read as an app update), and offers to
-open the releases page. **No install button**, for two reasons: replacing a
-running `.exe` on Windows needs a rename-then-swap, and nothing has ever been
-published to test a download against. It is a button, never a poll — this app
-runs offline by design and should not phone GitHub on launch. The daemon has
-the real thing already, from `dist`. Add `self_update`/`axoupdater` to the app
-once a `desktop-v*` tag exists to point it at.
+card in Settings → Status. It asks the releases API for the newest `v*`,
+compares numerically (so `0.10.0` beats `0.9.0`), and offers to open the
+releases page. **No install button**, for two reasons: replacing a running
+`.exe` on Windows needs a rename-then-swap, and nothing has ever been published
+to test a download against. It is a button, never a poll — this app runs offline
+by design and should not phone GitHub on launch. The daemon has the real thing
+already, from `dist`. Add `self_update`/`axoupdater` to the app once a tag
+exists to point it at.
+
+- **The tag prefix is load-bearing and it changed.** While there were two
+  series this filtered for `desktop-v*`; collapsing to one release left that
+  prefix matching nothing, which makes the card answer "Up to date." forever —
+  the one answer it must never give wrongly. It reads `v*` now, and the test
+  keeps a stray `desktop-v9.9.9` in its fixture so a 9.x of the abandoned
+  series cannot be read as an upgrade.
 
 Both halves were **driven, not only unit-tested**:
 
@@ -317,8 +337,11 @@ its release gates a four-platform matrix behind one cheap smoke job on a single
 runner, which `dist`'s generated `plan` job already does, and it sets
 `fail-fast: false` so one platform's break does not cancel three good builds.
 
-**Neither workflow has ever run.** The first `v*` / `desktop-v*` tag is the
-real test, and pushing one publishes a public release — a decision, not a step.
+**The pipeline has never run.** The first `v*` tag is the real test. The one
+part that cannot be checked locally at all is whether `dist` attaches an
+artifact it did not itself plan — if the app's zip is missing from the release,
+that is where to look, and `gh release upload` is the stopgap while the wiring
+is fixed.
 
 ### Deployment hardening — 2026-08-08
 

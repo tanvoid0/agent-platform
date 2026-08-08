@@ -94,10 +94,10 @@ it has been sending them the whole time. Contract in
 
 ### 2a. Release pipeline + auto-update — the real gap, now closed
 
-> **Built 2026-08-08.** `dist-workspace.toml` + `.github/workflows/release.yml`
-> (generated) for the daemon on four platforms, and
-> `.github/workflows/release-desktop.yml` for the Windows app on its own
-> `desktop-v*` tags. The app got the check half of an updater
+> **Built 2026-08-08.** One tag, `v<version>`, one release, both artifacts:
+> `dist-workspace.toml` + the generated `.github/workflows/release.yml` for the
+> daemon on four platforms, with `release-desktop.yml` folded in as a `dist`
+> custom job for the Windows app zip. The app got the check half of an updater
 > (`update_check.rs`); the daemon got `dist`'s real one. Details and the
 > reasoning in `plan.md` → **Releases**. What follows is the review that led
 > there.
@@ -244,4 +244,4 @@ Still open, and the reason this document exists:
   `SendRequest` and nothing would notice if the spec never learned about it.
   With two clients, the spec is the contract.
 - **The iced app's updater cannot install**, only notice. It needs a published
-  `desktop-v*` tag to test a download against.
+  `v*` tag to test a download against.

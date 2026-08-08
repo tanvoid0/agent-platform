@@ -4,8 +4,8 @@
 //! its own problem (the file is locked; it needs a rename-then-swap), and there
 //! has never been a published release to test a download against. What this
 //! does is cheap, safe and enough to stop someone running a build from months
-//! ago without knowing: ask GitHub for the newest `desktop-v*` tag, compare it
-//! to this binary's own version, and offer to open the release page.
+//! ago without knowing: ask GitHub for the newest `v*` tag, compare it to this
+//! binary's own version, and offer to open the release page.
 //!
 //! The daemon has a real self-updater already — `dist` generates an
 //! `agent-platform-server-<target>-update` binary per platform (see
@@ -14,9 +14,13 @@
 
 use serde::Deserialize;
 
-/// The tag namespace `.github/workflows/release-desktop.yml` publishes under.
-/// The daemon's `v*` tags are a different series and are skipped here.
-const TAG_PREFIX: &str = "desktop-v";
+/// The tag series `dist` publishes under — one release carries both the daemon
+/// and this app, and the two crates are versioned in lockstep, so the tag's
+/// version *is* this binary's version. There was briefly a second series
+/// (`desktop-v*`, from a workflow of its own); a prefix that matches nothing
+/// makes this card claim "up to date" forever, which is the one answer it must
+/// never give wrongly.
+const TAG_PREFIX: &str = "v";
 const RELEASES_API: &str =
     "https://api.github.com/repos/tanvoid0/agent-platform/releases?per_page=20";
 pub const RELEASES_PAGE: &str = "https://github.com/tanvoid0/agent-platform/releases";
@@ -50,7 +54,7 @@ struct Release {
     prerelease: bool,
 }
 
-/// The newest `desktop-v*` release that is newer than this build, or `None`.
+/// The newest `v*` release that is newer than this build, or `None`.
 ///
 /// Blocking, because `reqwest`'s blocking client is what this crate already
 /// carries and the caller runs it off the UI thread anyway.
@@ -109,17 +113,18 @@ mod tests {
     }
 
     #[test]
-    fn picks_the_highest_desktop_version_and_ignores_everything_else() {
+    fn picks_the_highest_version_and_ignores_everything_else() {
         let releases = vec![
-            // The daemon's series — a different product, and 9.x of it must
-            // never read as an app update.
-            release("v9.9.9"),
-            release("desktop-v0.1.9"),
-            release("desktop-v0.3.0"),
+            release("v0.1.9"),
+            release("v0.3.0"),
             // Out of publish order on purpose: the pick is by version.
-            release("desktop-v0.2.5"),
-            Release { tag_name: "desktop-v9.0.0".into(), draft: true, prerelease: false },
-            Release { tag_name: "desktop-v8.0.0".into(), draft: false, prerelease: true },
+            release("v0.2.5"),
+            // Neither a draft nor a prerelease is something to upgrade to.
+            Release { tag_name: "v9.0.0".into(), draft: true, prerelease: false },
+            Release { tag_name: "v8.0.0".into(), draft: false, prerelease: true },
+            // Not this series at all — the abandoned second one. It must not be
+            // read as a 9.x of this product.
+            release("desktop-v9.9.9"),
         ];
         assert_eq!(pick_newer("0.2.0", &releases).as_deref(), Some("0.3.0"));
         // Nothing published is above this build.
@@ -129,7 +134,7 @@ mod tests {
 
     #[test]
     fn an_unparseable_tag_never_wins() {
-        let releases = vec![release("desktop-vnightly"), release("desktop-v0.2.0")];
+        let releases = vec![release("vnightly"), release("v0.2.0")];
         assert_eq!(pick_newer("0.2.0", &releases), None);
     }
 
