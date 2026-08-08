@@ -66,10 +66,19 @@ jobs:
         working-directory: desktop
         run: cargo build --profile dist -p agent-platform-desktop -p agent-platform-server
 
+      # The plan arrives through `env`, not interpolated into the script. It is
+      # JSON containing the installers' own install lines — `curl --proto
+      # '=https' --tlsv1.2 -LsSf …` — and those single quotes closed the
+      # PowerShell string this used to sit in, leaving the rest to parse as
+      # arguments: "A positional parameter cannot be found that accepts argument
+      # '=https --tlsv1.2 -LsSf". The build had already succeeded; only the
+      # packaging died, so the release had four daemons and no app.
       - name: Package
         shell: pwsh
+        env:
+          PLAN: ${{ inputs.plan }}
         run: |
-          $version = (ConvertFrom-Json '${{ inputs.plan }}').announcement_tag -replace '^v', ''
+          $version = (ConvertFrom-Json $env:PLAN).announcement_tag -replace '^v', ''
           $name = "agent-platform-desktop-$version-x86_64-pc-windows-msvc"
           $stage = "staging/$name"
           New-Item -ItemType Directory -Force $stage | Out-Null
