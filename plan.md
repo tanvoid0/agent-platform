@@ -91,6 +91,190 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
 
 ## Backlog
 
+- **Notifications, in the app as well as on the desktop — landed 2026-08-08.**
+  `notify.rs` already toasted work that finished off-screen, and a toast is gone
+  in ten seconds; there was nothing left to come back to. It now also keeps an
+  inbox (global `Mutex<Vec<Note>>`, same reason `WATCHING` is global — notes are
+  posted from module `update`s that have no `App`), capped at 100.
+  - Two kinds. `away()` is *finished*; `review()` is **waiting on you** — the
+    Coder approval pause, and the two process statuses (`approval_required`,
+    `task_review_required`) that stop the engine dead. Those two never notified
+    before: `became_terminal` only fired on completed/failed/cancelled, so the
+    one state that actually needs a human was the one that went unannounced.
+    It is `settled()` now, keyed on "stopped moving", not "ended".
+  - Counts. Per screen on the sidebar entry (`ui::nav_item_counted`), global on
+    a bell (`ui::bell`) sharing the sidebar's Connected/Offline line. Warning
+    tone when any of what is counted is waiting on the user, Info when it merely
+    finished. The bell went on that line and not beside the app name because at
+    208px it pushed "Agent Platform" onto two lines — seen in a screenshot, not
+    reasoned about.
+  - Seen = visited. `main::update` already rewrote `notify::watching` after
+    every message; it now calls `notify::seen(key)` on the same line, so a badge
+    cannot outlive the visit it was about. `NOTIFY_KEYS` is that key↔screen map
+    in both directions — a note's row navigates to where it came from, and a
+    badge cannot point somewhere no note came from.
+  - Panel behind the bell, Esc closes it (above Abort, unlike the E.V. panel:
+    closing it stops nothing).
+
+  Still open: notes are in memory, so a restart forgets them — fine while the
+  work they point at is a live run. And a run only notifies while it is the
+  *selected* one: the detail poll follows it off-screen, but `ListTick` only
+  runs on the Processes screen, so a second background run is silent until you
+  look. A global list poll is the fix if that bites.
+- **A name and a voice of your own — landed 2026-08-08.** "E.V." was a
+  compile-time constant in three places at once: the display name, the wake
+  word's spellings, and the Edge voice. All three are settings now
+  (`Settings::assistant_name`, `wake_names`, `voice_name`), applied in `boot`
+  and on every edit.
+  - The name lives in `assistant::NAME_CELL` (`RwLock<&'static str>`, set by
+    `set_identity`, read by `assistant::name()`), not threaded through screens.
+    It is leaked on write because iced placeholders and button labels want a
+    borrow that outlives the view — a few bytes per rename, against a `String`
+    in every view signature. `composer_hint()` and `talk_label()` are the two
+    composed phrases that need the same treatment.
+  - **`assistant::NAME` stays "E.V." and is now the storage key**, not the
+    display name: it is the `source` on every chat and memory already filed, and
+    renaming it would orphan them. Only `name()` follows the setting.
+  - Wake spellings, because speech-to-text writes a spoken name however it
+    likes. `resolve_wake` is the rule: the user's comma list wins; empty falls
+    back to the name itself, or — while the name is the default — to the
+    built-in `NAMES` homophones, so nothing regresses for an install that never
+    touches this. `addressed()` matches one token, so a two-word name is spelled
+    as one word.
+  - The voice is stored as a short id (`en-US-AriaNeural`). `edge_voice()`
+    expands it to the long form Edge wants; everything else — including
+    `SPEECH_API_BASE` behind `client.speech(text, voice)`, which is where a
+    Piper/Kokoro voice someone trained themselves goes — takes the short one as
+    written. A malformed id falls back rather than reaching Edge, which answers
+    a bad voice with a socket error in front of every sentence.
+  - Not done: the tray item keeps the name it was built with until restart
+    (`ponytail:` in `main::update`), and a memory's byline still reads "E.V."
+    because that is the stored `source`.
+- **E.V. as the app's console — 2026-08-08, partly landed.** What shipped:
+  - One control for voice. The header `Text`/`Voice` segment is gone; the
+    composer's mic button *is* the mode (`Message::Listen` owns both the
+    recorder and `State::voice`). Four states became two, and the dead one —
+    voice mode with a shut mic, a HUD reporting on nothing — is unreachable.
+  - The wake word, which turned out to already exist. `addressed()` and its
+    `NAMES` whitelist have always run on every utterance; `follow_up_open()`
+    short-circuited on `armed`, so an open mic answered everything it heard.
+    That clause is gone and the `armed` field with it. Voice mode now opens the
+    window for `FOLLOW_UP` seconds (press the button, just talk), and after that
+    it is "E.V., …" or a reply to a reply. Side effect worth knowing: an open
+    mic no longer turns a phone call into a dozen turns.
+  - **App tools** — `desktop/crates/app/src/assistant_tools.rs`, shaped like
+    `memory`'s toolkit (`TOOLS` / `tools_spec` / runner). Two tools, not twelve:
+    `api_get(path)` reads any `/api/v1/` route through the new
+    `Client::api_get` (GET-only, prefix-guarded — the path comes from a model,
+    so it is a trust boundary), and `open_screen(name)` parks a `Screen` in
+    `assistant::State::nav` which `main.rs` drains into `Message::Nav`. A tool
+    per route would have been a second, staler copy of the REST surface.
+  - **E.V. from anywhere** — `assistant_view::panel` is the transcript, HUD and
+    composer split out of `view`; `screen::assistant_overlay` floats that same
+    widget tree over any screen. Ctrl+K or the sidebar's sparkle toggles it, Esc
+    closes it (below Abort — a turn in flight is the more urgent Esc). Same
+    `State`, so it is one thread across both surfaces, not a second chat.
+
+  - **The terminal behind the same card — and this was the bigger hole.**
+    `run_command` had been an unrestricted shell on the user's machine with
+    nothing between it and a model but a persona line asking it not to be
+    destructive. It now parks as `Pending::Command` exactly like a write:
+    `Settings::confirm_commands` defaults **on**, and its serde default is
+    `default_true` rather than `#[serde(default)]` so a settings file written
+    before this existed comes back guarded rather than silently open. No
+    allowlist of "safe" commands — `git log --pretty=%x00; rm -rf /` is why
+    that classifier is unsound, and an unsound guard is worse than an honest
+    card. Turning it off is a real choice in Settings, worded as one.
+  - **Writes, behind one card.** `api_write(method, path, body)` never reaches
+    the network on its own: `run_sync_tool` *parks* it as a `Pending::Write`, the
+    turn stalls (the round's other tool results are held in `State::held`, not
+    forwarded — a model shown half a round re-asks for the other half), and
+    `assistant_view::approval` shows the method, the path and the body verbatim.
+    `Message::Decide` runs it or answers the call with a refusal. One card at a
+    time: a second write in the same round is answered "one change at a time",
+    because a queue of confirmations is a queue of things nobody reads.
+  - **One chat UI.** `ui::transcript` and `ui::composer` are the kit now, and
+    Coder and E.V. both compose them — including the scrollbar right-padding
+    that had already been got wrong twice. Not one `State` for both: Coder's
+    turns are a different shape (approval cards, dock, per-tool output) and
+    unifying the models would have dragged the mic and the HUD into Coder to no
+    end. The pieces are shared; the screens stay their own. Since revisited and
+    the sharing widened rather than the screens merged: `ui::approval` (one
+    confirmation card — `run: Option<M>` is the unreadable-command case, which
+    must never show a live Run button), `ui::model_pickers` and `ui::error_bar`
+    are the kit now, and both screens compose them.
+  - **The wake word, without a new dependency.** `State::standby` keeps the mic
+    open with the HUD down and replies unspoken, and the existing pipeline —
+    energy gate → whisper → `addressed()` — does the spotting. Whisper only ever
+    sees speech the gate let through, so there is no rolling transcription and
+    no model file to ship. Hearing its name flips `voice` on, so the answer is
+    spoken and the HUD shows what it heard. Rules that make it liveable: the
+    follow-up window does not apply while waking (one wake would otherwise leave
+    the room answered for 45s), unaddressed speech is *dropped* rather than
+    parked in the composer, `Settings::wake_word` persists it off by default,
+    and the composer carries a MIC LIVE row — this is the one state with an open
+    mic and no HUD over it, so it does not get to be invisible.
+
+  Driven in the app, not just tested — which is where the next four came from:
+  - **`bool` on the `Any` pool 500s at runtime.** `GET /api/v1/workflows` and
+    `GET /api/v1/processes/{id}` both died with *"Any driver does not support the
+    SQLite type SqliteTypeInfo(Bool)"* / *"Rust type `bool` is not compatible
+    with SQL type `BIGINT`"*. Two separate shapes: `workflows.enabled` and
+    `model_registry_entries.is_active` are declared `BOOLEAN`, so they now go
+    through `crate::BOOL!` (defined in `db.rs`, `#[macro_export]`ed to the crate
+    root — a `CAST(CASE … AS BIGINT)`, because Postgres refuses `CAST(bool AS
+    BIGINT)` outright and a bare `THEN 1` there is `int4`, not `i64`
+    outright); `requires_review` is `INTEGER` on both backends, so it just needed
+    an `i64` field and `wire::sql_flag` to keep the wire's boolean. None of this
+    is checked at compile time, so **every `bool` on a `FromRow` struct is a
+    latent 500** — now written down in `db.rs`. Grep before adding one.
+  - **The panel could not be a layer.** It was `ui::modal` (scrim, blocked the
+    sidebar), then a scrim-less `stack` layer — which blocked it just as much,
+    because the full-window container that positions a layer swallows the click
+    either way. Measured, twice. It is now a real column of the shell row, so
+    the page beside it stays live; `ui::toast_layer`'s doc claim that it
+    "consumes no clicks" is corrected in place.
+  - **A global mic needs a global indicator.** Standby holds the mic open across
+    every screen, but its only disclosure was the composer, on one screen. There
+    is now a mic button in the sidebar footer whenever it is armed, and clicking
+    it turns the wake word off — one click from live to shut, from anywhere.
+  - **Transcript labels lied.** Every tool-call row was prefixed `$` and every
+    tool result labelled `TERMINAL` — both fine when the terminal was the only
+    tool, both false the moment `api_get` existed.
+
+  Reviewed after the fact, which found five more — all in the new code:
+  - **A tool round could go out half-answered.** Deciding a confirm card while
+    the read task was still running sent two requests for one turn, the first
+    answering only some of the assistant turn's `tool_calls`. Replaced the
+    ad-hoc "hold if pending" branch with `State::tool_waits`: a round names how
+    many batches it is waiting on, every batch accumulates into `held`, and the
+    request goes out at zero. A batch from an aborted round is dropped rather
+    than re-opening the turn.
+  - **`CAST(CASE … AS BIGINT)`**, not a bare `CASE` — see above. Would have
+    worked on SQLite and 500'd on Postgres, which is the backend nobody runs
+    locally and so the one that would have found it in production.
+  - **Ctrl+K on a chat screen primed the panel to appear later.** It flipped
+    `assistant_open` while the panel was suppressed, so the next navigation
+    somewhere else opened it unbidden. It now just navigates.
+  - **The wake-word setting could outlive the mic.** A refused microphone left
+    `standby` false and `settings.wake_word` true — the toggle read "Listening
+    for E.V." with nothing listening, and retried on every launch. `SetWakeWord`
+    now mirrors what actually happened, and boot routes through it.
+  - Stale doc in `assistant_tools.rs` claiming writes were absent, and a
+    zero-width placeholder that left a gap in the sidebar footer.
+
+  Still open:
+  - **Waking with the app closed.** Standby runs off the assistant's own tick,
+    so the process has to be alive. A true always-on spotter is still a separate
+    dependency and a model file.
+  - **The panel is E.V. only.** Ctrl+K cannot summon Coder's thread; it renders
+    `assistant::State`. Worth doing once there is a reason to have both.
+  - **A local model still invents app data.** Asked to open Workflows, it
+    volunteered "you have 28 saved workflows" without calling `api_get`; there
+    are three. The persona now forbids stating any count, name or status that did
+    not come from a tool result in that conversation, and names that exact
+    failure. Prompting is the only lever here — worth re-checking on a bigger
+    model before trusting a spoken answer about app state.
 - **macOS/Linux packaging** — **half closed 2026-08-08.** The *daemon* now
   ships for four platforms (below); the *iced app* is still Windows-only and
   still deferred until there is access to a mac or a Linux box — it links
@@ -510,13 +694,40 @@ babysat by a developer.
 
 **Not done, and why:**
 
-- **The 280 `state.pool` sites are still SQLite-only**, so `Config::from_env`
-  still refuses `DATABASE_URL`. That is now ordinary work rather than a blocked
-  one: the schema applies, the placeholder rewriting is proven, and there is a
-  Postgres in CI to catch a bad conversion. It is 280 per-query edits — each
-  `SELECT` needs its ids as `CAST(x AS BIGINT)` and its timestamps as
-  `CAST(x AS TEXT)`, and each row decode has to be re-checked — so it wants
-  doing a domain at a time, not in one commit.
+14. **`DATABASE_URL` works.** All thirteen domains are off `state.pool`, the
+    `SqlitePool` field is deleted, and `Config::from_env` passes a DSN through
+    instead of refusing it. `tests/postgres_schema.rs` drives the real router
+    against a real Postgres — create a project, read it back — so this is a
+    server that answers from Postgres, not a schema that parses.
+
+    **Four incompatibilities, none visible from reading the code.** Each was
+    found by running it:
+
+    - **Timestamps are text, and the Postgres schema now says so.** Every
+      timestamp in this server is a string end to end — `wire::sql_now()`
+      makes one, every INSERT binds one, the scheduler compares them with
+      `<=`. Postgres refuses to bind text into a `timestamp` column, so the
+      migration declares TEXT. A TIMESTAMP column would have meant casting at
+      several hundred write sites to gain a type nothing reads, and SQLite's
+      DATETIME is text already. The format is fixed-width, so it still sorts.
+    - **Three helpers named a backend in their signatures** while their call
+      sites looked converted: `workflows::set_workflow_field` and
+      `todos::set_item_column` were generic over `sqlx::Sqlite`, and
+      `assistant::purge_todo_board` / `executor::insert_task_node` took a
+      `Transaction<'_, Sqlite>`. A domain is not converted until its helpers
+      stop naming one.
+    - **A computed query's rewritten string has to outlive the query.** Five
+      sites build SQL conditionally and then add binds one at a time; the
+      `Cow` from `db::sql` dies first. In `list_action_sets` it died at the end
+      of a `match` arm.
+    - **Postgres type-checks binds and SQLite does not.** A string against an
+      `integer` column is `operator does not exist: integer = text` here and a
+      silent no-match there.
+
+    Also: the two Postgres tests share a database, and `sqlx::migrate!` takes a
+    session advisory lock — running them together reports `deadlock detected`,
+    because a scratch schema isolates tables and not the migrator's lock. They
+    serialise on a mutex.
 - **No global concurrency cap, deliberately.** `chat` has the one that matters
   (`AGENT_PLATFORM_CHAT_MAX_CONCURRENT`), because it is the path that costs an
   upstream call. A cap over the whole router queues rather than sheds, so under
