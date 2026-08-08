@@ -42,7 +42,17 @@ jobs:
       # without this it fails with "Unable to find libclang" rather than
       # anything about whisper. The runner image installs LLVM here and does not
       # export a variable pointing at it.
-      - run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+      #
+      # `CMAKE` overrides the one in the tracked `desktop/.cargo/config.toml`,
+      # which hardcodes a path inside Visual Studio **Community** on one
+      # developer's machine. The runners have **Enterprise**, so that path does
+      # not exist and the cmake crate fails with "The system cannot find the
+      # path specified. (os error 3)" — nothing about cmake or whisper. Cargo's
+      # `[env]` does not override a variable already set, so exporting it here
+      # wins; the runner has cmake on PATH.
+      - run: |
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          echo "CMAKE=cmake" >> $env:GITHUB_ENV
         shell: pwsh
 
       # `--profile dist` is the profile `dist` builds the daemon with, so the

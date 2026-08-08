@@ -93,7 +93,17 @@ jobs:
       # with "Unable to find libclang" rather than anything about whisper.
       # Hardcoded rather than read from an env var: the runner image installs
       # LLVM here and does not export a variable pointing at it.
-      - run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+      #
+      # `CMAKE` overrides the one in the tracked `desktop/.cargo/config.toml`,
+      # which points inside Visual Studio **Community** on one developer's
+      # machine. These runners have **Enterprise**, so that path does not exist
+      # and the cmake crate dies with "The system cannot find the path
+      # specified. (os error 3)" — a message about neither cmake nor whisper.
+      # This job had never actually run when that file was written. Cargo's
+      # `[env]` yields to a variable already set, so exporting it here wins.
+      - run: |
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          echo "CMAKE=cmake" >> $env:GITHUB_ENV
         shell: pwsh
       # The default feature set: `local-llm`/`cuda` need a CUDA toolkit no
       # hosted runner has, and the app ships with them off.

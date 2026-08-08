@@ -337,11 +337,39 @@ its release gates a four-platform matrix behind one cheap smoke job on a single
 runner, which `dist`'s generated `plan` job already does, and it sets
 `fail-fast: false` so one platform's break does not cancel three good builds.
 
-**The pipeline has never run.** The first `v*` tag is the real test. The one
-part that cannot be checked locally at all is whether `dist` attaches an
-artifact it did not itself plan — if the app's zip is missing from the release,
-that is where to look, and `gh release upload` is the stopgap while the wiring
-is fixed.
+**What the first tag taught, `v0.2.0`.** It failed in every build job and
+published nothing, which is the right way for it to fail. Three separate causes,
+and only the first was in the release config:
+
+1. **`dist` builds with `--workspace` by default.** `packages` scopes what is
+   *released*, not what is *built*, so every daemon job dragged the iced app in
+   and died on `atk-sys` (Linux) or `whisper-rs-sys` (Windows) — GTK and
+   whisper.cpp, neither of any use to a headless server. `precise-builds = true`
+   is the fix. `dist plan` cannot catch this: planning does not build.
+2. **`desktop/.cargo/config.toml` is tracked and hardcodes one machine's path.**
+   Its `CMAKE` points inside Visual Studio **Community**; the runners have
+   **Enterprise**, so the path does not exist and the cmake crate reports
+   "The system cannot find the path specified. (os error 3)" — a message naming
+   neither cmake nor whisper. Its own comment says it is "harmless elsewhere …
+   when this file is absent", which was never true: it is committed, so it is
+   never absent. Both Windows jobs now export `CMAKE=cmake`, and cargo's `[env]`
+   yields to a variable already set. **The real fix is still open**: a
+   machine-specific absolute path belongs in `~/.cargo/config.toml`, not in the
+   repo, and anyone whose VS is not Community 18 at that exact path hits this.
+3. **CI had never run at all**, on this branch or any other — it was added
+   2026-08-08 and the branch was not pushed until the tag. Its first run failed
+   too, and one of the failures is real: `postgres_schema.rs` reports
+   `relation "action_sets" does not exist` while applying migration 1. That test
+   skips itself without `TEST_DATABASE_URL`, so CI is the first place it has ever
+   executed — exactly what the job was added for.
+
+Still unverified, because no job got far enough to try it: whether `dist`
+attaches an artifact it did not itself plan. If the app's zip is missing from the
+next release, that is where to look, and `gh release upload` is the stopgap.
+
+**Next tag should be `v0.2.1`** — 0.2.0 is spent. Push the fixes and let CI go
+green on Windows first; that is the cheap proof of (2), and it costs a push
+rather than a public tag.
 
 ### Deployment hardening — 2026-08-08
 

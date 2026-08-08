@@ -30,6 +30,12 @@ ci = ["github"]
 # nothing to race.
 local-artifacts-jobs = ["./release-desktop"]
 packages = ["agent-platform-server"]
+# `packages` scopes what gets *released*, not what gets *built*. Without this,
+# `dist` builds with `--workspace` (its default, for feature unification) and
+# drags the iced app in — which is how the first tagged release died: `atk-sys`
+# on Linux and `whisper-rs-sys` on Windows, neither of which the daemon has any
+# use for. Per-package builds are the point here, not a nicety.
+precise-builds = true
 # `shell` and `powershell` are the two that need no package manager and no
 # signing story. The daemon is a single file with its migrations embedded, so
 # an installer is a download and a PATH entry.
