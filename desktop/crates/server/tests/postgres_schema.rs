@@ -264,6 +264,55 @@ async fn exercise(url: &str) -> Result<(), String> {
                 agent_platform_server::processes::EVENT_COLUMNS
             ),
         ),
+        (
+            "action_orchestrator::ACTION_COLUMNS",
+            format!(
+                "SELECT {} FROM actions WHERE id = ?",
+                agent_platform_server::action_orchestrator::ACTION_COLUMNS
+            ),
+        ),
+        (
+            "action_orchestrator::SESSION_COLUMNS",
+            format!(
+                "SELECT {} FROM action_sessions WHERE id = ?",
+                agent_platform_server::action_orchestrator::SESSION_COLUMNS
+            ),
+        ),
+        (
+            "model_ops::JOB_COLUMNS",
+            format!(
+                "SELECT {} FROM model_build_jobs WHERE id = ?",
+                agent_platform_server::model_ops::JOB_COLUMNS
+            ),
+        ),
+        (
+            "todos::BOARD_COLUMNS",
+            format!(
+                "SELECT {} FROM todo_boards b WHERE b.id = ?",
+                agent_platform_server::todos::BOARD_COLUMNS
+            ),
+        ),
+        (
+            "todos::CATEGORY_COLUMNS",
+            format!(
+                "SELECT {} FROM todo_categories WHERE id = ?",
+                agent_platform_server::todos::CATEGORY_COLUMNS
+            ),
+        ),
+        (
+            "todos::ITEM_COLUMNS",
+            format!(
+                "SELECT {} FROM todo_items WHERE id = ?",
+                agent_platform_server::todos::ITEM_COLUMNS
+            ),
+        ),
+        (
+            "todos::PROFILE_COLUMNS",
+            format!(
+                "SELECT {} FROM planner_agent_profiles WHERE id = ?",
+                agent_platform_server::todos::PROFILE_COLUMNS
+            ),
+        ),
     ] {
         sqlx::query(&db::sql(&query, Backend::Postgres))
             .bind(4242_i64)

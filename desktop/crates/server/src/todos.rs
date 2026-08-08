@@ -111,9 +111,9 @@ async fn assert_board_access(
     board_id: i64,
 ) -> Result<(), ApiError> {
     let board: Option<BoardOwner> =
-        sqlx::query_as("SELECT project_id FROM todo_boards WHERE id = ?")
+        sqlx::query_as(&crate::db::sql("SELECT project_id FROM todo_boards WHERE id = ?", state.backend))
             .bind(board_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     let Some(board) = board else {
         return Err(ApiError::not_found("Not found"));
@@ -130,9 +130,9 @@ pub(crate) async fn assert_item_access(
     principal: &Principal,
     item_id: i64,
 ) -> Result<(), ApiError> {
-    let board_id: Option<i64> = sqlx::query_scalar("SELECT board_id FROM todo_items WHERE id = ?")
+    let board_id: Option<i64> = sqlx::query_scalar(&crate::db::sql("SELECT board_id FROM todo_items WHERE id = ?", state.backend))
         .bind(item_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await?;
     match board_id {
         None => Err(ApiError::not_found("Not found")),
@@ -161,8 +161,9 @@ struct BoardOut {
     item_count: i64,
 }
 
-const BOARD_COLUMNS: &str =
-    "id, project_id, name, description, default_model, created_at, updated_at, \
+pub const BOARD_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \
+     CAST(project_id AS BIGINT) AS project_id, name, description, default_model, \
+     CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at, \
      (SELECT COUNT(*) FROM todo_categories c WHERE c.board_id = b.id) AS category_count, \
      (SELECT COUNT(*) FROM todo_items i WHERE i.board_id = b.id) AS item_count";
 
@@ -216,8 +217,11 @@ impl From<CategoryRow> for CategoryOut {
     }
 }
 
-pub(crate) const CATEGORY_COLUMNS: &str =
-    "id, board_id, name, color, sort_order, planner_profile_id, created_at, updated_at";
+pub const CATEGORY_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \
+     CAST(board_id AS BIGINT) AS board_id, name, color, \
+     CAST(sort_order AS BIGINT) AS sort_order, \
+     CAST(planner_profile_id AS BIGINT) AS planner_profile_id, \
+     CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at";
 
 #[derive(FromRow, Clone)]
 pub(crate) struct ItemRow {
@@ -244,10 +248,16 @@ pub(crate) struct ItemRow {
     pub(crate) updated_at: String,
 }
 
-pub(crate) const ITEM_COLUMNS: &str = "id, board_id, category_id, title, description, status, priority, \
-     tags_json, plan_json, metadata_json, assigned_profile_id, linked_process_id, parent_item_id, \
-     due_at, scheduled_at, time_horizon, item_kind, recurrence_json, completion_json, \
-     created_at, updated_at";
+pub const ITEM_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \
+     CAST(board_id AS BIGINT) AS board_id, CAST(category_id AS BIGINT) AS category_id, \
+     title, description, status, CAST(priority AS BIGINT) AS priority, \
+     tags_json, plan_json, metadata_json, \
+     CAST(assigned_profile_id AS BIGINT) AS assigned_profile_id, \
+     CAST(linked_process_id AS BIGINT) AS linked_process_id, \
+     CAST(parent_item_id AS BIGINT) AS parent_item_id, \
+     CAST(due_at AS TEXT) AS due_at, CAST(scheduled_at AS TEXT) AS scheduled_at, \
+     time_horizon, item_kind, recurrence_json, completion_json, \
+     CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at";
 
 #[derive(Serialize)]
 pub(crate) struct ItemOut {
@@ -429,9 +439,9 @@ struct ProjectQuery {
 }
 
 async fn load_board(state: &AppState, board_id: i64) -> Result<BoardOut, ApiError> {
-    sqlx::query_as(&format!("SELECT {BOARD_COLUMNS} FROM todo_boards b WHERE id = ?"))
+    sqlx::query_as(&crate::db::sql(&format!("SELECT {BOARD_COLUMNS} FROM todo_boards b WHERE id = ?"), state.backend))
         .bind(board_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await?
         .ok_or_else(|| ApiError::not_found("Board not found"))
 }
@@ -450,15 +460,15 @@ async fn list_boards(
     }
 
     let boards: Vec<BoardOut> = match q.project_id {
-        Some(project_id) => sqlx::query_as(&format!(
+        Some(project_id) => sqlx::query_as(&crate::db::sql(&format!(
             "SELECT {BOARD_COLUMNS} FROM todo_boards b WHERE project_id = ? ORDER BY id ASC"
-        ))
+        ), state.backend))
         .bind(project_id)
-        .fetch_all(&state.pool)
+        .fetch_all(&state.any)
         .await?,
         None => {
-            sqlx::query_as(&format!("SELECT {BOARD_COLUMNS} FROM todo_boards b ORDER BY id ASC"))
-                .fetch_all(&state.pool)
+            sqlx::query_as(&crate::db::sql(&format!("SELECT {BOARD_COLUMNS} FROM todo_boards b ORDER BY id ASC"), state.backend))
+                .fetch_all(&state.any)
                 .await?
         }
     };
@@ -518,9 +528,9 @@ async fn create_board(
     }
 
     let now = sql_now();
-    let board_id: i64 = sqlx::query_scalar(
+    let board_id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO todo_boards (project_id, name, description, default_model, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+         VALUES (?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(q.project_id)
     .bind(req.name.unwrap_or_default().trim())
@@ -528,7 +538,7 @@ async fn create_board(
     .bind(req.default_model)
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     if let Some(slug) = req.template_slug.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -551,14 +561,14 @@ pub(crate) async fn apply_board_template(
     let now = sql_now();
     for (i, (name, color, profile_slug)) in categories.iter().enumerate() {
         let profile_id: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM planner_agent_profiles WHERE slug = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT id FROM planner_agent_profiles WHERE slug = ?", state.backend))
                 .bind(profile_slug)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await?;
-        sqlx::query(
+        sqlx::query(&crate::db::sql(
             "INSERT INTO todo_categories \
              (board_id, name, color, sort_order, planner_profile_id, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?)", state.backend)
         )
         .bind(board_id)
         .bind(name)
@@ -567,7 +577,7 @@ pub(crate) async fn apply_board_template(
         .bind(profile_id)
         .bind(&now)
         .bind(&now)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     }
     Ok(())
@@ -585,29 +595,29 @@ async fn get_board(
     // `record_board_visit`: opening a board is what makes "Continue planning"
     // point at it, so the read has a write in it.
     if let Some(project_id) = board.project_id {
-        sqlx::query("UPDATE project SET last_todo_board_id = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE project SET last_todo_board_id = ? WHERE id = ?", state.backend))
             .bind(board_id)
             .bind(project_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
 
-    let categories: Vec<CategoryOut> = sqlx::query_as::<_, CategoryRow>(&format!(
+    let categories: Vec<CategoryOut> = sqlx::query_as::<_, CategoryRow>(&crate::db::sql(&format!(
         "SELECT {CATEGORY_COLUMNS} FROM todo_categories WHERE board_id = ? \
          ORDER BY sort_order ASC, id ASC"
-    ))
+    ), state.backend))
     .bind(board_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?
     .into_iter()
     .map(CategoryOut::from)
     .collect();
 
-    let items: Vec<ItemOut> = sqlx::query_as::<_, ItemRow>(&format!(
+    let items: Vec<ItemOut> = sqlx::query_as::<_, ItemRow>(&crate::db::sql(&format!(
         "SELECT {ITEM_COLUMNS} FROM todo_items WHERE board_id = ? ORDER BY updated_at DESC"
-    ))
+    ), state.backend))
     .bind(board_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?
     .into_iter()
     .map(ItemOut::from)
@@ -654,30 +664,30 @@ async fn update_board(
     }
 
     if let Some(name) = req.name {
-        sqlx::query("UPDATE todo_boards SET name = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE todo_boards SET name = ? WHERE id = ?", state.backend))
             .bind(name.trim())
             .bind(board_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(description) = req.description {
-        sqlx::query("UPDATE todo_boards SET description = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE todo_boards SET description = ? WHERE id = ?", state.backend))
             .bind(Some(description.trim().to_string()).filter(|d| !d.is_empty()))
             .bind(board_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(model) = req.default_model {
-        sqlx::query("UPDATE todo_boards SET default_model = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE todo_boards SET default_model = ? WHERE id = ?", state.backend))
             .bind(Some(model.trim().to_string()).filter(|m| !m.is_empty()))
             .bind(board_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
-    sqlx::query("UPDATE todo_boards SET updated_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE todo_boards SET updated_at = ? WHERE id = ?", state.backend))
         .bind(sql_now())
         .bind(board_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     Ok(Json(load_board(&state, board_id).await?).into_response())
@@ -694,9 +704,9 @@ async fn delete_board(
     // No cascade, matching `session.delete(board)` with SQLite foreign keys off:
     // categories and items outlive the board. Changing that here would be a
     // behaviour change hiding inside a port.
-    sqlx::query("DELETE FROM todo_boards WHERE id = ?")
+    sqlx::query(&crate::db::sql("DELETE FROM todo_boards WHERE id = ?", state.backend))
         .bind(board_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -713,12 +723,12 @@ async fn list_categories(
     require_scope(&principal, "todos:read")?;
     assert_board_access(&state, &principal, board_id).await?;
     load_board(&state, board_id).await?;
-    let categories: Vec<CategoryOut> = sqlx::query_as::<_, CategoryRow>(&format!(
+    let categories: Vec<CategoryOut> = sqlx::query_as::<_, CategoryRow>(&crate::db::sql(&format!(
         "SELECT {CATEGORY_COLUMNS} FROM todo_categories WHERE board_id = ? \
          ORDER BY sort_order ASC, id ASC"
-    ))
+    ), state.backend))
     .bind(board_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?
     .into_iter()
     .map(CategoryOut::from)
@@ -772,10 +782,10 @@ async fn create_category(
         None => random_palette_color(&[]),
     };
     let now = sql_now();
-    let id: i64 = sqlx::query_scalar(
+    let id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO todo_categories \
          (board_id, name, color, sort_order, planner_profile_id, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(board_id)
     .bind(req.name.unwrap_or_default().trim())
@@ -784,7 +794,7 @@ async fn create_category(
     .bind(req.planner_profile_id)
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     Ok((StatusCode::CREATED, Json(load_category(&state, board_id, id).await?)).into_response())
@@ -796,9 +806,9 @@ async fn load_category(
     category_id: i64,
 ) -> Result<CategoryOut, ApiError> {
     let row: Option<CategoryRow> =
-        sqlx::query_as(&format!("SELECT {CATEGORY_COLUMNS} FROM todo_categories WHERE id = ?"))
+        sqlx::query_as(&crate::db::sql(&format!("SELECT {CATEGORY_COLUMNS} FROM todo_categories WHERE id = ?"), state.backend))
             .bind(category_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     match row {
         Some(row) if row.board_id == board_id => Ok(row.into()),
@@ -842,37 +852,37 @@ async fn update_category(
     }
 
     if let Some(name) = req.name {
-        sqlx::query("UPDATE todo_categories SET name = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE todo_categories SET name = ? WHERE id = ?", state.backend))
             .bind(name.trim())
             .bind(category_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(color) = req.color {
-        sqlx::query("UPDATE todo_categories SET color = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE todo_categories SET color = ? WHERE id = ?", state.backend))
             .bind(color)
             .bind(category_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(sort_order) = req.sort_order {
-        sqlx::query("UPDATE todo_categories SET sort_order = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE todo_categories SET sort_order = ? WHERE id = ?", state.backend))
             .bind(sort_order)
             .bind(category_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(profile_id) = req.planner_profile_id {
-        sqlx::query("UPDATE todo_categories SET planner_profile_id = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE todo_categories SET planner_profile_id = ? WHERE id = ?", state.backend))
             .bind(profile_id)
             .bind(category_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
-    sqlx::query("UPDATE todo_categories SET updated_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE todo_categories SET updated_at = ? WHERE id = ?", state.backend))
         .bind(sql_now())
         .bind(category_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     Ok(Json(load_category(&state, board_id, category_id).await?).into_response())
@@ -884,9 +894,9 @@ async fn update_category(
 
 pub(crate) async fn load_item(state: &AppState, item_id: i64) -> Result<ItemOut, ApiError> {
     let row: Option<ItemRow> =
-        sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"))
+        sqlx::query_as(&crate::db::sql(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"), state.backend))
             .bind(item_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     row.map(ItemOut::from).ok_or_else(|| ApiError::not_found("Item not found"))
 }
@@ -899,11 +909,11 @@ async fn list_items(
     require_scope(&principal, "todos:read")?;
     assert_board_access(&state, &principal, board_id).await?;
     load_board(&state, board_id).await?;
-    let items: Vec<ItemOut> = sqlx::query_as::<_, ItemRow>(&format!(
+    let items: Vec<ItemOut> = sqlx::query_as::<_, ItemRow>(&crate::db::sql(&format!(
         "SELECT {ITEM_COLUMNS} FROM todo_items WHERE board_id = ? ORDER BY updated_at DESC"
-    ))
+    ), state.backend))
     .bind(board_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?
     .into_iter()
     .map(ItemOut::from)
@@ -1003,11 +1013,11 @@ async fn create_item(
     }
 
     let now = sql_now();
-    let id: i64 = sqlx::query_scalar(
+    let id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO todo_items (board_id, category_id, title, description, status, priority, \
          tags_json, assigned_profile_id, parent_item_id, due_at, scheduled_at, time_horizon, \
          item_kind, recurrence_json, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(board_id)
     .bind(req.category_id)
@@ -1030,7 +1040,7 @@ async fn create_item(
     )
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     Ok((StatusCode::CREATED, Json(load_item(&state, id).await?)).into_response())
@@ -1126,10 +1136,10 @@ async fn update_item(
         }
     }
 
-    sqlx::query("UPDATE todo_items SET updated_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE todo_items SET updated_at = ? WHERE id = ?", state.backend))
         .bind(sql_now())
         .bind(item_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     Ok(Json(load_item(&state, item_id).await?).into_response())
@@ -1144,11 +1154,11 @@ async fn set_item_column<T>(
     value: T,
 ) -> Result<(), ApiError>
 where
-    T: for<'q> sqlx::Encode<'q, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite> + Send,
+    T: for<'q> sqlx::Encode<'q, sqlx::Any> + sqlx::Type<sqlx::Any> + Send,
 {
     // The column name is from a fixed list in this module, never from input.
     let sql = format!("UPDATE todo_items SET {column} = ? WHERE id = ?");
-    sqlx::query(&sql).bind(value).bind(item_id).execute(&state.pool).await?;
+    sqlx::query(&crate::db::sql(&sql, state.backend)).bind(value).bind(item_id).execute(&state.any).await?;
     Ok(())
 }
 
@@ -1160,9 +1170,9 @@ async fn delete_item(
     require_scope(&principal, "todos:write")?;
     assert_item_access(&state, &principal, item_id).await?;
     load_item(&state, item_id).await?;
-    sqlx::query("DELETE FROM todo_items WHERE id = ?")
+    sqlx::query(&crate::db::sql("DELETE FROM todo_items WHERE id = ?", state.backend))
         .bind(item_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -1201,15 +1211,15 @@ pub(crate) async fn append_item_event(
     event_type: &str,
     content: Value,
 ) -> Result<(), ApiError> {
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "INSERT INTO todo_item_events (item_id, event_type, content_json, created_at) \
-         VALUES (?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?)", state.backend)
     )
     .bind(item_id)
     .bind(event_type)
     .bind(content.to_string())
     .bind(sql_now())
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
     Ok(())
 }
@@ -1254,6 +1264,9 @@ impl ItemPatch {
 
         // Column names come from the fixed list above, never from a request.
         let sql = format!("UPDATE todo_items SET {} WHERE id = ?", assignments.join(", "));
+        // Bound to a local: the query borrows the rewritten string while the
+        // binds are added one at a time.
+        let sql = crate::db::sql(&sql, state.backend).into_owned();
         let mut query = sqlx::query(&sql);
         for (_, value) in self.columns {
             query = match value {
@@ -1261,7 +1274,7 @@ impl ItemPatch {
                 Bind::Int(number) => query.bind(number),
             };
         }
-        query.bind(sql_now()).bind(item_id).execute(&state.pool).await?;
+        query.bind(sql_now()).bind(item_id).execute(&state.any).await?;
         Ok(())
     }
 }
@@ -1349,9 +1362,9 @@ async fn agent_apply(
     });
 
     let row: Option<ItemRow> =
-        sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"))
+        sqlx::query_as(&crate::db::sql(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"), state.backend))
             .bind(item_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     let Some(item) = row else {
         return Err(ApiError::not_found("Item not found"));
@@ -1649,22 +1662,22 @@ async fn agent_apply(
                     result.skipped.push("create_subtask_item: missing title".into());
                     continue;
                 };
-                let parent: Option<(i64, Option<i64>, Option<String>)> = sqlx::query_as(
-                    "SELECT board_id, category_id, time_horizon FROM todo_items WHERE id = ?",
+                let parent: Option<(i64, Option<i64>, Option<String>)> = sqlx::query_as(&crate::db::sql(
+                    "SELECT board_id, category_id, time_horizon FROM todo_items WHERE id = ?", state.backend)
                 )
                 .bind(parent_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await?;
                 let Some((board_id, category_id, parent_horizon)) = parent else {
                     result.skipped.push("create_subtask_item: parent not found".into());
                     continue;
                 };
                 let now = sql_now();
-                sqlx::query(
+                sqlx::query(&crate::db::sql(
                     "INSERT INTO todo_items (board_id, category_id, title, description, status, \
                      priority, parent_item_id, due_at, scheduled_at, time_horizon, item_kind, \
                      created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, 'plan', 0, ?, ?, ?, ?, 'task', ?, ?)",
+                     VALUES (?, ?, ?, ?, 'plan', 0, ?, ?, ?, ?, 'task', ?, ?)", state.backend)
                 )
                 .bind(board_id)
                 .bind(category_id)
@@ -1676,7 +1689,7 @@ async fn agent_apply(
                 .bind(parent_horizon.filter(|h| !h.is_empty()).unwrap_or_else(|| "week".into()))
                 .bind(&now)
                 .bind(&now)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await?;
                 result.applied.push(format!("Created subtask: {subtask_title}"));
             }
@@ -1696,9 +1709,9 @@ async fn agent_apply(
                     continue;
                 };
                 let project_id: Option<Option<i64>> =
-                    sqlx::query_scalar("SELECT project_id FROM todo_boards WHERE id = ?")
+                    sqlx::query_scalar(&crate::db::sql("SELECT project_id FROM todo_boards WHERE id = ?", state.backend))
                         .bind(item.board_id)
-                        .fetch_optional(&state.pool)
+                        .fetch_optional(&state.any)
                         .await?;
                 let Some(Some(project_id)) = project_id else {
                     result.skipped.push("store_user_profile: no project".into());
@@ -1797,12 +1810,12 @@ pub(crate) async fn merge_domain_profile(
     domain: &str,
     patch: &Map<String, Value>,
 ) -> Result<Map<String, Value>, ApiError> {
-    let existing: Option<(i64, Option<String>)> = sqlx::query_as(
-        "SELECT id, profile_json FROM assistant_domain_profiles WHERE project_id = ? AND domain = ?",
+    let existing: Option<(i64, Option<String>)> = sqlx::query_as(&crate::db::sql(
+        "SELECT id, profile_json FROM assistant_domain_profiles WHERE project_id = ? AND domain = ?", state.backend)
     )
     .bind(project_id)
     .bind(domain)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?;
 
     let (id, mut profile) = match existing {
@@ -1819,26 +1832,26 @@ pub(crate) async fn merge_domain_profile(
     let body = Value::Object(profile.clone()).to_string();
     match id {
         Some(id) => {
-            sqlx::query(
-                "UPDATE assistant_domain_profiles SET profile_json = ?, updated_at = ? WHERE id = ?",
+            sqlx::query(&crate::db::sql(
+                "UPDATE assistant_domain_profiles SET profile_json = ?, updated_at = ? WHERE id = ?", state.backend)
             )
             .bind(body)
             .bind(&now)
             .bind(id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
         }
         None => {
-            sqlx::query(
+            sqlx::query(&crate::db::sql(
                 "INSERT INTO assistant_domain_profiles \
-                 (project_id, domain, profile_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                 (project_id, domain, profile_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", state.backend)
             )
             .bind(project_id)
             .bind(domain)
             .bind(body)
             .bind(&now)
             .bind(&now)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
         }
     }
@@ -1934,9 +1947,9 @@ async fn planning_form_submit(
     }
 
     let stored: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT metadata_json FROM todo_items WHERE id = ?")
+        sqlx::query_as(&crate::db::sql("SELECT metadata_json FROM todo_items WHERE id = ?", state.backend))
             .bind(item_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     let Some((metadata_json,)) = stored else {
         return Err(ApiError::not_found("Item not found"));
@@ -1964,11 +1977,11 @@ async fn planning_form_submit(
 
     // One column, plus the timestamp — the rule that keeps this table safe while
     // Python still writes the agent routes beside it.
-    sqlx::query("UPDATE todo_items SET metadata_json = ?, updated_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE todo_items SET metadata_json = ?, updated_at = ? WHERE id = ?", state.backend))
         .bind(Value::Object(metadata).to_string())
         .bind(sql_now())
         .bind(item_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     append_item_event(
@@ -1992,14 +2005,14 @@ async fn item_events(
     assert_item_access(&state, &principal, item_id).await?;
     load_item(&state, item_id).await?;
 
-    let rows: Vec<EventRow> = sqlx::query_as(
+    let rows: Vec<EventRow> = sqlx::query_as(&crate::db::sql(
         "SELECT id, item_id, event_type, content_json, created_at FROM todo_item_events \
-         WHERE item_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+         WHERE item_id = ? AND id > ? ORDER BY id ASC LIMIT ?", state.backend)
     )
     .bind(item_id)
     .bind(q.after_id)
     .bind(q.limit)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     let events: Vec<Value> = rows
@@ -2139,11 +2152,11 @@ async fn spawn_process(
     // Python looks the template up with a bare `session.get` — no visibility
     // check, unlike every read in `teams.rs`. Kept as-is on purpose: this is a
     // parity port, and narrowing it here would 404 requests Python answers.
-    let template: TemplateRow = sqlx::query_as(
-        "SELECT id, name, description, color, roster_json FROM teamtemplate WHERE id = ?",
+    let template: TemplateRow = sqlx::query_as(&crate::db::sql(
+        "SELECT id, name, description, color, roster_json FROM teamtemplate WHERE id = ?", state.backend)
     )
     .bind(team_template_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?
     .ok_or_else(|| ApiError::not_found("Team template not found"))?;
 
@@ -2151,15 +2164,15 @@ async fn spawn_process(
     // above. A board with no project spawns an unassigned process; a project
     // that has vanished is a 404 rather than a process pointing at nothing.
     let project_id: Option<Option<i64>> =
-        sqlx::query_scalar("SELECT project_id FROM todo_boards WHERE id = ?")
+        sqlx::query_scalar(&crate::db::sql("SELECT project_id FROM todo_boards WHERE id = ?", state.backend))
             .bind(item.board_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     let project_id = project_id.flatten();
     if let Some(project_id) = project_id {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM project WHERE id = ?")
+        let exists: Option<i64> = sqlx::query_scalar(&crate::db::sql("SELECT id FROM project WHERE id = ?", state.backend))
             .bind(project_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
         if exists.is_none() {
             return Err(ApiError::not_found("Project not found"));
@@ -2182,11 +2195,11 @@ async fn spawn_process(
     // outside the token-counter two-writer hazard.
     let status = "pending";
     let now = sql_now();
-    let process_id: i64 = sqlx::query_scalar(
+    let process_id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO process \
          (goal, status, total_tokens, total_cost, tool_invocations_used, team_template_id, \
           team_snapshot_json, project_id, created_at, updated_at) \
-         VALUES (?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?) RETURNING id",
+         VALUES (?, ?, 0, 0.0, 0, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(&goal)
     .bind(status)
@@ -2195,7 +2208,7 @@ async fn spawn_process(
     .bind(project_id)
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     set_item_column(&state, item_id, "linked_process_id", process_id).await?;
@@ -2242,18 +2255,19 @@ pub(crate) struct ProfileRow {
     pub(crate) skill_paths_json: Option<String>,
 }
 
-pub(crate) const PROFILE_COLUMNS: &str = "id, slug, name, requirement_type, system_prompt, default_model, \
-     action_set_id, skill_paths_json";
+pub const PROFILE_COLUMNS: &str = "CAST(id AS BIGINT) AS id, slug, name, requirement_type, \
+     system_prompt, default_model, CAST(action_set_id AS BIGINT) AS action_set_id, \
+     skill_paths_json";
 
 async fn planner_profiles(
     State(state): State<Arc<AppState>>,
     principal: Principal,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:read")?;
-    let rows: Vec<ProfileRow> = sqlx::query_as(&format!(
+    let rows: Vec<ProfileRow> = sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {PROFILE_COLUMNS} FROM planner_agent_profiles ORDER BY id ASC"
-    ))
-    .fetch_all(&state.pool)
+    ), state.backend))
+    .fetch_all(&state.any)
     .await?;
 
     let profiles: Vec<Value> = rows
@@ -2294,27 +2308,27 @@ async fn resolve_profile_for_item(
     }
     if let Some(category_id) = item.category_id.filter(|id| *id != 0) {
         let category_profile: Option<Option<i64>> =
-            sqlx::query_scalar("SELECT planner_profile_id FROM todo_categories WHERE id = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT planner_profile_id FROM todo_categories WHERE id = ?", state.backend))
                 .bind(category_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await?;
         if let Some(profile_id) = category_profile.flatten().filter(|id| *id != 0) {
             return load_profile(state, profile_id).await;
         }
     }
-    Ok(sqlx::query_as(&format!(
+    Ok(sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {PROFILE_COLUMNS} FROM planner_agent_profiles ORDER BY id ASC LIMIT 1"
-    ))
-    .fetch_optional(&state.pool)
+    ), state.backend))
+    .fetch_optional(&state.any)
     .await?)
 }
 
 async fn load_profile(state: &AppState, profile_id: i64) -> Result<Option<ProfileRow>, ApiError> {
-    Ok(sqlx::query_as(&format!(
+    Ok(sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {PROFILE_COLUMNS} FROM planner_agent_profiles WHERE id = ?"
-    ))
+    ), state.backend))
     .bind(profile_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?)
 }
 
@@ -2381,15 +2395,15 @@ async fn item_context_rows(
     item: &ItemRow,
 ) -> Result<(BoardBrief, CategoryBrief), ApiError> {
     let board: BoardBrief =
-        sqlx::query_as("SELECT id, name, default_model FROM todo_boards WHERE id = ?")
+        sqlx::query_as(&crate::db::sql("SELECT id, name, default_model FROM todo_boards WHERE id = ?", state.backend))
             .bind(item.board_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     let category: CategoryBrief = match item.category_id {
         Some(category_id) => {
-            sqlx::query_as("SELECT id, name, planner_profile_id FROM todo_categories WHERE id = ?")
+            sqlx::query_as(&crate::db::sql("SELECT id, name, planner_profile_id FROM todo_categories WHERE id = ?", state.backend))
                 .bind(category_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await?
         }
         None => None,
@@ -2521,9 +2535,9 @@ async fn resolve_model(
         return Ok(model);
     }
     let board_model: Option<Option<String>> =
-        sqlx::query_scalar("SELECT default_model FROM todo_boards WHERE id = ?")
+        sqlx::query_scalar(&crate::db::sql("SELECT default_model FROM todo_boards WHERE id = ?", state.backend))
             .bind(item.board_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     match board_model.flatten().filter(|m| !m.is_empty()) {
         Some(model) => Ok(model),
@@ -2628,9 +2642,9 @@ async fn agent_chat(
     let (message, model_override, history) = parse_chat_request(&raw)?;
 
     let row: Option<ItemRow> =
-        sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"))
+        sqlx::query_as(&crate::db::sql(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"), state.backend))
             .bind(item_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     let Some(item) = row else {
         return Err(ApiError::not_found("Item not found"));
@@ -2866,9 +2880,9 @@ async fn merge_workspace_documents(state: &AppState, item: &ItemRow, context: &m
     }
 
     let project_id: Option<Option<i64>> =
-        sqlx::query_scalar("SELECT project_id FROM todo_boards WHERE id = ?")
+        sqlx::query_scalar(&crate::db::sql("SELECT project_id FROM todo_boards WHERE id = ?", state.backend))
             .bind(item.board_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await
             .ok()
             .flatten();
@@ -2939,9 +2953,9 @@ async fn agent_step(
     assert_item_access(&state, &principal, item_id).await?;
 
     let row: Option<ItemRow> =
-        sqlx::query_as(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"))
+        sqlx::query_as(&crate::db::sql(&format!("SELECT {ITEM_COLUMNS} FROM todo_items WHERE id = ?"), state.backend))
             .bind(item_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     let Some(item) = row else {
         return Err(ApiError::not_found("Item not found"));

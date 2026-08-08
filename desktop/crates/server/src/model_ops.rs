@@ -35,8 +35,8 @@
 //! dict is now [`AppState::model_jobs`], and it is the *same* process, because
 //! there is only one.
 //!
-//! ponytail: written against `state.pool` like every domain but `projects`; the
-//! Postgres port converts one domain at a time and this is not converted yet.
+//! On the `sqlx::Any` pool: every query goes through `db::sql`, and ids are
+//! selected as `CAST(… AS BIGINT)` because a Postgres `integer` is int4.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -253,7 +253,9 @@ struct JobRow {
     finished_at: Option<String>,
 }
 
-const JOB_COLUMNS: &str = "id, project_id, job_type, stages_json, status, current_stage, \
+pub const JOB_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \
+     CAST(project_id AS BIGINT) AS project_id, job_type, stages_json, status, \
+     CAST(current_stage AS BIGINT) AS current_stage, \
      log_path, result_json, register_alias, error_message, \
      CAST(created_at AS TEXT) AS created_at, CAST(started_at AS TEXT) AS started_at, \
      CAST(finished_at AS TEXT) AS finished_at";
@@ -287,12 +289,12 @@ async fn registry_entries_for_project(
     project_id: i64,
     project_name: Option<&str>,
 ) -> Result<Vec<Value>, ApiError> {
-    let rows: Vec<RegistryRow> = sqlx::query_as(
+    let rows: Vec<RegistryRow> = sqlx::query_as(&crate::db::sql(
         "SELECT id, project_id, version, ollama_tag, base_model, eval_score, is_active \
-         FROM model_registry_entries WHERE project_id = ? ORDER BY created_at DESC",
+         FROM model_registry_entries WHERE project_id = ? ORDER BY created_at DESC", state.backend)
     )
     .bind(project_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
     Ok(rows.iter().map(|row| row.to_out(project_name)).collect())
 }
@@ -314,18 +316,18 @@ async fn sync_project_row(state: &AppState, name: &str) -> Result<ProjectRow, Ap
     let manifest_json = Value::Object(manifest.clone()).to_string();
     let now = sql_now();
 
-    let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM model_projects WHERE name = ?")
+    let existing: Option<i64> = sqlx::query_scalar(&crate::db::sql("SELECT id FROM model_projects WHERE name = ?", state.backend))
         .bind(name)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await?;
 
     match existing {
         Some(id) => {
-            sqlx::query("UPDATE model_projects SET manifest_json = ?, updated_at = ? WHERE id = ?")
+            sqlx::query(&crate::db::sql("UPDATE model_projects SET manifest_json = ?, updated_at = ? WHERE id = ?", state.backend))
                 .bind(&manifest_json)
                 .bind(&now)
                 .bind(id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await?;
         }
         None => {
@@ -333,17 +335,17 @@ async fn sync_project_row(state: &AppState, name: &str) -> Result<ProjectRow, Ap
             // string counts — `manifest.get("description")` on a mapping or a
             // number would not survive the column either.
             let description = manifest.get("description").and_then(Value::as_str);
-            sqlx::query(
+            sqlx::query(&crate::db::sql(
                 "INSERT INTO model_projects \
                  (name, description, manifest_json, workspace_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, NULL, ?, ?)",
+                 VALUES (?, ?, ?, NULL, ?, ?)", state.backend)
             )
             .bind(name)
             .bind(description)
             .bind(&manifest_json)
             .bind(&now)
             .bind(&now)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
         }
     }
@@ -352,11 +354,11 @@ async fn sync_project_row(state: &AppState, name: &str) -> Result<ProjectRow, Ap
 }
 
 async fn require_project(state: &AppState, name: &str) -> Result<ProjectRow, ApiError> {
-    sqlx::query_as(
-        "SELECT id, name, description, manifest_json FROM model_projects WHERE name = ?",
+    sqlx::query_as(&crate::db::sql(
+        "SELECT id, name, description, manifest_json FROM model_projects WHERE name = ?", state.backend)
     )
     .bind(name)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?
     .ok_or_else(|| ApiError::not_found(format!("Project not found: {name}")))
 }
@@ -443,11 +445,11 @@ fn iso(raw: &str) -> String {
 }
 
 async fn job_out(state: &AppState, job_id: i64) -> Result<Value, ApiError> {
-    let job: JobRow = sqlx::query_as(&format!(
+    let job: JobRow = sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {JOB_COLUMNS} FROM model_build_jobs WHERE id = ?"
-    ))
+    ), state.backend))
     .bind(job_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?
     .ok_or_else(|| ApiError::not_found("Job not found"))?;
 
@@ -455,9 +457,9 @@ async fn job_out(state: &AppState, job_id: i64) -> Result<Value, ApiError> {
         None => None,
         Some(project_id) => {
             let found: Option<String> =
-                sqlx::query_scalar("SELECT name FROM model_projects WHERE id = ?")
+                sqlx::query_scalar(&crate::db::sql("SELECT name FROM model_projects WHERE id = ?", state.backend))
                     .bind(project_id)
-                    .fetch_optional(&state.pool)
+                    .fetch_optional(&state.any)
                     .await?;
             Some(found.unwrap_or_else(|| "unknown".into()))
         }
@@ -475,26 +477,26 @@ async fn create_ollama_job(
     std::fs::create_dir_all(&logs_dir).map_err(io_error)?;
 
     let now = sql_now();
-    let id: i64 = sqlx::query_scalar(
+    let id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO model_build_jobs \
          (project_id, job_type, operation_json, stages_json, status, current_stage, log_path, \
           result_json, register_alias, error_message, process_id, created_at, started_at, \
           finished_at) \
          VALUES (NULL, ?, ?, '[]', 'pending', NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL) \
-         RETURNING id",
+         RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(job_type)
     .bind(operation.to_string())
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     let log_path = logs_dir.join(format!("job_{id}.log"));
     std::fs::write(&log_path, "").map_err(io_error)?;
-    sqlx::query("UPDATE model_build_jobs SET log_path = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE model_build_jobs SET log_path = ? WHERE id = ?", state.backend))
         .bind(log_path.to_string_lossy().as_ref())
         .bind(id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(id)
 }
@@ -517,21 +519,21 @@ fn append_job_log(log_path: Option<&str>, text: &str) {
 fn spawn_ollama_job(state: Arc<AppState>, job_id: i64, job_type: String, operation: Value) {
     tokio::spawn(async move {
         let log_path: Option<String> =
-            sqlx::query_scalar("SELECT log_path FROM model_build_jobs WHERE id = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT log_path FROM model_build_jobs WHERE id = ?", state.backend))
                 .bind(job_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await
                 .ok()
                 .flatten();
 
-        let _ = sqlx::query(
+        let _ = sqlx::query(&crate::db::sql(
             "UPDATE model_build_jobs SET status = 'running', started_at = ?, current_stage = ? \
-             WHERE id = ?",
+             WHERE id = ?", state.backend)
         )
         .bind(sql_now())
         .bind(&job_type)
         .bind(job_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await;
 
         let outcome = match job_type.as_str() {
@@ -562,27 +564,27 @@ fn spawn_ollama_job(state: Arc<AppState>, job_id: i64, job_type: String, operati
 
         match outcome {
             Ok(last) => {
-                let _ = sqlx::query(
+                let _ = sqlx::query(&crate::db::sql(
                     "UPDATE model_build_jobs SET status = 'succeeded', finished_at = ?, \
-                     result_json = ? WHERE id = ?",
+                     result_json = ? WHERE id = ?", state.backend)
                 )
                 .bind(sql_now())
                 .bind(json!({ "ollama": last }).to_string())
                 .bind(job_id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await;
             }
             Err(message) => {
                 append_job_log(log_path.as_deref(), &format!("ERROR: {message}\n"));
                 let truncated: String = message.chars().take(2000).collect();
-                let _ = sqlx::query(
+                let _ = sqlx::query(&crate::db::sql(
                     "UPDATE model_build_jobs SET status = 'failed', finished_at = ?, \
-                     error_message = ? WHERE id = ?",
+                     error_message = ? WHERE id = ?", state.backend)
                 )
                 .bind(sql_now())
                 .bind(truncated)
                 .bind(job_id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await;
             }
         }
@@ -1008,10 +1010,10 @@ async fn projects_list(
 ) -> Result<Response, ApiError> {
     principal.require_scope("model:read")?;
     ensure_data_scaffold();
-    let rows: Vec<ProjectRow> = sqlx::query_as(
-        "SELECT id, name, description, manifest_json FROM model_projects ORDER BY name",
+    let rows: Vec<ProjectRow> = sqlx::query_as(&crate::db::sql(
+        "SELECT id, name, description, manifest_json FROM model_projects ORDER BY name", state.backend)
     )
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     let mut out = Vec::new();
@@ -1101,24 +1103,24 @@ async fn projects_create(
     let description = description
         .filter(|d| !d.is_empty())
         .or_else(|| data.get("description").and_then(Value::as_str).map(str::to_string));
-    let id: i64 = sqlx::query_scalar(
+    let id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO model_projects \
          (name, description, manifest_json, workspace_id, created_at, updated_at) \
-         VALUES (?, ?, ?, NULL, ?, ?) RETURNING id",
+         VALUES (?, ?, ?, NULL, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(&name)
     .bind(&description)
     .bind(Value::Object(data).to_string())
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
-    let row = sqlx::query_as(
-        "SELECT id, name, description, manifest_json FROM model_projects WHERE id = ?",
+    let row = sqlx::query_as(&crate::db::sql(
+        "SELECT id, name, description, manifest_json FROM model_projects WHERE id = ?", state.backend)
     )
     .bind(id)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
     Ok(Json(project_to_out(&state, &row).await?).into_response())
 }
@@ -1275,19 +1277,19 @@ async fn registry_list(
     principal: Principal,
 ) -> Result<Response, ApiError> {
     principal.require_scope("model:read")?;
-    let rows: Vec<RegistryRow> = sqlx::query_as(
+    let rows: Vec<RegistryRow> = sqlx::query_as(&crate::db::sql(
         "SELECT id, project_id, version, ollama_tag, base_model, eval_score, is_active \
-         FROM model_registry_entries ORDER BY created_at DESC",
+         FROM model_registry_entries ORDER BY created_at DESC", state.backend)
     )
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     let mut entries = Vec::new();
     for row in &rows {
         let project_name: Option<String> =
-            sqlx::query_scalar("SELECT name FROM model_projects WHERE id = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT name FROM model_projects WHERE id = ?", state.backend))
                 .bind(row.project_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await?;
         entries.push(row.to_out(project_name.as_deref()));
     }
@@ -1300,29 +1302,29 @@ async fn registry_activate(
     PathId(entry_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     principal.require_scope("model:write")?;
-    let row: RegistryRow = sqlx::query_as(
+    let row: RegistryRow = sqlx::query_as(&crate::db::sql(
         "SELECT id, project_id, version, ollama_tag, base_model, eval_score, is_active \
-         FROM model_registry_entries WHERE id = ?",
+         FROM model_registry_entries WHERE id = ?", state.backend)
     )
     .bind(entry_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?
     // `ValueError` there, and the route turns it into a 404.
     .ok_or_else(|| ApiError::not_found("Registry entry not found"))?;
 
-    sqlx::query("UPDATE model_registry_entries SET is_active = 0 WHERE project_id = ?")
+    sqlx::query(&crate::db::sql("UPDATE model_registry_entries SET is_active = 0 WHERE project_id = ?", state.backend))
         .bind(row.project_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
-    sqlx::query("UPDATE model_registry_entries SET is_active = 1 WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE model_registry_entries SET is_active = 1 WHERE id = ?", state.backend))
         .bind(entry_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     let project_name: Option<String> =
-        sqlx::query_scalar("SELECT name FROM model_projects WHERE id = ?")
+        sqlx::query_scalar(&crate::db::sql("SELECT name FROM model_projects WHERE id = ?", state.backend))
             .bind(row.project_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     let mut out = row.to_out(project_name.as_deref());
     out["is_active"] = json!(true);
@@ -1481,37 +1483,37 @@ async fn start_pipeline_job(state: Arc<AppState>, request: &BuildRequest) -> Res
     std::fs::create_dir_all(&logs_dir).map_err(io_error)?;
 
     let now = sql_now();
-    let job_id: i64 = sqlx::query_scalar(
+    let job_id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO model_build_jobs \
          (project_id, job_type, operation_json, stages_json, status, current_stage, log_path, \
           result_json, register_alias, error_message, process_id, created_at, started_at, \
           finished_at) \
          VALUES (?, 'pipeline', NULL, ?, 'pending', NULL, NULL, NULL, ?, NULL, ?, ?, NULL, NULL) \
-         RETURNING id",
+         RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(project.id)
     .bind(Value::from(request.stages.clone()).to_string())
     .bind(request.register_alias.as_deref())
     .bind(request.process_id)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     let log_path = logs_dir.join(format!("job_{job_id}.log"));
     std::fs::write(&log_path, "").map_err(io_error)?;
-    sqlx::query("UPDATE model_build_jobs SET log_path = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE model_build_jobs SET log_path = ? WHERE id = ?", state.backend))
         .bind(log_path.to_string_lossy().as_ref())
         .bind(job_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     // `link_process_to_job`: a job started by an orchestration step points back
     // at it. A missing process is silently skipped, as there.
     if let Some(process_id) = request.process_id {
-        let _ = sqlx::query("UPDATE process SET model_build_job_id = ? WHERE id = ?")
+        let _ = sqlx::query(&crate::db::sql("UPDATE process SET model_build_job_id = ? WHERE id = ?", state.backend))
             .bind(job_id)
             .bind(process_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await;
     }
 
@@ -1539,9 +1541,9 @@ async fn jobs_cancel(
 ) -> Result<Response, ApiError> {
     principal.require_scope("model:write")?;
     let status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM model_build_jobs WHERE id = ?")
+        sqlx::query_scalar(&crate::db::sql("SELECT status FROM model_build_jobs WHERE id = ?", state.backend))
             .bind(job_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     let status = status.ok_or_else(|| ApiError::not_found("Job not found"))?;
     if status != "pending" && status != "running" {
@@ -1555,10 +1557,10 @@ async fn jobs_cancel(
         handle.cancel();
     }
 
-    sqlx::query("UPDATE model_build_jobs SET status = 'cancelled', finished_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE model_build_jobs SET status = 'cancelled', finished_at = ? WHERE id = ?", state.backend))
         .bind(sql_now())
         .bind(job_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(Json(job_out(&state, job_id).await?).into_response())
 }
@@ -1574,11 +1576,11 @@ async fn jobs_stream(
     PathId(job_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     principal.require_scope("model:read")?;
-    let job: JobRow = sqlx::query_as(&format!(
+    let job: JobRow = sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {JOB_COLUMNS} FROM model_build_jobs WHERE id = ?"
-    ))
+    ), state.backend))
     .bind(job_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?
     .ok_or_else(|| ApiError::not_found("Job not found"))?;
 
@@ -1592,11 +1594,11 @@ async fn jobs_stream(
 
     let stream = async_stream::stream! {
         loop {
-            let row: Option<JobRow> = sqlx::query_as(&format!(
+            let row: Option<JobRow> = sqlx::query_as(&crate::db::sql(&format!(
                 "SELECT {JOB_COLUMNS} FROM model_build_jobs WHERE id = ?"
-            ))
+            ), state.backend))
             .bind(job_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await
             .ok()
             .flatten();
@@ -1693,9 +1695,9 @@ fn spawn_pipeline_job(state: Arc<AppState>, job_id: i64, project: String, offlin
         // A job the operator cancelled mid-stage is already `cancelled`; the
         // stage's non-zero exit must not overwrite that with `failed`.
         let current: Option<String> =
-            sqlx::query_scalar("SELECT status FROM model_build_jobs WHERE id = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT status FROM model_build_jobs WHERE id = ?", state.backend))
                 .bind(job_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await
                 .ok()
                 .flatten();
@@ -1704,34 +1706,34 @@ fn spawn_pipeline_job(state: Arc<AppState>, job_id: i64, project: String, offlin
         }
 
         let log_path: Option<String> =
-            sqlx::query_scalar("SELECT log_path FROM model_build_jobs WHERE id = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT log_path FROM model_build_jobs WHERE id = ?", state.backend))
                 .bind(job_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await
                 .ok()
                 .flatten();
 
         match outcome {
             Ok(()) => {
-                let _ = sqlx::query(
-                    "UPDATE model_build_jobs SET status = 'succeeded', finished_at = ? WHERE id = ?",
+                let _ = sqlx::query(&crate::db::sql(
+                    "UPDATE model_build_jobs SET status = 'succeeded', finished_at = ? WHERE id = ?", state.backend)
                 )
                 .bind(sql_now())
                 .bind(job_id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await;
             }
             Err(message) => {
                 append_job_log(log_path.as_deref(), &format!("ERROR: {message}\n"));
                 let truncated: String = message.chars().take(2000).collect();
-                let _ = sqlx::query(
+                let _ = sqlx::query(&crate::db::sql(
                     "UPDATE model_build_jobs SET status = 'failed', finished_at = ?, \
-                     error_message = ? WHERE id = ?",
+                     error_message = ? WHERE id = ?", state.backend)
                 )
                 .bind(sql_now())
                 .bind(truncated)
                 .bind(job_id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await;
             }
         }
@@ -1745,20 +1747,20 @@ async fn run_pipeline_job(
     offline_eval: bool,
     cancelled: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
-    let job: JobRow = sqlx::query_as(&format!(
+    let job: JobRow = sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {JOB_COLUMNS} FROM model_build_jobs WHERE id = ?"
-    ))
+    ), state.backend))
     .bind(job_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "Job vanished".to_string())?;
     let log_path = job.log_path.clone();
 
-    sqlx::query("UPDATE model_build_jobs SET status = 'running', started_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE model_build_jobs SET status = 'running', started_at = ? WHERE id = ?", state.backend))
         .bind(sql_now())
         .bind(job_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1769,10 +1771,10 @@ async fn run_pipeline_job(
         .unwrap_or_default();
     for stage in &stages {
         let stage = stage.as_str();
-        let _ = sqlx::query("UPDATE model_build_jobs SET current_stage = ? WHERE id = ?")
+        let _ = sqlx::query(&crate::db::sql("UPDATE model_build_jobs SET current_stage = ? WHERE id = ?", state.backend))
             .bind(stage)
             .bind(job_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await;
         append_job_log(log_path.as_deref(), &format!("=== stage: {stage} ===\n"));
 
@@ -1788,7 +1790,7 @@ async fn run_pipeline_job(
                     "SELECT result_json FROM model_build_jobs WHERE id = ?",
                 )
                 .bind(job_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await
                 .ok()
                 .flatten()
@@ -1798,10 +1800,10 @@ async fn run_pipeline_job(
             if let Some(map) = result.as_object_mut() {
                 map.insert("eval".into(), eval);
             }
-            let _ = sqlx::query("UPDATE model_build_jobs SET result_json = ? WHERE id = ?")
+            let _ = sqlx::query(&crate::db::sql("UPDATE model_build_jobs SET result_json = ? WHERE id = ?", state.backend))
                 .bind(result.to_string())
                 .bind(job_id)
-                .execute(&state.pool)
+                .execute(&state.any)
                 .await;
         }
     }
@@ -1810,9 +1812,9 @@ async fn run_pipeline_job(
     // manifest `ollama_tag` (its name when it has none).
     if let Some(alias) = job.register_alias.as_deref().filter(|a| !a.is_empty()) {
         let manifest: Option<String> =
-            sqlx::query_scalar("SELECT manifest_json FROM model_projects WHERE id = ?")
+            sqlx::query_scalar(&crate::db::sql("SELECT manifest_json FROM model_projects WHERE id = ?", state.backend))
                 .bind(job.project_id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&state.any)
                 .await
                 .ok()
                 .flatten();
@@ -1985,34 +1987,34 @@ async fn persist_registry_entry(
         .unwrap_or(&project_name)
         .to_string();
 
-    let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM model_registry_entries WHERE project_id = ? AND version = ?",
+    let existing: Option<i64> = sqlx::query_scalar(&crate::db::sql(
+        "SELECT id FROM model_registry_entries WHERE project_id = ? AND version = ?", state.backend)
     )
     .bind(project.id)
     .bind(&version)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?;
 
     let entry_id = match existing {
         Some(id) => id,
-        None => sqlx::query_scalar(
+        None => sqlx::query_scalar(&crate::db::sql(
             "INSERT INTO model_registry_entries (project_id, version, ollama_tag, is_active) \
-             VALUES (?, ?, ?, 0) RETURNING id",
+             VALUES (?, ?, ?, 0) RETURNING CAST(id AS BIGINT)", state.backend)
         )
         .bind(project.id)
         .bind(&version)
         .bind(&tag)
-        .fetch_one(&state.pool)
+        .fetch_one(&state.any)
         .await?,
     };
 
     // `eval_score` is only written when present: `if entry.get("eval_score") is
     // not None`, so a later stage cannot blank an earlier one's number.
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "UPDATE model_registry_entries \
          SET base_model = ?, adapter_path = ?, gguf_path = ?, metadata_json = ?, \
              eval_score = COALESCE(?, eval_score) \
-         WHERE id = ?",
+         WHERE id = ?", state.backend)
     )
     .bind(entry.get("base_model").and_then(Value::as_str))
     .bind(entry.get("adapter").and_then(Value::as_str))
@@ -2020,18 +2022,18 @@ async fn persist_registry_entry(
     .bind(entry.to_string())
     .bind(entry.get("eval_score").and_then(Value::as_f64))
     .bind(entry_id)
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
 
     if set_active {
-        sqlx::query("UPDATE model_registry_entries SET is_active = 0 WHERE project_id = ?")
+        sqlx::query(&crate::db::sql("UPDATE model_registry_entries SET is_active = 0 WHERE project_id = ?", state.backend))
             .bind(project.id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
-        sqlx::query("UPDATE model_registry_entries SET is_active = 1, ollama_tag = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE model_registry_entries SET is_active = 1, ollama_tag = ? WHERE id = ?", state.backend))
             .bind(&tag)
             .bind(entry_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     Ok(())

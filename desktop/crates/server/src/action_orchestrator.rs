@@ -64,11 +64,11 @@ pub(crate) async fn list_actions(
     state: &AppState,
     set_id: i64,
 ) -> Result<Vec<ActionRow>, ApiError> {
-    Ok(sqlx::query_as(
-        "SELECT action_id, name, description, parameters_json FROM actions WHERE set_id = ?",
+    Ok(sqlx::query_as(&crate::db::sql(
+        "SELECT action_id, name, description, parameters_json FROM actions WHERE set_id = ?", state.backend)
     )
     .bind(set_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?)
 }
 
@@ -865,8 +865,8 @@ struct ActionFullRow {
     endpoint: Option<String>,
 }
 
-const ACTION_COLUMNS: &str =
-    "id, action_id, name, description, parameters_json, execution_mode, endpoint";
+pub const ACTION_COLUMNS: &str = "CAST(id AS BIGINT) AS id, action_id, name, description, \
+     parameters_json, execution_mode, endpoint";
 
 impl ActionFullRow {
     /// `registry.action_to_dict`, which is also exactly `ActionResponse`.
@@ -898,21 +898,21 @@ fn decode_object_opt(raw: Option<&str>) -> Value {
 }
 
 async fn load_set(state: &AppState, set_id: i64) -> Result<ActionSetRow, ApiError> {
-    sqlx::query_as(
-        "SELECT id, client_id, name, description, metadata_json FROM action_sets WHERE id = ?",
+    sqlx::query_as(&crate::db::sql(
+        "SELECT id, client_id, name, description, metadata_json FROM action_sets WHERE id = ?", state.backend)
     )
     .bind(set_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?
     .ok_or_else(|| ApiError::not_found("Action set not found"))
 }
 
 async fn load_actions(state: &AppState, set_id: i64) -> Result<Vec<ActionFullRow>, ApiError> {
-    Ok(sqlx::query_as(&format!(
+    Ok(sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {ACTION_COLUMNS} FROM actions WHERE set_id = ?"
-    ))
+    ), state.backend))
     .bind(set_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?)
 }
 
@@ -954,9 +954,9 @@ async fn create_set(
     }
 
     let now = sql_now();
-    let set_id: i64 = sqlx::query_scalar(
+    let set_id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO action_sets (client_id, name, description, metadata_json, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+         VALUES (?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(&effective)
     .bind(&name)
@@ -965,7 +965,7 @@ async fn create_set(
     .bind(metadata.as_ref().filter(|m| !m.is_empty()).map(|m| Value::Object(m.clone()).to_string()))
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     for action in &actions {
@@ -989,20 +989,25 @@ async fn list_sets(
 
     // `list_action_sets`: an unowned set is shared, so it is listed for every
     // caller rather than only for the one that owns nothing.
+    // Both rewritten strings are bound to locals: a `match` arm's temporary
+    // dies at the end of the arm, and the query borrows it past that.
+    let owned_sql = crate::db::sql(
+        "SELECT CAST(id AS BIGINT) AS id, client_id, name, description, metadata_json \
+         FROM action_sets WHERE client_id = ? OR client_id IS NULL ORDER BY id DESC LIMIT ?",
+        state.backend,
+    )
+    .into_owned();
+    let all_sql = crate::db::sql(
+        "SELECT CAST(id AS BIGINT) AS id, client_id, name, description, metadata_json \
+         FROM action_sets ORDER BY id DESC LIMIT ?",
+        state.backend,
+    )
+    .into_owned();
     let rows: Vec<ActionSetRow> = match &effective {
-        Some(client_id) => sqlx::query_as(
-            "SELECT id, client_id, name, description, metadata_json FROM action_sets \
-             WHERE client_id = ? OR client_id IS NULL ORDER BY id DESC LIMIT ?",
-        )
-        .bind(client_id)
-        .bind(limit),
-        None => sqlx::query_as(
-            "SELECT id, client_id, name, description, metadata_json FROM action_sets \
-             ORDER BY id DESC LIMIT ?",
-        )
-        .bind(limit),
+        Some(client_id) => sqlx::query_as(&owned_sql).bind(client_id).bind(limit),
+        None => sqlx::query_as(&all_sql).bind(limit),
     }
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     let mut out = Vec::new();
@@ -1064,26 +1069,26 @@ async fn update_set(
     // `is not None` per field, so a key the caller omitted keeps its column —
     // and `updated_at` is not touched, because SQLModel has no `onupdate` here.
     if let Some(name) = name {
-        sqlx::query("UPDATE action_sets SET name = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE action_sets SET name = ? WHERE id = ?", state.backend))
             .bind(name)
             .bind(set_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(description) = description {
-        sqlx::query("UPDATE action_sets SET description = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE action_sets SET description = ? WHERE id = ?", state.backend))
             .bind(description)
             .bind(set_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(metadata) = metadata {
-        sqlx::query("UPDATE action_sets SET metadata_json = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE action_sets SET metadata_json = ? WHERE id = ?", state.backend))
             .bind(
                 (!metadata.is_empty()).then(|| Value::Object(metadata).to_string()),
             )
             .bind(set_id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
 
@@ -1100,13 +1105,13 @@ async fn delete_set(
 ) -> Result<Response, ApiError> {
     let scope = client_scope(&principal, &headers);
     require_set(&state, set_id, scope.as_deref()).await?;
-    sqlx::query("DELETE FROM actions WHERE set_id = ?")
+    sqlx::query(&crate::db::sql("DELETE FROM actions WHERE set_id = ?", state.backend))
         .bind(set_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
-    sqlx::query("DELETE FROM action_sets WHERE id = ?")
+    sqlx::query(&crate::db::sql("DELETE FROM action_sets WHERE id = ?", state.backend))
         .bind(set_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(Json(json!({ "success": true })).into_response())
 }
@@ -1129,11 +1134,11 @@ async fn insert_action(
     action: &ActionCreate,
     now: &str,
 ) -> Result<i64, ApiError> {
-    Ok(sqlx::query_scalar(
+    Ok(sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO actions \
          (set_id, action_id, name, description, parameters_json, execution_mode, endpoint, \
           created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(set_id)
     .bind(&action.action_id)
@@ -1144,7 +1149,7 @@ async fn insert_action(
     .bind(&action.endpoint)
     .bind(now)
     .bind(now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?)
 }
 
@@ -1175,10 +1180,10 @@ async fn add_action(
     require_set(&state, set_id, scope.as_deref()).await?;
 
     let duplicate: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM actions WHERE set_id = ? AND action_id = ?")
+        sqlx::query_scalar(&crate::db::sql("SELECT id FROM actions WHERE set_id = ? AND action_id = ?", state.backend))
             .bind(set_id)
             .bind(&action.action_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     if duplicate.is_some() {
         return Err(ApiError::bad_request(format!(
@@ -1193,9 +1198,9 @@ async fn add_action(
 }
 
 async fn require_action_by_row_id(state: &AppState, id: i64) -> Result<ActionFullRow, ApiError> {
-    sqlx::query_as(&format!("SELECT {ACTION_COLUMNS} FROM actions WHERE id = ?"))
+    sqlx::query_as(&crate::db::sql(&format!("SELECT {ACTION_COLUMNS} FROM actions WHERE id = ?"), state.backend))
         .bind(id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await?
         .ok_or_else(|| ApiError::not_found("Action not found"))
 }
@@ -1205,12 +1210,12 @@ async fn require_action(
     set_id: i64,
     action_id: &str,
 ) -> Result<ActionFullRow, ApiError> {
-    sqlx::query_as(&format!(
+    sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {ACTION_COLUMNS} FROM actions WHERE set_id = ? AND action_id = ?"
-    ))
+    ), state.backend))
     .bind(set_id)
     .bind(action_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?
     .ok_or_else(|| ApiError::not_found("Action not found"))
 }
@@ -1265,38 +1270,38 @@ async fn update_action_detail(
     let action = require_action(&state, set_id, &action_id).await?;
 
     if let Some(name) = name {
-        sqlx::query("UPDATE actions SET name = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE actions SET name = ? WHERE id = ?", state.backend))
             .bind(name)
             .bind(action.id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(description) = description {
-        sqlx::query("UPDATE actions SET description = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE actions SET description = ? WHERE id = ?", state.backend))
             .bind(description)
             .bind(action.id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(parameters) = parameters {
-        sqlx::query("UPDATE actions SET parameters_json = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE actions SET parameters_json = ? WHERE id = ?", state.backend))
             .bind(parameters_json(Some(&parameters)))
             .bind(action.id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(execution_mode) = execution_mode {
-        sqlx::query("UPDATE actions SET execution_mode = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE actions SET execution_mode = ? WHERE id = ?", state.backend))
             .bind(execution_mode)
             .bind(action.id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
     if let Some(endpoint) = endpoint {
-        sqlx::query("UPDATE actions SET endpoint = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql("UPDATE actions SET endpoint = ? WHERE id = ?", state.backend))
             .bind(endpoint)
             .bind(action.id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
 
@@ -1313,9 +1318,9 @@ async fn delete_action_endpoint(
     let scope = client_scope(&principal, &headers);
     require_set(&state, set_id, scope.as_deref()).await?;
     let action = require_action(&state, set_id, &action_id).await?;
-    sqlx::query("DELETE FROM actions WHERE id = ?")
+    sqlx::query(&crate::db::sql("DELETE FROM actions WHERE id = ?", state.backend))
         .bind(action.id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(Json(json!({ "success": true })).into_response())
 }
@@ -1335,8 +1340,10 @@ struct SessionRow {
     execution_mode: String,
 }
 
-const SESSION_COLUMNS: &str = "id, client_id, action_set_id, goal, context_json, status, \
-     current_step, max_steps, execution_mode";
+pub const SESSION_COLUMNS: &str = "CAST(id AS BIGINT) AS id, client_id, \
+     CAST(action_set_id AS BIGINT) AS action_set_id, goal, context_json, status, \
+     CAST(current_step AS BIGINT) AS current_step, \
+     CAST(max_steps AS BIGINT) AS max_steps, execution_mode";
 
 impl SessionRow {
     fn to_out(&self) -> Value {
@@ -1365,11 +1372,11 @@ async fn require_session(
     session_id: i64,
     scope: Option<&str>,
 ) -> Result<SessionRow, ApiError> {
-    let row: SessionRow = sqlx::query_as(&format!(
+    let row: SessionRow = sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {SESSION_COLUMNS} FROM action_sessions WHERE id = ?"
-    ))
+    ), state.backend))
     .bind(session_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?
     .ok_or_else(|| ApiError::not_found("Session not found"))?;
     if !client_access(row.client_id.as_deref(), scope) {
@@ -1409,11 +1416,11 @@ async fn create_session(
 
     let context = context.unwrap_or_default();
     let now = sql_now();
-    let session_id: i64 = sqlx::query_scalar(
+    let session_id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO action_sessions \
          (client_id, action_set_id, goal, context_json, status, current_step, max_steps, \
           execution_mode, created_at, updated_at, completed_at) \
-         VALUES (?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, NULL) RETURNING id",
+         VALUES (?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, NULL) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(&effective)
     .bind(action_set_id)
@@ -1423,7 +1430,7 @@ async fn create_session(
     .bind(&execution_mode)
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     let row = require_session(&state, session_id, scope.as_deref()).await?;
@@ -1515,20 +1522,20 @@ async fn request_step(
 
     // History is one entry per *executed* action: the step's planned actions
     // joined to whichever result was submitted for the same step and id.
-    let steps: Vec<StepRow> = sqlx::query_as(
+    let steps: Vec<StepRow> = sqlx::query_as(&crate::db::sql(
         "SELECT step_number, thought, actions_json, status FROM session_steps \
-         WHERE session_id = ? ORDER BY step_number",
+         WHERE session_id = ? ORDER BY step_number", state.backend)
     )
     .bind(session_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
     let mut history = Vec::new();
     for step in &steps {
         for planned in decode_array(&step.actions_json) {
             let action_id = planned.get("action_id").cloned().unwrap_or(Value::Null);
-            let result: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            let result: Option<(Option<String>, Option<String>)> = sqlx::query_as(&crate::db::sql(
                 "SELECT result_json, error FROM session_results \
-                 WHERE session_id = ? AND step_number = ? AND action_id = ?",
+                 WHERE session_id = ? AND step_number = ? AND action_id = ?", state.backend)
             )
             .bind(session_id)
             .bind(step.step_number)
@@ -1536,7 +1543,7 @@ async fn request_step(
             // action's id may be anything JSON allows; a non-string simply
             // matches nothing, which is what SQLAlchemy does with it too.
             .bind(action_id.as_str().unwrap_or_default())
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
             if let Some((result_json, error)) = result {
                 history.push(json!({
@@ -1573,22 +1580,22 @@ async fn request_step(
     }
 
     let step_number = session.current_step + 1;
-    sqlx::query("UPDATE action_sessions SET current_step = ?, status = 'awaiting_execution' WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE action_sessions SET current_step = ?, status = 'awaiting_execution' WHERE id = ?", state.backend))
         .bind(step_number)
         .bind(session_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "INSERT INTO session_steps \
          (session_id, step_number, thought, actions_json, status, created_at, executed_at) \
-         VALUES (?, ?, ?, ?, 'pending', ?, NULL)",
+         VALUES (?, ?, ?, ?, 'pending', ?, NULL)", state.backend)
     )
     .bind(session_id)
     .bind(step_number)
     .bind(&thought)
     .bind(serde_json::to_string(&planned).unwrap_or_else(|_| "[]".into()))
     .bind(sql_now())
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
 
     Ok(Json(step_response(
@@ -1604,10 +1611,10 @@ async fn request_step(
 }
 
 async fn complete(state: &AppState, session_id: i64) -> Result<(), ApiError> {
-    sqlx::query("UPDATE action_sessions SET status = 'completed', completed_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE action_sessions SET status = 'completed', completed_at = ? WHERE id = ?", state.backend))
         .bind(sql_now())
         .bind(session_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
     Ok(())
 }
@@ -1641,21 +1648,21 @@ async fn submit_result(
 
     let session = require_session(&state, session_id, scope.as_deref()).await?;
 
-    let step: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM session_steps WHERE session_id = ? AND step_number = ?",
+    let step: Option<i64> = sqlx::query_scalar(&crate::db::sql(
+        "SELECT id FROM session_steps WHERE session_id = ? AND step_number = ?", state.backend)
     )
     .bind(session_id)
     .bind(step_number)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await?;
     let step_id = step.ok_or_else(|| ApiError::not_found("Step not found"))?;
 
     let failed = error.as_ref().is_some_and(|e| !e.is_empty());
     let result = result.unwrap_or_default();
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "INSERT INTO session_results \
          (session_id, step_number, action_id, result_json, error, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?)", state.backend)
     )
     .bind(session_id)
     .bind(step_number)
@@ -1663,18 +1670,18 @@ async fn submit_result(
     .bind((!result.is_empty()).then(|| Value::Object(result).to_string()))
     .bind(&error)
     .bind(sql_now())
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
 
-    sqlx::query("UPDATE session_steps SET status = ?, executed_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE session_steps SET status = ?, executed_at = ? WHERE id = ?", state.backend))
         .bind(if failed { "failed" } else { "executed" })
         .bind(sql_now())
         .bind(step_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
-    sqlx::query("UPDATE action_sessions SET status = 'active' WHERE id = ?")
+    sqlx::query(&crate::db::sql("UPDATE action_sessions SET status = 'active' WHERE id = ?", state.backend))
         .bind(session_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     Ok(Json(json!({
@@ -1724,12 +1731,12 @@ async fn get_session_history(
     let scope = client_scope(&principal, &headers);
     let session = require_session(&state, session_id, scope.as_deref()).await?;
 
-    let steps: Vec<StepRow> = sqlx::query_as(
+    let steps: Vec<StepRow> = sqlx::query_as(&crate::db::sql(
         "SELECT step_number, thought, actions_json, status FROM session_steps \
-         WHERE session_id = ? ORDER BY step_number",
+         WHERE session_id = ? ORDER BY step_number", state.backend)
     )
     .bind(session_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     let mut steps_out = Vec::new();
@@ -1752,11 +1759,11 @@ async fn get_session_history(
         ));
     }
 
-    let results: Vec<(i64, String, Option<String>)> = sqlx::query_as(
-        "SELECT step_number, action_id, error FROM session_results WHERE session_id = ?",
+    let results: Vec<(i64, String, Option<String>)> = sqlx::query_as(&crate::db::sql(
+        "SELECT step_number, action_id, error FROM session_results WHERE session_id = ?", state.backend)
     )
     .bind(session_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     let results_out: Vec<Value> = results
