@@ -36,12 +36,16 @@ use serde_json::Value;
 /// passes `ensure_ascii=False`, so the same DAG is stored two ways depending on
 /// which path wrote it.
 ///
-/// ponytail: `workflow_engine::PythonJson` and `todos::EnsureAscii` are each
-/// half of this and both private to their module. Merged here rather than made
-/// `pub(crate)` in two files another agent owns; fold the three together when
-/// this domain settles.
+/// `workflow_engine::PythonJson` and `todos::EnsureAscii` were each half of
+/// this, privately, in their own module — the same UTF-16 surrogate walk
+/// written twice and the same separator pair written twice. They are gone;
+/// this is the one renderer, and `compact` is the axis they differed on.
 pub(crate) struct PyJson {
     pub ensure_ascii: bool,
+    /// `separators=(",", ":")` rather than `json.dumps`'s default `(", ", ": ")`.
+    /// serde_json's own compact form already *is* the tight pair, so this only
+    /// has to stop widening it.
+    pub compact: bool,
 }
 
 impl serde_json::ser::Formatter for PyJson {
@@ -53,7 +57,7 @@ impl serde_json::ser::Formatter for PyJson {
         if first {
             Ok(())
         } else {
-            writer.write_all(b", ")
+            writer.write_all(if self.compact { b"," } else { b", " })
         }
     }
 
@@ -65,7 +69,7 @@ impl serde_json::ser::Formatter for PyJson {
         if first {
             Ok(())
         } else {
-            writer.write_all(b", ")
+            writer.write_all(if self.compact { b"," } else { b", " })
         }
     }
 
@@ -73,7 +77,7 @@ impl serde_json::ser::Formatter for PyJson {
         &mut self,
         writer: &mut W,
     ) -> std::io::Result<()> {
-        writer.write_all(b": ")
+        writer.write_all(if self.compact { b":" } else { b": " })
     }
 
     fn write_string_fragment<W: ?Sized + std::io::Write>(
@@ -105,9 +109,21 @@ impl serde_json::ser::Formatter for PyJson {
 
 /// `json.dumps(value, ensure_ascii=…)` — default separators, no indent.
 pub(crate) fn python_json<T: Serialize>(value: &T, ensure_ascii: bool) -> String {
+    render(value, PyJson { ensure_ascii, compact: false })
+}
+
+/// `json.dumps(value, separators=(",", ":"), ensure_ascii=…)`.
+///
+/// The tight pair matters where the output is *stored* rather than echoed:
+/// `process.team_snapshot_json` is written once and never re-derived, so its
+/// bytes are the record.
+pub(crate) fn python_json_compact<T: Serialize>(value: &T, ensure_ascii: bool) -> String {
+    render(value, PyJson { ensure_ascii, compact: true })
+}
+
+fn render<T: Serialize>(value: &T, formatter: PyJson) -> String {
     let mut buffer = Vec::new();
-    let mut serializer =
-        serde_json::Serializer::with_formatter(&mut buffer, PyJson { ensure_ascii });
+    let mut serializer = serde_json::Serializer::with_formatter(&mut buffer, formatter);
     match value.serialize(&mut serializer) {
         Ok(()) => String::from_utf8(buffer).unwrap_or_default(),
         Err(_) => String::new(),

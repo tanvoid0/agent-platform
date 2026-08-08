@@ -87,9 +87,17 @@ pub fn sql(query: &str, backend: Backend) -> Cow<'_, str> {
 /// only way left to do it.** `SqliteConnectOptions::foreign_keys(false)` is not
 /// reachable from an `AnyPool`, and the URL form is rejected outright
 /// (`unknown query parameter 'foreign_keys'`) — so without this hook SQLite
-/// comes up with them ON, and deleting a board that still has items turns
-/// Python's 204 into a 500. The schema declares foreign keys the data does not
-/// honour; matching Python is the contract.
+/// comes up with them ON and deleting a board that still has items 500s.
+///
+/// **The schema declares foreign keys the data does not satisfy.** SQLAlchemy
+/// left the pragma at SQLite's default OFF, so no row here was ever checked:
+/// `PRAGMA foreign_key_check` on a real user database returns 55 violations,
+/// every one an `eventlog.task_id` pointing at a tasknode a finished DAG
+/// deleted. Turning them on is not a flag flip — it needs a migration that
+/// rebuilds the affected tables with `ON DELETE` actions (SQLite has no
+/// `ALTER TABLE … ADD CONSTRAINT`) and clears the orphans, and the handlers
+/// already delete children explicitly, which is why nothing is broken today.
+/// ponytail: worth doing the first time a dangling row causes a visible bug.
 ///
 /// **The hook has to be backend-conditional, and getting that wrong does not
 /// fail loudly.** Running the PRAGMA against Postgres makes `after_connect`

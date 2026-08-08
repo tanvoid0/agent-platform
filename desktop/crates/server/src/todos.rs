@@ -2053,43 +2053,14 @@ struct SpawnProcessResponse {
 /// `json.dumps` escapes every non-ASCII character — `ensure_ascii=True` is the
 /// default — where serde_json emits it raw. The rest of the compact form
 /// already matches, so only string fragments are overridden.
-struct EnsureAscii;
-
-impl serde_json::ser::Formatter for EnsureAscii {
-    fn write_string_fragment<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-        fragment: &str,
-    ) -> std::io::Result<()> {
-        let mut plain = 0;
-        let mut units = [0u16; 2];
-        for (i, ch) in fragment.char_indices() {
-            // DEL is ASCII but outside Python's printable range, so it escapes
-            // too. Everything below 0x20 never reaches here — serde_json has
-            // already routed it through `write_char_escape`.
-            if ch.is_ascii() && ch != '\u{7f}' {
-                continue;
-            }
-            writer.write_all(fragment[plain..i].as_bytes())?;
-            // Astral chars are a surrogate pair in Python's output, which is
-            // what UTF-16 units give us.
-            for unit in ch.encode_utf16(&mut units) {
-                writer.write_all(format!("\\u{:04x}", *unit).as_bytes())?;
-            }
-            plain = i + ch.len_utf8();
-        }
-        writer.write_all(fragment[plain..].as_bytes())
-    }
-}
-
 /// `team_schema.build_process_team_snapshot`.
 ///
 /// Two details are load-bearing, because `process.team_snapshot_json` is stored
 /// and never re-derived: the payload is built from structs so the keys keep
 /// pydantic's field-declaration order (a `serde_json::Map` would sort them),
-/// and it is written through [`EnsureAscii`] so a non-ASCII team name escapes
-/// the way `json.dumps` escapes it. The separators already match — serde_json's
-/// compact form *is* `separators=(",", ":")`.
+/// and it is written through [`crate::dag_schema::python_json_compact`] so a
+/// non-ASCII team name escapes the way `json.dumps` escapes it, with the tight
+/// separators this column has always been stored with.
 pub(crate) fn build_process_team_snapshot(
     team_template_id: i64,
     name: &str,
@@ -2107,12 +2078,7 @@ pub(crate) fn build_process_team_snapshot(
     }
 
     let payload = Snapshot { team_template_id, name, description, color, roster };
-    let mut buffer = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut buffer, EnsureAscii);
-    match payload.serialize(&mut serializer) {
-        Ok(()) => String::from_utf8(buffer).unwrap_or_default(),
-        Err(_) => String::new(),
-    }
+    crate::dag_schema::python_json_compact(&payload, true)
 }
 
 /// The template as it is snapshotted onto a process: the same read-path colour

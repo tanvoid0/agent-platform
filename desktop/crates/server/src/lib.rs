@@ -239,11 +239,14 @@ impl AppState {
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
-            // sqlx turns foreign keys ON per connection; SQLAlchemy leaves SQLite's
-            // default OFF. With them on, deleting a board that still has items is
-            // a 500 here and a 204 there — the schema has FKs the data does not
-            // honour. Matching Python is the contract; tightening this is a
-            // migration, not a port.
+            // sqlx turns foreign keys ON per connection; SQLAlchemy left SQLite's
+            // default OFF, so this data has never been FK-enforced in its life
+            // and does not satisfy the constraints the schema declares.
+            // Measured, not assumed: `PRAGMA foreign_key_check` on a real user
+            // database returns 55 violations, all `eventlog.task_id` pointing at
+            // tasknodes a finished DAG deleted. Turning this on is a migration
+            // that has to rebuild those tables with `ON DELETE` actions and
+            // clean the orphans first — see `db::connect_lazy`.
             .foreign_keys(false)
             .busy_timeout(std::time::Duration::from_secs(30));
         let url = db::url_for(db_path, None);

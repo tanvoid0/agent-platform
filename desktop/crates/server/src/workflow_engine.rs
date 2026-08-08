@@ -189,50 +189,11 @@ async fn execute_http(http: &reqwest::Client, params: &Value) -> Result<Value, S
 
     let output = json!({ "status": status, "body": body });
     if status >= 400 {
-        let rendered: String = python_json(&output["body"]).chars().take(500).collect();
+        let rendered: String =
+            crate::dag_schema::python_json(&output["body"], false).chars().take(500).collect();
         return Err(step_error(format!("http {status} from {url}: {rendered}")));
     }
     Ok(output)
-}
-
-/// `json.dumps` spacing. Python's default separators are `", "` and `": "`, and
-/// this rendering is the user-visible `error` stored on a failed step — so it is
-/// part of the contract, not a formatting preference.
-struct PythonJson;
-
-impl serde_json::ser::Formatter for PythonJson {
-    fn begin_array_value<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-        first: bool,
-    ) -> std::io::Result<()> {
-        if first { Ok(()) } else { writer.write_all(b", ") }
-    }
-
-    fn begin_object_key<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-        first: bool,
-    ) -> std::io::Result<()> {
-        if first { Ok(()) } else { writer.write_all(b", ") }
-    }
-
-    fn begin_object_value<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-    ) -> std::io::Result<()> {
-        writer.write_all(b": ")
-    }
-}
-
-fn python_json(value: &Value) -> String {
-    use serde::Serialize;
-    let mut buffer = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut buffer, PythonJson);
-    match value.serialize(&mut serializer) {
-        Ok(()) => String::from_utf8(buffer).unwrap_or_else(|_| value.to_string()),
-        Err(_) => value.to_string(),
-    }
 }
 
 /// A registered server-executed action, resolved to the endpoint it POSTs to.
@@ -490,11 +451,12 @@ mod tests {
     fn failed_step_bodies_render_with_pythons_spacing() {
         // This string is stored on the run and shown to the user, so the
         // separators are contract, not taste.
-        assert_eq!(python_json(&json!({"detail": "Not Found"})), r#"{"detail": "Not Found"}"#);
-        assert_eq!(python_json(&json!([1, 2])), "[1, 2]");
-        assert_eq!(python_json(&json!({"a": [{"b": 1}]})), r#"{"a": [{"b": 1}]}"#);
+        let py = |v: &serde_json::Value| crate::dag_schema::python_json(v, false);
+        assert_eq!(py(&json!({"detail": "Not Found"})), r#"{"detail": "Not Found"}"#);
+        assert_eq!(py(&json!([1, 2])), "[1, 2]");
+        assert_eq!(py(&json!({"a": [{"b": 1}]})), r#"{"a": [{"b": 1}]}"#);
         // Escaping is serde's, so a separator inside a string stays untouched.
-        assert_eq!(python_json(&json!({"a": "x, y"})), r#"{"a": "x, y"}"#);
+        assert_eq!(py(&json!({"a": "x, y"})), r#"{"a": "x, y"}"#);
     }
 
     #[test]

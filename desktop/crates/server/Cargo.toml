@@ -3,6 +3,9 @@ name = "agent-platform-server"
 version = "0.1.0"
 edition = "2021"
 description = "Rust API server for agent-platform: migrated domains plus a reverse proxy to the Python server (ADR 0007)"
+# `dist` requires this to generate GitHub CI; it is also what the generated
+# installers point at to fetch a release.
+repository = "https://github.com/tanvoid0/agent-platform"
 
 [[bin]]
 name = "agent-platformd"
@@ -23,12 +26,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # artifact is still one file.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "any", "chrono", "macros", "migrate"] }
 serde = { version = "1", features = ["derive"] }
-# `preserve_order` because a Python dict renders in insertion order and a
-# `serde_json::Map` is a `BTreeMap`, which renders sorted. That is not cosmetic:
-# `context_usage.categories.tools` counts the tokens of `json.dumps(tools)`, and
-# the real `TOOL_SPECS` measured 518 tokens in Python's order against 510 sorted
-# — a number in a response body a cross-render diffs. Everywhere else in this
-# crate it moves output the same direction, toward what Python emits.
+# `preserve_order` so a JSON object round-trips in the order it was written
+# rather than sorted — `serde_json::Map` is a `BTreeMap` without it. Kept now
+# that the server it was matched against is gone, because response bodies are
+# built by walking maps that were parsed from stored JSON, and re-ordering them
+# changes token counts (`context_usage.categories.tools` measured 518 tokens in
+# insertion order against 510 sorted) as well as what a client sees.
 serde_json = { version = "1", features = ["preserve_order"] }
 # Only ever deserialized into a `serde_json::Value` so the config tree is walked
 # with the same API as everything else here. Archived upstream, which is fine for
@@ -42,12 +45,11 @@ url = "2"
 getrandom = "0.2"
 subtle = "2"
 futures = "0.3"
-# Real BPE, not an estimate. `context_usage` is a response body field on the chat
-# routes and `tiktoken>=0.7.0` is a hard requirement on the Python side, so it
-# never takes its own char fallback — a heuristic here would differ on ten
-# numbers per response *and* shrink the outgoing prompt differently near the
-# context budget, which means the two servers would send the model different
-# messages. The vocab ships in the crate.
+# Real BPE, not an estimate. `context_usage` is a response body field on the
+# chat routes, and the same count decides what `context_budget` drops when a
+# prompt approaches the model's window — a character heuristic would trim a
+# different set of messages, which is a behaviour difference, not a rounding
+# one. The vocab ships in the crate.
 tiktoken-rs = "0.6"
 # Already in the tree via reqwest/hyper. Declared so a streamed chat response
 # forwards its chunks through untouched instead of copying every SSE frame.
