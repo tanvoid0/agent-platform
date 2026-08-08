@@ -149,6 +149,68 @@ async fn exercise(url: &str) -> Result<(), String> {
     assert_eq!(id, 4242);
     assert!(!created.is_empty());
 
+    // 6. The queries of the domains that have been converted off `state.pool`,
+    //    run as the handlers send them. SQLite accepts all of these and proves
+    //    nothing about them: the `?` rewriting, the `CAST`s and — the one that
+    //    actually bit — `enabled = TRUE` against a BOOLEAN column, where
+    //    `enabled = 1` is a type error here and fine there.
+    //
+    //    ponytail: the SQL, not the handler. Driving `auth::resolve` end to end
+    //    would need an `AppState` built from a URL rather than a file path;
+    //    worth doing once enough domains are converted that the SQL alone stops
+    //    being the whole risk.
+    //    The bind types are spelled per query rather than shared, because
+    //    Postgres checks them and SQLite does not: passing a string where an
+    //    `integer` column is compared is `operator does not exist: integer =
+    //    text` here and a silent no-match there.
+    let text_bound = [
+        (
+            "auth::resolve_workspace_token",
+            "SELECT CAST(id AS BIGINT) AS id, CAST(workspace_id AS BIGINT) AS workspace_id, \
+                    prefix, scopes_json, status, held_reason, \
+                    CAST(rate_limit_per_minute AS BIGINT) AS rate_limit_per_minute, \
+                    CAST(expires_at AS TEXT) AS expires_at, \
+                    CAST(last_used_at AS TEXT) AS last_used_at \
+             FROM api_tokens WHERE token_hash = ?",
+        ),
+        (
+            "workflow_engine::run_due_workflows",
+            "SELECT CAST(id AS BIGINT) AS id, steps_json, \
+                    CAST(interval_seconds AS BIGINT) AS interval_seconds FROM workflows \
+             WHERE enabled = TRUE AND interval_seconds IS NOT NULL \
+               AND next_run_at IS NOT NULL AND CAST(next_run_at AS TEXT) <= ?",
+        ),
+    ];
+    for (label, query) in text_bound {
+        sqlx::query(&db::sql(query, Backend::Postgres))
+            .bind("2026-01-01 00:00:00.000000")
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| format!("{label}: {e}"))?;
+    }
+
+    let id_bound = [
+        (
+            "auth::archived workspace",
+            "SELECT CAST(archived_at AS TEXT) FROM workspace WHERE id = ?",
+        ),
+        (
+            "workspace_files::require_project",
+            "SELECT CAST(id AS BIGINT) FROM project WHERE id = ?",
+        ),
+        (
+            "workspace_files::require_process_for_project",
+            "SELECT CAST(project_id AS BIGINT) FROM process WHERE id = ?",
+        ),
+    ];
+    for (label, query) in id_bound {
+        sqlx::query(&db::sql(query, Backend::Postgres))
+            .bind(4242_i64)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| format!("{label}: {e}"))?;
+    }
+
     pool.close().await;
     Ok(())
 }

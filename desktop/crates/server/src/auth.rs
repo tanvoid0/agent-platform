@@ -143,6 +143,10 @@ impl IntoResponse for AuthError {
     }
 }
 
+/// `expires_at` and `last_used_at` are `String`, not `NaiveDateTime`: the `Any`
+/// driver refuses a timestamp column on *both* backends, so the query casts
+/// them to text and [`crate::wire::parse_naive`] turns them back where they are
+/// actually compared. See the note on [`crate::db`].
 #[derive(FromRow)]
 struct TokenRow {
     id: i64,
@@ -152,8 +156,8 @@ struct TokenRow {
     status: String,
     held_reason: Option<String>,
     rate_limit_per_minute: Option<i64>,
-    expires_at: Option<NaiveDateTime>,
-    last_used_at: Option<NaiveDateTime>,
+    expires_at: Option<String>,
+    last_used_at: Option<String>,
 }
 
 /// Guards exactly the prefix `app/main.py` mounts with `_api_deps`. `/v1/*` (the
@@ -201,13 +205,17 @@ pub async fn resolve(state: &AppState, authorization: Option<&str>) -> Result<Pr
 }
 
 async fn resolve_workspace_token(state: &AppState, raw: &str) -> Result<Principal, AuthError> {
-    let row: Option<TokenRow> = sqlx::query_as(
-        "SELECT id, workspace_id, prefix, scopes_json, status, held_reason, \
-                rate_limit_per_minute, expires_at, last_used_at \
+    let row: Option<TokenRow> = sqlx::query_as(&crate::db::sql(
+        "SELECT CAST(id AS BIGINT) AS id, CAST(workspace_id AS BIGINT) AS workspace_id, \
+                prefix, scopes_json, status, held_reason, \
+                CAST(rate_limit_per_minute AS BIGINT) AS rate_limit_per_minute, \
+                CAST(expires_at AS TEXT) AS expires_at, \
+                CAST(last_used_at AS TEXT) AS last_used_at \
          FROM api_tokens WHERE token_hash = ?",
-    )
+        state.backend,
+    ))
     .bind(hash_token(raw))
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.any)
     .await
     .map_err(db_error)?;
 
@@ -232,17 +240,20 @@ async fn resolve_workspace_token(state: &AppState, raw: &str) -> Result<Principa
     }
 
     // Stored naive-UTC by `time_utils.utc_now_naive`, so compare naive-UTC.
-    if row.expires_at.is_some_and(|at| at < Utc::now().naive_utc()) {
+    let expires_at = row.expires_at.as_deref().and_then(crate::wire::parse_naive);
+    if expires_at.is_some_and(|at| at < Utc::now().naive_utc()) {
         return Err(
             AuthError::new(StatusCode::UNAUTHORIZED, "TOKEN_EXPIRED", "This token has expired.")
                 .with_prefix(prefix),
         );
     }
 
-    let archived: Option<Option<NaiveDateTime>> =
-        sqlx::query_scalar("SELECT archived_at FROM workspace WHERE id = ?")
+    let archived: Option<Option<String>> = sqlx::query_scalar(&crate::db::sql(
+        "SELECT CAST(archived_at AS TEXT) FROM workspace WHERE id = ?",
+        state.backend,
+    ))
             .bind(row.workspace_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await
             .map_err(db_error)?;
 
@@ -257,7 +268,8 @@ async fn resolve_workspace_token(state: &AppState, raw: &str) -> Result<Principa
 
     check_and_increment(state, row.id, row.rate_limit_per_minute).map_err(|e| e.with_prefix(prefix))?;
 
-    touch_last_used(state, row.id, row.last_used_at).await;
+    touch_last_used(state, row.id, row.last_used_at.as_deref().and_then(crate::wire::parse_naive))
+        .await;
 
     Ok(Principal {
         workspace_id: Some(row.workspace_id),
@@ -291,10 +303,13 @@ async fn touch_last_used(state: &AppState, token_id: i64, last_used_at: Option<N
     if !due {
         return;
     }
-    let result = sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE id = ?")
+    let result = sqlx::query(&crate::db::sql(
+        "UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
+        state.backend,
+    ))
         .bind(crate::wire::sql_string(now))
         .bind(token_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await;
     if let Err(e) = result {
         logd!("last_used_at update failed for token {token_id}: {e}");

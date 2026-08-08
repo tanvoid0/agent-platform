@@ -397,10 +397,13 @@ async fn require_project(
     principal: &Principal,
     project_id: i64,
 ) -> Result<(), ApiError> {
-    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM project WHERE id = ?")
-        .bind(project_id)
-        .fetch_optional(&state.pool)
-        .await?;
+    let exists: Option<i64> = sqlx::query_scalar(&crate::db::sql(
+        "SELECT CAST(id AS BIGINT) FROM project WHERE id = ?",
+        state.backend,
+    ))
+    .bind(project_id)
+    .fetch_optional(&state.any)
+    .await?;
     if exists.is_none() {
         return Err(ApiError::not_found("Project not found"));
     }
@@ -412,11 +415,13 @@ async fn require_process_for_project(
     project_id: i64,
     process_id: i64,
 ) -> Result<(), ApiError> {
-    let owner: Option<Option<i64>> =
-        sqlx::query_scalar("SELECT project_id FROM process WHERE id = ?")
-            .bind(process_id)
-            .fetch_optional(&state.pool)
-            .await?;
+    let owner: Option<Option<i64>> = sqlx::query_scalar(&crate::db::sql(
+        "SELECT CAST(project_id AS BIGINT) FROM process WHERE id = ?",
+        state.backend,
+    ))
+    .bind(process_id)
+    .fetch_optional(&state.any)
+    .await?;
     match owner {
         None => Err(ApiError::not_found("Process not found")),
         Some(project) if project == Some(project_id) => Ok(()),

@@ -208,12 +208,13 @@ async fn execute_action(state: &AppState, params: &Value) -> Result<Value, StepE
     );
 
     let row: Option<(String, Option<String>)> = match set_id {
-        Some(set_id) => sqlx::query_as(
+        Some(set_id) => sqlx::query_as(&crate::db::sql(
             "SELECT execution_mode, endpoint FROM actions WHERE set_id = ? AND action_id = ?",
-        )
+            state.backend,
+        ))
         .bind(set_id)
         .bind(&action_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await
         .map_err(|e| step_error(format!("action lookup failed: {e}")))?,
         None => None,
@@ -261,15 +262,16 @@ pub async fn execute_workflow(
         // that back as `{}`.
         _ => None,
     };
-    let run_id: i64 = sqlx::query_scalar(
+    let run_id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO workflow_runs (workflow_id, trigger, status, input_json, steps_json, started_at) \
-         VALUES (?, ?, 'running', ?, '[]', ?) RETURNING id",
-    )
+         VALUES (?, ?, 'running', ?, '[]', ?) RETURNING CAST(id AS BIGINT)",
+        state.backend,
+    ))
     .bind(workflow_id)
     .bind(trigger)
     .bind(&input_json)
     .bind(sql_now())
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     let mut ctx = json!({ "trigger": { "body": input }, "steps": {} });
@@ -317,15 +319,16 @@ pub async fn execute_workflow(
         }
     }
 
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "UPDATE workflow_runs SET status = ?, error = ?, steps_json = ?, finished_at = ? WHERE id = ?",
-    )
+        state.backend,
+    ))
     .bind(if failed.is_some() { "failed" } else { "succeeded" })
     .bind(&failed)
     .bind(Value::Array(results).to_string())
     .bind(sql_now())
     .bind(run_id)
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
 
     Ok(run_id)
@@ -369,22 +372,29 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
 
 async fn run_due_workflows(state: &AppState) -> Result<(), sqlx::Error> {
     let now = sql_now();
-    let due: Vec<(i64, String, i64)> = sqlx::query_as(
-        "SELECT id, steps_json, interval_seconds FROM workflows \
-         WHERE enabled = 1 AND interval_seconds IS NOT NULL \
-           AND next_run_at IS NOT NULL AND next_run_at <= ?",
-    )
+    // `enabled = TRUE`, not `= 1`: the column is BOOLEAN, and Postgres will not
+    // compare one to an integer. SQLite takes the keyword and stores 1.
+    let due: Vec<(i64, String, i64)> = sqlx::query_as(&crate::db::sql(
+        "SELECT CAST(id AS BIGINT) AS id, steps_json, \
+                CAST(interval_seconds AS BIGINT) AS interval_seconds FROM workflows \
+         WHERE enabled = TRUE AND interval_seconds IS NOT NULL \
+           AND next_run_at IS NOT NULL AND CAST(next_run_at AS TEXT) <= ?",
+        state.backend,
+    ))
     .bind(&now)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     // Advance before executing, so a workflow that crashes cannot tight-loop.
     for (id, _, interval_seconds) in &due {
         let next = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(*interval_seconds);
-        sqlx::query("UPDATE workflows SET next_run_at = ? WHERE id = ?")
+        sqlx::query(&crate::db::sql(
+            "UPDATE workflows SET next_run_at = ? WHERE id = ?",
+            state.backend,
+        ))
             .bind(next.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
             .bind(id)
-            .execute(&state.pool)
+            .execute(&state.any)
             .await?;
     }
 
