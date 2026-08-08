@@ -22,6 +22,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A second push should cancel the first: this matrix includes a Windows
+# whisper.cpp build, and running two to completion for the same ref is minutes
+# of runner time nobody reads.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # A CI failure should name the panic, not a pointer.
@@ -31,6 +38,26 @@ jobs:
   server:
     name: server (linux)
     runs-on: ubuntu-latest
+    # The Postgres half of `tests/postgres_schema.rs`. Without a DSN that test
+    # skips itself and says so, which is fine on a laptop and not fine here —
+    # this job is the only place the Postgres dialect is ever exercised.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: agent_platform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Not `DATABASE_URL`: `Config::from_env` refuses to start the server with
+      # that set, and the rest of the suite starts servers.
+      TEST_DATABASE_URL: postgresql://postgres:ci@localhost:5432/agent_platform
     defaults:
       run:
         working-directory: desktop
