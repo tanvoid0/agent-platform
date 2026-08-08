@@ -189,6 +189,40 @@ async fn exercise(url: &str) -> Result<(), String> {
             .map_err(|e| format!("{label}: {e}"))?;
     }
 
+    // The two column lists are `pub` so this runs the *real* strings rather than
+    // a copy that drifts. They are the ones carrying a `BOOLEAN` column through
+    // the `Any` driver, which is the decode SQLite cannot exercise: it stores
+    // booleans as integers and is happy either way.
+    for (label, query) in [
+        (
+            "workflows::WORKFLOW_COLUMNS",
+            format!(
+                "SELECT {} FROM workflows WHERE id = ?",
+                agent_platform_server::workflows::WORKFLOW_COLUMNS
+            ),
+        ),
+        (
+            "workflows::RUN_COLUMNS",
+            format!(
+                "SELECT {} FROM workflow_runs WHERE id = ?",
+                agent_platform_server::workflows::RUN_COLUMNS
+            ),
+        ),
+        (
+            "api_tokens::TOKEN_COLUMNS",
+            format!(
+                "SELECT {} FROM api_tokens WHERE id = ?",
+                agent_platform_server::api_tokens::TOKEN_COLUMNS
+            ),
+        ),
+    ] {
+        sqlx::query(&db::sql(&query, Backend::Postgres))
+            .bind(4242_i64)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| format!("{label}: {e}"))?;
+    }
+
     let id_bound = [
         (
             "auth::archived workspace",

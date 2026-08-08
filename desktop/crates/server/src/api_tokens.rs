@@ -12,11 +12,11 @@
 //! `last_used_at` — see [`crate::auth::touch_last_used`], which was the
 //! `ponytail:` note left there for whichever domain got here first.
 //!
-//! ponytail: written against `state.pool`, like every domain but `projects`.
-//! The Postgres port (`db.rs`, `sqlx::Any`) converts one domain at a time and
-//! this is simply not converted yet — writing untested `db::sql` placeholder
-//! rewriting for a backend this server refuses to start against would be a
-//! Postgres-only bug nobody could reproduce here.
+//! On the `sqlx::Any` pool: every query goes through `db::sql` and every id and
+//! counter is selected as `CAST(… AS BIGINT)`, because a Postgres `integer` is
+//! int4 where these fields are `i64`. [`TOKEN_COLUMNS`] is `pub` so
+//! `tests/postgres_schema.rs` runs the real string against a real server rather
+//! than a copy that drifts.
 
 use std::sync::Arc;
 
@@ -94,10 +94,14 @@ struct TokenRow {
     updated_at: String,
 }
 
-const TOKEN_COLUMNS: &str = "id, workspace_id, project_id, name, prefix, scopes_json, status, \
-     rate_limit_per_minute, CAST(expires_at AS TEXT) AS expires_at, \
+pub const TOKEN_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \
+     CAST(workspace_id AS BIGINT) AS workspace_id, \
+     CAST(project_id AS BIGINT) AS project_id, name, prefix, scopes_json, status, \
+     CAST(rate_limit_per_minute AS BIGINT) AS rate_limit_per_minute, CAST(expires_at AS TEXT) AS expires_at, \
      CAST(last_used_at AS TEXT) AS last_used_at, CAST(revoked_at AS TEXT) AS revoked_at, \
-     revoked_reason, held_reason, total_requests, total_errors, total_tokens, total_cost, \
+     revoked_reason, held_reason, CAST(total_requests AS BIGINT) AS total_requests, \
+     CAST(total_errors AS BIGINT) AS total_errors, \
+     CAST(total_tokens AS BIGINT) AS total_tokens, total_cost, \
      CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at";
 
 fn iso_opt(raw: &Option<String>) -> Value {
@@ -150,9 +154,12 @@ impl TokenRow {
 }
 
 async fn load_token(state: &AppState, token_id: i64) -> Result<Option<TokenRow>, ApiError> {
-    Ok(sqlx::query_as(&format!("SELECT {TOKEN_COLUMNS} FROM api_tokens WHERE id = ?"))
+    Ok(sqlx::query_as(&crate::db::sql(
+        &format!("SELECT {TOKEN_COLUMNS} FROM api_tokens WHERE id = ?"),
+        state.backend,
+    ))
         .bind(token_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.any)
         .await?)
 }
 
@@ -175,9 +182,12 @@ async fn require_token(
 /// same 404, and the name in the message is the caller-supplied default.
 async fn require_active_workspace(state: &AppState, workspace_id: i64) -> Result<(), ApiError> {
     let archived: Option<Option<String>> =
-        sqlx::query_scalar("SELECT CAST(archived_at AS TEXT) FROM workspace WHERE id = ?")
+        sqlx::query_scalar(&crate::db::sql(
+            "SELECT CAST(archived_at AS TEXT) FROM workspace WHERE id = ?",
+            state.backend,
+        ))
             .bind(workspace_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     match archived {
         Some(None) => Ok(()),
@@ -388,13 +398,14 @@ async fn create_token(
 
     let (full_token, prefix, token_hash) = generate_token();
     let now = sql_now();
-    let id: i64 = sqlx::query_scalar(
+    let id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO api_tokens \
          (workspace_id, project_id, name, prefix, token_hash, scopes_json, status, \
           rate_limit_per_minute, expires_at, total_requests, total_errors, total_tokens, \
           total_cost, created_at, updated_at) \
-         VALUES (?, NULL, ?, ?, ?, ?, 'active', ?, ?, 0, 0, 0, 0.0, ?, ?) RETURNING id",
-    )
+         VALUES (?, NULL, ?, ?, ?, ?, 'active', ?, ?, 0, 0, 0, 0.0, ?, ?) RETURNING CAST(id AS BIGINT)",
+        state.backend,
+    ))
     .bind(workspace_id)
     .bind(name.trim())
     .bind(&prefix)
@@ -404,7 +415,7 @@ async fn create_token(
     .bind(&expires_at)
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     let row = require_token(&state, workspace_id, id).await?;
@@ -422,11 +433,11 @@ async fn list_tokens(
 ) -> Result<Response, ApiError> {
     require_dashboard_caller(&principal)?;
     require_active_workspace(&state, workspace_id).await?;
-    let rows: Vec<TokenRow> = sqlx::query_as(&format!(
+    let rows: Vec<TokenRow> = sqlx::query_as(&crate::db::sql(&format!(
         "SELECT {TOKEN_COLUMNS} FROM api_tokens WHERE workspace_id = ? ORDER BY id DESC"
-    ))
+    ), state.backend))
     .bind(workspace_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
     let tokens: Vec<Value> = rows.iter().map(TokenRow::to_out).collect();
     Ok(Json(json!({ "tokens": tokens })).into_response())
@@ -483,10 +494,11 @@ async fn update_token(
     }
 
     let now = sql_now();
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "UPDATE api_tokens SET name = ?, scopes_json = ?, rate_limit_per_minute = ?, \
          expires_at = ?, updated_at = ? WHERE id = ?",
-    )
+        state.backend,
+    ))
     .bind(name.map(|n| n.trim().to_string()).unwrap_or_else(|| row.name.clone()))
     .bind(
         scopes
@@ -497,7 +509,7 @@ async fn update_token(
     .bind(if expires_set { expires_at } else { row.expires_at.clone() })
     .bind(&now)
     .bind(token_id)
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
 
     let row = require_token(&state, workspace_id, token_id).await?;
@@ -547,6 +559,9 @@ async fn token_usage(
     }
     sql.push_str(" ORDER BY usage_date ASC");
 
+    // Bound to a local: the query borrows the rewritten string for as long as
+    // the binds are added to it.
+    let sql = crate::db::sql(&sql, state.backend).into_owned();
     let mut query = sqlx::query_as::<_, UsageRow>(&sql).bind(token_id);
     if let Some(from) = &from {
         query = query.bind(from);
@@ -554,7 +569,7 @@ async fn token_usage(
     if let Some(to) = &to {
         query = query.bind(to);
     }
-    let rows = query.fetch_all(&state.pool).await?;
+    let rows = query.fetch_all(&state.any).await?;
 
     let daily: Vec<Value> = rows
         .iter()
@@ -606,15 +621,16 @@ async fn revoke_token(
     // Irreversible, and it does not check the current status: revoking a
     // revoked token succeeds and refreshes `revoked_at`.
     let now = sql_now();
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "UPDATE api_tokens SET status = 'revoked', revoked_at = ?, revoked_reason = ?, \
          updated_at = ? WHERE id = ?",
-    )
+        state.backend,
+    ))
     .bind(&now)
     .bind(&reason)
     .bind(&now)
     .bind(token_id)
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
 
     let row = require_token(&state, workspace_id, token_id).await?;
@@ -635,11 +651,14 @@ async fn hold_token(
     }
 
     let now = sql_now();
-    sqlx::query("UPDATE api_tokens SET status = 'held', held_reason = ?, updated_at = ? WHERE id = ?")
+    sqlx::query(&crate::db::sql(
+        "UPDATE api_tokens SET status = 'held', held_reason = ?, updated_at = ? WHERE id = ?",
+        state.backend,
+    ))
         .bind(&reason)
         .bind(&now)
         .bind(token_id)
-        .execute(&state.pool)
+        .execute(&state.any)
         .await?;
 
     let row = require_token(&state, workspace_id, token_id).await?;
@@ -658,12 +677,13 @@ async fn unhold_token(
     }
 
     let now = sql_now();
-    sqlx::query(
+    sqlx::query(&crate::db::sql(
         "UPDATE api_tokens SET status = 'active', held_reason = NULL, updated_at = ? WHERE id = ?",
-    )
+        state.backend,
+    ))
     .bind(&now)
     .bind(token_id)
-    .execute(&state.pool)
+    .execute(&state.any)
     .await?;
 
     let row = require_token(&state, workspace_id, token_id).await?;

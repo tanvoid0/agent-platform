@@ -218,8 +218,13 @@ struct WorkflowRow {
     updated_at: String,
 }
 
-const WORKFLOW_COLUMNS: &str = "id, client_id, name, description, steps_json, enabled, \
-     interval_seconds, next_run_at, created_at, updated_at";
+/// Every id is `CAST(… AS BIGINT)` and every timestamp `CAST(… AS TEXT)`: the
+/// `Any` driver refuses a timestamp column on either backend, and a Postgres
+/// `integer` is int4 where these fields are `i64`. See [`crate::db`].
+pub const WORKFLOW_COLUMNS: &str = "CAST(id AS BIGINT) AS id, client_id, name, description, \
+     steps_json, enabled, CAST(interval_seconds AS BIGINT) AS interval_seconds, \
+     CAST(next_run_at AS TEXT) AS next_run_at, CAST(created_at AS TEXT) AS created_at, \
+     CAST(updated_at AS TEXT) AS updated_at";
 
 fn workflow_out(row: &WorkflowRow) -> Value {
     json!({
@@ -248,8 +253,10 @@ struct RunRow {
     finished_at: Option<String>,
 }
 
-const RUN_COLUMNS: &str = "id, workflow_id, trigger, status, input_json, steps_json, error, \
-     started_at, finished_at";
+pub const RUN_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \
+     CAST(workflow_id AS BIGINT) AS workflow_id, trigger, status, input_json, steps_json, \
+     error, CAST(started_at AS TEXT) AS started_at, \
+     CAST(finished_at AS TEXT) AS finished_at";
 
 fn run_out(row: &RunRow) -> Value {
     let input = row
@@ -280,9 +287,12 @@ async fn accessible_workflow(
     workflow_id: i64,
 ) -> Result<WorkflowRow, ApiError> {
     let row: Option<WorkflowRow> =
-        sqlx::query_as(&format!("SELECT {WORKFLOW_COLUMNS} FROM workflows WHERE id = ?"))
+        sqlx::query_as(&crate::db::sql(
+            &format!("SELECT {WORKFLOW_COLUMNS} FROM workflows WHERE id = ?"),
+            state.backend,
+        ))
             .bind(workflow_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     let row = row.ok_or_else(|| ApiError::not_found("Workflow not found"))?;
     if !may_access(row.client_id.as_deref(), scope) {
@@ -316,11 +326,12 @@ async fn list_workflows(
     let scope = client_scope(&principal, &headers);
     // The limit applies before the access filter, exactly as in Python: a page
     // can come back short rather than reaching further down the table.
-    let rows: Vec<WorkflowRow> = sqlx::query_as(&format!(
-        "SELECT {WORKFLOW_COLUMNS} FROM workflows ORDER BY id DESC LIMIT ?"
+    let rows: Vec<WorkflowRow> = sqlx::query_as(&crate::db::sql(
+        &format!("SELECT {WORKFLOW_COLUMNS} FROM workflows ORDER BY id DESC LIMIT ?"),
+        state.backend,
     ))
     .bind(q.limit)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     let workflows: Vec<Value> = rows
@@ -416,11 +427,12 @@ async fn create_workflow(
 
     let now = crate::wire::sql_now();
     let next_run_at = req.interval_seconds.map(|s| next_run_from(s));
-    let id: i64 = sqlx::query_scalar(
+    let id: i64 = sqlx::query_scalar(&crate::db::sql(
         "INSERT INTO workflows (client_id, name, description, steps_json, enabled, \
          interval_seconds, next_run_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-    )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)",
+        state.backend,
+    ))
     .bind(scope.as_deref())
     .bind(req.name.unwrap_or_default())
     .bind(req.description)
@@ -430,7 +442,7 @@ async fn create_workflow(
     .bind(next_run_at)
     .bind(&now)
     .bind(&now)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.any)
     .await?;
 
     let row = accessible_workflow(&state, scope.as_deref(), id).await?;
@@ -523,10 +535,14 @@ async fn set_column<T>(
     value: T,
 ) -> Result<(), ApiError>
 where
-    T: for<'q> sqlx::Encode<'q, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite> + Send,
+    T: for<'q> sqlx::Encode<'q, sqlx::Any> + sqlx::Type<sqlx::Any> + Send,
 {
     let sql = format!("UPDATE workflows SET {column} = ? WHERE id = ?");
-    sqlx::query(&sql).bind(value).bind(workflow_id).execute(&state.pool).await?;
+    sqlx::query(&crate::db::sql(&sql, state.backend))
+        .bind(value)
+        .bind(workflow_id)
+        .execute(&state.any)
+        .await?;
     Ok(())
 }
 
@@ -539,12 +555,12 @@ async fn delete_workflow(
     let scope = client_scope(&principal, &headers);
     accessible_workflow(&state, scope.as_deref(), workflow_id).await?;
 
-    let mut tx = state.pool.begin().await?;
-    sqlx::query("DELETE FROM workflow_runs WHERE workflow_id = ?")
+    let mut tx = state.any.begin().await?;
+    sqlx::query(&crate::db::sql("DELETE FROM workflow_runs WHERE workflow_id = ?", state.backend))
         .bind(workflow_id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM workflows WHERE id = ?")
+    sqlx::query(&crate::db::sql("DELETE FROM workflows WHERE id = ?", state.backend))
         .bind(workflow_id)
         .execute(&mut *tx)
         .await?;
@@ -573,12 +589,13 @@ async fn list_runs(
     let scope = client_scope(&principal, &headers);
     accessible_workflow(&state, scope.as_deref(), workflow_id).await?;
 
-    let rows: Vec<RunRow> = sqlx::query_as(&format!(
-        "SELECT {RUN_COLUMNS} FROM workflow_runs WHERE workflow_id = ? ORDER BY id DESC LIMIT ?"
+    let rows: Vec<RunRow> = sqlx::query_as(&crate::db::sql(
+        &format!("SELECT {RUN_COLUMNS} FROM workflow_runs WHERE workflow_id = ? ORDER BY id DESC LIMIT ?"),
+        state.backend,
     ))
     .bind(workflow_id)
     .bind(q.limit)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.any)
     .await?;
 
     Ok(Json(json!({ "runs": rows.iter().map(run_out).collect::<Vec<_>>() })).into_response())
@@ -628,9 +645,12 @@ async fn run_workflow(
     )
     .await?;
 
-    let row: RunRow = sqlx::query_as(&format!("SELECT {RUN_COLUMNS} FROM workflow_runs WHERE id = ?"))
+    let row: RunRow = sqlx::query_as(&crate::db::sql(
+        &format!("SELECT {RUN_COLUMNS} FROM workflow_runs WHERE id = ?"),
+        state.backend,
+    ))
         .bind(run_id)
-        .fetch_one(&state.pool)
+        .fetch_one(&state.any)
         .await?;
     Ok(Json(run_out(&row)).into_response())
 }
@@ -645,9 +665,12 @@ async fn get_run(
     accessible_workflow(&state, scope.as_deref(), workflow_id).await?;
 
     let row: Option<RunRow> =
-        sqlx::query_as(&format!("SELECT {RUN_COLUMNS} FROM workflow_runs WHERE id = ?"))
+        sqlx::query_as(&crate::db::sql(
+            &format!("SELECT {RUN_COLUMNS} FROM workflow_runs WHERE id = ?"),
+            state.backend,
+        ))
             .bind(run_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&state.any)
             .await?;
     match row {
         Some(row) if row.workflow_id == workflow_id => Ok(Json(run_out(&row)).into_response()),
