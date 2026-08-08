@@ -130,7 +130,10 @@ impl Store {
         let saved =
             Saved { items: self.items.clone(), enabled: self.enabled, next_id: self.next_id };
         let write = std::fs::create_dir_all(&self.dir).and_then(|_| {
-            std::fs::write(self.dir.join(FILE), serde_json::to_string_pretty(&saved).unwrap())
+            crate::shell::write_atomic(
+                &self.dir.join(FILE),
+                &serde_json::to_string_pretty(&saved).unwrap(),
+            )
         });
         self.error = write.err().map(|e| format!("Could not save memories: {e}"));
     }

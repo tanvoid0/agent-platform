@@ -402,6 +402,17 @@ babysat by a developer.
     no list of, and is covered instead by the master key it is now required to
     have, which is exactly what a rebinding attacker does not hold.
 
+12. **The desktop's own state files are written atomically.** `settings.json`,
+    `chats.json`, `memories.json` and `master.key` are each rewritten whole on
+    every change with `std::fs::write`, which truncates first — and all four
+    loaders fall back to a default when parsing fails, so a half-written file is
+    not an error anyone sees, it is the user's settings or their entire chat
+    history silently gone. Not a remote possibility either: quit is
+    `std::process::exit(0)` (`iced::exit()` hangs on Windows), which does not
+    wait for a save in flight. `shell::write_atomic` writes a sibling, `sync_all`s
+    it and renames over. The agent's own `write_file` tool is left alone — an
+    in-place truncate is what editors do and what file watchers expect.
+
 **Not done, and why:**
 
 - **`AppState.pool` + `AppState.any` — bigger than the 280 query sites.** The

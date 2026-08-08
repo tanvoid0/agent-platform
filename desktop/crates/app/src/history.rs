@@ -80,7 +80,10 @@ impl Store {
     fn save(&self) {
         let saved = Saved { items: self.items.clone(), next_id: self.next_id };
         let _ = std::fs::create_dir_all(&self.dir).and_then(|_| {
-            std::fs::write(self.dir.join(FILE), serde_json::to_string_pretty(&saved).unwrap())
+            crate::shell::write_atomic(
+                &self.dir.join(FILE),
+                &serde_json::to_string_pretty(&saved).unwrap(),
+            )
         });
     }
 

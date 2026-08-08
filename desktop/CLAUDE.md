@@ -68,6 +68,12 @@ Windows CUDA: a failed configure poisons the cmake cache
 - Data lives in `%APPDATA%\com.tanvoid0.agentplatform` — SQLite, workspaces,
   `settings.json`. The master key is `master.key` in that dir, **not** in
   `settings.json`.
+- **Every app-state file is rewritten whole, so write it with
+  `shell::write_atomic`, never `fs::write`.** `settings.json`, `chats.json`,
+  `memories.json` and `master.key` all load with a silent fallback to a default,
+  so a truncated file is not an error the user sees — it is their settings or
+  their whole chat history quietly gone. Quit is `std::process::exit(0)`, which
+  does not wait for a save in flight.
 - SSE: the terminal sentinel is only sent when there is no backlog, so consumers
   gate on polled status. A sentinel is told apart from a log-row `"error"` by its
   missing `timestamp`/`task_id`.

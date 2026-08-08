@@ -217,7 +217,44 @@ impl Settings {
 
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("settings.json"), serde_json::to_string_pretty(self).unwrap())
+        write_atomic(&dir.join("settings.json"), &serde_json::to_string_pretty(self).unwrap())
+    }
+}
+
+/// Replace a file's contents in one step, or not at all.
+///
+/// **`std::fs::write` truncates first.** Everything this app keeps on disk is a
+/// whole file rewritten on every change — `settings.json`, `chats.json`,
+/// `memories.json`, `master.key` — so a process that dies between the truncate
+/// and the write leaves an empty or half-written file, and every one of those
+/// loaders falls back to a default when parsing fails. The user's settings,
+/// their chat history or everything the assistant remembered are gone, silently.
+///
+/// This is not a remote possibility here: quitting is `std::process::exit(0)`
+/// (`iced::exit()` hangs on Windows — see `desktop/CLAUDE.md`), which does not
+/// wait for anything else holding a file open.
+///
+/// Write beside the target, flush it to the disk, then rename over. `rename`
+/// replaces an existing file on both platforms and is atomic within a volume,
+/// which a temp directory would not be — hence the sibling.
+pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        // Without this the rename can land before the bytes do, and a power cut
+        // leaves a correctly-named file full of zeroes.
+        file.sync_all()?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Do not leave the temp file behind to be mistaken for a backup.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
 }
 
@@ -387,7 +424,9 @@ pub fn load_or_create_key(dir: &Path) -> std::io::Result<String> {
     getrandom::getrandom(&mut raw)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let key: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(&path, &key)?;
+    // Atomic too: a half-written key reads as a valid-looking wrong one, and
+    // the app then cannot authenticate against the server holding its data.
+    write_atomic(&path, &key)?;
     Ok(key)
 }
 
@@ -621,6 +660,36 @@ pub fn reveal_path(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The point of [`write_atomic`] is that the *old* contents survive a failed
+    /// write, where `std::fs::write` would have truncated them first.
+    #[test]
+    fn a_replaced_file_is_never_seen_half_written() {
+        let dir = std::env::temp_dir().join(format!("agp-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        write_atomic(&path, "{\"port\":18410}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"port\":18410}");
+
+        // Replacing an existing file is the case that matters: `rename` has to
+        // overwrite rather than fail, which is the one behaviour that differs
+        // between platforms.
+        write_atomic(&path, "{\"port\":9000}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"port\":9000}");
+
+        // A failed write leaves the previous contents intact, and no `.tmp`
+        // beside them to be mistaken for a backup. The directory as a target is
+        // the portable way to make the create fail.
+        let blocked = dir.join("sub");
+        std::fs::create_dir_all(&blocked).unwrap();
+        assert!(write_atomic(&blocked, "nope").is_err());
+        assert!(!dir.join("sub.tmp").exists(), "the temp file was left behind");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"port\":9000}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn log_ring_cursor_and_wrap() {
