@@ -26,6 +26,11 @@ skills-lock.json
 
 # Desktop shell
 desktop/target/
+# `dist` runs from the repo root, not from `desktop/`, so it writes its staged
+# release artifacts to a `target/` out here that the line above does not cover.
+# Found because `dist build` left three untracked files at the root;
+# `check_repo_hygiene.py` did not, because it only looks at tracked paths.
+/target/
 # MSVC leaves object files where it was invoked — cargo's own output is under
 # target/, so anything named *.obj out here is a stray.
 *.obj
