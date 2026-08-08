@@ -31,12 +31,11 @@ use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        // Both spellings, unlike `api_tokens`: this router's own path is
-        // `/workspaces` **with** a prefix, so FastAPI serves `/workspaces/` and
-        // redirects the bare form onto it — but `GET /api/v1/workspaces` is what
-        // every caller sends and Python answers it with a 307 the client
-        // follows. Registering only the slashed form here would leave the bare
-        // one to the proxy, which is correct and one hop cheaper than guessing.
+        // Both spellings. FastAPI served `/workspaces/` and redirected the bare
+        // form onto it, but `GET /api/v1/workspaces` is what every caller sends;
+        // leaving it to the proxy was correct while there was a proxy, and a
+        // 404 the moment there was not.
+        .route("/api/v1/workspaces", get(list_workspaces).post(create_workspace))
         .route("/api/v1/workspaces/", get(list_workspaces).post(create_workspace))
         .route(
             "/api/v1/workspaces/{workspace_id}",

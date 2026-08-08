@@ -12,8 +12,8 @@
 //!   `CONFIG_DIR` (see `llm_config`), so Rust and Python can serve it side by
 //!   side while the rest is ported.
 //!
-//! Migrated so far: `/v1/health`, `/v1/health/readiness`, `/v1/models`,
-//! `/v1/capabilities`. Everything else still falls through to the proxy.
+//! The whole `/v1` surface is here — the "migrated so far" list this comment
+//! used to carry outlived the proxy it was measured against.
 
 use std::collections::HashMap;
 use std::sync::Arc;

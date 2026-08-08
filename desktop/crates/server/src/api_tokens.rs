@@ -38,11 +38,15 @@ use crate::AppState;
 pub fn routes() -> Router<Arc<AppState>> {
     const BASE: &str = "/api/v1/workspaces/{workspace_id}/api-tokens";
     Router::new()
-        // **Only the trailing-slash spelling.** The router's own path is `/`,
-        // and FastAPI answers the bare form with a `307` to it — so the bare
-        // form is left to fall through to the proxy, which returns Python's
-        // redirect verbatim. Registering it here would answer `200` where
-        // Python answers `307`, which the cross-render caught.
+        // **Both spellings.** FastAPI answered the bare form with a `307` onto
+        // the slashed one, so only the slashed one was registered here and the
+        // bare one fell through to the proxy — which returned Python's redirect
+        // verbatim. There is no proxy: the bare form became a 404, and any
+        // caller that was relying on the redirect broke silently when the
+        // interpreter went. Answering it directly is what `projects.rs` already
+        // does, for the reason it gives there — a redirect through a hop that
+        // no longer exists is not a contract worth reproducing.
+        .route(BASE, get(list_tokens).post(create_token))
         .route(&format!("{BASE}/"), get(list_tokens).post(create_token))
         .route(&format!("{BASE}/{{token_id}}"), get(get_token).patch(update_token))
         .route(&format!("{BASE}/{{token_id}}/usage"), get(token_usage))

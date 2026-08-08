@@ -119,6 +119,13 @@ const CODER_PLACEHOLDERS: [&str; 1] = [DEFAULT_TITLE];
 /// `_LEGACY_MODE_LABELS`.
 const LEGACY_MODE_LABELS: [&str; 5] = ["plan", "debug", "multitask", "ask", "auto"];
 
+/// Caps on a caller-supplied `tools` list. Not ported from anything — Python
+/// had no such field. Both are far above any honest client (this crate sends
+/// six specs in ~2 KB) and far below a list that would crowd out the
+/// conversation or the provider's own body limit.
+const MAX_REQUEST_TOOLS: usize = 64;
+const MAX_REQUEST_TOOLS_BYTES: usize = 64 * 1024;
+
 // ---------------------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------------------
@@ -750,6 +757,15 @@ struct SendRequest {
     max_tokens: Option<i64>,
     #[serde(default)]
     delegate_tools: bool,
+    /// A caller-supplied tool list, replacing [`tool_specs`] for this turn.
+    ///
+    /// Only meaningful to a delegating client: whatever the model calls comes
+    /// straight back as a `tool_call` frame for that client to run. A
+    /// non-delegating caller may still send one, and a name this crate's local
+    /// executor does not know answers `"Error: unknown tool '…'."` as the tool
+    /// result — the same thing a hallucinated call has always got.
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
     #[serde(default)]
     mode_instruction: Option<String>,
     #[serde(default)]
@@ -778,10 +794,49 @@ impl SendRequest {
             ),
             Some(_) => {}
         }
+        self.validate_tools(&mut errors);
         if !errors.is_empty() {
             return Err(ApiError::validation(errors));
         }
         Ok(self.message.as_deref().unwrap_or_default())
+    }
+
+    /// `tools` goes into an upstream request body, so it is checked here rather
+    /// than trusted: an entry that is not an object is a body the provider
+    /// rejects with its own error, and the caps stop a list large enough to
+    /// crowd out the conversation it is attached to.
+    fn validate_tools(&self, errors: &mut Vec<Value>) {
+        let Some(tools) = self.tools.as_deref() else { return };
+        if tools.is_empty() {
+            // An empty list means "no tools this turn", not "use the defaults":
+            // `call_llm_step` reads `Some(&[])` as a tool-free step, which is
+            // the same thing PLAN does.
+            return;
+        }
+        if tools.len() > MAX_REQUEST_TOOLS {
+            errors.push(ApiError::field_error(
+                "tools",
+                "too_long",
+                &format!("List should have at most {MAX_REQUEST_TOOLS} items"),
+            ));
+            return;
+        }
+        if let Some(idx) = tools.iter().position(|t| !t.is_object()) {
+            errors.push(ApiError::field_error(
+                "tools",
+                "model_type",
+                &format!("Item {idx} is not a valid dictionary"),
+            ));
+            return;
+        }
+        let bytes: usize = tools.iter().map(|t| t.to_string().len()).sum();
+        if bytes > MAX_REQUEST_TOOLS_BYTES {
+            errors.push(ApiError::field_error(
+                "tools",
+                "too_long",
+                &format!("Serialized tools should be at most {MAX_REQUEST_TOOLS_BYTES} bytes"),
+            ));
+        }
     }
 
     fn turn_options(&self) -> TurnOptions {
@@ -791,6 +846,7 @@ impl SendRequest {
             max_tokens: self.max_tokens,
             auto_approve_commands: self.auto_approve_commands,
             plan: self.plan,
+            tools: self.tools.clone(),
         }
     }
 }
@@ -1470,6 +1526,42 @@ mod tests {
             names,
             ["read_file", "write_file", "list_dir", "search", "repo_map", "run_command"]
         );
+    }
+
+    /// A caller-supplied `tools` list reaches `TurnOptions` and is checked on
+    /// the way. The three rejections are the ones that would otherwise reach a
+    /// provider as a body it answers with its own error.
+    #[test]
+    fn caller_tools_are_validated_and_carried() {
+        let send = |tools: Value| -> SendRequest {
+            serde_json::from_value(json!({"message": "hi", "tools": tools})).expect("body")
+        };
+        let spec = json!({"type": "function", "function": {"name": "t"}});
+
+        // Absent, empty and well-formed all pass; the first two are distinct
+        // states, so `turn_options` must not collapse them.
+        let bare: SendRequest = serde_json::from_value(json!({"message": "hi"})).expect("body");
+        assert!(bare.validate().is_ok());
+        assert!(bare.turn_options().tools.is_none());
+
+        let empty = send(json!([]));
+        assert!(empty.validate().is_ok());
+        assert_eq!(empty.turn_options().tools.as_deref(), Some(&[][..]));
+
+        let one = send(json!([spec]));
+        assert!(one.validate().is_ok());
+        assert_eq!(one.turn_options().tools.expect("tools").len(), 1);
+
+        let too_many = send(Value::Array(vec![spec.clone(); MAX_REQUEST_TOOLS + 1]));
+        assert!(too_many.validate().is_err());
+
+        let not_objects = send(json!(["read_file"]));
+        assert!(not_objects.validate().is_err());
+
+        // Few enough entries to pass the count cap, large enough to fail bytes.
+        let padding = "x".repeat(MAX_REQUEST_TOOLS_BYTES / 4);
+        let fat = send(Value::Array(vec![json!({"pad": padding}); 8]));
+        assert!(fat.validate().is_err());
     }
 
     /// `_llm_messages_from_history` drops everything it is not explicitly

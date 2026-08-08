@@ -279,6 +279,9 @@ pub(crate) struct TurnOptions {
     pub max_tokens: Option<i64>,
     pub auto_approve_commands: bool,
     pub plan: bool,
+    /// The caller's tool list, replacing [`crate::coder::tool_specs`] for every
+    /// step of this turn. `None` is the default set; `Some(&[])` is tool-free.
+    pub tools: Option<Vec<Value>>,
 }
 
 /// `_call_llm_step`. `tools=false` is the PLAN step: the tools are left out of
@@ -305,8 +308,16 @@ async fn call_llm_step(
         json!(opts.max_tokens.unwrap_or_else(max_output_tokens_default)),
     );
     if tools {
-        payload.insert("tools".into(), Value::Array(crate::coder::tool_specs()));
-        payload.insert("tool_choice".into(), json!("auto"));
+        // The caller's list wins when it sent one. A delegating client runs
+        // whatever the model calls, so the set it advertises is its business,
+        // not this crate's — but an empty list still means "no tools", so a
+        // client that filtered everything out gets a tool-free step rather
+        // than a surprise default set.
+        let specs = opts.tools.clone().unwrap_or_else(crate::coder::tool_specs);
+        if !specs.is_empty() {
+            payload.insert("tools".into(), Value::Array(specs));
+            payload.insert("tool_choice".into(), json!("auto"));
+        }
     }
     let sanitized = opts.model.as_deref().and_then(sanitize_llm_model_alias);
     if let Some(model) = &sanitized {

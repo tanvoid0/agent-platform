@@ -11807,54 +11807,6 @@
      }
     }
    }
-  },
-  "/api/v1/api-tokens/scopes": {
-   "get": {
-    "tags": [
-     "api-tokens"
-    ],
-    "summary": "List Available Scopes",
-    "description": "Catalog of scopes a token can be granted (for dashboard autocomplete).",
-    "operationId": "list_available_scopes_api_v1_api_tokens_scopes_get",
-    "parameters": [
-     {
-      "name": "authorization",
-      "in": "header",
-      "required": false,
-      "schema": {
-       "anyOf": [
-        {
-         "type": "string"
-        },
-        {
-         "type": "null"
-        }
-       ],
-       "title": "Authorization"
-      }
-     }
-    ],
-    "responses": {
-     "200": {
-      "description": "Successful Response",
-      "content": {
-       "application/json": {
-        "schema": {}
-       }
-      }
-     },
-     "422": {
-      "description": "Validation Error",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/HTTPValidationError"
-        }
-       }
-      }
-     }
-    }
-   }
   }
  },
  "components": {

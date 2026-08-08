@@ -8,9 +8,9 @@
 //! - `GET /{id}/processes` has moved with the processes domain and is registered
 //!   in [`crate::processes`], not here — it reads the process table and checks
 //!   project access without `process:read`, which makes it that domain's rule to
-//!   keep. `/{id}/workspace/*` still falls through to the proxy: it is a
-//!   different router in Python (`workspace_files_router`) that happens to share
-//!   the path.
+//!   keep. `/{id}/workspace/*` is not here either: it was a different router in
+//!   Python (`workspace_files_router`) that happened to share the path, and it
+//!   lives in [`crate::workspace_files`] now.
 
 use std::path::PathBuf;
 use std::sync::Arc;
