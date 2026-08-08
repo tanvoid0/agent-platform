@@ -1,6 +1,6 @@
 [package]
 name = "agent-platform-desktop"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Native desktop app for agent-platform (iced), owning the Python server sidecar"
 
