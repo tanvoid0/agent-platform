@@ -29,6 +29,7 @@
 use sqlx::any::{AnyPoolOptions, install_default_drivers};
 use sqlx::AnyPool;
 use std::borrow::Cow;
+use std::path::PathBuf;
 
 /// Which backend a pool is talking to. Decided once at startup from the URL,
 /// because every query needs it and asking the pool per call is noise.
@@ -156,6 +157,90 @@ pub async fn ensure_schema(pool: &AnyPool) -> Result<(), sqlx::Error> {
     sqlx::migrate!("./migrations").run(pool).await.map_err(sqlx::Error::from)
 }
 
+/// How many timestamped copies [`backup`] keeps.
+const BACKUP_GENERATIONS: usize = 3;
+
+/// Take a consistent copy of the database, and prune the oldest.
+///
+/// **There was no backup of any kind.** The desktop's SQLite file is the whole
+/// of a user's projects, plans, threads and workspaces, on a laptop, with
+/// nothing copying it anywhere — the failure this closes is not exotic, it is
+/// one bad shutdown.
+///
+/// `VACUUM INTO` rather than a file copy: it is SQLite's own snapshot, it reads
+/// through a transaction so a live server writing underneath it cannot produce a
+/// torn file, and it defragments on the way out. Copying `*.db` while the WAL
+/// holds four megabytes of uncheckpointed pages produces a file that is missing
+/// them.
+///
+/// A failure is logged and swallowed. This runs after the listener is bound, on
+/// its own task, and a server that refuses to serve because it could not write a
+/// backup is worse than one running without today's copy.
+///
+/// ponytail: keeps three generations beside the database, so it survives a
+/// corrupt file but not a lost disk. Off-machine is a deployment's job, not
+/// this process's.
+pub async fn backup(pool: &AnyPool, db_path: &std::path::Path) {
+    if crate::env_opt("AGENT_PLATFORM_BACKUP").as_deref() == Some("0") {
+        return;
+    }
+    let Some(dir) = db_path.parent() else { return };
+    let stem = db_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stamp = crate::request_id::iso_now().replace([':', '-'], "").replace('.', "");
+    let target = dir.join(format!("{stem}.{}.bak", &stamp[..stamp.len().min(15)]));
+
+    // The path goes into the statement as a literal — `VACUUM INTO` takes no
+    // bind parameter. Single quotes are doubled, which is the only escape SQL
+    // string literals have, and the path is ours rather than a caller's.
+    let literal = target.display().to_string().replace('\'', "''");
+    if let Err(e) = sqlx::query(&format!("VACUUM INTO '{literal}'")).execute(pool).await {
+        logd!("backup failed: {e}");
+        return;
+    }
+    logd!("backup written to {}", target.display());
+    prune_backups(dir, &stem);
+}
+
+/// Keep the newest [`BACKUP_GENERATIONS`], delete the rest.
+///
+/// Sorted by name, not by mtime: the timestamp is in the name and is fixed
+/// width, so it sorts chronologically, and a file whose mtime was changed by a
+/// sync client does not reorder the set.
+fn prune_backups(dir: &std::path::Path, stem: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut backups: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&format!("{stem}.")) && n.ends_with(".bak"))
+        })
+        .collect();
+    if backups.len() <= BACKUP_GENERATIONS {
+        return;
+    }
+    backups.sort();
+    for old in &backups[..backups.len() - BACKUP_GENERATIONS] {
+        if let Err(e) = std::fs::remove_file(old) {
+            logd!("could not remove old backup {}: {e}", old.display());
+        }
+    }
+}
+
+/// Fold the write-ahead log back into the database file and truncate it.
+///
+/// SQLite checkpoints automatically at 1000 pages but never *truncates*, so the
+/// `-wal` sidecar only grows: on a real install it was 4 MB beside a 496 KB
+/// database. That is not a correctness problem — it is read on open — but it is
+/// the difference between copying one small file and one large one, and it is a
+/// single statement at the only moment nothing is writing.
+pub async fn checkpoint(pool: &AnyPool) {
+    if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(pool).await {
+        logd!("wal checkpoint failed: {e}");
+    }
+}
+
 #[cfg(test)]
 mod schema_tests {
     use super::*;
@@ -208,6 +293,66 @@ mod schema_tests {
 
         pool.close().await;
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A backup has to be readable, and the set has to stop growing.
+    #[tokio::test]
+    async fn a_backup_is_a_usable_database_and_only_three_are_kept() {
+        let dir = std::env::temp_dir().join(format!("agp-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent_platform.db");
+        let pool = connect_lazy(&url_for(&path, None), Backend::Sqlite);
+        ensure_schema(&pool).await.unwrap();
+        sqlx::query("INSERT INTO project (id, name, created_at, updated_at) \
+                     VALUES (1, 'kept', '2026-01-01', '2026-01-01')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Five runs, so the prune has something to do. The stamp has
+        // second resolution, so the names are forced apart rather than
+        // sleeping through five seconds of test time.
+        for n in 0..5 {
+            backup(&pool, &path).await;
+            let made = newest(&dir);
+            std::fs::rename(&made, dir.join(format!("agent_platform.db.2026010100000{n}.bak")))
+                .unwrap();
+        }
+        prune_backups(&dir, "agent_platform.db");
+
+        let mut kept: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".bak"))
+            .collect();
+        kept.sort();
+        assert_eq!(kept.len(), BACKUP_GENERATIONS, "{kept:?}");
+        assert!(kept[0].ends_with("000002.bak"), "the oldest go, not the newest: {kept:?}");
+
+        // The copy is a database, not a file of the right size.
+        let copy = connect_lazy(&url_for(&dir.join(&kept[2]), None), Backend::Sqlite);
+        let name: Option<String> = sqlx::query_scalar("SELECT name FROM project WHERE id = 1")
+            .fetch_optional(&copy)
+            .await
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("kept"));
+
+        copy.close().await;
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn newest(dir: &std::path::Path) -> PathBuf {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "bak"))
+            .collect();
+        found.sort();
+        found.pop().expect("a backup was written")
     }
 
     /// Every database in the field was built by Alembic and has no

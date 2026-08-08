@@ -215,6 +215,39 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
   nested groups if career workflows demand it.
 - **Document routing** — per-model native PDF/vision vs derived markdown
   (capability flags exist on providers).
+- **portal_desktop, the second client** — reviewed 2026-08-08,
+  [`docs/portal-desktop-review.md`](docs/portal-desktop-review.md). The
+  SvelteKit/Tauri app at `../../../portal/portal_desktop` calls this platform and
+  the migration did **not** break it: every route it uses answers, on the same
+  port with the same auth (verified live, not read). What broke is its
+  *documentation* — it sends users to `/config`, `/tokens` and `/docs`, three
+  pages that died with the Python server. Fixed on its side the same day, along
+  with a release-notes template that said the same thing. Left open:
+  - ~~**Decide the `tools` field.**~~ — **honoured**, same day. Portal had been
+    putting a mode-filtered tool list in the stream body since before the
+    migration and nothing ever read it (Python's `CoderChatSendRequest` had no
+    such field either). Now `SendRequest.tools` → `TurnOptions.tools` →
+    `call_llm_step`, with three distinct states: absent is this crate's six
+    specs, a non-empty list is the caller's verbatim, and `[]` is a tool-free
+    turn rather than a surprise default set. Capped at 64 entries / 64 KB and
+    required to be objects — it goes straight into an upstream request body, so
+    it is a trust boundary, not a passthrough. **Only meaningful to a delegating
+    client**, which runs whatever the model calls; a non-delegating caller gets
+    `"Error: unknown tool '…'."` back as the tool result, which is what a
+    hallucinated call has always got. Portal needed no change.
+  - **Release + updater.** This repo builds and tests and never ships. Portal's
+    `release.yml` is the shape to copy — a cheap smoke job gating a four-platform
+    matrix, `fail-fast: false`, signed updater artifacts, `latest.json` — but
+    `tauri-action` is Tauri-only, so an iced binary wants `cargo-dist` plus
+    `self_update`/`axoupdater`. Same item as **macOS/Linux packaging** above.
+  - **Merged? No** — ADR 0005 and 0007 already decided against the webview stack,
+    the two UIs cannot share a line of code, and four of portal's two dozen
+    domains touch this platform. The split that follows: portal has a webview so
+    it is the one that can ever have Monaco/preview/xterm (the three things the
+    hearth item closed as impossible here); this app is the platform console.
+    What that costs is a contract two clients agree on — hence
+    [`docs/coder-delegation-protocol.md`](docs/coder-delegation-protocol.md), and
+    it raises `openapi.json`'s silent drift from tidiness to correctness.
 - **Deployment hardening** — the gap between "runs on this machine" and
   "survives a container restart". Four landed 2026-08-08 (below); the rest are
   listed there and none is started.
@@ -279,22 +312,67 @@ babysat by a developer.
 7. **The rate-limit window map is pruned** at 1024 entries. Size-triggered, not
    timed: a sweep of stale minutes costs less than the map that made it needed.
 
-**Not done, in the order worth doing:**
+8. **openapi drift is detected**, one direction. `tests/openapi_drift.rs`
+   drives every operation the document declares through the router and fails
+   if it hits the fallback. A route that exists but is *undocumented* stays
+   invisible — an axum `Router` cannot be asked what it serves — and that
+   remaining half is what `utoipa` would close, worth its cost the first time
+   an undocumented route matters. **The first run found two real things:**
+   `GET /api/v1/api-tokens/scopes` was documented and never served (removed
+   from the document — nothing calls it, and Python's body cannot be
+   reproduced from what is left), and the bare spellings of the collection
+   paths had become 404s. FastAPI answered `/api/v1/workspaces` with a 307
+   onto `/api/v1/workspaces/`, so `workspaces.rs` and `api_tokens.rs`
+   registered only the slashed form and let the bare one fall through to the
+   proxy — correct while there was a proxy, a 404 the moment there was not,
+   and invisible to the drift test because the document only ever declared the
+   slashed spelling. Both are registered now, as `projects.rs` already did.
+9. **Three Python-JSON renderers became one.** `dag_schema::PyJson`,
+   `workflow_engine::PythonJson` and `todos::EnsureAscii` were the same UTF-16
+   surrogate walk written twice and the same separator pair written twice,
+   differing only on `json.dumps`'s default separators versus the tight pair.
+   That is a field now; `python_json` and `python_json_compact` are the two
+   call shapes anything needs.
+10. **A startup backup, and a WAL checkpoint at shutdown.** There was no backup
+    of any kind: the desktop's SQLite file is a user's whole workspace, on a
+    laptop, copied nowhere. `db::backup` takes a `VACUUM INTO` snapshot after
+    the listener binds (SQLite's own consistent snapshot — copying `*.db` while
+    the WAL holds uncheckpointed pages produces a file missing them) and keeps
+    three generations beside the database; `AGENT_PLATFORM_BACKUP=0` skips it.
+    `db::checkpoint` runs `PRAGMA wal_checkpoint(TRUNCATE)` past the graceful
+    drain, because SQLite checkpoints at 1000 pages but never truncates and the
+    sidecar only grows — 4 MB beside a 496 KB database on a real install.
+    Verified live against a copy of the real user database: the `.bak` opens as
+    a database with every row in it.
 
-- **`openapi.json` drifts silently** — see the note on `lib.rs::openapi`.
-- **The parity tax outlived its counterparty.** The Python server is deleted,
-  but the crate still declines foreign keys ("matching Python is the
-  contract"), carries `preserve_order` + `tiktoken-rs` for token-count parity,
-  keeps two hand-rolled `json.dumps` renderers (`workflow_engine::PythonJson`
-  and `todos::EnsureAscii` — the duplication is flagged in `dag_schema.rs`) and
-  shapes errors like pydantic's. Each is now deletion, not maintenance.
-- **`AppState.pool` + `AppState.any`** — finishing the `sqlx::Any` conversion
-  deletes a field and lets `Config::from_env` stop refusing `DATABASE_URL`.
+**Not done, and why:**
+
+- **`AppState.pool` + `AppState.any` — bigger than the 280 query sites.** The
+  conversion's whole value is Postgres, and two things block it before any
+  query is touched. `migrations/0001_initial.sql` is SQLite DDL: 146 uses of
+  `DATETIME`/`VARCHAR`, and `DATETIME` is not a Postgres type at all, so the
+  schema cannot even apply. And `id INTEGER NOT NULL, PRIMARY KEY (id)` leans
+  on SQLite's rowid for autoincrement, which Postgres does not do — every
+  INSERT that omits an id would fail. So Postgres needs its own schema, then
+  the 280 sites, then somewhere to run the suite against a real Postgres.
+  Converting the query sites first would be 280 edits nothing can verify.
+- **No global concurrency cap, deliberately.** `chat` has the one that matters
+  (`AGENT_PLATFORM_CHAT_MAX_CONCURRENT`), because it is the path that costs an
+  upstream call. A cap over the whole router queues rather than sheds, so under
+  load it converts a rejection into unbounded latency — worth adding with a
+  load-shed policy, not on its own.
+- **Foreign keys stay off**, with the reason now measured rather than
+  inherited: `PRAGMA foreign_key_check` on a real user database returns 55
+  violations, all `eventlog.task_id` pointing at tasknodes a finished DAG
+  deleted. SQLAlchemy left the pragma at SQLite's default OFF, so this data was
+  never checked in its life. Turning them on needs a migration that rebuilds
+  those tables with `ON DELETE` actions — SQLite has no `ALTER TABLE … ADD
+  CONSTRAINT` — and clears the orphans. The handlers delete children
+  explicitly, which is why nothing is broken today.
 - **Rate limiting is per-token and in-process**; the master key is unlimited,
   and an N-up deployment would need a shared store.
-- **No backup or vacuum story** for the SQLite file.
-- **No global concurrency cap** — only `chat` has one, via
-  `AGENT_PLATFORM_CHAT_MAX_CONCURRENT`.
+- **The backup is on-machine only.** Three generations beside the database
+  survive a corrupt file, not a lost disk. Off-machine is a deployment's job.
 
 ### Rust server migration — **closed 2026-08-07**
 

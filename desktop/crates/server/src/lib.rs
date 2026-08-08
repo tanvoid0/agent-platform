@@ -495,9 +495,23 @@ pub async fn serve(cfg: Config) -> Result<(), BoxError> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     logd!("listening on http://{addr}");
 
-    axum::serve(listener, router(state))
+    // After the bind, on its own task: a `VACUUM INTO` of a large database
+    // should not be the reason the port is late, and nothing about it has to
+    // finish before the first request.
+    {
+        let state = state.clone();
+        let db_path = cfg.db_path.clone();
+        tokio::spawn(async move { db::backup(&state.any, &db_path).await });
+    }
+
+    axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Past the graceful drain, so nothing is writing. The `-wal` sidecar is
+    // never truncated on its own and only grows; this is the one moment it can
+    // be folded back in for free.
+    db::checkpoint(&state.any).await;
 
     Ok(())
 }
