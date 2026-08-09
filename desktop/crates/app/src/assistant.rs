@@ -7,7 +7,14 @@
 //! Voice: Microsoft Edge neural TTS (AriaNeural over the free websocket
 //! endpoint — no key, needs internet) played through rodio; falls back to the
 //! platform's native engine (SAPI/WinRT, AVSpeech, speech-dispatcher) offline.
+//!
+//! What is left here is identity, the tool loop, `State` and `update`. The two
+//! halves that never read `State` live next door: [`crate::assistant_gate`] is
+//! the mic gate and its constants, [`crate::assistant_voice`] is text-to-speech.
 
+use crate::assistant_gate::*;
+use crate::assistant_voice::*;
+use crate::domain::non_empty;
 use agent_platform_client::sse::ChatChunk;
 use agent_platform_client::types::{ChatCompletionBody, ChatMessage, ProviderEntry, ToolCall};
 use agent_platform_client::Client;
@@ -376,34 +383,6 @@ async fn run_tools(
     results
 }
 
-/// The voice Edge speaks in until the user picks another, as a short id.
-pub const DEFAULT_VOICE: &str = "en-US-AriaNeural";
-
-/// Edge wants the long form of a voice id. Everything else — the speech backend
-/// behind `SPEECH_API_BASE`, including a trained Piper model — wants the short
-/// one, so the short one is what is stored and this expands it here.
-///
-/// Anything that is not `<locale>-<Voice>` falls back to the default: a typo
-/// reaching Edge comes back as a socket error in front of every sentence.
-fn edge_voice(short: &str) -> String {
-    let short = if short.is_empty() { DEFAULT_VOICE } else { short };
-    let Some((locale, voice)) = short.rsplit_once('-') else {
-        return edge_voice(DEFAULT_VOICE);
-    };
-    format!("Microsoft Server Speech Text to Speech Voice ({locale}, {voice})")
-}
-
-/// Speech rates the settings screen offers, as Edge's percent-of-normal.
-pub const VOICE_RATES: [(&str, i32); 5] =
-    [("Calm", -10), ("Normal", 0), ("Brisk", 15), ("Fast", 30), ("Rapid", 45)];
-
-/// Above normal on purpose: E.V. answers in short bursts, and a narration pace
-/// makes a two-line answer feel like a wait.
-pub const DEFAULT_VOICE_RATE: i32 = 15;
-
-/// How far the adaptive nudge below may push the rate either side of the
-/// setting — past this the voice stops sounding like the one that was picked.
-const RATE_SPAN: i32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -417,138 +396,7 @@ pub enum Mode {
     Speaking,
 }
 
-/// The analyzer's step. Drawing runs at the display's rate; this does not — the
-/// window length, the attack/release constants and every frame counter in the
-/// mic gate below are written against 60 Hz, and a variable rate would retune
-/// all of them at once.
-const DT: f32 = 1.0 / 60.0;
-/// Spectrum bins the HUD draws. Also the number of web spokes it lights.
-pub const BANDS: usize = 24;
-/// Samples fed to the analyzer each frame (~43 ms at 48 kHz — long enough for
-/// the bass bins to see a couple of cycles).
-const WINDOW: usize = 2048;
-/// Level history behind the waveform ribbon, newest last (~2 s at 60 fps).
-pub const WAVE: usize = 120;
 
-// --- The gate ---------------------------------------------------------------
-// Hands-free means the mic hears everything: the fan, the keyboard, the person
-// on the phone next door, and E.V.'s own replies coming back out of the
-// speakers. Every constant below exists to throw one of those away.
-
-/// Speech must clear the room's own noise by this much (linear, ≈11 dB). A
-/// person talking to their machine sits well above it; a television two rooms
-/// away does not.
-const OPEN_SNR: f32 = 3.5;
-/// Absolute floor, for a silent room where the adaptive floor is near zero and
-/// any hiss would otherwise clear the SNR test.
-const ABS_FLOOR: f32 = 0.006;
-/// Frames of speech-shaped audio before the gate opens (~130 ms). A door, a
-/// key press and a mouse click are all shorter than this.
-const ONSET_FRAMES: u32 = 8;
-/// Silence that ends an utterance. Long enough to think mid-sentence.
-const HANG: f32 = 0.75;
-/// Shortest thing that counts as an instruction, in seconds of actual speech.
-const MIN_VOICED: f32 = 0.25;
-/// Hard cap on one utterance.
-const MAX_UTTERANCE: f32 = 30.0;
-/// Pre-roll kept ahead of the gate opening, so the first consonant survives.
-const PREROLL: f32 = 0.4;
-/// The mic hears the speakers: stay shut while E.V. talks, plus this tail for
-/// the room's reverb.
-const ECHO_TAIL: f32 = 0.35;
-/// How far above the speakers' own bleed a voice has to sit to read as you
-/// talking over E.V. rather than as E.V. hearing itself.
-///
-/// ponytail: still half-duplex — this detects the interruption and stops the
-/// reply, it does not transcribe through playback. That needs acoustic echo
-/// cancellation. On speakers loud enough to clip the mic preamp, the bleed
-/// stops tracking and barge-in goes deaf; headphones or lower volume fix it.
-const BARGE_SNR: f32 = 3.0;
-/// Frames of that before E.V. stops talking (~200 ms) — deliberately longer
-/// than `ONSET_FRAMES`, because cutting a reply off by mistake is worse than
-/// stopping a beat late.
-const BARGE_FRAMES: u32 = 12;
-/// After E.V. replies — or after you open voice mode — you can just talk. Long
-/// enough to read the reply and think before answering it. Outside this window
-/// an utterance has to name E.V. to be sent on its own: that is the wake word,
-/// and `addressed` is what checks it.
-const FOLLOW_UP: f32 = 45.0;
-/// How much louder than the floor an utterance's peak must be to read as
-/// close-talk rather than someone else's conversation across the room.
-const CLOSE_TALK_SNR: f32 = 5.0;
-/// Cosine similarity to the enrolled voice below which an utterance is treated
-/// as somebody else. Deliberately forgiving: a stranger reaching the model is
-/// recoverable, but E.V. ignoring the person it belongs to is not. Watch the
-/// HUD's `VID` readout against your own voice and tighten it if strangers get
-/// through.
-pub const VOICE_MATCH: f32 = 0.82;
-/// Utterances averaged into the enrolled print before it stops being provisional.
-const ENROLL_UTTERANCES: u32 = 4;
-/// Similarity to the *provisional* print required to be averaged into it.
-/// Looser than `VOICE_MATCH` — that print is one utterance old and still
-/// moving, so this bar only has to reject a different person, not a different
-/// sentence from the same one.
-const ENROLL_MATCH: f32 = 0.70;
-
-/// Is this frame shaped like a voice? Fans and traffic sit under 200 Hz, hiss
-/// and keyboard clatter spread flat across everything; speech puts most of its
-/// energy in the middle. The bands are already computed for the HUD, so this
-/// costs a couple of dozen adds.
-fn voice_like(bands: &[f32; BANDS]) -> bool {
-    let total: f32 = bands.iter().sum();
-    if total < 0.05 {
-        return false;
-    }
-    let (mut speech, mut bins) = (0.0, 0);
-    for (i, v) in bands.iter().enumerate() {
-        if (150.0..4000.0).contains(&crate::stt::band_freq(i, BANDS)) {
-            speech += v;
-            bins += 1;
-        }
-    }
-    // Compare against what a *flat* spectrum would score, not a fixed number:
-    // the bins are log-spaced, so most of them already fall inside the speech
-    // window and white noise clears any fixed threshold. Speech has to be more
-    // concentrated than noise, which is the only claim actually being made.
-    //
-    // The margin is thin on purpose. These are display bands — sqrt-compressed,
-    // with the HUD's high-frequency tilt — so real speech concentrates only a
-    // few points above flat while noise sits at or below it; a 1.1 margin put
-    // the bar above actual speech and made hands-free deaf.
-    speech / total > (bins as f32 / bands.len() as f32) * 1.03
-}
-
-/// Whisper narrates silence. Fed a stretch of room tone, a cough or a door it
-/// does not emit nothing — it emits one of a small set of stock captions burned
-/// in from its training data. That was survivable while an unaddressed line
-/// only parked in the composer; now that an armed mic sends everything, a cough
-/// opens a turn that says "you".
-///
-/// ponytail: fixed English list, whole-utterance match only. Extend it as new
-/// ghosts turn up. The real fix is whisper's own no-speech probability, which
-/// the binding does not expose.
-const GHOSTS: [&str; 8] = [
-    "you",
-    "thank you",
-    "thanks",
-    "thank you very much",
-    "thanks for watching",
-    "thank you for watching",
-    "bye",
-    "silence",
-];
-
-/// Is the whole transcript one of whisper's stock captions for "nothing was
-/// said"? Costs a real "thank you" aimed at E.V., which is a reply worth
-/// nothing anyway.
-fn is_ghost(text: &str) -> bool {
-    let plain: String = text
-        .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect::<String>()
-        .to_lowercase();
-    GHOSTS.contains(&plain.split_whitespace().collect::<Vec<_>>().join(" ").as_str())
-}
 
 /// Whitelist of how whisper spells "E.V." when someone says it out loud — the
 /// default name's spellings, used until the user configures their own. The
@@ -1223,146 +1071,8 @@ impl State {
     }
 }
 
-/// Post-capture triage: does a closed utterance go to the transcriber, or was
-/// it too brief to be an instruction / too far from the mic to have been aimed
-/// at one? Someone else's conversation carries, but it carries quietly.
-///
-/// The close-talk test is *relative* to the learned room floor; the divisor
-/// clamp only guards digital silence. Clamping it at `ABS_FLOOR` — as this
-/// once did — quietly turned the test into "peak above 0.03 absolute", which a
-/// low-gain mic never reaches: the gate would open (that bar is `ABS_FLOOR`),
-/// show Listening, then drop every utterance right here.
-/// Is this frame somebody talking over E.V., rather than E.V.'s own voice
-/// arriving back through the mic? Both tests matter: the level rules out the
-/// speakers, the shape rules out a door slamming during a reply.
-fn over_playback(mic: f32, bleed: f32, gate: f32, bands: &[f32; BANDS]) -> bool {
-    mic > (bleed * BARGE_SNR).max(gate) && voice_like(bands)
-}
 
-fn keep_utterance(voiced: f32, samples: usize, peak: f32, floor: f32) -> bool {
-    voiced >= MIN_VOICED
-        && samples >= crate::stt::MIN_SAMPLES
-        && peak / floor.max(1e-4) >= CLOSE_TALK_SNR
-}
 
-/// Seconds between two `phase` readings. `phase` wraps every hour, so a plain
-/// subtraction goes hugely negative across the wrap — which would read as "E.V.
-/// just spoke" forever and leave both timers stuck in their open state.
-fn since(now: f32, then: f32) -> f32 {
-    (now - then).rem_euclid(3600.0)
-}
-
-/// Shortest chunk worth sending to the synthesizer. Below this the per-clip
-/// overhead costs more than the sentence saves, and "Hm." on its own is a
-/// worse listen than waiting for the clause it belongs to.
-const MIN_SPEECH_CHUNK: usize = 24;
-
-/// Except for the chunk that opens a reply, which also breaks on a comma and
-/// at half the length. That one is the only chunk anybody waits on: until it
-/// is synthesized there is silence, so a clause spoken now beats the whole
-/// sentence spoken a second later. Everything after it is being made while the
-/// previous one plays, where a longer chunk reads better and costs nothing.
-const MIN_FIRST_CHUNK: usize = 12;
-
-/// Split off the first complete sentence, leaving the remainder in `buf`.
-///
-/// Returns `None` while the buffer holds no closed sentence of usable length —
-/// the caller keeps accumulating deltas and flushes the tail at end of stream.
-///
-/// ponytail: naive terminator scan. Splits "3.5" and "Dr. Chen" mid-sentence,
-/// which costs a small pause in the wrong place, not a wrong word. Swap in a
-/// real segmenter if the voice starts sounding choppy on numeric answers.
-fn take_sentence(buf: &mut String, first: bool) -> Option<String> {
-    let min = if first { MIN_FIRST_CHUNK } else { MIN_SPEECH_CHUNK };
-    let bytes = buf.as_bytes();
-    for (i, c) in buf.char_indices() {
-        if i + 1 < min {
-            continue;
-        }
-        let terminator = matches!(c, '.' | '!' | '?' | '\n' | ';' | ':') || (first && c == ',');
-        // A terminator only closes a sentence when whitespace follows it, so a
-        // decimal point or "e.g." inside a word does not split the clause.
-        let closes = terminator
-            && bytes
-                .get(i + c.len_utf8())
-                .is_none_or(|b| b.is_ascii_whitespace());
-        if closes {
-            let cut = i + c.len_utf8();
-            let sentence = buf[..cut].to_string();
-            buf.drain(..cut);
-            // Leading space of the next sentence belongs to nobody.
-            while buf.starts_with(char::is_whitespace) {
-                buf.remove(0);
-            }
-            return Some(sentence);
-        }
-    }
-    None
-}
-
-/// What the voice actually says: markdown stripped, so E.V. never reads
-/// "asterisk asterisk" or a wall of code aloud.
-fn speech_text(md: &str) -> String {
-    let mut out = String::new();
-    let mut in_fence = false;
-    for line in md.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            if !in_fence {
-                out.push_str("Code omitted. ");
-            }
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
-        }
-        // Heading/list/quote markers carry no speech.
-        let body = trimmed.trim_start_matches(['#', '>', '-', '+', ' ']);
-        let mut chars = body.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '*' | '_' | '`' | '~' => {}
-                '!' if chars.peek() == Some(&'[') => {}
-                '[' => {}
-                ']' => {
-                    // Keep a link's text, drop its (url).
-                    if chars.peek() == Some(&'(') {
-                        for c in chars.by_ref() {
-                            if c == ')' {
-                                break;
-                            }
-                        }
-                    }
-                }
-                _ => out.push(c),
-            }
-        }
-        out.push(' ');
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Whether the server's own speech endpoint is worth asking — see
-/// `next_synthesis`. Process-wide because the answer is about the server, not
-/// about one thread.
-static SERVER_SPEECH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-type EdgeClient = msedge_tts::tts::client::MSEdgeTTSClient<std::net::TcpStream>;
-
-/// The Edge websocket, kept open across sentences.
-///
-/// Opening one costs a DNS lookup, a TCP connect and a TLS + websocket
-/// handshake — a second or two on a cold start, and it used to sit in front of
-/// every single sentence. That handshake was most of the gap between the first
-/// token appearing and the first word being spoken.
-static EDGE: std::sync::Mutex<Option<EdgeClient>> = std::sync::Mutex::new(None);
-
-fn edge_lock() -> std::sync::MutexGuard<'static, Option<EdgeClient>> {
-    // A panic inside a synthesis leaves no state worth protecting: the socket
-    // is dropped either way, and refusing to ever speak again is worse.
-    EDGE.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// Open the socket now, so the first sentence of the reply does not pay for the
 /// handshake. A no-op when one is already up.
@@ -1379,42 +1089,6 @@ fn warm_voice() -> Task<Message> {
     .discard()
 }
 
-/// Neural synthesis over Edge's websocket. Blocking, so callers wrap it in
-/// `spawn_blocking`; MP3 bytes come back for rodio to decode.
-fn synthesize(text: &str, rate: i32, voice: &str) -> Result<Vec<u8>, String> {
-    use msedge_tts::tts::SpeechConfig;
-    let config = SpeechConfig {
-        voice_name: edge_voice(voice),
-        audio_format: "audio-24khz-96kbitrate-mono-mp3".into(),
-        pitch: 0,
-        rate,
-        volume: 0,
-    };
-    let mut edge = edge_lock();
-    let mut failure = String::new();
-    // Twice: a kept socket goes away on its own — idle timeout, sleep, a
-    // dropped network — and the far end's half of that only shows up here, on
-    // the next send. The retry is a fresh connection, which is what the caller
-    // would have got anyway.
-    for _ in 0..2 {
-        if edge.is_none() {
-            *edge = Some(msedge_tts::tts::client::connect().map_err(|e| e.to_string())?);
-        }
-        match edge.as_mut().unwrap().synthesize(text, &config) {
-            Ok(audio) if !audio.audio_bytes.is_empty() => return Ok(audio.audio_bytes),
-            Ok(_) => failure = "empty audio".into(),
-            Err(e) => failure = e.to_string(),
-        }
-        // Whatever went wrong, this socket is not trusted for the retry.
-        *edge = None;
-    }
-    Err(failure)
-}
-
-fn non_empty(s: &str) -> Option<String> {
-    let t = s.trim();
-    (!t.is_empty()).then(|| t.to_string())
-}
 
 /// Fetch the provider catalog for the header dropdowns.
 pub fn load_catalog(client: &Client) -> Task<Message> {

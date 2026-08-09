@@ -214,7 +214,7 @@ fn default_local_n_ctx() -> u32 {
 }
 
 fn default_voice_rate() -> i32 {
-    crate::assistant::DEFAULT_VOICE_RATE
+    crate::assistant_voice::DEFAULT_VOICE_RATE
 }
 
 impl Default for Settings {
@@ -691,6 +691,26 @@ pub fn reveal_path(path: &str) {
         "xdg-open"
     };
     let _ = Command::new(program).arg(path).spawn();
+}
+
+/// Open a URL in the default browser — the platform launcher [`reveal_path`]
+/// already uses takes one just as happily as a path.
+pub fn open_url(url: &str) {
+    reveal_path(url);
+}
+
+/// Start a background program (an LLM backend the user asked us to launch).
+/// Errors are returned rather than swallowed: "Launch" that silently does
+/// nothing is worse than one that says the command is not installed.
+pub fn spawn_detached(program: &str, args: &[&str]) -> std::io::Result<()> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.spawn().map(|_| ())
 }
 
 #[cfg(test)]

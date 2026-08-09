@@ -45,16 +45,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/v1/me/workspace", get(get_my_workspace))
 }
 
-/// `_require_master_key`.
-fn require_master_key(principal: &Principal) -> Result<(), ApiError> {
-    if principal.workspace_id.is_some() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "Workspaces cannot be managed using an API token.",
-        ));
-    }
-    Ok(())
-}
+/// `_require_master_key`'s message; the check is
+/// [`Principal::require_master_key`].
+const NOT_A_TENANT: &str = "Workspaces cannot be managed using an API token.";
 
 #[derive(FromRow)]
 struct WorkspaceRow {
@@ -128,7 +121,7 @@ async fn list_workspaces(
     principal: Principal,
     RawQuery(query): RawQuery,
 ) -> Result<Response, ApiError> {
-    require_master_key(&principal)?;
+    principal.require_master_key(NOT_A_TENANT)?;
     let include_archived = bool_query(query.as_deref(), "include_archived", false)?;
     let sql = if include_archived {
         format!("SELECT {COLUMNS} FROM workspace ORDER BY id ASC")
@@ -163,7 +156,7 @@ async fn create_workspace(
     principal: Principal,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
-    require_master_key(&principal)?;
+    principal.require_master_key(NOT_A_TENANT)?;
     let body = parse_body(&raw)?;
 
     let mut errors = Vec::new();
@@ -222,7 +215,7 @@ async fn get_workspace(
     principal: Principal,
     PathId(workspace_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
-    require_master_key(&principal)?;
+    principal.require_master_key(NOT_A_TENANT)?;
     let row = require_active(&state, workspace_id).await?;
     Ok(Json(row.to_out()).into_response())
 }
@@ -233,7 +226,7 @@ async fn update_workspace(
     PathId(workspace_id): PathId<i64>,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
-    require_master_key(&principal)?;
+    principal.require_master_key(NOT_A_TENANT)?;
     let body = parse_body(&raw)?;
 
     let mut errors = Vec::new();
@@ -281,6 +274,50 @@ async fn update_workspace(
 
 const ARCHIVE_REASON: &str = "Workspace archived";
 
+/// Everything an archive touches except the workspace row itself, returning
+/// `(tokens_revoked, teams_removed)` for the response to report.
+///
+/// Both halves used to select the ids and then loop a statement per id, purely
+/// so those counts could be `Vec::len()`. `rows_affected` is the same number, so
+/// the selects and the loops are gone and an archive is three statements
+/// whatever the tenant's size. Split out from the handler because a `Principal`
+/// is awkward to build in a test and these counts are the part worth pinning.
+async fn archive_rows(
+    state: &AppState,
+    workspace_id: i64,
+    now: &str,
+) -> Result<(u64, u64), ApiError> {
+    let tokens_revoked = sqlx::query(&crate::db::sql(
+        "UPDATE api_tokens SET status = 'revoked', revoked_at = ?, revoked_reason = ?, \
+         updated_at = ? WHERE workspace_id = ? AND status != 'revoked'", state.backend)
+    )
+    .bind(now)
+    .bind(ARCHIVE_REASON)
+    .bind(now)
+    .bind(workspace_id)
+    .execute(&state.any)
+    .await?
+    .rows_affected();
+
+    // Orphan the processes first: the FK points at `teamtemplate`, so deleting
+    // the rows out from under a live process is what the null is avoiding.
+    sqlx::query(&crate::db::sql(
+        "UPDATE process SET team_template_id = NULL WHERE team_template_id IN \
+         (SELECT id FROM teamtemplate WHERE workspace_id = ?)", state.backend)
+    )
+    .bind(workspace_id)
+    .execute(&state.any)
+    .await?;
+    let teams_removed =
+        sqlx::query(&crate::db::sql("DELETE FROM teamtemplate WHERE workspace_id = ?", state.backend))
+            .bind(workspace_id)
+            .execute(&state.any)
+            .await?
+            .rows_affected();
+
+    Ok((tokens_revoked, teams_removed))
+}
+
 /// `archive_workspace`. Not a delete: the tenant is hidden, its tokens are
 /// revoked so nothing keeps authenticating, and its teams go — with any process
 /// that pointed at one detached first, because that FK outlives the team.
@@ -289,7 +326,7 @@ async fn delete_workspace(
     principal: Principal,
     PathId(workspace_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
-    require_master_key(&principal)?;
+    principal.require_master_key(NOT_A_TENANT)?;
     let row = require_active(&state, workspace_id).await?;
     // The `already archived` 409 in Python is unreachable — `require_active`
     // has already 404'd — and it is unreachable here for the same reason.
@@ -298,40 +335,7 @@ async fn delete_workspace(
     }
 
     let now = sql_now();
-    let tokens: Vec<i64> = sqlx::query_scalar(&crate::db::sql(
-        "SELECT id FROM api_tokens WHERE workspace_id = ? AND status != 'revoked'", state.backend)
-    )
-    .bind(workspace_id)
-    .fetch_all(&state.any)
-    .await?;
-    for token_id in &tokens {
-        sqlx::query(&crate::db::sql(
-            "UPDATE api_tokens SET status = 'revoked', revoked_at = ?, revoked_reason = ?, \
-             updated_at = ? WHERE id = ?", state.backend)
-        )
-        .bind(&now)
-        .bind(ARCHIVE_REASON)
-        .bind(&now)
-        .bind(token_id)
-        .execute(&state.any)
-        .await?;
-    }
-
-    let teams: Vec<i64> =
-        sqlx::query_scalar(&crate::db::sql("SELECT id FROM teamtemplate WHERE workspace_id = ?", state.backend))
-            .bind(workspace_id)
-            .fetch_all(&state.any)
-            .await?;
-    for team_id in &teams {
-        sqlx::query(&crate::db::sql("UPDATE process SET team_template_id = NULL WHERE team_template_id = ?", state.backend))
-            .bind(team_id)
-            .execute(&state.any)
-            .await?;
-        sqlx::query(&crate::db::sql("DELETE FROM teamtemplate WHERE id = ?", state.backend))
-            .bind(team_id)
-            .execute(&state.any)
-            .await?;
-    }
+    let (tokens_revoked, teams_removed) = archive_rows(&state, workspace_id, &now).await?;
 
     sqlx::query(&crate::db::sql("UPDATE workspace SET archived_at = ?, updated_at = ? WHERE id = ?", state.backend))
         .bind(&now)
@@ -343,8 +347,8 @@ async fn delete_workspace(
     Ok(Json(json!({
         "ok": true,
         "archived_at": iso_from_sql(&now),
-        "tokens_revoked": tokens.len(),
-        "teams_removed": teams.len(),
+        "tokens_revoked": tokens_revoked,
+        "teams_removed": teams_removed,
     }))
     .into_response())
 }
@@ -378,9 +382,95 @@ mod tests {
 
     #[test]
     fn only_the_master_key_manages_tenants() {
-        assert!(require_master_key(&Principal::unrestricted()).is_ok());
+        assert!(Principal::unrestricted().require_master_key(NOT_A_TENANT).is_ok());
         let tenant =
             Principal { workspace_id: Some(3), token_id: Some(1), scopes: vec!["*".into()] };
-        assert_eq!(require_master_key(&tenant).unwrap_err().status, StatusCode::FORBIDDEN);
+        assert_eq!(tenant.require_master_key(NOT_A_TENANT).unwrap_err().status, StatusCode::FORBIDDEN);
+    }
+
+    /// The counts the response reports used to be `Vec::len()` over ids the
+    /// handler had just selected; they are `rows_affected` now. Same numbers or
+    /// the archive lies to the caller — and the two rows belonging to the *other*
+    /// workspace are what a missing `WHERE workspace_id` would take with it.
+    #[tokio::test]
+    async fn archiving_touches_one_tenant_and_counts_what_it_changed() {
+        let path = std::env::temp_dir()
+            .join(format!("agp-archive-{}-{}.db", std::process::id(), line!()));
+        let _ = std::fs::remove_file(&path);
+        let state = AppState::new(&path, None);
+        crate::db::ensure_schema(&state.any).await.unwrap();
+
+        for (id, slug) in [(1, "acme"), (2, "other")] {
+            sqlx::query("INSERT INTO workspace (id, name, slug) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind(slug)
+                .bind(slug)
+                .execute(&state.any)
+                .await
+                .unwrap();
+        }
+        // Two live tokens and one already revoked in the tenant being archived,
+        // one live token in the tenant that must be left alone.
+        for (id, ws, status) in
+            [(1, 1, "active"), (2, 1, "active"), (3, 1, "revoked"), (4, 2, "active")]
+        {
+            sqlx::query(
+                "INSERT INTO api_tokens (id, name, prefix, token_hash, status, workspace_id) \
+                 VALUES (?, 't', 'p', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(format!("hash-{id}"))
+            .bind(status)
+            .bind(ws)
+            .execute(&state.any)
+            .await
+            .unwrap();
+        }
+        for (id, ws) in [(1, 1), (2, 1), (3, 2)] {
+            sqlx::query(
+                "INSERT INTO teamtemplate (id, name, roster_json, created_at, updated_at, \
+                 workspace_id) VALUES (?, 'team', '[]', '2026-01-01', '2026-01-01', ?)",
+            )
+            .bind(id)
+            .bind(ws)
+            .execute(&state.any)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO process (id, goal, status, total_tokens, total_cost, \
+             tool_invocations_used, created_at, updated_at, team_template_id) \
+             VALUES (1, 'g', 'pending', 0, 0.0, 0, '2026-01-01', '2026-01-01', 1)",
+        )
+        .execute(&state.any)
+        .await
+        .unwrap();
+
+        let (tokens, teams) = archive_rows(&state, 1, "2026-01-02 00:00:00").await.unwrap();
+        assert_eq!(tokens, 2, "the already-revoked token is not counted again");
+        assert_eq!(teams, 2);
+
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM api_tokens WHERE status != 'revoked' AND workspace_id = 2",
+        )
+        .fetch_one(&state.any)
+        .await
+        .unwrap();
+        assert_eq!(live, 1, "the other tenant's token survives");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teamtemplate")
+            .fetch_one(&state.any)
+            .await
+            .unwrap();
+        assert_eq!(left, 1, "only the other tenant's team is left");
+        // The FK would have refused the delete if the process still pointed at it.
+        let orphaned: Option<i64> =
+            sqlx::query_scalar("SELECT team_template_id FROM process WHERE id = 1")
+                .fetch_one(&state.any)
+                .await
+                .unwrap();
+        assert_eq!(orphaned, None);
+
+        state.any.close().await;
+        let _ = std::fs::remove_file(&path);
     }
 }

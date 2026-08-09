@@ -4,6 +4,7 @@
 //! of whichever workflow is selected. No canvas, no node graph — a workflow is
 //! a short list of steps, and a list renders a list best.
 
+use crate::domain::truncate;
 use crate::ui::{self, space, Icon, Tone};
 use crate::workflows::{Message, State};
 use agent_platform_client::types::{WorkflowInfo, WorkflowRunInfo};
@@ -252,14 +253,6 @@ fn step_row<'a>(
         cells.push(container(ui::muted(truncate(&text, 160))).width(Length::Fill).into());
     }
     column![ui::cluster(cells)].padding(iced::Padding::from([2.0, 0.0])).into()
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max).collect::<String>())
-    }
 }
 
 fn human_secs(seconds: i64) -> String {

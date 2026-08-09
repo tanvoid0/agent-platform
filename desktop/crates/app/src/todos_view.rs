@@ -32,13 +32,7 @@ fn tone(status: &str) -> Tone {
 pub fn view(state: &State) -> Element<'_, Message> {
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
     if let Some(err) = &state.error {
-        blocks.push(
-            ui::cluster(vec![
-                container(ui::alert_error_traced(err, Message::TraceLogs)).width(Length::Fill).into(),
-                ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss),
-            ])
-            .into(),
-        );
+        blocks.push(ui::error_bar(err, Message::TraceLogs, Message::Dismiss, Vec::new()));
     }
 
     if let Some(name) = &state.new_board {

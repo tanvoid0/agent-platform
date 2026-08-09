@@ -11,7 +11,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
 
     if let Some(err) = &state.error {
-        blocks.push(dismissible(ui::alert_error_traced(err, Message::TraceLogs)));
+        blocks.push(ui::error_bar(err, Message::TraceLogs, Message::DismissNotice, Vec::new()));
     }
     if let Some(draft) = &state.new_project {
         blocks.push(ui::card_with_header(
@@ -61,14 +61,6 @@ pub fn view(state: &State) -> Element<'_, Message> {
             body
         },
     )
-}
-
-fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
-    ui::cluster(vec![
-        container(inner).width(Length::Fill).into(),
-        ui::button_ghost(Icon::X, "Dismiss", Message::DismissNotice),
-    ])
-    .into()
 }
 
 fn projects_card(state: &State) -> Element<'_, Message> {
@@ -209,7 +201,7 @@ fn ollama_card(state: &State) -> Element<'_, Message> {
                     ui::cluster(vec![
                         ui::mono(m.name.clone()),
                         ui::spacer(),
-                        ui::caption(m.size.map(format_size).unwrap_or_default()),
+                        ui::caption(m.size.map(domain::format_size).unwrap_or_default()),
                     ])
                     .into()
                 })
@@ -274,16 +266,6 @@ fn registry_card(state: &State) -> Element<'_, Message> {
 }
 
 /// Bytes as GB/MB, matching how the web UI labels model sizes.
-fn format_size(bytes: i64) -> String {
-    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let b = bytes as f64;
-    if b >= GB {
-        format!("{:.1} GB", b / GB)
-    } else {
-        format!("{:.0} MB", b / (1024.0 * 1024.0))
-    }
-}
-
 /// Kept beside the registry table so job timestamps read the same as elsewhere.
 pub fn job_age(job: &agent_platform_client::types::ModelBuildJob) -> String {
     domain::relative_time(&job.created_at).unwrap_or_default()

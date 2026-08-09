@@ -1293,15 +1293,22 @@ async fn registry_list(
     .fetch_all(&state.any)
     .await?;
 
-    let mut entries = Vec::new();
-    for row in &rows {
-        let project_name: Option<String> =
-            sqlx::query_scalar(&crate::db::sql("SELECT name FROM model_projects WHERE id = ?", state.backend))
-                .bind(row.project_id)
-                .fetch_optional(&state.any)
-                .await?;
-        entries.push(row.to_out(project_name.as_deref()));
-    }
+    // One lookup for the whole page instead of one per row. A join would need a
+    // second row struct — `REGISTRY_COLUMNS` is shared with two other queries
+    // that do not want the name — and there are never more model projects than
+    // fit comfortably in a map.
+    let names: std::collections::HashMap<i64, String> =
+        sqlx::query_as::<_, (i64, String)>(&crate::db::sql(
+            "SELECT id, name FROM model_projects",
+            state.backend,
+        ))
+        .fetch_all(&state.any)
+        .await?
+        .into_iter()
+        .collect();
+
+    let entries: Vec<Value> =
+        rows.iter().map(|row| row.to_out(names.get(&row.project_id).map(String::as_str))).collect();
     Ok(Json(json!({ "entries": entries })).into_response())
 }
 
@@ -1794,9 +1801,10 @@ async fn run_pipeline_job(
         // do so by returning a dict. Now it prints one.
         if let Some(eval) = markers.eval {
             let mut result = object_or_empty(
-                sqlx::query_scalar::<_, Option<String>>(
+                sqlx::query_scalar::<_, Option<String>>(&crate::db::sql(
                     "SELECT result_json FROM model_build_jobs WHERE id = ?",
-                )
+                    state.backend,
+                ))
                 .bind(job_id)
                 .fetch_optional(&state.any)
                 .await

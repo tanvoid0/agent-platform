@@ -17,8 +17,10 @@ mod agenda_view;
 mod apidocs;
 mod apidocs_view;
 mod assistant;
+mod assistant_gate;
 mod assistant_tools;
 mod assistant_view;
+mod assistant_voice;
 mod bubble_shader;
 mod chat;
 mod chat_view;
@@ -1602,16 +1604,22 @@ fn subscription(app: &App) -> Subscription<Message> {
             window::Event::Unfocused => Some(Message::WindowFocus(false)),
             _ => None,
         }),
-        // Tray menu events: global receiver, polled.
+        // Tray menu events. `muda`'s receiver is a sync crossbeam channel with no
+        // async side, so this used to `try_recv` on a 150 ms timer — 6.7 wakeups
+        // a second, forever, including while the window is hidden and the app is
+        // only a server host. It blocks on the receiver instead: one parked
+        // thread out of tokio's blocking pool, and the app sleeps until the user
+        // actually picks something out of the tray.
         Subscription::run(|| {
             iced::stream::channel(16, async |mut out| {
-                let rx = MenuEvent::receiver();
                 loop {
-                    while let Ok(ev) = rx.try_recv() {
-                        let _ =
-                            futures::SinkExt::send(&mut out, Message::Tray(ev.id.0.clone())).await;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    let recv =
+                        tokio::task::spawn_blocking(|| MenuEvent::receiver().recv()).await;
+                    // The sender is a `muda` static and never drops, so an error
+                    // here means the runtime is going down — leave, rather than
+                    // spin on a channel that will not produce again.
+                    let Ok(Ok(ev)) = recv else { return };
+                    let _ = futures::SinkExt::send(&mut out, Message::Tray(ev.id.0)).await;
                 }
             })
         }),

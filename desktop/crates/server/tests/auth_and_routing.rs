@@ -9,24 +9,19 @@
 //! buffer. Streaming is still covered where it is produced (`model_ops`'s job
 //! stream, `processes`' run stream).
 
+mod common;
+
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 
 use agent_platform_server::auth::hash_token;
-use agent_platform_server::{router, AppState};
 use serde_json::Value;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Executor, SqlitePool};
 
-const MASTER: &str = "master-key-under-test";
-
-static SEQ: AtomicU32 = AtomicU32::new(0);
+use common::{start_server, MASTER};
 
 fn temp_db_path() -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("agp-server-test-{pid}-{n}.db"))
+    common::temp_db_path("server-test")
 }
 
 /// The columns auth reads, with the names Alembic gives them.
@@ -84,14 +79,6 @@ async fn seed_db(path: &PathBuf) {
         .unwrap();
     }
     pool.close().await;
-}
-
-async fn start_server(db: &PathBuf, master_key: Option<&str>) -> String {
-    let state = Arc::new(AppState::new(db, master_key.map(str::to_owned)));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
-    origin
 }
 
 async fn get(origin: &str, path: &str, bearer: Option<&str>) -> (u16, String) {
@@ -327,7 +314,9 @@ async fn oversized_json_is_refused_and_uploads_are_not() {
 
     let db = temp_db_path();
     seed_db(&db).await;
-    let app = agent_platform_server::router(Arc::new(AppState::new(&db, None)));
+    let app = agent_platform_server::router(std::sync::Arc::new(
+        agent_platform_server::AppState::new(&db, None),
+    ));
 
     async fn post(
         app: &axum::Router,

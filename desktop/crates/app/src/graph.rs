@@ -3,6 +3,7 @@
 //!
 //! Layout is pure and tested; the canvas only renders and hit-tests.
 
+use crate::domain::truncate;
 use crate::domain;
 use crate::ui::theme;
 use agent_platform_client::types::{RosterRole, SubagentNode, TaskNodeRecord};
@@ -473,14 +474,6 @@ fn blend(base: Color, other: Color, amount: f32) -> Color {
         base.g + (other.g - base.g) * amount,
         base.b + (other.b - base.b) * amount,
     )
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max).collect::<String>())
-    }
 }
 
 #[cfg(test)]

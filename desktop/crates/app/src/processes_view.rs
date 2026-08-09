@@ -1,5 +1,6 @@
 //! Processes screen rendering — composed from the shadcn-style `ui` kit.
 
+use crate::domain::truncate;
 use crate::domain::{self, BoardColumn, BoardRow};
 use crate::processes::{Message, State, ViewMode};
 use crate::ui::{self, space, Icon, Tone};
@@ -120,14 +121,6 @@ fn run_list_item(p: &ProcessRecord, selected: bool) -> Element<'_, Message> {
     )
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max).collect::<String>())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Right: detail pane
 // ---------------------------------------------------------------------------
@@ -136,7 +129,7 @@ fn detail_pane<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message>
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
 
     if let Some(err) = &state.error {
-        blocks.push(dismissible(ui::alert_error_traced(err, Message::TraceLogs)));
+        blocks.push(ui::error_bar(err, Message::TraceLogs, Message::DismissNotice, Vec::new()));
     }
 
     let Some(process) = state.selected_process() else {
@@ -176,14 +169,6 @@ fn detail_pane<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message>
         Some(actions_row(state, process)),
         ui::stack_lg(blocks),
     )
-}
-
-fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
-    ui::cluster(vec![
-        container(inner).width(Length::Fill).into(),
-        ui::button_ghost(Icon::X, "Dismiss", Message::DismissNotice),
-    ])
-    .into()
 }
 
 fn actions_row<'a>(state: &'a State, process: &'a ProcessRecord) -> Element<'a, Message> {

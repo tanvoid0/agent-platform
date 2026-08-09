@@ -21,13 +21,7 @@ pub fn view<'a>(state: &'a State, theme: &Theme) -> Element<'a, Message> {
     let mut blocks: Vec<Element<'a, Message>> = Vec::new();
 
     if let Some(err) = &state.error {
-        blocks.push(
-            ui::cluster(vec![
-                container(ui::alert_error_traced(err, Message::TraceLogs)).width(Length::Fill).into(),
-                ui::button_ghost(Icon::X, "Dismiss", Message::Dismiss),
-            ])
-            .into(),
-        );
+        blocks.push(ui::error_bar(err, Message::TraceLogs, Message::Dismiss, Vec::new()));
     }
 
     blocks.push(picker(state));

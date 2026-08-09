@@ -77,6 +77,15 @@ pub struct ProviderSpec {
     pub modalities: &'static [Modality],
     /// `PROVIDER_LOCAL_SORT_ORDER`; 99 for the ids that map omits.
     pub sort_order: u8,
+    /// The env var holding this provider's credential, `None` for a local
+    /// backend that wants none. Whatever is named here is a secret by
+    /// definition: `llm_admin` masks it and `dotenv` refuses to take it from the
+    /// committed YAML, and the test at the bottom of `llm_admin` is what makes
+    /// those two follow this column instead of a hand-written copy of it.
+    pub api_key_env: Option<&'static str>,
+    /// The env var overriding this provider's base URL, `None` for a hosted one
+    /// that is only ever reached at its own address.
+    pub base_url_env: Option<&'static str>,
 }
 
 use Modality::{Chat, Embeddings, ImageGeneration, Speech, VisionInput};
@@ -87,6 +96,8 @@ use Modality::{Chat, Embeddings, ImageGeneration, Speech, VisionInput};
 pub const PROVIDERS: &[ProviderSpec] = &[
     ProviderSpec {
         id: "ollama",
+        api_key_env: None,
+        base_url_env: Some("OLLAMA_API_BASE"),
         label: "Ollama",
         registry: Registry::Chat,
         default_model: "llama3",
@@ -95,6 +106,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
     },
     ProviderSpec {
         id: "lm_studio",
+        api_key_env: Some("LM_STUDIO_API_KEY"),
+        base_url_env: Some("LM_STUDIO_API_BASE"),
         label: "LM Studio",
         registry: Registry::Chat,
         default_model: "google/gemma-4-e4b",
@@ -103,6 +116,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
     },
     ProviderSpec {
         id: "aimlapi",
+        api_key_env: Some("AIMLAPI_API_KEY"),
+        base_url_env: Some("AIMLAPI_OPENAI_BASE"),
         label: "AIMLAPI",
         registry: Registry::Chat,
         default_model: "openai/gpt-4.1-mini",
@@ -113,6 +128,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         // Claude's OpenAI-compatible surface has no embeddings endpoint; it does
         // take image inputs.
         id: "anthropic",
+        api_key_env: Some("ANTHROPIC_API_KEY"),
+        base_url_env: Some("ANTHROPIC_OPENAI_BASE"),
         label: "Claude",
         registry: Registry::Chat,
         default_model: "",
@@ -121,6 +138,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
     },
     ProviderSpec {
         id: "gemini",
+        api_key_env: Some("GEMINI_API_KEY"),
+        base_url_env: Some("GEMINI_OPENAI_BASE"),
         label: "Cloud",
         registry: Registry::Chat,
         default_model: "gemini-2.0-flash",
@@ -129,6 +148,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
     },
     ProviderSpec {
         id: "image_local",
+        api_key_env: None,
+        base_url_env: Some("IMAGE_API_BASE"),
         label: "Image (local)",
         registry: Registry::Image,
         default_model: DEFAULT_IMAGE_MODEL,
@@ -137,6 +158,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
     },
     ProviderSpec {
         id: "speech_local",
+        api_key_env: Some("SPEECH_API_KEY"),
+        base_url_env: Some("SPEECH_API_BASE"),
         label: "Speech (local)",
         registry: Registry::Speech,
         default_model: DEFAULT_SPEECH_MODEL,

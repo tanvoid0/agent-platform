@@ -9,29 +9,18 @@
 //! Every case here is rejected *before* the handler reaches the database or the
 //! model, which is why no seeding and no upstream are needed.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+mod common;
 
-use agent_platform_server::{router, AppState};
 use serde_json::{json, Value};
 
-const MASTER: &str = "master-key-under-test";
+use common::MASTER;
 
-static SEQ: AtomicU32 = AtomicU32::new(0);
-
-fn temp_db_path() -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("agp-tools-cap-{pid}-{n}.db"))
+fn temp_db_path() -> std::path::PathBuf {
+    common::temp_db_path("tools-cap")
 }
 
-async fn start_server(db: &PathBuf) -> String {
-    let state = Arc::new(AppState::new(db, Some(MASTER.to_string())));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
-    origin
+async fn start_server(db: &std::path::Path) -> String {
+    common::start_server(db, Some(MASTER)).await
 }
 
 async fn post(origin: &str, path: &str, body: Value) -> (u16, String) {

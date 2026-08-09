@@ -99,6 +99,21 @@ impl Principal {
             format!("Token lacks required scope '{scope}'."),
         ))
     }
+
+    /// An operator action, not a tenant one. A workspace token is a valid Bearer
+    /// credential and gets past auth, so every route that manages the platform
+    /// rather than the tenant's own data has to say so itself.
+    ///
+    /// `denial` is the whole message because the two callers explain the same
+    /// rule from different ends — "this endpoint wants the master key" for the
+    /// `.env` surface, "workspaces are not yours to manage" for tenancy — and
+    /// the wording is the only part of this that was ever different.
+    pub fn require_master_key(&self, denial: &'static str) -> Result<(), crate::error::ApiError> {
+        if self.workspace_id.is_some() {
+            return Err(crate::error::ApiError::new(StatusCode::FORBIDDEN, denial));
+        }
+        Ok(())
+    }
 }
 
 /// Mirrors `app/api_tokens/exceptions.py`: an HTTP status plus a machine-readable

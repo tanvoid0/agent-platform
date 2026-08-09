@@ -5,6 +5,7 @@
 //! status. Columns are statuses rather than categories because a status is the
 //! thing a card *moves* through; the category rides along as a badge.
 
+use crate::domain::err_string;
 use agent_platform_client::types::*;
 use agent_platform_client::Client;
 use iced::Task;
@@ -70,10 +71,6 @@ pub enum Message {
     /// Any write finished; the board is refetched rather than patched locally.
     Done(Result<(), String>),
     Dismiss,
-}
-
-fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
-    r.map_err(|e| e.to_string())
 }
 
 pub fn refresh(client: &Client) -> Task<Message> {

@@ -1,12 +1,18 @@
 //! Port of `app/assistant/clarifying_form.py` — turning an `ask_clarifying_questions`
 //! action into an interactive `PlanningFormSpec`-shaped form.
 //!
-//! Regexes, not hand-rolled parsing: seven small patterns here (paren-option
+//! Regexes, not hand-rolled parsing: the dozen small patterns here (paren-option
 //! extraction, "prefer X or Y" splitting, field-kind inference) are genuinely
 //! regex-shaped in the Python original, and re-deriving them by hand risked a
-//! quieter divergence than pulling in the crate. Constructed fresh per call
-//! rather than cached — this runs a handful of times per chat turn, not a hot
-//! loop.
+//! quieter divergence than pulling in the crate.
+//!
+//! They are compiled once. This is not a hot path — a handful of calls per chat
+//! turn, in front of a model round-trip — so the win is not the microseconds:
+//! it is that every pattern is now declared in one block where they can be read
+//! against each other, and that a malformed one fails on first use rather than
+//! on whichever call first reaches its branch.
+
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde_json::{Map, Value};
@@ -14,6 +20,31 @@ use serde_json::{Map, Value};
 const MAX_FIELDS: usize = 12;
 const MAX_OPTION_LEN: usize = 120;
 const VALID_KINDS: &[&str] = &["boolean", "single_select", "multi_select", "text", "textarea"];
+
+macro_rules! pattern {
+    ($name:ident, $re:expr) => {
+        static $name: LazyLock<Regex> = LazyLock::new(|| Regex::new($re).unwrap());
+    };
+}
+
+// Anything not allowed in a generated field id.
+pattern!(SLUG_STRIP, r"[^a-z0-9]+");
+// The same for an id the model supplied, which may keep its case.
+pattern!(ID_STRIP, r"[^a-zA-Z0-9_]");
+// A trailing `(a, b, c)`, optionally followed by `?` — the option list.
+pattern!(PAREN, r"\(([^)]+)\)\??\s*$");
+pattern!(TRAILING_PAREN, r"\s*\([^)]+\)\s*$");
+pattern!(EG_PREFIX, r"(?i)^e\.g\.?,?\s*");
+pattern!(OPTION_SPLIT, r"(?i),|/|\s+or\s+");
+pattern!(OR_SPLIT, r"(?i)\s+or\s+");
+// Greedy `.*` on purpose; see `prefer_or_options`.
+pattern!(PREFER, r"(?i)^.*\bprefer\b");
+// Openers that make a question a yes/no one.
+pattern!(AUX_VERB, r"(?i)^(do|does|did|is|can|will|should|would|have you|has)\b");
+pattern!(ARE_THERE, r"^are there\b");
+// `\b`, not `starts_with`: "whatever" does not open a question.
+pattern!(WHAT, r"^what\b");
+pattern!(COUNT_WORD, r"\b\d+\s*(days?|meals?|times?)\b");
 
 fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
@@ -31,9 +62,8 @@ fn strip_punct(s: &str) -> String {
 
 /// `_slug_id`.
 fn slug_id(index: usize, label: &str) -> String {
-    let re = Regex::new(r"[^a-z0-9]+").unwrap();
     let lowered = label.to_lowercase();
-    let replaced = re.replace_all(&lowered, "_");
+    let replaced = SLUG_STRIP.replace_all(&lowered, "_");
     let slug = truncate_chars(replaced.trim_matches('_'), 40);
     if slug.is_empty() {
         format!("q{index}")
@@ -45,18 +75,15 @@ fn slug_id(index: usize, label: &str) -> String {
 /// `_parse_paren_options`: a trailing `(a, b, c)` or `(a or b)`, optionally
 /// followed by `?`, becomes 2–8 option strings.
 fn parse_paren_options(question: &str) -> Option<Vec<String>> {
-    let paren = Regex::new(r"\(([^)]+)\)\??\s*$").unwrap();
-    let caps = paren.captures(question.trim())?;
+    let caps = PAREN.captures(question.trim())?;
     let inner = caps.get(1)?.as_str().trim();
 
-    let eg = Regex::new(r"(?i)^e\.g\.?,?\s*").unwrap();
-    let inner = eg.replace(inner, "").trim().to_string();
+    let inner = EG_PREFIX.replace(inner, "").trim().to_string();
     if inner.is_empty() || inner.chars().count() > 200 {
         return None;
     }
 
-    let splitter = Regex::new(r"(?i),|/|\s+or\s+").unwrap();
-    let opts: Vec<String> = splitter
+    let opts: Vec<String> = OPTION_SPLIT
         .split(&inner)
         // First filter is on the *un*-dot-stripped trim (`if p.strip()`).
         .filter(|p| !p.trim().is_empty())
@@ -80,15 +107,13 @@ fn prefer_or_options(question: &str) -> Option<Vec<String>> {
     if !lower.contains("prefer") || !lower.contains(" or ") {
         return None;
     }
-    let splitter = Regex::new(r"(?i)\s+or\s+").unwrap();
-    let parts: Vec<&str> = splitter.splitn(question, 2).collect();
+    let parts: Vec<&str> = OR_SPLIT.splitn(question, 2).collect();
     if parts.len() != 2 {
         return None;
     }
     // Greedy `.*` anchored at the start: the *last* `prefer` in `parts[0]` is
     // where the cut lands, same as Python's backtracking engine settles on.
-    let prefer = Regex::new(r"(?i)^.*\bprefer\b").unwrap();
-    let left = strip_punct(&prefer.replace(parts[0], ""));
+    let left = strip_punct(&PREFER.replace(parts[0], ""));
     let right = strip_punct(parts[1]);
     let opts: Vec<String> =
         [left, right].into_iter().filter(|o| !o.is_empty() && o.chars().count() < 120).collect();
@@ -114,15 +139,13 @@ fn infer_field_kind(question: &str, options: Option<&[String]>) -> &'static str 
     }
     let lower = question.to_lowercase();
     let lower = lower.trim();
-    if Regex::new(r"^are there\b").unwrap().is_match(lower) || Regex::new(r"^what\b").unwrap().is_match(lower) {
+    if ARE_THERE.is_match(lower) || WHAT.is_match(lower) {
         return "textarea";
     }
-    let aux = Regex::new(r"(?i)^(do|does|did|is|can|will|should|would|have you|has)\b").unwrap();
-    if aux.is_match(lower) && !lower.contains(" or ") && !lower.contains("how many") {
+    if AUX_VERB.is_match(lower) && !lower.contains(" or ") && !lower.contains("how many") {
         return "boolean";
     }
-    let count_word = Regex::new(r"\b\d+\s*(days?|meals?|times?)\b").unwrap();
-    if lower.contains("how many") || count_word.is_match(lower) {
+    if lower.contains("how many") || COUNT_WORD.is_match(lower) {
         return "text";
     }
     if question.chars().count() > 100 {
@@ -151,8 +174,7 @@ fn coerce_llm_field(raw: &Map<String, Value>, index: usize) -> Option<Map<String
 
     let fid = match raw.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
         Some(fid) => {
-            let re = Regex::new(r"[^a-zA-Z0-9_]").unwrap();
-            truncate_chars(&re.replace_all(fid, "_"), 40)
+            truncate_chars(&ID_STRIP.replace_all(fid, "_"), 40)
         }
         None => slug_id(index, &label),
     };
@@ -220,8 +242,7 @@ fn coerce_llm_field(raw: &Map<String, Value>, index: usize) -> Option<Map<String
 /// `_field_from_question`.
 fn field_from_question(question: &str, index: usize, profile: Option<&Map<String, Value>>) -> Map<String, Value> {
     let q = question.trim();
-    let strip_trailing_paren = Regex::new(r"\s*\([^)]+\)\s*$").unwrap();
-    let stripped = strip_trailing_paren.replace(q, "");
+    let stripped = TRAILING_PAREN.replace(q, "");
     let label = if stripped.trim().is_empty() { q.to_string() } else { stripped.trim().to_string() };
 
     let options = parse_paren_options(q).or_else(|| prefer_or_options(q));

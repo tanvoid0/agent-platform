@@ -51,11 +51,12 @@ const MASTER_KEY_ENV: &str = "AGENT_PLATFORM_MASTER_KEY";
 
 /// Written back in this order, every key present even when empty — the file is
 /// regenerated wholesale rather than patched.
-const ENV_KEYS: [&str; 9] = [
+const ENV_KEYS: [&str; 10] = [
     MASTER_KEY_ENV,
     "GEMINI_API_KEY",
     "AIMLAPI_API_KEY",
     "AIMLAPI_OPENAI_BASE",
+    "ANTHROPIC_API_KEY",
     "OLLAMA_API_BASE",
     "LM_STUDIO_API_BASE",
     "LM_STUDIO_API_KEY",
@@ -63,9 +64,20 @@ const ENV_KEYS: [&str; 9] = [
     "DEFAULT_MODEL",
 ];
 
-/// Masked in `GET /env`; every other key returns its plaintext `value`.
-const SENSITIVE_ENV_KEYS: [&str; 4] =
-    [MASTER_KEY_ENV, "GEMINI_API_KEY", "AIMLAPI_API_KEY", "LM_STUDIO_API_KEY"];
+/// Masked in `GET /env`; every other key returns its plaintext `value`. Also
+/// what `dotenv` refuses to take from the committed YAML — hiding a key here
+/// and accepting it from a checked-in file would cancel out.
+///
+/// Every `ProviderSpec::api_key_env` belongs here, whatever registry it is in;
+/// `the_provider_table_is_the_source_of_the_key_lists` is the test that says so.
+pub(crate) const SENSITIVE_ENV_KEYS: [&str; 6] = [
+    MASTER_KEY_ENV,
+    "GEMINI_API_KEY",
+    "AIMLAPI_API_KEY",
+    "LM_STUDIO_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "SPEECH_API_KEY",
+];
 
 pub fn routes() -> Router<Arc<AppState>> {
     const BASE: &str = "/api/v1/llm-proxy";
@@ -86,18 +98,9 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 /// `require_master_key`. Reading or writing the server's `.env` / `config.yaml`,
-/// or printing the master key, is an operator action: a workspace token
-/// authenticates a tenant, so it must not reach these even though it is a valid
-/// Bearer credential.
-fn require_master_key(principal: &Principal) -> Result<(), ApiError> {
-    if principal.workspace_id.is_some() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "This endpoint requires the platform master key, not a workspace token.",
-        ));
-    }
-    Ok(())
-}
+/// or printing the master key, is an operator action; see
+/// [`Principal::require_master_key`].
+const NOT_A_TENANT: &str = "This endpoint requires the platform master key, not a workspace token.";
 
 // ---------------------------------------------------------------------------
 // The dotenv file
@@ -206,7 +209,7 @@ fn probe_body(response: &crate::upstream_http::UpstreamResponse, limit: usize) -
 // ---------------------------------------------------------------------------
 
 async fn snippet(principal: Principal) -> Result<Response, ApiError> {
-    require_master_key(&principal)?;
+    principal.require_master_key(NOT_A_TENANT)?;
     let master = master_key_from_env(&read_env_file());
     let base = public_base();
     let snippet = format!(
@@ -217,7 +220,7 @@ async fn snippet(principal: Principal) -> Result<Response, ApiError> {
 }
 
 async fn get_env(principal: Principal) -> Result<Response, ApiError> {
-    require_master_key(&principal)?;
+    principal.require_master_key(NOT_A_TENANT)?;
     let env = read_env_file();
     let mut keys = Map::new();
     for key in ENV_KEYS {
@@ -244,7 +247,7 @@ async fn get_env(principal: Principal) -> Result<Response, ApiError> {
 }
 
 async fn post_env(principal: Principal, body: Bytes) -> Result<Response, ApiError> {
-    require_master_key(&principal)?;
+    principal.require_master_key(NOT_A_TENANT)?;
     let body = parse_body(&body)?;
 
     // `EnvUpdate` is nine optional strings and pydantic ignores the rest, so a
@@ -288,7 +291,7 @@ async fn post_env(principal: Principal, body: Bytes) -> Result<Response, ApiErro
 }
 
 async fn get_config_yaml(principal: Principal) -> Result<Response, ApiError> {
-    require_master_key(&principal)?;
+    principal.require_master_key(NOT_A_TENANT)?;
     let path = config_yaml_path();
     if !path.is_file() {
         return Err(ApiError::not_found("config.yaml not found"));
@@ -304,7 +307,7 @@ async fn get_config_yaml(principal: Principal) -> Result<Response, ApiError> {
 /// the parsed tree. Comments and formatting in an operator's config survive a
 /// round trip through this route, which they would not if it saved the parse.
 async fn post_config_yaml(principal: Principal, body: Bytes) -> Result<Response, ApiError> {
-    require_master_key(&principal)?;
+    principal.require_master_key(NOT_A_TENANT)?;
     let body = parse_body(&body)?;
 
     let content = match body.get("content") {
@@ -827,10 +830,10 @@ mod tests {
 
     #[test]
     fn only_the_master_key_reaches_operator_config() {
-        assert!(require_master_key(&Principal::unrestricted()).is_ok());
+        assert!(Principal::unrestricted().require_master_key(NOT_A_TENANT).is_ok());
         let tenant =
             Principal { workspace_id: Some(1), token_id: Some(2), scopes: vec!["*".into()] };
-        assert_eq!(require_master_key(&tenant).unwrap_err().status, StatusCode::FORBIDDEN);
+        assert_eq!(tenant.require_master_key(NOT_A_TENANT).unwrap_err().status, StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -917,6 +920,35 @@ mod tests {
         // file Python itself wrote on Windows is CRLF.
         assert_eq!(read_text_universal("a\r\nb\rc\n"), "a\nb\nc\n");
         assert_eq!(read_text_universal("a\nb"), "a\nb");
+    }
+
+    /// A sixth provider added to `llm_config::PROVIDERS` and nowhere else is the
+    /// failure this catches: its key would come back in plaintext from
+    /// `GET /env`, be accepted out of the committed YAML, and — for a chat
+    /// provider — have no field on the desktop's Providers screen to set it in.
+    /// All three lists follow the one table now, and this is what enforces that.
+    ///
+    /// Base URLs are deliberately not checked: `ENV_KEYS` is also the set of
+    /// keys `write_env_file` owns and rewrites, and an override like
+    /// `ANTHROPIC_OPENAI_BASE` is an operator escape hatch, not something the
+    /// app should be managing the lifetime of.
+    #[test]
+    fn the_provider_table_is_the_source_of_the_key_lists() {
+        for p in crate::llm_config::PROVIDERS {
+            let Some(key) = p.api_key_env else { continue };
+            assert!(
+                SENSITIVE_ENV_KEYS.contains(&key),
+                "{}'s {key} is not masked in GET /env, so it is also not refused from the YAML",
+                p.id
+            );
+            if p.registry == crate::llm_config::Registry::Chat {
+                assert!(
+                    ENV_KEYS.contains(&key),
+                    "{}'s {key} has no field on the Providers screen",
+                    p.id
+                );
+            }
+        }
     }
 
     #[test]

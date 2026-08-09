@@ -6,6 +6,7 @@
 //! reviewer's pending suggestions. Cards are *completed* here rather than moved
 //! — Plans is the screen for moving things through columns.
 
+use crate::domain::err_string;
 use crate::agenda_chat;
 use agent_platform_client::types::*;
 use agent_platform_client::Client;
@@ -75,10 +76,6 @@ pub enum Message {
     Done(Result<(), String>),
     Dismiss,
     Chat(agenda_chat::Message),
-}
-
-fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
-    r.map_err(|e| e.to_string())
 }
 
 pub fn refresh(client: &Client) -> Task<Message> {

@@ -91,6 +91,117 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
 
 ## Backlog
 
+- **Reuse and hot-path sweep — landed 2026-08-09.** A read of the whole
+  tree for duplication, scattered tables and per-request work. Nothing here is a
+  feature; it is the drift a year of screens leaves behind. Three passes, in
+  this order, each one green on `cargo test` before the next starts.
+
+  **Pass 1 — the copies, and two bugs found while counting them.**
+  - `model_ops.rs`'s job runner had the crate's one `sqlx::query*` with a `?`
+    placeholder that skipped `crate::db::sql()`. Harmless on SQLite, which takes
+    `?` verbatim; the moment the `sqlx::Any` pool runs against Postgres it is a
+    syntax error in the middle of a build job. Wrapped.
+  - `dotenv::YAML_SECRET_KEYS` listed three keys against
+    `llm_admin::SENSITIVE_ENV_KEYS`'s five, so `AIMLAPI_API_KEY` and
+    `ANTHROPIC_API_KEY` were masked in `GET /env` while still being *accepted*
+    from the committed `config/agent_platform.yaml`. Two lists that must agree
+    and no test saying so; `dotenv.rs` reads the one list now.
+  - `ui::error_bar` already existed and only `coder_view` called it. Nine other
+    screens hand-rolled the same row — five as a private `fn dismissible` copy,
+    four as an inline `cluster`. All nine call the kit fn.
+  - `err_string` (×7), `non_empty` (×4), `truncate` (×3): byte-identical private
+    copies across screens, now single `pub fn`s in `domain.rs` beside
+    `format_size`.
+  - `temp_db_path`/`start_server` were copied into three integration tests;
+    `server/tests/common/mod.rs` holds them.
+
+  **Pass 2 — one table per fact, and the per-request work.**
+  - Provider knowledge lived in five places: `llm_config::PROVIDERS`,
+    `llm_admin::{ENV_KEYS,SENSITIVE_ENV_KEYS}`, `dotenv::YAML_SECRET_KEYS`,
+    literals in `llm.rs`, and the app's `providers::PROVIDER_META`.
+    `ProviderSpec` carries `api_key_env`/`base_url_env` now and
+    `llm_admin::the_provider_table_is_the_source_of_the_key_lists` walks it: a
+    credential named there must be masked, and — for a chat provider — must have
+    a field on the Providers screen. `SPEECH_API_KEY` was neither, and is both
+    now. **The lists are pinned to the table, not generated from it.** `ENV_KEYS`
+    is also the set `write_env_file` owns and *rewrites*, so deriving it would
+    have grown the user's `.env` by whatever the table happened to hold; a test
+    that fails loudly is the same guard without the blast radius.
+  - `registry_list` ran one `SELECT name FROM model_projects` per registry row.
+    One map lookup for the page now — not a join, because `REGISTRY_COLUMNS` is
+    shared with two queries that do not want the name and a join would need a
+    second row struct. `workspaces::archive` ran a SELECT plus a statement per
+    token and two per team, only so the response's counts could be `Vec::len()`;
+    `rows_affected` is the same number, so it is three set-based statements and
+    `archive_rows` is split out with a test pinning the counts and the blast
+    radius (the *other* tenant's token and team survive). Recovery's per-process
+    `COUNT(*)` is left alone — it runs once at startup over a handful of rows.
+
+  **Pass 3 — `app/src/assistant.rs` was five subjects in one file.** Identity,
+  the tool spec and its executor, TTS, the mic gate's DSP, and only then `State`
+  + `update`. The two that never touch `State` left: `assistant_gate.rs` (160
+  lines — the SNR/onset/hang constants, `voice_like`, `is_ghost`,
+  `keep_utterance`, `over_playback`, `since`) and `assistant_voice.rs` (165 —
+  the Edge socket, `take_sentence`, `speech_text`, `synthesize`, the rate
+  table). `warm_voice` stayed behind because it returns a `Task<Message>`.
+  2572 lines left, no behaviour change. While moving it, `keep_utterance`'s doc
+  comment got reattached to `keep_utterance` — it had been stacked on
+  `over_playback` where it read as one comment about the wrong function.
+
+  **Pass 4 — the three the sweep first argued itself out of.** Each was called
+  not worth doing on cost grounds; each turned out to be worth doing on
+  readability or correctness grounds instead, which is the better reason.
+  - **`clarifying_form`'s twelve `Regex::new` per call** are twelve `LazyLock`
+    statics declared in one block behind a `pattern!` macro. The saved
+    microseconds are still irrelevant in front of a model round-trip — the point
+    is that the patterns can now be read against each other, and a malformed one
+    fails on first use rather than on whichever call first reaches its branch.
+  - **`require_master_key` was three functions for two meanings.**
+    `Principal::require_master_key(denial)` is the tenant check, next to
+    `require_scope` where it belongs; `llm_admin` and `workspaces` keep only
+    their wording, as a `NOT_A_TENANT` const each. `coder`'s was never the same
+    check — it is "this server has no master key, so the loop cannot call its
+    own `/v1`", a 503 the operator fixes — and it is
+    `require_master_key_configured` now, so the name stops claiming otherwise.
+    That mis-naming is what made the three look foldable in the first place.
+  - **The tray's 150 ms `try_recv` poll** blocks on the receiver from
+    `spawn_blocking`. One parked thread instead of 6.7 wakeups a second forever,
+    including while the window is hidden and the app is only a server host.
+
+  Still deliberately not done: **a shared `start_server` for every integration
+  test.** Three tests, three genuinely different setups (hand-seeded Alembic
+  schema, none, migrated). `tests/common/mod.rs` holds what actually repeats —
+  `MASTER`, `temp_db_path`, the plain router-on-an-ephemeral-port — and no more.
+
+- **Providers screen is per-provider now — landed 2026-08-08.** The catalog rows
+  were status text and the `.env` fields were one flat list underneath, so the
+  user had to match "AI/ML API key" to the "AIMLAPI" row by hand. Each row now
+  carries a tick/cross badge, a running/stopped badge for the two local
+  backends, and its own dialog (`providers_view::provider_modal`) with that
+  provider's key, base URL and default-model dropdown. The flat "Keys and
+  endpoints" card is gone; `providers::PROVIDER_META` is the one table saying
+  which env keys, which key-mint URL and which launch command belong to a
+  provider.
+  - Inline actions for the thing each row is missing: **Launch** for a stopped
+    local backend (`shell::spawn_detached` — `ollama serve`, `lms server
+    start`), **Get API key** for an unconfigured cloud one (`shell::open_url`).
+  - Model ops folded in only where it applies: the Ollama dialog carries the
+    whole "Local models" surface — the installed models with their sizes
+    (`GET /model-ops/ollama/models`, bounded to 180px and scrolling inside
+    itself) and the pull field over `POST /model-ops/ollama/models/pull`. No
+    other provider grows this half; nothing else can pull. `format_size` moved
+    to `domain.rs` rather than being copied. The pull job is **not** polled here
+    (this screen has no tick subscription) — the toast says to Refresh, and
+    Model ops keeps the job card that actually watches one.
+  - `ANTHROPIC_API_KEY` joined `ENV_KEYS`/`SENSITIVE_ENV_KEYS` in `llm_admin.rs`
+    and `EnvUpdate`; the Claude row was in the catalog with no way to configure
+    it. A test walks `PROVIDER_META` and asserts every field it renders survives
+    into the save body, so a sixth provider cannot be added half-wired.
+
+  Still open: "running" is inferred from an empty model list (that is what
+  `build_admin` reports for an unreachable local backend), not a probe, and
+  Launch does not wait for the port — the toast says to hit Refresh.
+
 - **Notifications, in the app as well as on the desktop — landed 2026-08-08.**
   `notify.rs` already toasted work that finished off-screen, and a toast is gone
   in ten seconds; there was nothing left to come back to. It now also keeps an

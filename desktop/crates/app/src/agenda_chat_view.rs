@@ -30,10 +30,14 @@ pub fn pane<'a>(state: &'a State, theme: &Theme) -> Element<'a, Message> {
         }
     }
     if let Some(err) = &state.error {
-        blocks.push(dismissible(ui::alert_error_traced(err, Message::TraceLogs)));
+        blocks.push(ui::error_bar(err, Message::TraceLogs, Message::DismissError, Vec::new()));
     }
     if let Some(notice) = &state.notice {
-        blocks.push(dismissible(ui::alert(Tone::Success, notice.clone(), None)));
+        blocks.push(ui::dismissible(
+            ui::alert(Tone::Success, notice.clone(), None),
+            Message::DismissError,
+            Vec::new(),
+        ));
     }
 
     blocks.push(container(transcript(state, theme)).height(Length::Fill).into());
@@ -43,14 +47,6 @@ pub fn pane<'a>(state: &'a State, theme: &Theme) -> Element<'a, Message> {
         .width(WIDTH)
         .height(Length::Fill)
         .into()
-}
-
-fn dismissible<'a>(banner: Element<'a, Message>) -> Element<'a, Message> {
-    ui::cluster(vec![
-        container(banner).width(Length::Fill).into(),
-        ui::button_ghost(Icon::X, "Dismiss", Message::DismissError),
-    ])
-    .into()
 }
 
 /// Which thread, and the two ways out of it: a new one, or closing the pane.

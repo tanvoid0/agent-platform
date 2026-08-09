@@ -32,7 +32,7 @@ pub fn view(state: &State, kind: Kind) -> Element<'_, Message> {
 
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
     if let Some(err) = &state.error {
-        blocks.push(dismissible(ui::alert_error_traced(err, Message::TraceLogs)));
+        blocks.push(ui::error_bar(err, Message::TraceLogs, Message::DismissNotice, Vec::new()));
     }
 
     blocks.push(match (&state.draft, kind) {
@@ -65,14 +65,6 @@ pub fn view(state: &State, kind: Kind) -> Element<'_, Message> {
             420.0,
         ),
     }
-}
-
-fn dismissible(inner: Element<'_, Message>) -> Element<'_, Message> {
-    ui::cluster(vec![
-        container(inner).width(Length::Fill).into(),
-        ui::button_ghost(Icon::X, "Dismiss", Message::DismissNotice),
-    ])
-    .into()
 }
 
 // ---------------------------------------------------------------------------

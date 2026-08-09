@@ -82,13 +82,7 @@ pub fn panel<'a>(
 
     let mut blocks: Vec<Element<'_, Message>> = Vec::new();
     if let Some(err) = &state.error {
-        blocks.push(
-            ui::cluster(vec![
-                container(ui::alert_error_traced(err, Message::TraceLogs)).width(Length::Fill).into(),
-                ui::button_ghost(Icon::X, "Dismiss", Message::DismissError),
-            ])
-            .into(),
-        );
+        blocks.push(ui::error_bar(err, Message::TraceLogs, Message::DismissError, Vec::new()));
     }
     // An empty transcript keeps its natural height inside a capped panel, so it
     // does not stretch its card. A filling caller is the whole window, though —

@@ -909,7 +909,7 @@ fn appearance_view(app: &App) -> Element<'_, Message> {
                     ui::field(
                         "Voice id",
                         ui::input(
-                            crate::assistant::DEFAULT_VOICE,
+                            crate::assistant_voice::DEFAULT_VOICE,
                             &app.settings.voice_name,
                             Message::SetVoiceName,
                         ),
@@ -926,7 +926,7 @@ fn appearance_view(app: &App) -> Element<'_, Message> {
                 Some(ui::muted(format!("How fast {name} reads a reply aloud, in voice mode."))),
                 None,
                 ui::stack(vec![
-                    ui::segmented(crate::assistant::VOICE_RATES.map(|(label, r)| {
+                    ui::segmented(crate::assistant_voice::VOICE_RATES.map(|(label, r)| {
                         (label, rate == r, Message::SetVoiceRate(r))
                     })),
                     ui::caption(format!(

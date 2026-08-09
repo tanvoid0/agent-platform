@@ -5,23 +5,78 @@
 //! value, so an untouched key field means "leave what is stored alone" — an
 //! empty string would otherwise read as "clear it".
 
+use crate::domain::err_string;
 use agent_platform_client::types::*;
 use agent_platform_client::Client;
 use iced::Task;
 
-/// `.env` keys this screen edits, in render order. The master key is absent on
-/// purpose: the shell owns it, and rewriting it would orphan this client.
-pub const SECRET_FIELDS: [(&str, &str); 3] = [
-    ("GEMINI_API_KEY", "Gemini API key"),
-    ("AIMLAPI_API_KEY", "AI/ML API key"),
-    ("LM_STUDIO_API_KEY", "LM Studio API key"),
+/// What the catalog does not carry: which `.env` fields belong to a provider,
+/// where its key is minted, and how to start it when it runs on this machine.
+///
+/// The master key is absent on purpose — the shell owns it, and rewriting it
+/// would orphan this client.
+pub struct ProviderMeta {
+    pub id: &'static str,
+    /// Env key and label of the write-only API key, when the provider has one.
+    pub secret: Option<(&'static str, &'static str)>,
+    /// Env key, label and placeholder of the base URL, when it has one.
+    pub endpoint: Option<(&'static str, &'static str, &'static str)>,
+    /// Where to mint a key. Offered whenever the provider is unconfigured.
+    pub key_url: Option<&'static str>,
+    /// Command that starts the backend locally, for the "Launch" action.
+    pub launch: Option<(&'static str, &'static [&'static str])>,
+    /// Whether models can be pulled into this provider (Ollama only).
+    pub pullable: bool,
+}
+
+pub const PROVIDER_META: [ProviderMeta; 5] = [
+    ProviderMeta {
+        id: "ollama",
+        secret: None,
+        endpoint: Some(("OLLAMA_API_BASE", "Base URL", "http://127.0.0.1:11434")),
+        key_url: None,
+        launch: Some(("ollama", &["serve"])),
+        pullable: true,
+    },
+    ProviderMeta {
+        id: "lm_studio",
+        secret: Some(("LM_STUDIO_API_KEY", "API key")),
+        endpoint: Some(("LM_STUDIO_API_BASE", "Base URL", "http://127.0.0.1:1234/v1")),
+        key_url: None,
+        // LM Studio's CLI, installed beside the app; `lms` is on PATH once the
+        // user has run its bootstrap.
+        launch: Some(("lms", &["server", "start"])),
+        pullable: false,
+    },
+    ProviderMeta {
+        id: "aimlapi",
+        secret: Some(("AIMLAPI_API_KEY", "API key")),
+        endpoint: Some(("AIMLAPI_OPENAI_BASE", "Base URL", "https://api.aimlapi.com/v1")),
+        key_url: Some("https://aimlapi.com/app/keys"),
+        launch: None,
+        pullable: false,
+    },
+    ProviderMeta {
+        id: "anthropic",
+        secret: Some(("ANTHROPIC_API_KEY", "API key")),
+        endpoint: None,
+        key_url: Some("https://console.anthropic.com/settings/keys"),
+        launch: None,
+        pullable: false,
+    },
+    ProviderMeta {
+        id: "gemini",
+        secret: Some(("GEMINI_API_KEY", "API key")),
+        endpoint: None,
+        key_url: Some("https://aistudio.google.com/apikey"),
+        launch: None,
+        pullable: false,
+    },
 ];
 
-pub const ENDPOINT_FIELDS: [(&str, &str, &str); 3] = [
-    ("OLLAMA_API_BASE", "Ollama base URL", "http://127.0.0.1:11434"),
-    ("LM_STUDIO_API_BASE", "LM Studio base URL", "http://127.0.0.1:1234/v1"),
-    ("AIMLAPI_OPENAI_BASE", "AI/ML API base URL", "https://api.aimlapi.com/v1"),
-];
+pub fn meta(id: &str) -> Option<&'static ProviderMeta> {
+    PROVIDER_META.iter().find(|m| m.id == id)
+}
 
 #[derive(Default)]
 pub struct State {
@@ -34,6 +89,14 @@ pub struct State {
     pub drafts: Vec<(String, String)>,
     pub default_provider: String,
     pub default_model: String,
+    /// Provider id whose settings modal is open.
+    pub open: Option<String>,
+    /// Draft name for an Ollama pull, in the open modal.
+    pub pull_name: String,
+    /// Models Ollama has on this machine, with their sizes — the Model ops
+    /// card, shown where a model is actually chosen. Empty when Ollama is down;
+    /// that is not an error banner, the catalog row already says it is stopped.
+    pub local_models: Vec<OllamaModelSummary>,
     pub busy: bool,
     pub error: Option<String>,
     pub notice: crate::domain::Toast,
@@ -62,11 +125,19 @@ impl State {
 
     /// Models offered for the currently chosen default provider.
     pub fn model_options(&self) -> Vec<String> {
+        self.models_of(&self.default_provider)
+    }
+
+    pub fn models_of(&self, provider: &str) -> Vec<String> {
         self.catalog
             .iter()
-            .find(|p| p.id == self.default_provider)
+            .find(|p| p.id == provider)
             .map(|p| p.models.options.clone())
             .unwrap_or_default()
+    }
+
+    pub fn entry(&self, provider: &str) -> Option<&ProviderEntry> {
+        self.catalog.iter().find(|p| p.id == provider)
     }
 
     fn set_draft(&mut self, key: &str, value: String) {
@@ -86,6 +157,7 @@ impl State {
                 "GEMINI_API_KEY" => body.gemini_api_key = v,
                 "AIMLAPI_API_KEY" => body.aimlapi_api_key = v,
                 "LM_STUDIO_API_KEY" => body.lm_studio_api_key = v,
+                "ANTHROPIC_API_KEY" => body.anthropic_api_key = v,
                 "OLLAMA_API_BASE" => body.ollama_api_base = v,
                 "LM_STUDIO_API_BASE" => body.lm_studio_api_base = v,
                 "AIMLAPI_OPENAI_BASE" => body.aimlapi_openai_base = v,
@@ -111,20 +183,30 @@ pub enum Message {
     Refresh,
     EnvLoaded(Result<Box<LlmEnv>, String>),
     CatalogLoaded(Result<Vec<ProviderEntry>, String>),
+    LocalModelsLoaded(Result<Vec<OllamaModelSummary>, String>),
     FieldChanged(&'static str, String),
     DefaultProviderChanged(String),
     DefaultModelChanged(String),
+    /// A model picked inside a provider's modal: it becomes the default model
+    /// *and* makes that provider the default one.
+    ProviderModelPicked(String, String),
+    /// Open / close the per-provider settings modal.
+    Open(String),
+    Close,
+    /// Start a local backend with the command in its [`ProviderMeta`].
+    Launch(&'static str),
+    /// Open a provider's key page in the browser.
+    OpenUrl(&'static str),
+    PullNameChanged(String),
+    PullModel,
+    Pulled(Result<i64, String>),
     Save,
     Saved(Result<String, String>),
     Dismiss,
 }
 
-fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
-    r.map_err(|e| e.to_string())
-}
-
 pub fn refresh(client: &Client) -> Task<Message> {
-    let (c1, c2) = (client.clone(), client.clone());
+    let (c1, c2, c3) = (client.clone(), client.clone(), client.clone());
     Task::batch([
         Task::perform(
             async move { err_string(c1.llm_env().await).map(Box::new) },
@@ -133,6 +215,10 @@ pub fn refresh(client: &Client) -> Task<Message> {
         Task::perform(
             async move { err_string(c2.llm_providers().await).map(|c| c.providers) },
             Message::CatalogLoaded,
+        ),
+        Task::perform(
+            async move { err_string(c3.ollama_models().await).map(|r| r.models) },
+            Message::LocalModelsLoaded,
         ),
     ])
 }
@@ -155,6 +241,12 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.error = None;
             state.catalog = providers;
             state.catalog_loaded = true;
+            Task::none()
+        }
+        // Ollama being down is the normal case here, not a failure worth a
+        // banner: the catalog row already renders it as "stopped".
+        Message::LocalModelsLoaded(result) => {
+            state.local_models = result.unwrap_or_default();
             Task::none()
         }
         Message::CatalogLoaded(Err(e)) => {
@@ -183,6 +275,70 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::DefaultModelChanged(model) => {
             state.default_model = model;
             Task::none()
+        }
+        Message::ProviderModelPicked(provider, model) => {
+            state.default_provider = provider;
+            state.default_model = model;
+            Task::none()
+        }
+
+        Message::Open(provider) => {
+            state.pull_name.clear();
+            state.open = Some(provider);
+            Task::none()
+        }
+        Message::Close => {
+            state.open = None;
+            Task::none()
+        }
+        Message::Launch(provider) => {
+            let Some((program, args)) = meta(provider).and_then(|m| m.launch) else {
+                return Task::none();
+            };
+            match crate::shell::spawn_detached(program, args) {
+                // The backend needs a moment to bind before it answers a probe,
+                // so the catalog is not refreshed here — the user hits Refresh.
+                Ok(()) => state.notice.set(format!("Started `{program}`. Refresh once it is up.")),
+                Err(e) => state.error = Some(format!("Could not start `{program}`: {e}")),
+            }
+            Task::none()
+        }
+        Message::OpenUrl(url) => {
+            crate::shell::open_url(url);
+            Task::none()
+        }
+        Message::PullNameChanged(name) => {
+            state.pull_name = name;
+            Task::none()
+        }
+        Message::PullModel => {
+            let name = state.pull_name.trim().to_string();
+            if name.is_empty() {
+                state.error = Some("Enter a model name to pull.".into());
+                return Task::none();
+            }
+            state.busy = true;
+            let client = client.clone();
+            Task::perform(
+                async move { err_string(client.pull_ollama_model(&name).await).map(|j| j.id) },
+                Message::Pulled,
+            )
+        }
+        Message::Pulled(result) => {
+            state.busy = false;
+            match result {
+                Ok(_) => {
+                    state.pull_name.clear();
+                    // The job runs on the server; this screen has no poll, so
+                    // say so rather than implying the list updates itself.
+                    state.notice.set("Pull started in the background. Refresh to see it land.");
+                    Task::none()
+                }
+                Err(e) => {
+                    state.error = Some(e);
+                    Task::none()
+                }
+            }
         }
 
         Message::Save => {
@@ -281,6 +437,45 @@ mod tests {
         let body = s.pending();
         assert_eq!(body.default_provider.as_deref(), Some("gemini"));
         assert_eq!(body.default_model.as_deref(), Some(""));
+    }
+
+    /// Every field a modal can render has to reach `EnvUpdate`, or the dialog
+    /// silently drops what was typed into it.
+    #[test]
+    fn every_provider_secret_and_endpoint_is_a_field_the_save_body_carries() {
+        for m in &PROVIDER_META {
+            for key in m.secret.map(|(k, _)| k).into_iter().chain(m.endpoint.map(|(k, _, _)| k)) {
+                let mut s = State::default();
+                let _ = update(&mut s, &client(), Message::FieldChanged(key, "v".into()));
+                let body = s.pending();
+                let json = serde_json::to_value(&body).unwrap();
+                assert_eq!(json.get(key).and_then(|v| v.as_str()), Some("v"), "{key} is dropped");
+            }
+        }
+    }
+
+    /// Ollama being down is the normal case on this screen — the catalog row
+    /// already says "stopped", so the model list must not also raise a banner.
+    #[test]
+    fn a_missing_ollama_does_not_raise_an_error_banner() {
+        let mut s = loaded();
+        let _ =
+            update(&mut s, &client(), Message::LocalModelsLoaded(Err("connection refused".into())));
+        assert!(s.error.is_none());
+        assert!(s.local_models.is_empty());
+    }
+
+    #[test]
+    fn picking_a_model_in_a_modal_also_claims_the_default_provider() {
+        let mut s = loaded();
+        let _ = update(
+            &mut s,
+            &client(),
+            Message::ProviderModelPicked("gemini".into(), "gemini-2.0-flash".into()),
+        );
+        let body = s.pending();
+        assert_eq!(body.default_provider.as_deref(), Some("gemini"));
+        assert_eq!(body.default_model.as_deref(), Some("gemini-2.0-flash"));
     }
 
     #[test]

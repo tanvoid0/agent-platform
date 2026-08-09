@@ -4,6 +4,7 @@
 //! Build jobs are polled rather than streamed — the job endpoint already
 //! returns `log_tail`, so one poll gives both status and logs.
 
+use crate::domain::{err_string, non_empty};
 use agent_platform_client::types::*;
 use agent_platform_client::Client;
 use iced::Task;
@@ -101,10 +102,6 @@ pub enum Message {
 
     PickDatasetFile,
     DatasetUploaded(Result<Option<String>, String>),
-}
-
-fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
-    r.map_err(|e| e.to_string())
 }
 
 pub fn refresh(client: &Client) -> Task<Message> {
@@ -363,11 +360,6 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             Task::none()
         }
     }
-}
-
-fn non_empty(s: &str) -> Option<String> {
-    let t = s.trim();
-    (!t.is_empty()).then(|| t.to_string())
 }
 
 fn is_terminal_job_status(status: &str) -> bool {

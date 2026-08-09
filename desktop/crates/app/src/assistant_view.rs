@@ -8,7 +8,8 @@
 //! band pass over the mic (or over E.V.'s own playback) at 60 fps, so nothing
 //! on screen is a canned loop — the web spokes *are* the spectrum bins.
 
-use crate::assistant::{Message, Mode, State, BANDS, WAVE};
+use crate::assistant::{Message, Mode, State};
+use crate::assistant_gate::{BANDS, WAVE};
 use crate::shell::HudStyle;
 use crate::ui::{self, space, theme, Icon, Tone};
 use iced::widget::canvas::{self, Frame, Geometry, LineCap, Path, Stroke, Text};
@@ -109,7 +110,7 @@ pub fn panel<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Eleme
         // hidden: learning, locked on, or told this was someone else.
         match (state.voice_enrolled(), state.voice_sim) {
             (false, _) if state.armed() => ui::caption("Learning your voice…".to_string()),
-            (true, Some(sim)) if sim < crate::assistant::VOICE_MATCH => {
+            (true, Some(sim)) if sim < crate::assistant_gate::VOICE_MATCH => {
                 ui::caption("Different voice — parked, not sent".to_string())
             }
             (true, _) => ui::caption("Voice ID locked".to_string()),

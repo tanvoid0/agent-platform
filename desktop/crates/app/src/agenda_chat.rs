@@ -11,6 +11,7 @@
 //! turn is a single slow request, and the user's own message is shown optimistically
 //! while it runs.
 
+use crate::domain::err_string;
 use agent_platform_client::types::*;
 use agent_platform_client::Client;
 use iced::widget::markdown;
@@ -216,10 +217,6 @@ pub enum Message {
     Applied(Result<AssistantApplyResult, String>),
     LinkClicked(String),
     DismissError,
-}
-
-fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
-    r.map_err(|e| e.to_string())
 }
 
 fn load_thread(client: &Client, project: i64, thread: Option<i64>) -> Task<Message> {

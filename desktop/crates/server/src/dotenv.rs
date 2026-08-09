@@ -32,9 +32,14 @@ use crate::env_opt;
 use crate::llm_config::parse_env_text;
 
 /// Never taken from YAML: `config/agent_platform.yaml` is committed, and these
-/// belong in `.env` or the real environment only. Mirrors `_SECRET_ENV_KEYS`.
-const YAML_SECRET_KEYS: [&str; 3] =
-    ["AGENT_PLATFORM_MASTER_KEY", "GEMINI_API_KEY", "LM_STUDIO_API_KEY"];
+/// belong in `.env` or the real environment only.
+///
+/// This is `llm_admin`'s masking list, not a copy of it. A key that `GET /env`
+/// hides is a key that must not arrive from a committed file, and the two lists
+/// spelled separately had already drifted — the admin surface masked
+/// `AIMLAPI_API_KEY` and `ANTHROPIC_API_KEY` while the copy here still let the
+/// YAML supply them.
+use crate::llm_admin::SENSITIVE_ENV_KEYS as YAML_SECRET_KEYS;
 
 /// Apply both files to the process environment.
 ///

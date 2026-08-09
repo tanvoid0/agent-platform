@@ -48,3 +48,8 @@ services/speech-service/voices/
 # in `git status` after a test run.
 *.db-wal
 *.db-shm
+
+# `orm/rustpa` — an experimental Rust ORM and its derive macros, in their own
+# cargo workspace with their own target dir. Nothing under `desktop/` depends on
+# it and no build touches it; it lives here to be worked on, not to be shipped.
+/orm/

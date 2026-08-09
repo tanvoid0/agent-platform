@@ -620,6 +620,8 @@ pub struct EnvUpdate {
     pub lm_studio_api_base: Option<String>,
     #[serde(rename = "LM_STUDIO_API_KEY", skip_serializing_if = "Option::is_none")]
     pub lm_studio_api_key: Option<String>,
+    #[serde(rename = "ANTHROPIC_API_KEY", skip_serializing_if = "Option::is_none")]
+    pub anthropic_api_key: Option<String>,
     #[serde(rename = "DEFAULT_PROVIDER", skip_serializing_if = "Option::is_none")]
     pub default_provider: Option<String>,
     #[serde(rename = "DEFAULT_MODEL", skip_serializing_if = "Option::is_none")]

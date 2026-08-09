@@ -5,6 +5,7 @@
 //! the subscription is gated on the polled status exactly as the web hook was —
 //! a terminal process replaying a backlog closes without a sentinel.
 
+use crate::domain::{err_string, non_empty};
 use crate::domain::{self, BoardColumn, BoardRow};
 use agent_platform_client::types::*;
 use agent_platform_client::Client;
@@ -314,10 +315,6 @@ impl From<crate::graph::CanvasEvent> for Message {
     fn from(event: crate::graph::CanvasEvent) -> Self {
         Message::Canvas(event)
     }
-}
-
-fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
-    r.map_err(|e| e.to_string())
 }
 
 pub fn load_lists(client: &Client) -> Task<Message> {
@@ -674,11 +671,6 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             crate::chat::update(thread, client, (&provider, &model), msg).map(Message::Chat)
         }
     }
-}
-
-fn non_empty(s: &str) -> Option<String> {
-    let t = s.trim();
-    (!t.is_empty()).then(|| t.to_string())
 }
 
 fn is_terminal_status(status: ProcessStatus) -> bool {

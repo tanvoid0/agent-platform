@@ -6,26 +6,15 @@
 //! test in a shared binary would decide the answer for every other test running
 //! beside it.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use agent_platform_server::{router, AppState};
+mod common;
 
 const ALLOWED: &str = "http://localhost:5173";
 
-fn temp_db_path() -> PathBuf {
-    std::env::temp_dir().join(format!("agp-cors-test-{}.db", std::process::id()))
-}
-
+/// No schema: `/health` is a bare `SELECT 1` and the preflight never reaches a
+/// handler, so nothing here reads a table. The CORS layer wraps the router
+/// either way, which is the whole subject.
 async fn start_server() -> String {
-    let db = temp_db_path();
-    let _ = std::fs::remove_file(&db);
-    let state = Arc::new(AppState::new(&db, Some("master-key-under-test".into())));
-    agent_platform_server::db::ensure_schema(&state.any).await.unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
-    origin
+    common::start_server(&common::temp_db_path("cors-test"), Some(common::MASTER)).await
 }
 
 #[tokio::test]

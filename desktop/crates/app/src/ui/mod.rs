@@ -887,20 +887,29 @@ pub fn model_pickers<'a, M: 'a + Clone>(
     ])
 }
 
+/// Any banner with a Dismiss on its right. `extra` sits between the two, for
+/// repairs specific to what the banner says (opening mic settings, say), and is
+/// usually empty.
+pub fn dismissible<'a, M: 'a + Clone>(
+    inner: Element<'a, M>,
+    on_dismiss: M,
+    extra: Vec<Element<'a, M>>,
+) -> Element<'a, M> {
+    let mut row: Vec<Element<'a, M>> = vec![container(inner).width(Length::Fill).into()];
+    row.extend(extra);
+    row.push(button_ghost(Icon::X, "Dismiss", on_dismiss));
+    cluster(row).into()
+}
+
 /// A turn's error, over the composer that will retry it: the message, the way
-/// into the logs behind it, and the way to dismiss it. `extra` is for repairs
-/// specific to one error (opening mic settings, say) and is usually empty.
+/// into the logs behind it, and the way to dismiss it.
 pub fn error_bar<'a, M: 'a + Clone>(
     message: &'a str,
     on_trace: impl Fn(String) -> M + 'a,
     on_dismiss: M,
     extra: Vec<Element<'a, M>>,
 ) -> Element<'a, M> {
-    let mut row: Vec<Element<'a, M>> =
-        vec![container(alert_error_traced(message, on_trace)).width(Length::Fill).into()];
-    row.extend(extra);
-    row.push(button_ghost(Icon::X, "Dismiss", on_dismiss));
-    cluster(row).into()
+    dismissible(alert_error_traced(message, on_trace), on_dismiss, extra)
 }
 
 /// Collapsible chain-of-thought section above a reasoning model's reply: a

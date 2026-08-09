@@ -5,6 +5,7 @@
 //! owns the step schema and validates on save, so the app round-trips the JSON
 //! verbatim and surfaces the server's error message when it is rejected.
 
+use crate::domain::err_string;
 use agent_platform_client::types::{
     WorkflowAssistBody, WorkflowAssistResponse, WorkflowBody, WorkflowInfo, WorkflowRunInfo,
 };
@@ -97,10 +98,6 @@ pub enum Message {
     Dismiss,
     /// "View logs" on a traced error banner — intercepted in `main::update`
     TraceLogs(String),
-}
-
-fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
-    r.map_err(|e| e.to_string())
 }
 
 /// Step errors can carry a whole HTML error page; the banner needs one line,

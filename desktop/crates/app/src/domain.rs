@@ -232,13 +232,46 @@ pub fn parse_task_dependencies(task: &TaskNodeRecord) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(&task.dependencies_json).unwrap_or_default()
 }
 
+/// Clip to `max` *characters* — not bytes, so a multi-byte name cannot be cut
+/// mid-codepoint — with an ellipsis standing in for what was dropped. The
+/// ellipsis is outside the budget, as three screens independently decided.
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
 /// Shortened uuid for dense UI (`web/src/api/dag.ts` shortUuid).
 pub fn short_uuid(uuid: &str) -> String {
-    let t = uuid.trim();
-    if t.chars().count() <= 8 {
-        t.to_string()
+    truncate(uuid.trim(), 8)
+}
+
+/// A trimmed field, or `None` when the user left it blank. Every screen with an
+/// optional text input wants this before it builds a request body: the server
+/// reads `""` as "set it to empty", which is not what an untouched field means.
+pub fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Flatten a client error into the `String` every screen's `error` field holds.
+/// `Task::perform` needs an owned, `'static` result, and no screen has ever
+/// matched on the error's variant.
+pub fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
+    r.map_err(|e| e.to_string())
+}
+
+/// Model weights on disk, GB above a gigabyte and MB below. Shared by Model ops
+/// and the Ollama provider dialog, which list the same models.
+pub fn format_size(bytes: i64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
     } else {
-        format!("{}…", t.chars().take(8).collect::<String>())
+        format!("{:.0} MB", b / (1024.0 * 1024.0))
     }
 }
 
