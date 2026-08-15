@@ -103,9 +103,14 @@ impl Size {
 /// Full-control button; the helpers below cover the common cases. Buttons carry
 /// a leading icon (shadcn's `<Button><Icon /> Label</Button>`); pass `None` only
 /// where a glyph would add noise.
+///
+/// `label` takes `impl text::IntoFragment` (as `heading`/`body`/`badge` already
+/// do), not a bare `&'a str`, so a computed label ("Open in Google") works here
+/// the same as a literal one — the only difference from a plain `&str` call
+/// site is that `text(label)` accepts an owned `String` too.
 pub fn button_sized<'a, M: 'a + Clone>(
     glyph: Option<Icon>,
-    label: &'a str,
+    label: impl text::IntoFragment<'a>,
     variant: ButtonVariant,
     size: Size,
     on_press: Option<M>,
@@ -127,7 +132,7 @@ pub fn button_sized<'a, M: 'a + Clone>(
 /// `<Button>` — primary action.
 pub fn button_default<'a, M: 'a + Clone>(
     glyph: Icon,
-    label: &'a str,
+    label: impl text::IntoFragment<'a>,
     on_press: M,
 ) -> Element<'a, M> {
     button_sized(Some(glyph), label, ButtonVariant::Default, Size::Sm, Some(on_press))
@@ -136,7 +141,7 @@ pub fn button_default<'a, M: 'a + Clone>(
 /// `<Button variant="secondary">`
 pub fn button_secondary<'a, M: 'a + Clone>(
     glyph: Icon,
-    label: &'a str,
+    label: impl text::IntoFragment<'a>,
     on_press: M,
 ) -> Element<'a, M> {
     button_sized(Some(glyph), label, ButtonVariant::Secondary, Size::Sm, Some(on_press))
@@ -145,7 +150,7 @@ pub fn button_secondary<'a, M: 'a + Clone>(
 /// `<Button variant="outline">`
 pub fn button_outline<'a, M: 'a + Clone>(
     glyph: Icon,
-    label: &'a str,
+    label: impl text::IntoFragment<'a>,
     on_press: M,
 ) -> Element<'a, M> {
     button_sized(Some(glyph), label, ButtonVariant::Outline, Size::Sm, Some(on_press))
@@ -154,7 +159,7 @@ pub fn button_outline<'a, M: 'a + Clone>(
 /// `<Button variant="ghost">`
 pub fn button_ghost<'a, M: 'a + Clone>(
     glyph: Icon,
-    label: &'a str,
+    label: impl text::IntoFragment<'a>,
     on_press: M,
 ) -> Element<'a, M> {
     button_sized(Some(glyph), label, ButtonVariant::Ghost, Size::Sm, Some(on_press))
@@ -226,7 +231,7 @@ pub fn toggle<'a, M: 'a + Clone>(
 /// `<Button variant="destructive">`
 pub fn button_destructive<'a, M: 'a + Clone>(
     glyph: Icon,
-    label: &'a str,
+    label: impl text::IntoFragment<'a>,
     on_press: M,
 ) -> Element<'a, M> {
     button_sized(Some(glyph), label, ButtonVariant::Destructive, Size::Sm, Some(on_press))
@@ -786,6 +791,26 @@ pub fn input_submit<'a, M: 'a + Clone>(
         .on_input(on_input)
         .on_submit(on_submit)
         .size(font::SM)
+        .padding(Padding::from([8.0, 12.0]))
+        .style(theme::input)
+        .into()
+}
+
+/// [`input_submit`], set in the monospace font — the one editable surface in
+/// the app that shows a string the user might type straight over (the Search
+/// screen's dork box). Same style otherwise, so it reads as an input and not
+/// as a code block someone forgot to make editable.
+pub fn input_mono_submit<'a, M: 'a + Clone>(
+    placeholder: &'a str,
+    value: &'a str,
+    on_input: impl Fn(String) -> M + 'a,
+    on_submit: M,
+) -> Element<'a, M> {
+    text_input(placeholder, value)
+        .on_input(on_input)
+        .on_submit(on_submit)
+        .size(font::XS)
+        .font(iced::Font::MONOSPACE)
         .padding(Padding::from([8.0, 12.0]))
         .style(theme::input)
         .into()

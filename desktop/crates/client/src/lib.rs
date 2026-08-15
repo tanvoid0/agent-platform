@@ -9,4 +9,4 @@ pub mod enums;
 pub mod sse;
 pub mod types;
 
-pub use client::{Client, Error, Result};
+pub use client::{Client, DorkRequest, Error, Result};

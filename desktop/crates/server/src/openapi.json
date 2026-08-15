@@ -11663,6 +11663,670 @@
     }
    }
   },
+  "/api/v1/search": {
+   "get": {
+    "tags": [
+     "search"
+    ],
+    "summary": "Search",
+    "description": "ADR 0008's amendment (\"results, behind a key\"): resolves the query exactly as GET /api/v1/search/dork does (ask=, q=, engine, site, filetype, drop, add_field/add_value all mean the same thing here), then, only when a search provider key is configured on this install, runs it and reads results back. The response is everything /search/dork returns (query, url, engine, source, recipes, parts, explanation, chips) plus three fields: `configured` (bool), `results` (array of {title, url, domain, snippet}), and `total_estimate` (integer or null). No key configured is the default install state, not an error: `configured` is false, `results` is an empty array, `total_estimate` is null, and every other field is populated exactly as /search/dork would answer it — an unconfigured install must not be told apart from a search that matched nothing by an empty `results` array alone, which is what `configured` is for. A key without a search-engine id (SEARCH_CX) is unconfigured the same way, not a partial configuration. `limit` caps how many results come back, default and maximum 10 — the search provider's own per-call cap, never paginated to fake a larger number (see `total_estimate` for that). A key Google rejects, or that has run out of its daily quota, is a real error distinct from `configured: false` and is answered with the provider's own message and a non-2xx status, not folded into the unconfigured response.",
+    "operationId": "search_api_v1_search_get",
+    "parameters": [
+     {
+      "name": "ask",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Ask"
+      }
+     },
+     {
+      "name": "q",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Q"
+      }
+     },
+     {
+      "name": "engine",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Engine"
+      }
+     },
+     {
+      "name": "site",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Site"
+      }
+     },
+     {
+      "name": "filetype",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Filetype"
+      }
+     },
+     {
+      "name": "drop",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Drop"
+      }
+     },
+     {
+      "name": "add_field",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Add Field"
+      }
+     },
+     {
+      "name": "add_value",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Add Value"
+      }
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Limit",
+       "description": "Capped at 10 regardless of what is asked for — the search provider's own per-call limit."
+      }
+     },
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response Search Api V1 Search Get"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Neither ask nor q was given, or add_field/add_value named an unknown field or failed that field's guard",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response Search Api V1 Search Get 400"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/api/v1/search/dork": {
+   "get": {
+    "tags": [
+     "search"
+    ],
+    "summary": "Search Dork",
+    "description": "Translates a sentence (?ask=) or an already-written dork (?q=) into a Google dork query: the operator string, the ready-to-open URL, the parsed parts, one removable chip per part, and a plain-English explanation. q wins when both are given. Neither given is a 400. Optional engine (google|duckduckgo|bing, default google), site and filetype override or augment the translation. `drop` removes one piece already in the query before re-rendering — the exact token `render()` emitted for it (`site:reddit.com`, `filetype:pdf`, `-membrane`, `intitle:\"Foo Bar\"`); an unmatched `drop` is a no-op, not a 400. `add_field`/`add_value` are the inverse of `drop`: they add one operator to the query, built server-side (so the caller never spells dork syntax itself) and applied after `drop`, before the `site`/`filetype` overrides. `add_field` is a parts field name (`sites`, `exclude_sites`, `related`, `exclude`, `exact`, `any_of`, `intitle`, `intext`, `inurl`, `filetype`, `after`, `before`, `range`); `add_value` is the raw value (for `range`, `lo..hi` or `lo-hi`). Unlike `drop`, an unknown `add_field` or an `add_value` that fails that field's guard (whitespace in a domain, a non-numeric range) is a 400 naming the problem — a failed add would otherwise be the user's action doing nothing with no feedback. No outbound HTTP: this route calls at most this server's own /v1/chat/completions to translate ask= when the deterministic rules found nothing beyond plain terms. `explanation` mixes two row shapes, told apart by `kind`: `{kind: \"recipe\", label, meaning}` for a fired named intent (label is a recipe name like \"document\") and `{kind: \"operator\", label, meaning}` for a per-operator line (label is the operator string itself, like \"site:reddit.com\") — a recipe name is not an operator, so the two are never folded into one field. `chips` is one entry per removable element of `parts` — `{token, label, field}` — built server-side by `DorkQuery::chips` with the same grammar `drop` matches: `token` is handed back verbatim as `drop=`, `label` is the value with its operator prefix stripped for display, and `field` names the `parts` field it came from (`sites`, `exclude`, `exact`, `any_of`, `intitle`, `intext`, `inurl`, `exclude_sites`, `related`, `filetype`, `after`, `before`, `range`) so a client can choose a tone without parsing dork syntax; a grouped `(site:a OR site:b)` in the rendered string still yields one chip per site, never one per collapsed group. `parts.filetype` also accepts a pasted `ext:` dork on the way in (`DorkQuery::parse` treats `ext:` as a `filetype:` synonym) but `parts`/`query` always report the canonical `filetype:` spelling back.",
+    "operationId": "search_dork_api_v1_search_dork_get",
+    "parameters": [
+     {
+      "name": "ask",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Ask"
+      }
+     },
+     {
+      "name": "q",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Q"
+      }
+     },
+     {
+      "name": "engine",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Engine"
+      }
+     },
+     {
+      "name": "site",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Site"
+      }
+     },
+     {
+      "name": "filetype",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Filetype"
+      }
+     },
+     {
+      "name": "drop",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Drop"
+      }
+     },
+     {
+      "name": "add_field",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Add Field"
+      }
+     },
+     {
+      "name": "add_value",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Add Value"
+      }
+     },
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response Search Dork Api V1 Search Dork Get"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Neither ask nor q was given, or add_field/add_value named an unknown field or failed that field's guard",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response Search Dork Api V1 Search Dork Get 400"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/api/v1/search/history": {
+   "get": {
+    "tags": [
+     "search"
+    ],
+    "summary": "List Search History",
+    "description": "This workspace's search history, newest first — every dork the app POSTed here, whether it was only built (opened=false) or actually run (opened=true). A workspace token sees only its own rows; the master key sees every workspace's. `limit` defaults to 50 and is capped at 200 regardless of what is asked for. `opened_only=true` restricts to rows that were actually run.",
+    "operationId": "list_search_history_api_v1_search_history_get",
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "integer",
+       "default": 50,
+       "title": "Limit"
+      }
+     },
+     {
+      "name": "opened_only",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "boolean",
+       "default": false,
+       "title": "Opened Only"
+      }
+     },
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response List Search History Api V1 Search History Get"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   },
+   "post": {
+    "tags": [
+     "search"
+    ],
+    "summary": "Create Search History",
+    "description": "Records one dork the caller built or ran — {query, engine, source, opened}, all required except opened (default false). Not called automatically by GET /search/dork; the app posts explicitly, opened=false when a query is built and opened=true when the user runs it. Posting a query already on file for this workspace with opened=false and now opened=true promotes that row (flips the flag, bumps created_at) instead of inserting a near-duplicate; every other post inserts. Missing or blank query/engine/source is a 400.",
+    "operationId": "create_search_history_api_v1_search_history_post",
+    "parameters": [
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Authorization"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "Body Create Search History Api V1 Search History Post"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Successful Response — an existing not-yet-opened row was promoted",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response Create Search History Api V1 Search History Post"
+        }
+       }
+      }
+     },
+     "201": {
+      "description": "Created — a new row was inserted",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response Create Search History Api V1 Search History Post 201"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "query, engine or source was missing or blank",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response Create Search History Api V1 Search History Post 400"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "tags": [
+     "search"
+    ],
+    "summary": "Clear Search History",
+    "description": "Deletes every row of this workspace's search history (every row, unfiltered, for the master key). Always 204, whether or not there was anything to delete.",
+    "operationId": "clear_search_history_api_v1_search_history_delete",
+    "parameters": [
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "Successful Response"
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/api/v1/search/history/{history_id}": {
+   "delete": {
+    "tags": [
+     "search"
+    ],
+    "summary": "Delete Search History",
+    "description": "Deletes one search history row. 404 — never 401 — when history_id belongs to a different workspace, so a workspace token cannot learn that another tenant's row exists.",
+    "operationId": "delete_search_history_api_v1_search_history__history_id__delete",
+    "parameters": [
+     {
+      "name": "history_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "integer",
+       "title": "History Id"
+      }
+     },
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "Successful Response"
+     },
+     "404": {
+      "description": "No such row, or it belongs to a different workspace",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "additionalProperties": true,
+         "title": "Response Delete Search History Api V1 Search History  History Id  Delete 404"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
   "/api/v1/system/status": {
    "get": {
     "tags": [

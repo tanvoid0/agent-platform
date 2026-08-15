@@ -622,6 +622,16 @@ pub struct EnvUpdate {
     pub lm_studio_api_key: Option<String>,
     #[serde(rename = "ANTHROPIC_API_KEY", skip_serializing_if = "Option::is_none")]
     pub anthropic_api_key: Option<String>,
+    /// Google Programmable Search credentials (ADR 0008's amendment) — not a
+    /// chat provider, so no `ProviderMeta` row, but the desktop's Providers
+    /// screen carries its own small card for these two, same write-only
+    /// contract as the fields above.
+    #[serde(rename = "SEARCH_API_KEY", skip_serializing_if = "Option::is_none")]
+    pub search_api_key: Option<String>,
+    /// Not a credential (`SENSITIVE_ENV_KEYS` on the server excludes it), so it
+    /// round-trips as plain text through `EnvKey::value` rather than a mask.
+    #[serde(rename = "SEARCH_CX", skip_serializing_if = "Option::is_none")]
+    pub search_cx: Option<String>,
     #[serde(rename = "DEFAULT_PROVIDER", skip_serializing_if = "Option::is_none")]
     pub default_provider: Option<String>,
     #[serde(rename = "DEFAULT_MODEL", skip_serializing_if = "Option::is_none")]
@@ -1071,4 +1081,216 @@ pub struct AssistantApplyResult {
     /// is not read, because the thread is refetched anyway.
     #[serde(default)]
     pub continuation: Option<Value>,
+}
+
+// -- Web search (ADR 0008, docs/web-search-module-plan.md) -------------------
+
+/// Mirrors the server's `DorkQuery` (`server/src/search_dork.rs`) field for
+/// field. Deserialization target for a response's `parts` only — rendering
+/// the operator string is the server's job alone
+/// (`GET /api/v1/search/dork?q=…&drop=…`), so removing a chip re-runs the
+/// search against the server rather than re-deriving the grammar here. See
+/// `docs/web-search-module-plan.md`. **Must not regain any rendering or
+/// operator-spelling logic** — that was deliberately deleted from this crate;
+/// no dork grammar exists outside the server's `search_dork.rs`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DorkParts {
+    #[serde(default)]
+    pub terms: String,
+    #[serde(default)]
+    pub exact: Vec<String>,
+    #[serde(default)]
+    pub any_of: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub sites: Vec<String>,
+    #[serde(default)]
+    pub exclude_sites: Vec<String>,
+    /// `related:` — sites similar to this one.
+    #[serde(default)]
+    pub related: Vec<String>,
+    #[serde(default)]
+    pub filetype: Option<String>,
+    #[serde(default)]
+    pub intitle: Vec<String>,
+    /// `intext:` — the page body must contain this.
+    #[serde(default)]
+    pub intext: Vec<String>,
+    #[serde(default)]
+    pub inurl: Vec<String>,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Google's `lo..hi` numeric range operator, kept as strings same as
+    /// `after`/`before` — this struct never evaluates the value, only carries it.
+    #[serde(default)]
+    pub range: Option<(String, String)>,
+}
+
+/// One removable chip — mirrors the server's `DorkChip`
+/// (`server/src/search_dork.rs::DorkQuery::chips`). `token` is handed back
+/// verbatim as `drop=` on the next request; `label` is display text with the
+/// dork operator prefix already stripped; `field` names the `DorkParts`
+/// field it came from (`sites`, `exclude`, `exact`, `any_of`, `intitle`,
+/// `inurl`, `exclude_sites`, `filetype`, `after`, `before`) so the client can
+/// pick a tone without parsing dork syntax.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DorkChip {
+    pub token: String,
+    pub label: String,
+    pub field: String,
+}
+
+/// One line of `search.rs`'s `explanation` array. `kind` is `"recipe"` (a
+/// fired intent recipe's own sentence — leads, rendered stronger) or
+/// `"operator"` (one per operator [`DorkParts::render`] can emit — follows,
+/// rendered lighter); see `server/src/search.rs`'s doc comment on why the two
+/// must not be folded into one shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DorkExplanationLine {
+    pub kind: String,
+    pub label: String,
+    pub meaning: String,
+}
+
+/// `GET /api/v1/search/dork`'s full response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DorkResponse {
+    pub query: String,
+    pub url: String,
+    pub engine: SearchEngine,
+    /// `"verbatim"` (from `q=`) | `"rules"` (a recipe fired) | `"model"` (the
+    /// server's own LLM translated it) — display only.
+    pub source: String,
+    #[serde(default)]
+    pub recipes: Vec<String>,
+    pub parts: DorkParts,
+    #[serde(default)]
+    pub explanation: Vec<DorkExplanationLine>,
+    /// One removable chip per element in `parts` — see [`DorkChip`]. The
+    /// client renders these directly rather than re-deriving dork grammar
+    /// from `parts` itself.
+    #[serde(default)]
+    pub chips: Vec<DorkChip>,
+}
+
+/// One result row from `GET /api/v1/search` (ADR 0008's amendment) — mirrors
+/// `server/src/search.rs::parse_cse_body`'s wire shape exactly.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub domain: String,
+    pub snippet: String,
+}
+
+/// `GET /api/v1/search`'s full response — everything [`DorkResponse`] answers
+/// (`#[serde(flatten)]`, since the server builds both from the same
+/// `dork_body` map) plus the amendment's three fields. `configured: false` is
+/// the default install and is **not** an error and **not** "no matches" —
+/// see `server/src/search.rs`'s module doc comment and the ADR amendment
+/// "results, behind a key". A caller must check `configured` before trusting
+/// `results`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchResponse {
+    #[serde(flatten)]
+    pub dork: DorkResponse,
+    pub configured: bool,
+    #[serde(default)]
+    pub results: Vec<SearchResult>,
+    #[serde(default)]
+    pub total_estimate: Option<i64>,
+}
+
+// -- Web search: history (`/api/v1/search/history`) --------------------------
+
+/// One row of `search_history` — mirrors `server/src/search.rs`'s
+/// `SearchHistoryOut`. `opened` is a wire boolean (the server's `sql_flag`
+/// serializer turns its `INTEGER` column into one); see that module's doc
+/// comment for why the column itself cannot be a `bool`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchHistoryEntry {
+    pub id: i64,
+    pub workspace_id: Option<i64>,
+    pub query: String,
+    pub engine: String,
+    pub source: String,
+    pub opened: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchHistoryResponse {
+    pub history: Vec<SearchHistoryEntry>,
+}
+
+#[cfg(test)]
+mod dork_tests {
+    use super::*;
+
+    #[test]
+    fn a_dork_response_decodes() {
+        let body = r#"{"query":"filetype:pdf intitle:\"Attention Is All You Need\"",
+            "url":"https://www.google.com/search?q=x","engine":"google","source":"rules",
+            "recipes":["document"],
+            "parts":{"terms":"","filetype":"pdf","intitle":["Attention Is All You Need"]},
+            "explanation":[{"kind":"recipe","label":"document","meaning":"Looking for a document"},
+                           {"kind":"operator","label":"filetype:pdf","meaning":"only results of file type pdf"}],
+            "chips":[{"token":"filetype:pdf","label":"pdf","field":"filetype"},
+                     {"token":"intitle:\"Attention Is All You Need\"","label":"Attention Is All You Need","field":"intitle"}]}"#;
+        let r: DorkResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(r.source, "rules");
+        assert_eq!(r.engine, SearchEngine::Google);
+        assert_eq!(r.parts.filetype.as_deref(), Some("pdf"));
+        assert_eq!(r.explanation[0].kind, "recipe");
+        assert_eq!(r.explanation[1].kind, "operator");
+        assert_eq!(r.chips.len(), 2);
+        assert_eq!(r.chips[0].token, "filetype:pdf");
+        assert_eq!(r.chips[0].field, "filetype");
+    }
+
+    /// The unconfigured path (ADR 0008's amendment) — everything `/dork`
+    /// answers is still present, flattened alongside `configured: false` and
+    /// an empty `results`.
+    #[test]
+    fn a_search_response_decodes_when_unconfigured() {
+        let body = r#"{"query":"cheap mechanical keyboard",
+            "url":"https://www.google.com/search?q=x","engine":"google","source":"verbatim",
+            "recipes":[],"parts":{"terms":"cheap mechanical keyboard"},"explanation":[],"chips":[],
+            "configured":false,"results":[],"total_estimate":null}"#;
+        let r: SearchResponse = serde_json::from_str(body).unwrap();
+        assert!(!r.configured);
+        assert!(r.results.is_empty());
+        assert_eq!(r.total_estimate, None);
+        // The flattened dork fields are still the real translation, not a stub.
+        assert_eq!(r.dork.query, "cheap mechanical keyboard");
+        assert_eq!(r.dork.source, "verbatim");
+    }
+
+    /// The keyed path: `results` and `total_estimate` populated alongside the
+    /// same dork fields `/dork` would have answered.
+    #[test]
+    fn a_search_response_decodes_with_results() {
+        let body = r#"{"query":"keyboard","url":"https://www.google.com/search?q=x",
+            "engine":"google","source":"verbatim","recipes":[],"parts":{"terms":"keyboard"},
+            "explanation":[],"chips":[],"configured":true,
+            "results":[{"title":"t","url":"https://example.com","domain":"example.com","snippet":"s"}],
+            "total_estimate":12400}"#;
+        let r: SearchResponse = serde_json::from_str(body).unwrap();
+        assert!(r.configured);
+        assert_eq!(r.results.len(), 1);
+        assert_eq!(r.results[0].domain, "example.com");
+        assert_eq!(r.total_estimate, Some(12400));
+    }
+
+    #[test]
+    fn a_search_history_list_decodes() {
+        let body = r#"{"history":[{"id":1,"workspace_id":null,"query":"keyboard",
+            "engine":"google","source":"verbatim","opened":true,"created_at":"2026-08-15T00:00:00"}]}"#;
+        let r: SearchHistoryResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(r.history.len(), 1);
+        assert!(r.history[0].opened);
+    }
 }

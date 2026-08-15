@@ -4,6 +4,17 @@
 //! Secrets are write-only. The server returns `set` + a masked tail, never the
 //! value, so an untouched key field means "leave what is stored alone" — an
 //! empty string would otherwise read as "clear it".
+//!
+//! **Web search (ADR 0008's amendment) is deliberately not a [`PROVIDER_META`]
+//! row.** That table is shaped around chat models — a models dropdown, a base
+//! URL, a launch command — and `SEARCH_API_KEY`/`SEARCH_CX` are two opaque
+//! strings with none of that; forcing them in means either widening the row
+//! for a shape only they use, or a row that renders mostly empty. It renders
+//! instead as its own small card (`providers_view.rs::search_card`), the same
+//! way the server's `llm_admin.rs` already treats it as a manual addition to
+//! `ENV_KEYS`/`SENSITIVE_ENV_KEYS` rather than a `ProviderSpec` row. See
+//! `search_credentials_reach_the_save_body` below for this file's half of the
+//! "not walked by a table, so pin it directly" pattern the server's tests use.
 
 use crate::domain::err_string;
 use agent_platform_client::types::*;
@@ -140,6 +151,30 @@ impl State {
         self.catalog.iter().find(|p| p.id == provider)
     }
 
+    /// Whether the *saved* `.env` (not an unsaved draft — same rule the
+    /// catalog badges above already follow) has this env key set.
+    fn env_set(&self, key: &str) -> bool {
+        self.env_key(key).is_some_and(|k| k.set)
+    }
+
+    /// `SearchBackend::from_env`'s "both or neither" rule, mirrored client-side
+    /// so the badge agrees with what `/api/v1/search` will actually do.
+    pub fn search_configured(&self) -> bool {
+        self.env_set("SEARCH_API_KEY") && self.env_set("SEARCH_CX")
+    }
+
+    /// `None` when search is fully configured or fully unset — there is
+    /// nothing more to say in either case. `Some` names the one field still
+    /// missing, for the half-configured state `SearchBackend::from_env`
+    /// treats as unconfigured (a key with no cx, or a cx with no key).
+    pub fn search_missing(&self) -> Option<&'static str> {
+        match (self.env_set("SEARCH_API_KEY"), self.env_set("SEARCH_CX")) {
+            (true, false) => Some("the search engine ID"),
+            (false, true) => Some("the API key"),
+            _ => None,
+        }
+    }
+
     fn set_draft(&mut self, key: &str, value: String) {
         match self.drafts.iter_mut().find(|(k, _)| k == key) {
             Some(slot) => slot.1 = value,
@@ -158,6 +193,8 @@ impl State {
                 "AIMLAPI_API_KEY" => body.aimlapi_api_key = v,
                 "LM_STUDIO_API_KEY" => body.lm_studio_api_key = v,
                 "ANTHROPIC_API_KEY" => body.anthropic_api_key = v,
+                "SEARCH_API_KEY" => body.search_api_key = v,
+                "SEARCH_CX" => body.search_cx = v,
                 "OLLAMA_API_BASE" => body.ollama_api_base = v,
                 "LM_STUDIO_API_BASE" => body.lm_studio_api_base = v,
                 "AIMLAPI_OPENAI_BASE" => body.aimlapi_openai_base = v,
@@ -328,6 +365,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.busy = false;
             match result {
                 Ok(_) => {
+                    state.error = None;
                     state.pull_name.clear();
                     // The job runs on the server; this screen has no poll, so
                     // say so rather than implying the list updates itself.
@@ -354,6 +392,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.busy = false;
             match result {
                 Ok(message) => {
+                    state.error = None;
                     state.notice.set(message);
                     refresh(client)
                 }
@@ -452,6 +491,60 @@ mod tests {
                 assert_eq!(json.get(key).and_then(|v| v.as_str()), Some("v"), "{key} is dropped");
             }
         }
+    }
+
+    /// `SEARCH_API_KEY`/`SEARCH_CX` are the non-chat-credential case
+    /// `every_provider_secret_and_endpoint_is_a_field_the_save_body_carries`'s
+    /// doc comment calls out: they have no `PROVIDER_META` row (search is not
+    /// an LLM provider — see this module's doc comment on the placement
+    /// call), so nothing walks a table to catch a dropped field here. This
+    /// pins both directly, the same way the server's
+    /// `search_credentials_are_present_and_masked_correctly` pins its side.
+    #[test]
+    fn search_credentials_reach_the_save_body() {
+        for key in ["SEARCH_API_KEY", "SEARCH_CX"] {
+            let mut s = State::default();
+            let _ = update(&mut s, &client(), Message::FieldChanged(key, "v".into()));
+            let body = s.pending();
+            let json = serde_json::to_value(&body).unwrap();
+            assert_eq!(json.get(key).and_then(|v| v.as_str()), Some("v"), "{key} is dropped");
+        }
+    }
+
+    /// Both required together — a key with no cx (or vice versa) must read as
+    /// unconfigured and name the missing one, never as silently half-working.
+    #[test]
+    fn search_is_configured_only_when_both_fields_are_set() {
+        let env = |key_set: bool, cx_set: bool| {
+            let mut keys = serde_json::Map::new();
+            if key_set {
+                keys.insert("SEARCH_API_KEY".into(), json!({"set": true, "masked": "****abcd"}));
+            }
+            if cx_set {
+                keys.insert("SEARCH_CX".into(), json!({"set": true, "value": "012345:abc"}));
+            }
+            let env: LlmEnv = serde_json::from_value(json!({
+                "keys": serde_json::Value::Object(keys),
+                "persisted_defaults": {"provider": "", "model": ""},
+                "resolved_defaults": {"provider": "", "model": ""},
+            }))
+            .unwrap();
+            let mut s = State::default();
+            let _ = update(&mut s, &client(), Message::EnvLoaded(Ok(Box::new(env))));
+            s
+        };
+
+        assert!(!env(false, false).search_configured());
+        assert!(env(false, false).search_missing().is_none(), "nothing to name when both are unset");
+
+        assert!(!env(true, false).search_configured());
+        assert_eq!(env(true, false).search_missing(), Some("the search engine ID"));
+
+        assert!(!env(false, true).search_configured());
+        assert_eq!(env(false, true).search_missing(), Some("the API key"));
+
+        assert!(env(true, true).search_configured());
+        assert!(env(true, true).search_missing().is_none());
     }
 
     /// Ollama being down is the normal case on this screen — the catalog row

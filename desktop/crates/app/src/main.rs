@@ -53,6 +53,8 @@ mod processes_view;
 mod providers;
 mod providers_view;
 mod screen;
+mod search;
+mod search_view;
 mod shell;
 mod stt;
 mod ui;
@@ -83,6 +85,7 @@ pub enum Screen {
     Plans,
     Agenda,
     Coder,
+    Search,
     Assistant,
     Memory,
     Logs,
@@ -195,6 +198,10 @@ pub struct App {
     /// Whether the window has the OS focus. Work that finishes behind another
     /// app is work the user did not see finish — see [`watching_key`].
     pub focused: bool,
+    /// Whether the login entry is currently registered. Read from the registry,
+    /// which is where that fact lives — see [`shell::autostart`]. Cached here
+    /// because `view` runs per frame and reading it spawns `reg.exe`.
+    pub autostart: bool,
     tray: Option<TrayIcon>,
     /// The tray's disabled status line, and the text it currently shows.
     tray_status: Option<MenuItem>,
@@ -233,6 +240,7 @@ pub struct App {
     pub todos: todos::State,
     pub agenda: agenda::State,
     pub coder: coder::State,
+    pub search: search::State,
     pub apidocs: apidocs::State,
     /// Whether a newer build has been published. Only ever filled by the user
     /// pressing the button in Settings → Status — nothing here phones home on
@@ -346,6 +354,10 @@ pub enum Message {
     SetVoiceName(String),
     /// Confirm card before E.V. runs a shell command. Persisted.
     SetConfirmCommands(bool),
+    /// Start the app at login. Persisted in the registry, not `settings.json`.
+    SetAutostart(bool),
+    /// Come up in the tray with no window. Persisted.
+    SetStartMinimized(bool),
     PickLocalModel,
     /// The GGUF for in-process inference: `None` is a cancelled picker, and an
     /// empty string clears the setting (back to server-answered turns).
@@ -372,6 +384,7 @@ pub enum Message {
     Todos(todos::Message),
     Agenda(agenda::Message),
     Coder(coder::Message),
+    Search(search::Message),
     ApiDocs(apidocs::Message),
 }
 
@@ -637,6 +650,7 @@ fn boot() -> (App, Task<Message>) {
         // Corrected by the first focus event; a window that opens is focused,
         // and one that never opens is covered by `window: None`.
         focused: true,
+        autostart: shell::autostart::enabled(),
         tray,
         tray_status,
         tray_status_text: String::new(),
@@ -682,6 +696,7 @@ fn boot() -> (App, Task<Message>) {
         todos: todos::State::default(),
         agenda: agenda::State::default(),
         coder: coder::State::restored(&coder_workspace, coder_provider, coder_model, coder_plan),
+        search: search::State::default(),
         apidocs: apidocs::State::default(),
         update_check: update_check::State::default(),
     };
@@ -785,6 +800,9 @@ fn enter_screen_inner(app: &mut App) -> Task<Message> {
         Screen::Workflows => Task::done(Message::Workflows(workflows::Message::Refresh)),
         Screen::Plans => Task::done(Message::Todos(todos::Message::Refresh)),
         Screen::Agenda => Task::done(Message::Agenda(agenda::Message::Refresh)),
+        // History is server-owned now (`/api/v1/search/history`) — another
+        // window, or E.V., can have added to it since the last visit.
+        Screen::Search => Task::done(Message::Search(search::Message::LoadHistory)),
         // Past sessions every visit — another window, or the CLI, can have
         // added one. The model dropdowns are fetched once; they change only
         // when a provider is configured, which is a different screen.
@@ -1186,6 +1204,20 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             save_settings(app);
             Task::none()
         }
+        Message::SetAutostart(on) => {
+            // Re-read rather than assume: the registry is the state, so a failed
+            // write must leave the toggle showing what is actually there.
+            if let Err(e) = shell::autostart::set(on) {
+                app.shell.log_line(format!("[shell] could not change the login entry: {e}"));
+            }
+            app.autostart = shell::autostart::enabled();
+            Task::none()
+        }
+        Message::SetStartMinimized(on) => {
+            app.settings.start_minimized = on;
+            save_settings(app);
+            Task::none()
+        }
         Message::SetWakeWord(on) => {
             // The assistant owns the recorder, so it does the opening and the
             // closing — and opening is the half that can fail.
@@ -1521,6 +1553,8 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::Workflows(msg) => {
             workflows::update(&mut app.workflows, &app.client, msg).map(Message::Workflows)
         }
+        Message::Search(search::Message::TraceLogs(id)) => trace_logs_task(app, id),
+        Message::Search(msg) => search::update(&mut app.search, &app.client, msg).map(Message::Search),
     }
 }
 

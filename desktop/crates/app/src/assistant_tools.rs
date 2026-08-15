@@ -19,21 +19,23 @@
 //! behind that — the card is the check.
 
 use crate::Screen;
+use agent_platform_client::types::SearchEngine;
 use agent_platform_client::Client;
 
 /// Tool names handled here. The assistant checks this before dispatching a call
 /// to the terminal.
-pub const TOOLS: [&str; 3] = ["api_get", "api_write", "open_screen"];
+pub const TOOLS: [&str; 4] = ["api_get", "api_write", "open_screen", "web_search"];
 
 /// Handled without leaving the update loop, against the app's own state rather
-/// than the network. `api_write` is in here because parking it *is* its
-/// synchronous answer — it reaches the network only after the user says so.
-pub const SYNC_TOOLS: [&str; 2] = ["open_screen", "api_write"];
+/// than the network. `api_write` and `web_search` are in here because parking
+/// is their synchronous answer — each reaches the network only after the user
+/// says so.
+pub const SYNC_TOOLS: [&str; 3] = ["open_screen", "api_write", "web_search"];
 
 /// Something the model asked to do that nobody has agreed to yet. Held on
 /// `assistant::State`, rendered as a confirm card, and only then run.
 ///
-/// Both variants are "this leaves the app and changes something outside it",
+/// Every variant is "this leaves the app and changes something outside it",
 /// which is the line the card draws. Reads (`api_get`, `list_memories`) never
 /// come through here — a confirmation for every one of those is a confirmation
 /// nobody reads, and then the one that mattered gets clicked through too.
@@ -54,21 +56,39 @@ pub enum Pending {
     /// do, which is exactly why it is on this list: the persona asking the model
     /// not to be destructive is a request, not a guard.
     Command { id: String, command: String },
+    /// A web search, waiting to be opened in the user's real browser
+    /// (`shell::open_url`) — see ADR 0008 decision 7. Only the query and the
+    /// engine are known here; the URL itself is only resolvable by calling
+    /// `GET /api/v1/search/dork`, which happens on approval.
+    Search {
+        id: String,
+        /// The dork the model wrote, or the sentence it asked — whichever was
+        /// given. Shown verbatim on the card, same reasoning as `Write`'s body.
+        query: String,
+        /// `true` when `query` is a dork already written (`q`, the form E.V.
+        /// is told to prefer); `false` when it is a sentence to translate
+        /// (`ask`). Decides which parameter `Client::search_dork` gets on
+        /// approval — sending a sentence as `q` would skip the server's
+        /// recipe/model translation entirely.
+        verbatim: bool,
+        engine: SearchEngine,
+    },
 }
 
 impl Pending {
     pub fn id(&self) -> &str {
         match self {
-            Pending::Write { id, .. } | Pending::Command { id, .. } => id,
+            Pending::Write { id, .. } | Pending::Command { id, .. } | Pending::Search { id, .. } => id,
         }
     }
 
     /// The card's question. Different words because they are different risks:
-    /// one is this app's data, the other is the whole machine.
+    /// this app's data, the whole machine, or the user's browser.
     pub fn heading(&self) -> &'static str {
         match self {
             Pending::Write { .. } => "Make this change?",
             Pending::Command { .. } => "Run this on your machine?",
+            Pending::Search { .. } => "Open this search in your browser?",
         }
     }
 
@@ -77,6 +97,10 @@ impl Pending {
         match self {
             Pending::Write { method, path, .. } => format!("{method} {path}"),
             Pending::Command { command, .. } => format!("$ {command}"),
+            // Named engine, not the URL: the URL does not exist yet (it is
+            // built server-side on approval), and a percent-encoded guess at
+            // it would be less honest than what is actually known right now.
+            Pending::Search { query, engine, .. } => format!("Search {engine} for: {query}"),
         }
     }
 
@@ -86,6 +110,8 @@ impl Pending {
             Pending::Write { body, .. } if *body != serde_json::json!({}) => {
                 Some(serde_json::to_string_pretty(body).unwrap_or_else(|_| body.to_string()))
             }
+            // The command/search are the whole of it — `summary` already says
+            // everything there is to agree to.
             _ => None,
         }
     }
@@ -94,7 +120,7 @@ impl Pending {
 /// Screens `open_screen` will move to, and what they hold. Doubles as the
 /// enum's allowed-values list in the tool spec, so the model cannot ask for a
 /// screen that does not exist.
-const SCREENS: [(&str, Screen, &str); 12] = [
+const SCREENS: [(&str, Screen, &str); 13] = [
     ("dashboard", Screen::Dashboard, "server health and the landing page"),
     ("processes", Screen::Processes, "agent runs, live and past"),
     ("projects", Screen::Projects, "projects"),
@@ -107,6 +133,7 @@ const SCREENS: [(&str, Screen, &str); 12] = [
     ("memory", Screen::Memory, "what E.V. remembers about the user"),
     ("logs", Screen::Logs, "the server log"),
     ("settings", Screen::Settings, "theme, voice, providers, model-ops"),
+    ("search", Screen::Search, "web search query builder"),
 ];
 
 pub fn screen_named(name: &str) -> Option<Screen> {
@@ -141,7 +168,12 @@ pub fn tools_spec() -> Vec<serde_json::Value> {
                     rejects a bare limit — it needs one of project_id, client_id or \
                     unassigned_only=true), \
                     /api/v1/processes/{id} (one run with its tasks), \
-                    /api/v1/system/status (server health). \
+                    /api/v1/system/status (server health), \
+                    /api/v1/search/dork?q=… (build a Google-dork web search query; q takes \
+                    dork operators — site:, filetype:, intitle:, \"exact phrase\", -exclude — \
+                    directly and is the form to prefer, since you can already write the \
+                    operators yourself and do not need the server to translate a sentence for \
+                    you; ask=… is the sentence-translating alternative). \
                     Only GET, only /api/v1/ — this cannot change anything.",
                 "parameters": {
                     "type": "object",
@@ -202,6 +234,38 @@ pub fn tools_spec() -> Vec<serde_json::Value> {
                         "screen": { "type": "string", "enum": screens }
                     },
                     "required": ["screen"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Open a web search in the user's real browser — this leaves the \
+                    app, so the user sees the query and the engine on a confirm card and has to \
+                    approve it before anything opens. Prefer q: a Google-dork query you write \
+                    yourself with operators (site:, filetype:, intitle:, \"exact phrase\", \
+                    -exclude) — you are already a language model, so writing the operators \
+                    yourself skips a translation round trip. Use ask instead only when you want \
+                    the server to translate a plain sentence for you.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "q": {
+                            "type": "string",
+                            "description": "A dork you already wrote, e.g. filetype:pdf intitle:\"Attention Is All You Need\"."
+                        },
+                        "ask": {
+                            "type": "string",
+                            "description": "A plain sentence to translate, when you are not writing the dork yourself."
+                        },
+                        "engine": {
+                            "type": "string",
+                            "enum": ["google", "duckduckgo", "bing"],
+                            "description": "Defaults to google."
+                        }
+                    },
+                    "required": []
                 }
             }
         }),
@@ -276,6 +340,42 @@ pub fn run_sync_tool(id: &str, name: &str, arguments: &str) -> Option<Sync> {
                 )));
             }
             Some(Sync::Parked(Box::new(Pending::Command { id: id.to_string(), command })))
+        }
+        "web_search" => {
+            let q = args.get("q").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            let ask =
+                args.get("ask").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            // `q` wins when both are given — it is already an operator string,
+            // so translating it too would be a round trip for nothing (same
+            // precedence as the server's own `search_dork` route).
+            let (query, verbatim) = match (q, ask) {
+                (Some(q), _) => (q.to_string(), true),
+                (None, Some(ask)) => (ask.to_string(), false),
+                // Unreadable, same reasoning as `run_command`'s blank check: a
+                // card with nothing to search is nothing the user can agree to.
+                (None, None) => {
+                    return Some(Sync::Answered(format!(
+                        "error: web_search needs {{\"q\": \"…\"}} (a dork) or {{\"ask\": \"…\"}} \
+                         (a sentence), got: {arguments}"
+                    )));
+                }
+            };
+            let raw_engine =
+                args.get("engine").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            let engine = match raw_engine {
+                None => SearchEngine::Google,
+                Some("google") => SearchEngine::Google,
+                Some("duckduckgo") => SearchEngine::DuckDuckGo,
+                Some("bing") => SearchEngine::Bing,
+                // Named upfront rather than left to fail on Run: a bad engine
+                // can only ever produce a card the user cannot usefully accept.
+                Some(other) => {
+                    return Some(Sync::Answered(format!(
+                        "error: engine must be google, duckduckgo or bing, got {other:?}"
+                    )));
+                }
+            };
+            Some(Sync::Parked(Box::new(Pending::Search { id: id.to_string(), query, verbatim, engine })))
         }
         _ => None,
     }
@@ -360,6 +460,66 @@ mod tests {
                 Sync::Answered(text) => assert!(text.starts_with("error:"), "{args}: {text}"),
                 other => panic!("{args} must not become a card: {other:?}"),
             }
+        }
+    }
+
+    /// Opening a browser leaves the app, so `web_search` goes through the same
+    /// gate as `run_command` and must never answer itself.
+    #[test]
+    fn web_search_parks_and_never_answers_itself() {
+        let out = run_sync_tool(
+            "s1",
+            "web_search",
+            r#"{"q":"filetype:pdf intitle:\"Attention Is All You Need\""}"#,
+        )
+        .unwrap();
+        let Sync::Parked(p) = out else { panic!("a search must park: {out:?}") };
+        assert_eq!(p.id(), "s1", "it has to answer the call that asked for it");
+        assert_eq!(
+            p.summary(),
+            "Search Google for: filetype:pdf intitle:\"Attention Is All You Need\""
+        );
+        assert_eq!(p.heading(), "Open this search in your browser?");
+        assert_eq!(p.detail(), None, "the query is the whole of it");
+        let Pending::Search { verbatim, engine, .. } = &*p else { panic!() };
+        assert!(*verbatim, "q is a dork already written");
+        assert_eq!(*engine, SearchEngine::Google, "default when engine is omitted");
+    }
+
+    /// `q` wins when both are given, matching the server's own precedence —
+    /// translating a dork the model already wrote would be a round trip for
+    /// nothing (`docs/web-search-module-plan.md`).
+    #[test]
+    fn a_dork_wins_over_a_sentence_when_both_are_given() {
+        let out = run_sync_tool(
+            "s2",
+            "web_search",
+            r#"{"q":"site:reddit.com keyboards","ask":"cheap keyboards","engine":"bing"}"#,
+        )
+        .unwrap();
+        let Sync::Parked(p) = out else { panic!("{out:?}") };
+        let Pending::Search { query, verbatim, engine, .. } = &*p else { panic!() };
+        assert_eq!(query, "site:reddit.com keyboards");
+        assert!(*verbatim);
+        assert_eq!(*engine, SearchEngine::Bing);
+    }
+
+    /// A blank query and a bad engine are both answered before a card, not
+    /// parked — a blank or unresolvable card is nothing the user can agree to.
+    #[test]
+    fn a_blank_query_and_a_bad_engine_are_refused_before_the_card() {
+        for args in [r#"{"q":"   "}"#, r#"{"ask":""}"#, "{}", "not json"] {
+            match run_sync_tool("s3", "web_search", args).unwrap() {
+                Sync::Answered(text) => assert!(text.starts_with("error:"), "{args}: {text}"),
+                other => panic!("{args} must not become a card: {other:?}"),
+            }
+        }
+        match run_sync_tool("s3", "web_search", r#"{"ask":"cats","engine":"yahoo"}"#).unwrap() {
+            Sync::Answered(text) => {
+                assert!(text.starts_with("error:"), "{text}");
+                assert!(text.contains("google"), "it must name the real ones: {text}");
+            }
+            other => panic!("a bad engine must not reach a confirm card: {other:?}"),
         }
     }
 

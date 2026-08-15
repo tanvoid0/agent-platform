@@ -17,7 +17,7 @@ use crate::assistant_voice::*;
 use crate::domain::non_empty;
 use agent_platform_client::sse::ChatChunk;
 use agent_platform_client::types::{ChatCompletionBody, ChatMessage, ProviderEntry, ToolCall};
-use agent_platform_client::Client;
+use agent_platform_client::{Client, DorkRequest};
 use iced::Task;
 use std::collections::VecDeque;
 use std::io::Cursor;
@@ -327,6 +327,29 @@ async fn run_pending(client: &Client, proposal: &crate::assistant_tools::Pending
             }
         }
         Pending::Command { command, .. } => run_command(command.clone(), None, TOOL_TIMEOUT).await,
+        Pending::Search { query, verbatim, engine, .. } => {
+            // `verbatim` decided at parking time which parameter this is —
+            // sending an `ask` sentence as `q` would skip the server's
+            // recipe/model translation entirely (`docs/web-search-module-plan.md`).
+            let (ask, q) = if *verbatim { (None, Some(query.as_str())) } else { (Some(query.as_str()), None) };
+            let req = DorkRequest { ask, q, engine: *engine, ..Default::default() };
+            match client.search_dork(req).await {
+                Ok(resp) => {
+                    // The browser, not this app, is the result surface — ADR
+                    // 0008 decision 1.
+                    crate::shell::open_url(&resp.url);
+                    // Best-effort: a search E.V. actually ran belongs in
+                    // history the same as one opened from the dashboard's
+                    // "Open in …" button — a failed write here must not turn
+                    // a search that already succeeded into a tool error.
+                    let _ = client
+                        .create_search_history(&resp.query, resp.engine.as_str(), &resp.source, true)
+                        .await;
+                    format!("Opened a {} search for: {}\n{}", resp.engine, resp.query, resp.url)
+                }
+                Err(e) => format!("error: {e}"),
+            }
+        }
     }
 }
 
@@ -945,8 +968,9 @@ impl State {
             return;
         }
         if let Some(bytes) = self.audio_queue.pop_front() {
-            if let Err(e) = self.play(bytes) {
-                self.error = Some(e);
+            match self.play(bytes) {
+                Ok(()) => self.error = None,
+                Err(e) => self.error = Some(e),
             }
         }
     }
@@ -1193,6 +1217,7 @@ pub fn update(
             state.push_turn("user", prompt);
             state.draft.clear();
             state.sending = true;
+            state.error = None;
             state.tool_rounds = 0;
             state.tool_buf.clear();
             state.request(client)
@@ -1461,6 +1486,7 @@ pub fn update(
                 state.error = Some(e);
                 return Task::none();
             }
+            state.error = None;
             // You pressed the button, so the first thing you say is obviously
             // for E.V. — the follow-up window opens here so it needs no name.
             // After that the name is the wake word.
@@ -1473,12 +1499,13 @@ pub fn update(
             match (on, state.voice) {
                 // Voice mode owns the mic while it is up; standby inherits it
                 // when the user leaves, and gives it back here.
-                (true, false) => {
-                    if let Err(e) = state.open_mic() {
+                (true, false) => match state.open_mic() {
+                    Ok(()) => state.error = None,
+                    Err(e) => {
                         state.error = Some(e);
                         state.standby = false;
                     }
-                }
+                },
                 (false, false) => state.close_mic(),
                 _ => {}
             }
@@ -1486,6 +1513,9 @@ pub fn update(
         }
         Message::Heard(result) => {
             state.transcribing = false;
+            if result.is_ok() {
+                state.error = None;
+            }
             match result {
                 Ok((text, print)) if !text.trim().is_empty() && !is_ghost(&text) => {
                     // Whose voice was that? Until enrolled, everything that got

@@ -166,3 +166,54 @@ impl ProcessSyncAction {
 }
 
 pub const PROCESS_SYNC_ACTIONS: [ProcessSyncAction; 5] = [ProcessSyncAction::None, ProcessSyncAction::Blocked, ProcessSyncAction::AlignedStatus, ProcessSyncAction::RequeuedPlan, ProcessSyncAction::RequeuedExecution];
+
+/// `GET /api/v1/search/dork`'s `engine` — mirrors the server's `Engine`
+/// (`server/src/search_dork.rs`), including its `google` default. Used both
+/// for display (the engine picker) and as a request param, so — unlike
+/// `source`/`kind` on the same route, which are read-only display strings —
+/// a typo here would be a silent bug rather than a cosmetic one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum SearchEngine {
+    #[serde(rename = "google")]
+    Google,
+    #[serde(rename = "duckduckgo")]
+    DuckDuckGo,
+    #[serde(rename = "bing")]
+    Bing,
+    #[serde(other)]
+    Unknown,
+}
+
+impl SearchEngine {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::DuckDuckGo => "duckduckgo",
+            Self::Bing => "bing",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl Default for SearchEngine {
+    fn default() -> Self {
+        Self::Google
+    }
+}
+
+/// Display label for the engine picker — the pick_list widget renders
+/// `ToString`, and "DuckDuckGo" reads better there than the wire spelling.
+impl std::fmt::Display for SearchEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Google => "Google",
+            Self::DuckDuckGo => "DuckDuckGo",
+            Self::Bing => "Bing",
+            Self::Unknown => "Unknown",
+        };
+        write!(f, "{label}")
+    }
+}
+
+pub const SEARCH_ENGINES: [SearchEngine; 3] =
+    [SearchEngine::Google, SearchEngine::DuckDuckGo, SearchEngine::Bing];

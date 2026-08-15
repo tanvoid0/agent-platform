@@ -29,6 +29,9 @@
 //! - **model ops** — `model_ops.rs`: all seventeen routes, including the build
 //!   pipeline, whose stages run as subprocesses against `worker/`
 //! - **status + logs** — `system.rs` over the ring in `observability.rs`
+//! - **web search** — `search.rs` (the one route) over `search_dork.rs` (the
+//!   pure `DorkQuery` translator, ADR 0008). No outbound HTTP: the browser
+//!   runs the search, this server only builds the query.
 //!
 //! Cross-cutting: `db.rs` (the SQLite/Postgres choke point, and the schema
 //! bootstrap that replaced Alembic), `wire.rs` and `error.rs` (shared shapes
@@ -85,6 +88,8 @@ pub mod processes;
 pub mod projects;
 pub mod provider_catalog;
 pub mod request_id;
+pub mod search;
+pub mod search_dork;
 pub mod system;
 pub mod teams;
 pub mod todos;
@@ -486,6 +491,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(llm_admin::routes())
         .merge(model_ops::routes())
         .merge(processes::routes())
+        .merge(search::routes())
         .merge(system::routes())
         .merge(projects::routes())
         .merge(teams::routes())

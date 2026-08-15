@@ -681,6 +681,92 @@ fn kill_process(pid: u32) {
     let _ = Command::new("kill").arg(pid.to_string()).output();
 }
 
+/// Start the app at login, from the per-user `Run` key.
+///
+/// **Not a Windows service.** This process is the tray UI *and* the server host
+/// in one; a service runs in a session with no desktop, so it could not put an
+/// icon in the tray or open the window. The `Run` key is what an always-on
+/// desktop app (Docker, Ollama, Slack) actually uses: no installer step, no
+/// admin rights, and the user can see and remove it from Task Manager's Startup
+/// tab.
+///
+/// **The registry is the state, not `settings.json`.** That Startup tab can
+/// disable the entry behind our back, and a copy of the fact in our own file
+/// would then be a lie. `reg.exe` rather than the registry API, for the same
+/// reason [`is_our_process`] shells out to `tasklist`: no unsafe, no extra
+/// `windows-sys` feature, and the call happens twice a session.
+#[cfg(windows)]
+pub mod autostart {
+    use std::process::Command;
+
+    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    const VALUE: &str = "AgentPlatform";
+
+    /// What lands in the key. `--minimized` is the point of the whole thing: at
+    /// login the app comes up in the tray with the server running, not as a
+    /// window in front of whatever the user was doing. Quoted because the
+    /// install path has a space in it (`C:\Program Files\…`) and the flag after
+    /// it would otherwise read as part of the path.
+    fn command(exe: &std::path::Path) -> String {
+        format!("\"{}\" --minimized", exe.display())
+    }
+
+    fn reg(args: &[&str]) -> std::io::Result<std::process::Output> {
+        use std::os::windows::process::CommandExt;
+        Command::new("reg").args(args).creation_flags(0x0800_0000).output() // CREATE_NO_WINDOW
+    }
+
+    pub fn enabled() -> bool {
+        reg(&["query", RUN_KEY, "/v", VALUE]).is_ok_and(|o| o.status.success())
+    }
+
+    pub fn set(on: bool) -> std::io::Result<()> {
+        let out = if on {
+            let exe = std::env::current_exe()?;
+            reg(&["add", RUN_KEY, "/v", VALUE, "/t", "REG_SZ", "/d", &command(&exe), "/f"])?
+        } else if enabled() {
+            reg(&["delete", RUN_KEY, "/v", VALUE, "/f"])?
+        } else {
+            return Ok(()); // deleting a value that is not there is an error to reg.exe
+        };
+        match out.status.success() {
+            true => Ok(()),
+            false => Err(std::io::Error::other(
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// The registry write itself is `reg.exe`'s problem; the quoting is
+        /// ours, and an install path with a space in it is the normal case.
+        #[test]
+        fn the_login_command_quotes_the_path_and_starts_in_the_tray() {
+            let line = super::command(std::path::Path::new(
+                r"C:\Program Files\Agent Platform\agent-platform.exe",
+            ));
+            assert_eq!(
+                line,
+                "\"C:\\Program Files\\Agent Platform\\agent-platform.exe\" --minimized"
+            );
+        }
+    }
+}
+
+/// No login entry off Windows — the app only builds there (see plan.md). The
+/// stub keeps the Settings toggle compiling rather than `cfg`-ing the screen.
+#[cfg(not(windows))]
+pub mod autostart {
+    pub fn enabled() -> bool {
+        false
+    }
+
+    pub fn set(_on: bool) -> std::io::Result<()> {
+        Err(std::io::Error::other("starting at login is Windows-only"))
+    }
+}
+
 /// Reveal a path in the platform file manager.
 pub fn reveal_path(path: &str) {
     let program = if cfg!(windows) {

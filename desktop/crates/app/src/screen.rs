@@ -22,6 +22,7 @@ const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
             (Screen::Plans, Icon::ListChecks, "Plans"),
             (Screen::Agenda, Icon::Clock, "Agenda"),
             (Screen::Coder, Icon::Cpu, "Coder"),
+            (Screen::Search, Icon::Search, "Search"),
         ],
     ),
     // One entry, two tabs: see [`chat_view`].
@@ -57,6 +58,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Screen::Coder => {
             crate::coder_view::view(&app.coder, &app.settings.theme.resolve()).map(Message::Coder)
         }
+        Screen::Search => crate::search_view::view(&app.search).map(Message::Search),
         Screen::Assistant | Screen::Memory => chat_view(app),
     };
 
@@ -973,6 +975,7 @@ fn status_view(app: &App) -> Element<'_, Message> {
     }
 
     blocks.push(server_card(app));
+    blocks.push(startup_card(app));
     #[cfg(feature = "local-llm")]
     blocks.push(local_llm_card(app));
     blocks.push(api_card(app));
@@ -1042,6 +1045,40 @@ fn server_card(app: &App) -> Element<'_, Message> {
         Some(ui::muted("The API process this app owns.")),
         actions,
         ui::stack(rows),
+    )
+}
+
+/// Run at login, and come up without a window.
+///
+/// The login entry is the per-user `Run` key, not a Windows service: this
+/// process is the tray icon and the server host at once, and a service gets no
+/// desktop to put a tray icon on. See [`crate::shell::autostart`].
+fn startup_card(app: &App) -> Element<'_, Message> {
+    ui::card_with_header(
+        "Startup",
+        Some(ui::muted(
+            "Run when you sign in, so the API server is up before you open the window.",
+        )),
+        None,
+        ui::stack(vec![
+            ui::toggle(
+                if app.autostart { Icon::Check } else { Icon::X },
+                if app.autostart { "Starts when you sign in" } else { "Off" },
+                app.autostart,
+                Message::SetAutostart(!app.autostart),
+            ),
+            ui::toggle(
+                if app.settings.start_minimized { Icon::Monitor } else { Icon::X },
+                "Open in the tray, with no window",
+                app.settings.start_minimized,
+                Message::SetStartMinimized(!app.settings.start_minimized),
+            ),
+            ui::caption(
+                "The login entry always starts in the tray; the second toggle is for when you \
+                 launch the app yourself. Either way the server runs and the tray icon opens \
+                 the window.",
+            ),
+        ]),
     )
 }
 

@@ -51,7 +51,12 @@ const MASTER_KEY_ENV: &str = "AGENT_PLATFORM_MASTER_KEY";
 
 /// Written back in this order, every key present even when empty — the file is
 /// regenerated wholesale rather than patched.
-const ENV_KEYS: [&str; 10] = [
+///
+/// `SEARCH_API_KEY`/`SEARCH_CX` (ADR 0008's amendment, "results, behind a
+/// key") are here even though search has no `ProviderSpec` row: this is the
+/// set the `.env` editor (`GET`/`POST /env` below) will actually write, and
+/// there is no other list a search key could ride in on.
+const ENV_KEYS: [&str; 12] = [
     MASTER_KEY_ENV,
     "GEMINI_API_KEY",
     "AIMLAPI_API_KEY",
@@ -62,6 +67,8 @@ const ENV_KEYS: [&str; 10] = [
     "LM_STUDIO_API_KEY",
     "DEFAULT_PROVIDER",
     "DEFAULT_MODEL",
+    "SEARCH_API_KEY",
+    "SEARCH_CX",
 ];
 
 /// Masked in `GET /env`; every other key returns its plaintext `value`. Also
@@ -69,14 +76,22 @@ const ENV_KEYS: [&str; 10] = [
 /// and accepting it from a checked-in file would cancel out.
 ///
 /// Every `ProviderSpec::api_key_env` belongs here, whatever registry it is in;
-/// `the_provider_table_is_the_source_of_the_key_lists` is the test that says so.
-pub(crate) const SENSITIVE_ENV_KEYS: [&str; 6] = [
+/// `the_provider_table_is_the_source_of_the_key_lists` is the test that says
+/// so for the provider table. `SEARCH_API_KEY` is not in that table at all —
+/// search is not an LLM provider — so it is a manual addition, checked by
+/// `search_credentials_are_present_and_masked_correctly` below instead.
+/// `SEARCH_CX` is deliberately **not** here: it names a Programmable Search
+/// *engine*, not an account, so sharing it is not a credential leak the way
+/// the key is — it still needs `ENV_KEYS` above so the editor can write it,
+/// just not masking here or refusal from committed YAML.
+pub(crate) const SENSITIVE_ENV_KEYS: [&str; 7] = [
     MASTER_KEY_ENV,
     "GEMINI_API_KEY",
     "AIMLAPI_API_KEY",
     "LM_STUDIO_API_KEY",
     "ANTHROPIC_API_KEY",
     "SPEECH_API_KEY",
+    "SEARCH_API_KEY",
 ];
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -949,6 +964,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `SEARCH_API_KEY`/`SEARCH_CX` are not driven by `llm_config::PROVIDERS` —
+    /// search is not an LLM provider, so there is no `ProviderSpec` row for
+    /// `the_provider_table_is_the_source_of_the_key_lists` to walk. This is
+    /// the manual case that test's own doc comment calls for: `SPEECH_API_KEY`
+    /// is the precedent (masked, no `ProviderSpec` requires it to be),
+    /// `SEARCH_API_KEY` follows it exactly. `SEARCH_CX` breaks from the
+    /// precedent on purpose — see `SENSITIVE_ENV_KEYS`'s doc comment for why —
+    /// so this pins both directions rather than just the one that would fail
+    /// silently.
+    #[test]
+    fn search_credentials_are_present_and_masked_correctly() {
+        assert!(ENV_KEYS.contains(&"SEARCH_API_KEY"), "the .env editor must accept the search key");
+        assert!(ENV_KEYS.contains(&"SEARCH_CX"), "the .env editor must accept the search engine id");
+        assert!(SENSITIVE_ENV_KEYS.contains(&"SEARCH_API_KEY"), "the search key is a credential");
+        assert!(
+            !SENSITIVE_ENV_KEYS.contains(&"SEARCH_CX"),
+            "the search engine id is not a credential"
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
     }
 
     blocks.push(catalog_card(state));
+    blocks.push(search_card(state));
     blocks.push(defaults_card(state));
 
     let page = ui::page(
@@ -137,6 +138,87 @@ fn row_action<'a>(
         }
         _ => container(ui::body("")).into(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Web search (ADR 0008's amendment) — not a catalog row, see providers.rs's
+// module doc comment for why.
+// ---------------------------------------------------------------------------
+
+/// Google requires two separate things: an API key from the Cloud console,
+/// and a Programmable Search Engine id (`cx`) from its own control panel. A
+/// user who only gets the key is stuck with no way to know a second signup
+/// is needed, so both links are offered up front rather than one.
+const SEARCH_KEY_URL: &str = "https://console.cloud.google.com/apis/credentials";
+const SEARCH_ENGINE_URL: &str = "https://programmablesearchengine.google.com/controlpanel/create";
+
+fn search_card(state: &State) -> Element<'_, Message> {
+    let (glyph, label, tone) = if state.search_configured() {
+        (Icon::CheckCircle, "configured", Tone::Success)
+    } else {
+        (Icon::XCircle, "not configured", Tone::Danger)
+    };
+
+    let mut rows: Vec<Element<'_, Message>> = vec![
+        ui::cluster(vec![ui::badge_icon(glyph, label, tone), ui::spacer()]).into(),
+        ui::muted(
+            "Google Programmable Search — free for up to 100 queries/day. Without it, the \
+             Search screen hands your query off to your browser instead, which is not a \
+             failure state; it's what the module does out of the box.",
+        ),
+    ];
+
+    // Both fields are required together (`SearchBackend::from_env`): a key
+    // with no cx is unconfigured, not half-configured, so say which one is
+    // still missing rather than letting a one-field save look like it did
+    // nothing.
+    if let Some(missing) = state.search_missing() {
+        rows.push(ui::caption(format!("Not configured — {missing} is still missing.")));
+    }
+
+    let key_set = state.env_key("SEARCH_API_KEY").is_some_and(|k| k.set);
+    let key_placeholder = if key_set { "stored — type to replace" } else { "not set" };
+    let mut key_cells = vec![container(ui::input(
+        key_placeholder,
+        state.draft("SEARCH_API_KEY"),
+        |v| Message::FieldChanged("SEARCH_API_KEY", v),
+    ))
+    .width(Length::Fill)
+    .into()];
+    if key_set && !state.edited("SEARCH_API_KEY") {
+        key_cells.push(ui::mono(
+            state.env_key("SEARCH_API_KEY").map(|k| k.masked.as_str()).unwrap_or_default(),
+        ));
+    }
+    rows.push(ui::field("API key", ui::cluster(key_cells)));
+
+    // Not a secret (`SENSITIVE_ENV_KEYS` excludes `SEARCH_CX` — it names an
+    // engine, not an account), so it comes back in full and shows what is
+    // stored the same way a base URL field does.
+    let cx_value = if state.edited("SEARCH_CX") {
+        state.draft("SEARCH_CX")
+    } else {
+        state.env_key("SEARCH_CX").map(|k| k.value.as_str()).unwrap_or_default()
+    };
+    rows.push(ui::field(
+        "Search engine ID (cx)",
+        ui::input("not set", cx_value, |v| Message::FieldChanged("SEARCH_CX", v)),
+    ));
+
+    rows.push(ui::cluster(vec![
+        ui::button_ghost(Icon::Globe, "Get an API key", Message::OpenUrl(SEARCH_KEY_URL)),
+        // A fresh engine defaults to a fixed site list; it must be switched to
+        // search the entire web, or every query it runs comes back empty.
+        ui::button_ghost(Icon::Globe, "Create a search engine", Message::OpenUrl(SEARCH_ENGINE_URL)),
+    ])
+    .into());
+
+    ui::card_with_header(
+        "Web search",
+        Some(ui::muted("Lets the Search screen (and E.V.) read results back, not just build the query.")),
+        None,
+        ui::stack(rows),
+    )
 }
 
 // ---------------------------------------------------------------------------

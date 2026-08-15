@@ -78,7 +78,18 @@ pub(crate) fn detail_message(body: &Value) -> String {
             })
             .collect::<Vec<_>>()
             .join("; "),
-        _ => "Request failed".to_string(),
+        // `agent-platformd`'s `ApiError` (the Rust server) answers
+        // `{"error": {"message": ..., "code": ...}}`, not the old Python
+        // server's `{"detail": ...}` — `sse.rs` already reads this same
+        // pointer for the SSE error frame. Without this fallback every Rust
+        // route's error message (a named 400 included) collapsed to the
+        // generic "Request failed" below, which is the one thing a caller
+        // asking the server to name the problem cannot afford.
+        _ => body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "Request failed".to_string()),
     }
 }
 
@@ -710,6 +721,135 @@ impl Client {
     pub async fn workflow_assist(&self, body: &WorkflowAssistBody) -> Result<WorkflowAssistResponse> {
         self.post_json("/api/v1/workflows/assist", body).await
     }
+
+    // -- Web search (ADR 0008, docs/web-search-module-plan.md) ---------------
+
+    /// `GET /api/v1/search/dork` — builds a Google-dork query from a sentence
+    /// (`ask`) or parses one already written (`q`; wins over `ask` when both
+    /// are given, matching the server). The server makes no outbound call of
+    /// its own; what comes back is a ready-to-open URL for
+    /// `crate::shell::open_url` (in the desktop app) to hand to the browser.
+    pub async fn search_dork(&self, req: DorkRequest<'_>) -> Result<DorkResponse> {
+        self.get_json(&dork_query_string("/api/v1/search/dork", &req)).await
+    }
+
+    /// `GET /api/v1/search` — the ADR 0008 amendment's results route. Resolves
+    /// the query exactly as [`Client::search_dork`] does, then — only when
+    /// this install has a key configured — runs it and answers the results
+    /// alongside everything `/dork` would have answered. `configured: false`
+    /// is the default install, not an error and not "no matches"; see
+    /// [`crate::types::SearchResponse`]. `limit` caps how many results come
+    /// back; `None` uses the server's own default.
+    pub async fn search(&self, req: DorkRequest<'_>, limit: Option<u32>) -> Result<SearchResponse> {
+        let mut path = dork_query_string("/api/v1/search", &req);
+        if let Some(limit) = limit {
+            path.push_str(&format!("&limit={limit}"));
+        }
+        self.get_json(&path).await
+    }
+
+    // -- Web search: history (`/api/v1/search/history`) ----------------------
+
+    /// `limit`: `None` uses the server's own default (50, capped at 200).
+    /// `opened_only` filters to rows the user actually ran.
+    pub async fn search_history(
+        &self,
+        limit: Option<u32>,
+        opened_only: bool,
+    ) -> Result<SearchHistoryResponse> {
+        let mut params = Vec::new();
+        if let Some(limit) = limit {
+            params.push(format!("limit={limit}"));
+        }
+        if opened_only {
+            params.push("opened_only=true".to_string());
+        }
+        let path = if params.is_empty() {
+            "/api/v1/search/history".to_string()
+        } else {
+            format!("/api/v1/search/history?{}", params.join("&"))
+        };
+        self.get_json(&path).await
+    }
+
+    /// Records one dork the caller built (`opened: false`) or ran (`opened:
+    /// true`). Posting a query already on file for this workspace with
+    /// `opened: false`, now `opened: true`, promotes that row instead of
+    /// inserting a near-duplicate — the server's own logic
+    /// (`search.rs::create_history`), not this client's.
+    pub async fn create_search_history(
+        &self,
+        query: &str,
+        engine: &str,
+        source: &str,
+        opened: bool,
+    ) -> Result<SearchHistoryEntry> {
+        self.post_json(
+            "/api/v1/search/history",
+            &serde_json::json!({ "query": query, "engine": engine, "source": source, "opened": opened }),
+        )
+        .await
+    }
+
+    pub async fn delete_search_history(&self, id: i64) -> Result<()> {
+        self.delete_json::<serde::de::IgnoredAny>(&format!("/api/v1/search/history/{id}"))
+            .await
+            .map(|_| ())
+    }
+
+    /// Clears every history row this caller can see (scoped to the caller's
+    /// own workspace server-side).
+    pub async fn clear_search_history(&self) -> Result<()> {
+        self.delete_json::<serde::de::IgnoredAny>("/api/v1/search/history").await.map(|_| ())
+    }
+}
+
+/// One `GET /api/v1/search/dork` or `GET /api/v1/search` request. Six
+/// positional parameters (`ask`, `q`, `engine`, `drop`, `add_field`,
+/// `add_value`) is past the point a call site stays readable, so this struct
+/// takes their place — every field optional via `Default`, so a caller only
+/// names what it needs. Mirrors the server's `DorkParams`
+/// (`server/src/search.rs`).
+#[derive(Debug, Clone, Default)]
+pub struct DorkRequest<'a> {
+    /// A sentence to translate. Ignored when `q` is also given — matching the
+    /// server, which prefers `q` because it is already an operator string.
+    pub ask: Option<&'a str>,
+    /// A dork already written, verbatim.
+    pub q: Option<&'a str>,
+    pub engine: SearchEngine,
+    /// A chip's own token (`site:reddit.com`, `filetype:pdf`, …) — the server
+    /// removes that one piece from `q`/`ask`'s result and re-renders.
+    /// Unmatched is a silent no-op server-side, same as this client stays
+    /// silent about it.
+    pub drop: Option<&'a str>,
+    /// Paired with `add_value`: adds one operator server-side, built from a
+    /// `DorkQuery` field name (`server/src/search_dork.rs::DorkQuery::add_part`'s
+    /// match arms) — never an operator spelling. Unlike `drop`, a bad pair is a
+    /// 400 naming the problem, not a silent no-op.
+    pub add_field: Option<&'a str>,
+    pub add_value: Option<&'a str>,
+}
+
+/// The query string both dork routes share — extracted so `/dork` and
+/// `/search` build it identically rather than forking it.
+fn dork_query_string(base: &str, req: &DorkRequest<'_>) -> String {
+    let mut path = format!("{base}?engine={}", req.engine.as_str());
+    if let Some(q) = req.q {
+        path.push_str(&format!("&q={}", urlencode(q)));
+    } else if let Some(ask) = req.ask {
+        path.push_str(&format!("&ask={}", urlencode(ask)));
+    }
+    if let Some(drop) = req.drop {
+        path.push_str(&format!("&drop={}", urlencode(drop)));
+    }
+    if let Some(field) = req.add_field {
+        path.push_str(&format!("&add_field={}", urlencode(field)));
+    }
+    if let Some(value) = req.add_value {
+        path.push_str(&format!("&add_value={}", urlencode(value)));
+    }
+    path
 }
 
 /// Minimal percent-encoding for path segments (model project names).
@@ -738,6 +878,16 @@ mod tests {
         assert_eq!(detail_message(&serde_json::json!({})), "Request failed");
     }
 
+    /// `agent-platformd`'s own `ApiError` shape — no `detail` key at all — must
+    /// still surface its message rather than falling to the generic default.
+    #[test]
+    fn detail_message_falls_back_to_the_rust_servers_error_envelope() {
+        let body = serde_json::json!({
+            "error": { "message": "range needs two numbers, got \"abc\"", "code": "bad_request" }
+        });
+        assert_eq!(detail_message(&body), "range needs two numbers, got \"abc\"");
+    }
+
     /// Every screen renders `Error::to_string()` straight into its banner, so
     /// this string is user copy. A dead port is the case the user actually hits
     /// (the app races the daemon's startup), and reqwest's own wording for it —
@@ -762,6 +912,32 @@ mod tests {
     fn urlencode_path_segment() {
         assert_eq!(urlencode("my-model_1.0"), "my-model_1.0");
         assert_eq!(urlencode("a b/c"), "a%20b%2Fc");
+    }
+
+    #[test]
+    fn dork_query_string_prefers_q_over_ask_and_carries_every_optional_param() {
+        let req = DorkRequest {
+            ask: Some("ignored when q is given"),
+            q: Some("keyboard site:reddit.com"),
+            engine: SearchEngine::DuckDuckGo,
+            drop: Some("site:reddit.com"),
+            add_field: Some("filetype"),
+            add_value: Some("pdf"),
+        };
+        let path = dork_query_string("/api/v1/search", &req);
+        assert!(path.starts_with("/api/v1/search?engine=duckduckgo"));
+        assert!(path.contains("&q=keyboard%20site%3Areddit.com"));
+        assert!(!path.contains("&ask="), "q must win over ask: {path}");
+        assert!(path.contains("&drop=site%3Areddit.com"));
+        assert!(path.contains("&add_field=filetype"));
+        assert!(path.contains("&add_value=pdf"));
+    }
+
+    #[test]
+    fn dork_query_string_with_only_ask_and_no_optional_params() {
+        let req = DorkRequest { ask: Some("cheap keyboard"), ..DorkRequest::default() };
+        let path = dork_query_string("/api/v1/search/dork", &req);
+        assert_eq!(path, "/api/v1/search/dork?engine=google&ask=cheap%20keyboard");
     }
 
     /// Verbatim `DashboardOut`, dumped from the server's own pydantic model —

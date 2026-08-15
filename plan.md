@@ -91,6 +91,242 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
 
 ## Backlog
 
+- **Start at login — landed 2026-08-15.** Settings → Status grows a **Startup**
+  card: one toggle writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  with `"<exe>" --minimized`, a second exposes `start_minimized`, which had been
+  a settings field with no UI since the Tauri port.
+  - **Not a Windows service, deliberately.** This process is the tray icon and
+    the server host at once; a service runs in a session with no desktop, so it
+    could not show the tray or open the window, and it would want admin rights
+    and an installer step to register. The `Run` key is what every always-on
+    desktop app uses, and the user can see and remove it from Task Manager's
+    Startup tab. If a headless always-on daemon is ever wanted, that is
+    `agent-platformd` as its own service — a different feature, and it needs the
+    install's `master.key` and data dir passed to it.
+  - **The registry is the state, not `settings.json`.** That Startup tab can
+    disable the entry behind the app's back, so a second copy of the fact in our
+    own file would be a lie; `App::autostart` is a cache of the registry read at
+    boot, not a persisted setting. `reg.exe` rather than the registry API, same
+    reason `is_our_process` shells out to `tasklist` — no unsafe, no extra
+    `windows-sys` feature, twice a session. A failed write re-reads rather than
+    flipping the toggle to what was asked for.
+  - `--minimized` was already parsed in `boot`; nothing new was needed to make
+    the login launch land in the tray.
+
+- **Web search — landed 2026-08-15.**
+  [ADR 0008](docs/adr/0008-web-search.md), plan in
+  [`docs/web-search-module-plan.md`](docs/web-search-module-plan.md). Natural
+  language in, a Google dork out, opened in the user's own browser.
+
+  **The shape, and why it has no provider.** There is no free programmatic web
+  search — Google CSE is 100/day behind a Cloud project, Brave's free tier wants
+  a card, and scraping `google.com/search` is CAPTCHA'd, against the terms and
+  silently fragile. So the server **builds the query and hands it to the
+  browser** (`shell::open_url`, already there for Providers' "Get API key"). It
+  makes **no outbound HTTP at all**; the only thing it calls is its own
+  in-process `/v1`. Zero cost, zero key, zero quota, nothing to maintain.
+  - **The line that matters is finding vs comparing.** Finding a document, a
+    discussion, a paper, a page on a site is all operator work and is delivered.
+    Comparing what came back — "which of these is cheapest", "summarise these
+    five" — needs the results in hand and is **not**. The price-comparison
+    example that opened the ask lands on the wrong side of that line; the ADR
+    records the upgrade path so the deferral is a pause, not a blank.
+  - **`DorkQuery` is a struct, not a string the model writes** (`search_dork.rs`).
+    The model emits the *fields*; Rust renders the operators. That is what makes
+    `site:my site.com` impossible to ship — it has to come through `add_site` or
+    `validate`, both of which reject whitespace. `parse` is the inverse, so raw
+    dork typed into the box comes back as the same editable chips.
+  - **`from_phrases` is a table of named intent recipes**, not ad-hoc patterns —
+    `document`, `discussion`, `academic`, `docs`, `shopping`, plus `onsite`,
+    `recent`, `exclusion`. Recipes are **additive on the struct**, so composition
+    falls out instead of being special-cased: "cheap pdf manual on arxiv.org"
+    fires three at once. Each carries a plain sentence that leads the
+    explanation ahead of the per-operator lines, because the intent is the
+    knowledge the user is missing. `search.rs` reaches for the model **only when
+    no recipe fired**, and any model failure — no master key, bad JSON, timeout —
+    degrades to the rule output rather than 500ing.
+  - **No exposure-hunting recipes.** `intitle:"index of"`, `filetype:env` and
+    the exposed-config families are absent from the table. Typing one into `q=`
+    still builds it faithfully — that is the caller's own query — but a curated
+    table of them makes this a recon tool rather than a search helper. Written
+    down because the table is exactly where someone adds them without noticing.
+  - **E.V. needs no new read tool.** The route is a `GET` under `/api/v1/`, and
+    `assistant_tools::api_get` is already a prefix-guarded GET-only reader for
+    any such route. A `POST` would have cost a new tool or put a confirm card in
+    front of a *read*, which is the pattern that trains people to click through
+    the cards that matter.
+
+  **Review found four, all in the new code, two of them real:**
+  - **A bare title marker forced `filetype:pdf`.** "find the article called Foo"
+    rendered `filetype:pdf intitle:Foo` — a restriction nobody asked for, quietly
+    discarding every non-PDF result. A title marker means match the title; it
+    does not mean the thing is a document. `apply_academic` had the same
+    assumption for "citation" and "research", now narrowed to paper/study/journal.
+  - **The shopping sites were `.com`-only** — `site:amazon.com` does not match
+    amazon.co.uk, so the recipe searched the wrong storefronts for a UK user. The
+    tell that it was an oversight rather than a decision: the price-range regex
+    in the same file already accepts `£`. Both TLDs per retailer now, walmart
+    dropped rather than shipped US-only again, `ponytail:` on the ceiling.
+  - `used_rules()` was dead — the design moved to the fired-recipe list and only
+    its own test still called it.
+  - `explanation` rows put a *recipe name* in a field called `operator`. Same bug
+    the transcript labels had (see the E.V. console entry below: every tool row
+    prefixed `$` after a second tool existed). A `kind` discriminator now tells
+    a recipe row from an operator row, changed while no client had been built
+    against the contract yet.
+
+  **The screen** is `Screen::Search` (`search.rs`/`search_view.rs`): a sentence
+  box, the rendered dork under it **in mono and editable**, removable chips for
+  the parts, the explanation, an engine picker and *Open in …*. A caption says
+  which mode the next run uses — "translates the sentence above (`ask=`)" or
+  "uses this query verbatim (`q=`)" — because editing the dork box silently
+  changing what gets sent is the one ambiguity that screen has.
+
+  **E.V. needed one tool after all, and only one.** Reads come free through
+  `api_get`, but *opening a browser leaves the app*, so `web_search` parks as
+  `Pending::Search` and the card asks "Open this search in your browser?" over
+  `Search Google for: <the dork>`. It names the engine rather than showing a
+  URL, because the URL does not exist until approval — it is built server-side —
+  and a percent-encoded guess would be less honest than what is actually known.
+  `Pending::Search` carries a `verbatim` flag: the card is built *before* the
+  server is called, so without remembering whether the model sent `q` or `ask`,
+  approval could not know which parameter to use, and a sentence sent through
+  `q` would silently skip translation.
+
+  **Three rounds of review, and the second one was self-inflicted.** Beyond the
+  four findings above:
+  - **The client grew its own copy of `render()`** — 44 byte-identical lines of
+    operator grammar in a crate that cannot see the server, "pinned" by a test
+    asserting a hardcoded string, which would have kept passing through any
+    drift. It existed only because removing a chip needs a query string to send.
+  - The first fix — a `drop=<token>` parameter, removal logic beside `render`
+    on the server — was right but under-specified: it never said *where the
+    chips get their tokens*, so the gap got filled with a hand-maintained index
+    into `explain()`'s output order, bumped for the collapsed group rows. That
+    is a parallel walk of another crate's function in a second crate, correct
+    on the day and silently wrong the moment `explain()` reorders — chips would
+    hand back the wrong token and removing one would delete another. **Worse
+    than the copy it replaced**, because a copy is at least legible.
+  - The answer was **the server emitting the chips** (`DorkQuery::chips()`,
+    beside `render`/`explain`/`drop_part`): `{token, label, field}`, one per
+    removable element, token produced by the same code that renders it. Tone
+    stays client-side; nothing else does. `part_chips` is now a twelve-line map
+    and **no dork operator is constructed anywhere outside `search_dork.rs`** —
+    checked by grep, not by assertion. The invariant the cursor could never
+    have: every chip's token must be droppable, dropping each in turn removes
+    exactly one element, and the query ends empty but for `terms`.
+
+  Left alone deliberately: `render`/`explain`/`drop_part`/`chips` each spell the
+  operators independently *within* `search_dork.rs`. One file, adjacent
+  functions, a mismatch visible immediately, and the pair that must agree is
+  pinned by the invariant test. Three refactor rounds on one file is enough.
+
+  **Then four more rounds, from one question: "shouldn't the dork have options
+  such as search by type, search by website containing?"** It should, and the
+  question exposed two different holes.
+
+  - **Operator coverage.** `intext:` (page body contains) was simply absent next
+    to `intitle`/`inurl`. `related:` was missing. The numeric range was
+    *half-built* — `apply_shopping` appended `"100..200"` into the leftover text
+    so it landed in `terms` as a bare string, which meant it was not a field, not
+    a chip, not removable and not recoverable by `parse`. It is `range` now.
+    `ext:` is accepted on parse as a one-way alias into `filetype`, because a
+    dork pasted from elsewhere was silently losing the operator into `terms`.
+    Deliberately still absent, with the reason written where someone would reach
+    for them: `cache:` and `link:` (**Google removed both** — offering them
+    builds queries that cannot work), the `allin*:` family (repeating the
+    singular covers it, and a second spelling is a second thing to keep in step
+    across all six walks), and `*` (already works, `terms` is verbatim).
+  - **The chips were remove-only, which undercut the premise.** There was
+    `RemovePart` and no add. So the only ways to *add* an operator were to phrase
+    the sentence so a recipe fired, or type the operator — which needs the syntax
+    the module exists to remove. `add_field=`+`add_value=` mirrors `drop=`, the
+    server builds the operator in both directions, and the picker's labels carry
+    both halves ("Page text contains (`intext:`)") so it can be found without the
+    syntax and left knowing it. A failed **add** is a 400 naming the problem
+    where a failed **drop** is a silent no-op — a drop that matches nothing
+    changes nothing visible, but an add that silently does nothing reads as a
+    broken button.
+
+  **History is real now** — see the deferral note in the plan doc, which this
+  closed. Workspace-scoped because storing changes the tenancy question,
+  `opened` as INTEGER because a `bool` on a `FromRow` struct is a latent 500 on
+  the `Any` pool, and recording is an explicit POST rather than a side effect of
+  `GET /search/dork` — that route is hit by every chip edit, and auto-recording
+  would fill history with fragments of a query nobody ran.
+
+  **Results landed, behind a key, and the deferral that blocked them was wrong
+  on a fact.** ADR 0008 said there is no free programmatic search; Google CSE is
+  100/day free **with no billing account** — the reasoning went from "needs a
+  Cloud project" to "needs money", which are different things, and Brave was the
+  one that wanted a card. The ADR carries an amendment saying so rather than a
+  rewrite, because the original reasoning still governs the no-key path, which is
+  every install until someone configures one.
+  - **Unconfigured is the default and stays the whole product.** `configured:
+    false` with *every other field still populated*, so the screen renders
+    exactly what it renders today. Never a 503, never a bare empty list — an
+    empty list reads as "nothing matched" and sends the user hunting for a better
+    query when the answer is "this install does not do results". A key that
+    Google **rejects** is a different problem and surfaces as a real error.
+  - `/search` is `/dork` **plus three keys** — same `resolve_dork_query`, same
+    `dork_body` — so the results route cannot drift from the builder route.
+  - Still deferred, line unmoved: fetching result pages for JSON-LD price
+    extraction. CSE returns titles, snippets and URLs; turning those into a price
+    table is the SSRF surface and the per-site ceiling. Results are *comparing
+    what a search returned*; extraction is *reading what those pages say*.
+
+  **One cross-cutting bug, found because search is the first feature that
+  depends on a named 400 reaching the user.** `client.rs`'s `detail_message`
+  only read `{"detail": …}` — the **deleted Python server's** error shape.
+  `agent-platformd`'s `ApiError` answers `{"error": {"message": …}}`, and
+  `sse.rs` already had a reader for that same shape while the plain REST path
+  never got one. So **every named error from the Rust server, on every screen,
+  had been collapsing to the generic "Request failed"** since the migration.
+  Nothing depended on the wording before, which is why it survived. Fixed with
+  both shapes read and a test.
+
+  **The stale-banner sweep was finished, and it had been wrong about being
+  done.** The 2026-08-07 entry below records this bug found and fixed in seven
+  files. Two more turned up in `providers.rs` this week — *a file that sweep had
+  already marked fixed* — which said the method had been applied per file and
+  not per arm. A full audit of all fifteen files with an `error` field found
+  **16 more arms across 7 files**:
+  - **`agenda_chat.rs` had all five of its success arms broken.** Its only clear
+    site was `DismissError`, so every failure that screen could produce stuck
+    until the user dismissed it by hand. That file was not under-swept, it was
+    skipped.
+  - **`assistant.rs` and `chat.rs` never cleared on `Send`.** `coder.rs` clears
+    at the start of every new turn and they did not, so one failed turn banner
+    outlived every successful turn after it. `assistant.rs` also stuck on a
+    failed transcription (STT runs continuously in voice mode, so *one* bad
+    utterance banner survived every good one) and on audio playback.
+  - `processes.rs::TeamsLoaded(Ok)`, `workflows.rs::{RunsLoaded,RanNow}(Ok)`,
+    `modelops.rs::{JobStarted,JobUpdated}(Ok)`, and four in `coder.rs`
+    (terminal open, diff load, checkpoint restore, browser nav) — all the same
+    shape: the retry after a transient failure never cleared what the failure
+    set.
+
+  **Two shapes were deliberately left alone**, and they are worth knowing
+  before the next sweep re-flags them:
+  - `coder.rs` and `assistant.rs` each have **one `error` field serving several
+    independent subjects** (terminal, checkpoint, thread, turn, tool-post,
+    preview; and chat, mic, playback, TTS). Each subject's own success/failure
+    pairing is now symmetric, and success in one subject deliberately does *not*
+    clear another's banner. Splitting the field is the real fix and is not a
+    bug-sweep's job.
+  - Synchronous validation errors (empty name, no stage picked) have no paired
+    success arm at all — they clear on the next attempt at the same action.
+
+  **Why this keeps happening:** the asymmetry is invisible at the call site.
+  Nothing in the type system links "this arm sets a banner" to "that arm must
+  clear it", the failure is only reachable through a transient error, and the
+  symptom — a banner that is merely *stale* rather than wrong — reads as
+  plausible. A sweep that reports only what it changed cannot be audited for
+  what it missed, which is how the last one shipped incomplete; this one listed
+  its "correct as-is" verdicts too.
+
+  580 tests green across the three crates, hygiene clean.
+
 - **Reuse and hot-path sweep — landed 2026-08-09.** A read of the whole
   tree for duplication, scattered tables and per-request work. Nothing here is a
   feature; it is the drift a year of screens leaves behind. Three passes, in
