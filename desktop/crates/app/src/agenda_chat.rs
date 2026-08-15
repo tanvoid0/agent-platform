@@ -284,6 +284,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         }
         Message::Reload => reload(state, client),
         Message::ThreadsLoaded(Ok(threads)) => {
+            state.error = None;
             state.threads = threads;
             Task::none()
         }
@@ -312,10 +313,12 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::ThreadCreated(Ok(id)) => {
             state.thread_id = Some(id);
             state.notice = None;
+            state.error = None;
             reload(state, client)
         }
         Message::Loaded(Ok(thread)) => {
             state.loading = false;
+            state.error = None;
             state.absorb(*thread);
             iced::widget::operation::snap_to_end(State::scroll_id())
         }
@@ -420,6 +423,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         }
         Message::Turned(Ok(thread)) => {
             state.sending = false;
+            state.error = None;
             state.absorb(*thread);
             iced::widget::operation::snap_to_end(State::scroll_id())
         }
@@ -427,6 +431,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::DismissActions => apply(state, client, true),
         Message::Applied(Ok(result)) => {
             state.sending = false;
+            state.error = None;
             // The apply itself already landed; the continuation turn is allowed
             // to fail, so what changed is reported from the apply's own result —
             // but only when that turn is missing. When it came back it carries
@@ -602,6 +607,16 @@ mod tests {
         let _ = update(&mut state, &client(), Message::Send);
         assert!(state.messages.is_empty());
         assert_eq!(state.draft, "hi");
+    }
+
+    /// A turn that fails (server unreachable, say) must not leave the banner up
+    /// forever once a later turn actually goes through.
+    #[test]
+    fn a_successful_turn_clears_a_stale_error() {
+        let mut state = State { open: true, project: Some(1), error: Some("boom".into()), ..State::default() };
+        let thread = AssistantChatThread { thread_id: Some(1), ..AssistantChatThread::default() };
+        let _ = update(&mut state, &client(), Message::Turned(Ok(Box::new(thread))));
+        assert!(state.error.is_none());
     }
 
     /// The server's copy of the thread is the truth: the optimistic turn is

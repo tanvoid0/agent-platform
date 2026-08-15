@@ -175,6 +175,7 @@ pub fn update(
             state.push_turn("user", prompt);
             state.draft.clear();
             state.sending = true;
+            state.error = None;
 
             let (provider, model) = state
                 .pinned

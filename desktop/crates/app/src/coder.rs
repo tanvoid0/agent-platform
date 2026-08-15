@@ -311,6 +311,7 @@ impl State {
             Ok(session) => {
                 let id = session.0.widget_id().clone();
                 self.term = Some(session);
+                self.error = None;
                 iced_term::TerminalView::focus(id)
             }
             Err(e) => {
@@ -703,6 +704,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             )
         }
         Message::DiffLoaded(Ok(text)) => {
+            state.error = None;
             if let Some((_, slot)) = state.reviewing.as_mut() {
                 *slot = Some(text);
             }
@@ -737,6 +739,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         // The later checkpoints are gone from the branch now, so the timeline is
         // refetched rather than trimmed locally.
         Message::Restored(Ok(())) => {
+            state.error = None;
             state.reviewing = None;
             load_checkpoints(state)
         }
@@ -1257,7 +1260,10 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             // float over, not the user closing anything.
             crate::coder_browser::run(crate::coder_browser::Cmd::Hide, Message::BrowserDone)
         }
-        Message::BrowserDone(Ok(())) => Task::none(),
+        Message::BrowserDone(Ok(())) => {
+            state.error = None;
+            Task::none()
+        }
         Message::BrowserDone(Err(e)) => {
             state.browser_open = false;
             state.error = Some(e);

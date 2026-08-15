@@ -187,6 +187,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         }
         Message::RunsLoaded(Ok(runs)) => {
             state.runs_loading = false;
+            state.error = None;
             state.runs = runs;
             Task::none()
         }
@@ -228,6 +229,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                     // A failed run is bad news and must look like it; only a
                     // clean run goes in the green banner.
                     if run.status == "succeeded" {
+                        state.error = None;
                         state.notice.set(format!("Run #{} succeeded.", run.id));
                     } else {
                         state.error = Some(format!(

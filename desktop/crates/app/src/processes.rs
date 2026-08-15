@@ -430,6 +430,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::EventsLoaded(Err(_)) => Task::none(),
         Message::TeamsLoaded(Ok(teams)) => {
             state.lists_loaded.0 = true;
+            state.error = None;
             if state.composer.team_id.is_none() {
                 state.composer.team_id = teams.first().map(|t| t.id);
             }
@@ -856,6 +857,16 @@ mod tests {
         s.inspecting = None;
         s.ensure_chat();
         assert_eq!(s.chats.len(), 2);
+    }
+
+    #[test]
+    fn teams_recovering_after_the_daemon_finishes_booting_clears_the_banner() {
+        let mut s = State::default();
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let _ = update(&mut s, &client, Message::TeamsLoaded(Err("connection refused".into())));
+        assert!(s.error.is_some());
+        let _ = update(&mut s, &client, Message::TeamsLoaded(Ok(vec![])));
+        assert!(s.error.is_none());
     }
 
     #[test]

@@ -273,6 +273,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
 
         Message::JobStarted(Ok(job)) => {
             state.busy = false;
+            state.error = None;
             state.job = Some(*job);
             Task::none()
         }
@@ -292,6 +293,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             None => Task::none(),
         },
         Message::JobUpdated(Ok(job)) => {
+            state.error = None;
             let previous = state.job.as_ref().map(|j| j.status.clone());
             let finished = became_terminal(previous.as_deref(), &job.status);
             if finished {
