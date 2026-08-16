@@ -117,3 +117,35 @@ without a new thread.
 - The server's resolved default model is `llama3`, which **cannot hold a tool
   loop** — it reads a file and then ends the turn silently. A client without a
   model picker will look broken.
+
+### `retry` and `approve` accept the whole of `SendRequest`, and ignore parts of it
+
+`RetryRequest` and `ApprovalRequest` both `#[serde(flatten)]` a `SendRequest`, so
+on the wire those two routes accept **every** field listed above. They do not
+*read* every field, and nothing tells you which ones went nowhere — an ignored
+field is not an error, it is silence.
+
+| Route | Reads | Accepts and ignores |
+|---|---|---|
+| `POST /coder/chat/retry` | `thread_id`, `workspace_root`, `allow_commands`, `delegate_tools`, `tools`, `mode_instruction`, `model`, `provider`, `max_tokens` | `message` — a retry replays the stored history, it does not take a new turn |
+| `POST /coder/chat/approve` | `thread_id`, `call_id`, `approve`, `edited_command`, `delegate_tools`, `tools`, `mode_instruction`, `model`, `provider`, `max_tokens` | `message`, `workspace_root`, `allow_commands`, `plan` |
+
+The approve exclusions are deliberate, and each has a reason worth knowing:
+
+- **`allow_commands` is forced `true`.** The user has just approved this command;
+  the session-level switch is not consulted a second time. Sending `false` here
+  does not veto the approval you already gave.
+- **`workspace_root` is forced to the thread's own.** A resume may only run where
+  the thread already runs, so a different root in the body is dropped rather than
+  honoured.
+- **`plan` is forced `false`.** The plan, if there was one, happened on the turn
+  that got parked.
+
+This is why `openapi.json` documents `CoderApprovalRequest` and `CoderRetryRequest`
+as *narrower* than what the flatten accepts. The spec describes what the route
+honours, which is the more useful contract — but it means "the server took my
+field without complaining" is not evidence the field did anything.
+
+`portal_desktop` currently sends `allow_commands` and `auto_approve_commands` on
+approve. Harmless — the route wants `true` and hardcodes it — but it is a no-op,
+not a setting.

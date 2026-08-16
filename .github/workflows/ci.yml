@@ -119,3 +119,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: python scripts/check_repo_hygiene.py
+      # The shape half of openapi drift. `tests/openapi_drift.rs` proves every
+      # documented operation reaches a handler; this proves the request bodies
+      # still look like their schemas. Cheap enough to sit in the same job.
+      - run: python scripts/check_openapi_request_drift.py
