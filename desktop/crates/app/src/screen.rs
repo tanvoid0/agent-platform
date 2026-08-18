@@ -1132,6 +1132,7 @@ fn local_llm_card(app: &App) -> Element<'_, Message> {
                     ui::cluster(picker).into(),
                 ]),
             ),
+            ui::field("Download", local_model_download(app)),
             ui::field(
                 "Context",
                 container(ui::input("8192", &app.local_ctx_input, Message::SetLocalCtx))
@@ -1167,6 +1168,49 @@ fn local_llm_card(app: &App) -> Element<'_, Message> {
             ),
         ]),
     )
+}
+
+/// The Hugging Face row on the same card: paste a reference, get a GGUF.
+///
+/// No search and no browse — the model card in the browser is a better catalog
+/// than anything this could draw, and what it gives you is a link to paste.
+#[cfg(feature = "local-llm")]
+fn local_model_download(app: &App) -> Element<'_, Message> {
+    let mut bar = vec![
+        container(ui::input_submit(
+            "owner/repo/model-Q4_K_M.gguf, or a Hugging Face link",
+            &app.model_dl.input,
+            Message::SetModelUrl,
+            Message::DownloadModel,
+        ))
+        .width(Length::Fill)
+        .into(),
+    ];
+    if app.model_dl.active {
+        bar.push(ui::badge("downloading…", Tone::Info));
+        // The one control that matters on a 20 GB transfer: the way out.
+        bar.push(ui::button_ghost(Icon::X, "Cancel", Message::CancelModelDownload));
+    } else {
+        bar.push(ui::button_secondary(Icon::Download, "Get", Message::DownloadModel));
+    }
+    let mut rows = vec![ui::cluster(bar).into()];
+
+    if app.model_dl.active {
+        let got = crate::model_download::human(app.model_dl.received);
+        rows.push(ui::caption(match app.model_dl.total {
+            // The server may not send a length; a bare byte count still moves.
+            None => format!("{got} so far"),
+            Some(total) => format!(
+                "{got} of {} ({}%)",
+                crate::model_download::human(total),
+                app.model_dl.received * 100 / total.max(1)
+            ),
+        }));
+    }
+    if let Some(e) = &app.model_dl.error {
+        rows.push(ui::alert_error(e.clone()));
+    }
+    ui::stack(rows).into()
 }
 
 fn api_card(app: &App) -> Element<'_, Message> {

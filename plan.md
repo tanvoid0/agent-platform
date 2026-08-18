@@ -3597,6 +3597,33 @@ Ordered by what unblocks what:
    agent turn works, not just prose. Not covered: `/v1/embeddings`, and a
    caller's `model` is ignored — whatever GGUF is configured answers.
 
+6. ~~**Getting a GGUF without Ollama.**~~ — shipped: a *Download* row on the
+   same Settings card takes `owner/repo/file.gguf` or any Hugging Face link,
+   streams the file into `<data dir>/models/`, and sets `local_model_path` to
+   it. [`model_download.rs`](desktop/crates/app/src/model_download.rs) — a
+   redirecting `GET` and a `.part` rename, no registry client: HF's own model
+   page is a better catalog than anything this could draw, and what it gives
+   you is a link to paste. A `/blob/` URL (what the address bar holds) is
+   rewritten to `/resolve/`, since otherwise you silently download HTML.
+   Cancel is `Task::abortable` — dropping the stream *is* the cancel, and the
+   handler sweeps the `.part` the drop leaves mid-write. Not covered: repo
+   search, resume, hash verification, and gated repos — nothing sends a token,
+   so those come back as the 401 they are. Until this,
+   the only pull path was Ollama's, which is what pointed every install at a
+   `blobs/sha256-…` file.
+
+   **Driven, not only unit-tested**: two opt-in tests pull llama.cpp's own
+   19 MB tinyllamas GGUF off HF. The first takes it whole — redirect followed,
+   four progress ticks, the `.part` gone and `GGUF` at byte zero, which is the
+   assertion a redirect page served as the file would fail. The second drops
+   the stream one tick in and checks the half-file is sitting at exactly the
+   path the cancel handler sweeps, since two spellings of that name is the one
+   way cancel can leak gigabytes.
+
+   ```bash
+   cargo test -p agent-platform-desktop model_download -- --ignored --nocapture
+   ```
+
 *The pre-desktop refactor checklist (`docs/refactor-handoff-followup.md`) is
 complete and the file is deleted: services extracted (`app/services/`),
 `datetime.utcnow()` gone, route layers thinned; its frontend items died with

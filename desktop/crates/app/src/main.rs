@@ -45,6 +45,7 @@ mod library_view;
 mod logs;
 mod memory;
 mod memory_view;
+mod model_download;
 mod modelops;
 mod modelops_view;
 mod notify;
@@ -217,6 +218,9 @@ pub struct App {
     pub local_ctx_input: String,
     /// The same, for the port the local model is served on. Empty means off.
     pub local_server_port_input: String,
+    /// The Hugging Face download row on the same card: what is typed in it, and
+    /// how far the transfer has got.
+    pub model_dl: model_download::State,
     /// Which of the two chat tabs the sidebar entry returns to.
     pub chat_tab: Screen,
     pub status: Option<SystemStatus>,
@@ -365,6 +369,12 @@ pub enum Message {
     SetLocalCtx(String),
     SetLocalServerPort(String),
     UnloadLocalModel,
+    /// The Hugging Face reference in the download row.
+    SetModelUrl(String),
+    DownloadModel,
+    CancelModelDownload,
+    /// One step of that download; the terminal arms clear the row.
+    ModelDownloaded(model_download::Progress),
     Copy(&'static str, String),
     RestartServer,
     RestartApp,
@@ -662,6 +672,7 @@ fn boot() -> (App, Task<Message>) {
             0 => String::new(),
             p => p.to_string(),
         },
+        model_dl: model_download::State::default(),
         chat_tab: Screen::Assistant,
         status: None,
         status_error: None,
@@ -1292,6 +1303,66 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.local_server_port_input = ctx_digits(&raw).chars().take(5).collect();
             app.settings.local_server_port = app.local_server_port_input.parse().unwrap_or(0);
             save_settings(app);
+            Task::none()
+        }
+        Message::SetModelUrl(v) => {
+            app.model_dl.input = v;
+            app.model_dl.error = None;
+            Task::none()
+        }
+        Message::DownloadModel if app.model_dl.active => Task::none(),
+        Message::DownloadModel => match model_download::resolve(&app.model_dl.input) {
+            Err(e) => {
+                app.model_dl.error = Some(e);
+                Task::none()
+            }
+            Ok((url, name)) => {
+                app.model_dl.active = true;
+                app.model_dl.received = 0;
+                app.model_dl.total = None;
+                app.model_dl.error = None;
+                let dir = app.shell.data_dir.join("models");
+                app.model_dl.part = Some(model_download::part_path(&dir, &name));
+                let (task, handle) = Task::stream(model_download::download(url, dir, name))
+                    .map(Message::ModelDownloaded)
+                    .abortable();
+                app.model_dl.handle = Some(handle);
+                task
+            }
+        },
+        Message::CancelModelDownload => {
+            if let Some(handle) = app.model_dl.handle.take() {
+                handle.abort();
+            }
+            // Aborting drops the stream mid-write, so nothing inside the
+            // transfer gets to clean up after itself.
+            if let Some(part) = app.model_dl.part.take() {
+                let _ = std::fs::remove_file(part);
+            }
+            app.model_dl.active = false;
+            Task::none()
+        }
+        Message::ModelDownloaded(model_download::Progress::Downloading { received, total }) => {
+            app.model_dl.received = received;
+            app.model_dl.total = total;
+            Task::none()
+        }
+        Message::ModelDownloaded(model_download::Progress::Done(path)) => {
+            app.model_dl.active = false;
+            app.model_dl.handle = None;
+            app.model_dl.part = None;
+            app.model_dl.input.clear();
+            // Point at it, since a download nobody selects is a wasted 20 GB.
+            // Same restart rule as the picker: the weights load on the next run.
+            app.settings.local_model_path = path;
+            save_settings(app);
+            Task::none()
+        }
+        Message::ModelDownloaded(model_download::Progress::Failed(e)) => {
+            app.model_dl.active = false;
+            app.model_dl.handle = None;
+            app.model_dl.part = None;
+            app.model_dl.error = Some(e);
             Task::none()
         }
         Message::UnloadLocalModel => {
