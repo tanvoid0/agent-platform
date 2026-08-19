@@ -3800,9 +3800,10 @@ crates, CRLF preservation included),
 `agents_md_is_carried_when_the_project_has_one`, and the spec-list test that
 names every advertised tool. **Not yet driven live**, for Phase 1's reason.
 
-**Phase 4 — graduated autonomy and a second reader — is two of three.** Both
-landed items are client-only; the wire protocol still has not moved since the
-hearth migration.
+**Phase 4 — graduated autonomy and a second reader — is done**, its third item
+last and only after the dependency it was blocked on was forked. The first two
+are client-only; the wire protocol still has not moved since the hearth
+migration.
 
 1. **Autonomy tiers and the command allowlist.** The header's Commands checkbox
    is a four-state control now — `Autonomy::{Off, Ask, Allowlist, Auto}`. `Off`
@@ -3856,25 +3857,73 @@ hearth migration.
    - It waits for the turn it is about: a review asked for mid-turn does
      nothing, because the turn still running is still changing the files the
      diff describes.
-3. **Agent commands in the visible terminal — blocked on `iced_term`, not
-   deferred by choice.** The plan was sentinel echo: write `<cmd>; echo <mark>$?`
-   into the PTY drawer and scrape the result off the grid. `iced_term` 0.8 has
-   the scraper — `Backend::selectable_content()` — but `Terminal::backend` is
-   `pub(crate)`, so nothing outside that crate can reach it, and `Terminal`
-   exposes no content accessor of its own (`new`, `widget_id`, `subscription`,
-   `handle`, and that is the whole surface). The ways through are a vendored
-   `iced_term` carrying one `pub fn`, or an upstream PR — a dependency decision
-   rather than a screen change, which is why this stops here instead of growing
-   a second command-output panel beside the terminal that already exists.
+3. **Agent commands in the visible terminal — landed 2026-08-19**, once the
+   dependency it was blocked on was forked. An approved `run_command` is typed
+   into the drawer the user can see, the dock switches to it, and the row says
+   `— in the terminal`. Headless stays the fallback and is what runs when there
+   is no folder or the drawer will not open.
+   - **The blocker was real and the note above named the wrong method.**
+     `Backend::selectable_content()` returns the *current selection*, not the
+     screen — scraping with it would have meant hijacking the user's own
+     selection. The grid is `Backend::renderable_content().grid`, and
+     `Terminal::backend` is `pub(crate)` with no accessor beside it. So the fork
+     carries **one method**, `Terminal::text()` — the buffer as `Vec<String>`,
+     scrollback first, trailing blanks trimmed, `Backend` still private —
+     [`tanvoid0/iced_term@feat/terminal-text`](https://github.com/tanvoid0/iced_term/tree/feat/terminal-text),
+     wired in by the `[patch.crates-io]` block in `desktop/Cargo.toml`. Upstream
+     is alive (20 commits past the 0.8.0 release, community PRs merging), so
+     that block is meant to come out rather than live there.
+   - **Every alternative that avoids the fork breaks the thing the PTY was for.**
+     Teeing the command to a file we read ourselves needs no crate change and is
+     the obvious dodge — but a pipe takes the child off the tty, and a program
+     with no tty does not prompt, does not colour and does not paginate. The
+     interactivity *is* the feature; a tee buys the watchable half by throwing
+     away the promptable one.
+   - **Two markers, and the second one carries a number.** `wrap` brackets the
+     command with `@@AGPRUN-BEGIN:<id>` / `@@AGPRUN-END:<id> <status> <code>`,
+     and `scrape` reads the output back out from between them. The shell echoes
+     the line that was typed, so that echo is on screen carrying both markers
+     *before* the command runs — which is why a marker only counts at the start
+     of a row (the echo sits behind a prompt) and the closing one only counts
+     when a **number** follows it (the echo carries the unexpanded
+     `$(if($?){0}else{1})` or `%s`). Without that second test a command long
+     enough to wrap onto the next row ends itself before it begins.
+   - **The two shells disagree about what an exit code is**, so both are sent:
+     `sh` has `$?` and it covers everything, while PowerShell has `$?` for "did
+     that work" and `$LASTEXITCODE` for "what number did the last native exe
+     return" — a cmdlet sets only the first. The reader prefers the number when
+     there is one.
+   - **The poll rides the clock that was already ticking.** No timer of its own:
+     `Message::Tick` fires once a second while a turn is in flight, and that is
+     what reads the grid. Same 180s cap as the headless executor — where a
+     command runs must not change how long it is allowed to take.
+   - **A stop stops watching, it does not kill the command.** It is running in
+     the user's own shell, where they can watch it finish or Ctrl-C it; killing
+     a shell to end a turn is a bigger thing than that button says. Same for the
+     timeout, which tells the model where the command went rather than that it
+     vanished. Closing the drawer under a running command *does* end it, and the
+     call is answered saying so — the server is blocked on it either way.
+   - **Known: the markers are visible in the user's terminal.** That is what
+     sentinel echo costs, and the alternative is not reading the screen at all.
 
 Checks: `a_rule_does_not_stretch_past_the_command_it_names` (word boundaries and
 every shell operator), `the_saved_rule_is_the_program_and_its_verb`,
 `an_allowed_command_runs_without_a_card_and_the_row_says_which_rule`,
 `always_allow_saves_the_rule_for_this_folder_and_turns_the_tier_on`,
-`the_review_pass_hands_the_diff_back_tool_free`, and
-`the_review_pass_waits_for_the_turn_it_is_about`. **Not yet driven live**, for
-Phase 1's reason — which now covers four phases and is the largest thing owed on
-this screen.
+`the_review_pass_hands_the_diff_back_tool_free`,
+`the_review_pass_waits_for_the_turn_it_is_about`, and for 4.3
+`the_shells_echo_of_the_command_is_not_mistaken_for_its_output`,
+`a_marker_with_no_exit_code_after_it_is_not_the_end_of_anything`,
+`a_failure_keeps_the_number_the_process_actually_returned`.
+
+4.3 was **driven live** the day it landed, `llama3.1:8b` on the sandboxed
+daemon: an approved `python main.py` ran in the drawer with the row reading
+`$ python main.py — in the terminal` and the model answering off its output;
+then `pause` stopped on *Press Enter to continue…* with the row still
+`running…` and the composer counting, and pressing Enter **in the terminal**
+finished the turn — the model's next line was "The program is paused as
+requested." That is the accept criterion whole: it streams where the user can
+see it, its output reaches the model, and the user can answer it.
 
 **Phase 5.3 — fork / handoff — landed ahead of the rest of the phase**, which it
 does not depend on. *Hand off to a new one*, beside *New session*, spends one

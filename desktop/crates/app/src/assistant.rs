@@ -369,7 +369,7 @@ async fn run_pending(client: &Client, proposal: &crate::assistant_tools::Pending
 /// Cut a tool result down to what is worth spending context on. Shared by the
 /// terminal and `api_get`: both can return a megabyte, and the model reads the
 /// same "there was more" either way.
-fn cap_output(mut text: String) -> String {
+pub(crate) fn cap_output(mut text: String) -> String {
     if text.len() <= MAX_TOOL_OUTPUT {
         return text;
     }

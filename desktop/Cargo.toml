@@ -11,3 +11,12 @@ exclude = ["spike-llama"]
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# `iced_term` 0.8 can be written into but not read from: `Terminal::backend` is
+# `pub(crate)` and the widget exposes no accessor, so nothing outside that crate
+# can see what the terminal shows. The Coder screen needs to — an agent command
+# runs in the drawer and its output has to reach the model. The fork carries one
+# method, `Terminal::text()`, and nothing else; it is upstream as a PR and this
+# block comes out when that merges.
+[patch.crates-io]
+iced_term = { git = "https://github.com/tanvoid0/iced_term.git", branch = "feat/terminal-text" }

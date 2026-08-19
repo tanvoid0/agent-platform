@@ -176,7 +176,7 @@ Copilot), append it to `mode_instruction` next to `.agent/notes.md`. Shown as
 a chip in the header so its influence is visible.
 *Accept: a rule in AGENTS.md observably steers a turn.*
 
-## Phase 4 — Graduated autonomy + verification — **4.1/4.2 landed 2026-08-19**
+## Phase 4 — Graduated autonomy + verification — **landed 2026-08-19**
 
 **4.1 Autonomy presets + command allowlist — M.** *(client-only)*
 Three tiers in the header — **Ask** (today), **Allowlist**, **Auto**
@@ -220,13 +220,18 @@ the fallback. Do last in the phase; it has the most edge cases (exit
 detection, interleaved user typing).
 *Accept: an approved `cargo test` streams in the terminal; its output still
 reaches the model; the user can answer a y/N prompt.*
-**Blocked on the crate, not deferred.** `iced_term` 0.8 has the scraper this
-needs — `Backend::selectable_content()` — but `Terminal::backend` is
-`pub(crate)` and `Terminal` exposes no content accessor of its own, so nothing
-outside that crate can read the grid. The ways through are a vendored
-`iced_term` carrying one `pub fn`, or an upstream PR: a dependency decision
-rather than a screen change. Not worked around — a second command-output panel
-beside the terminal we already have is the run bar step 5 deleted.
+**Landed 2026-08-19**, once the dependency was forked. The sketch above named
+`Backend::selectable_content()`; that returns the current *selection*, not the
+screen, so the fork exposes one method instead — `Terminal::text()`, the buffer
+as `Vec<String>` — at `tanvoid0/iced_term@feat/terminal-text`, wired in by
+`[patch.crates-io]` in `desktop/Cargo.toml` and meant to come out when upstream
+takes it. Teeing to a file dodges the fork but takes the child off the tty, so
+it buys the watchable half by throwing away the promptable one. `wrap` brackets
+the command with two markers and `scrape` reads between them; the closing marker
+only counts when a number follows it, because the shell's echo of the typed line
+is on screen carrying both markers before the command has run.
+*Accept: met live* — an approved command streamed in the drawer, its output
+reached the model, and `pause` was answered by hand to finish the turn.
 
 ## Phase 5 — Multi-session board *(the Cursor Agents Window; biggest lift)* — **landed 2026-08-19**
 
@@ -293,7 +298,7 @@ toast naming the session. See plan.md.
 | 1 | stop, per-file revert, queue+steer, follow | S+M+M+S | none |
 | 2 | plan gate, todos | M+M | none |
 | 3 | edit_file, @-mentions, AGENTS.md | L+M+S | edit_file only |
-| 4 | autonomy tiers ✓, review pass ✓, terminal runs (blocked) | M+S+L | none |
+| 4 | autonomy tiers ✓, review pass ✓, terminal runs ✓ | M+S+L | none |
 | 5 | session board ✓, worktrees ✓, handoff ✓ | S+M+S | none (parallel streams verified) |
 
 Each item ships alone: own commit(s), driven live before claimed done,

@@ -280,6 +280,27 @@ pub enum Status {
     Idle,
 }
 
+/// An agent command running in the visible drawer rather than headless.
+///
+/// The turn is parked on it exactly as it would be on a headless one: the
+/// server is blocked, and [`poll_terminal_run`] is what eventually answers.
+#[derive(Debug)]
+struct TermRun {
+    /// The call this owes a result for.
+    call_id: String,
+    /// What the shell brackets the output with — see [`crate::coder_term::wrap`].
+    mark: String,
+    /// Seconds waited, counted off the screen's own clock rather than a timer
+    /// of its own. The turn already ticks once a second while it is running.
+    waited: u32,
+}
+
+/// How long an agent's command may sit in the drawer before the turn stops
+/// waiting for it. Same as the headless executor's cap
+/// (`coder_tools::COMMAND_TIMEOUT`) — where it runs must not change how long it
+/// is allowed to take.
+const TERM_RUN_TIMEOUT: u32 = 180;
+
 #[derive(Debug, Default)]
 pub struct State {
     /// The folder the agent works in. Every path it asks for is resolved
@@ -431,6 +452,10 @@ pub struct State {
     /// `None` until asked for: a shell process per app launch, in a folder that
     /// may not be open yet, is a process nobody asked to start.
     pub term: Option<crate::coder_term::Session>,
+    /// The agent's command that is running in that drawer, waiting for the
+    /// shell to say it finished. `None` means nothing of ours is in there —
+    /// whatever else the user is running is their own.
+    term_run: Option<TermRun>,
     /// Ids handed to terminals so far. The widget's subscription is keyed on it,
     /// so reopening must not reuse one.
     term_seq: u64,
@@ -1661,7 +1686,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             if state.sending || state.would_queue() {
                 state.elapsed += 1;
             }
-            Task::none()
+            poll_terminal_run(state)
         }
         Message::AnimTick => {
             state.frame = state.frame.wrapping_add(1);
@@ -1705,6 +1730,11 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 return Task::none();
             }
             state.stopped = true;
+            // Stop watching the drawer. The command itself is left alone — it is
+            // running in the user's own shell, where they can watch it finish or
+            // Ctrl-C it themselves, and killing a shell to end a turn is a
+            // bigger thing than the button says.
+            state.term_run = None;
             // A stopped plan turn is a plan that was never written, so there is
             // nothing for the card to ask about.
             state.kind = TurnKind::Work;
@@ -1855,6 +1885,18 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.following =
                 state.follow.then(|| write_path(&root, &name, &arguments)).flatten();
             let allow = state.autonomy.allows_commands();
+            // An approved command runs where the user can watch it and answer
+            // it, rather than headless behind a spinner. Headless stays the
+            // fallback and this returns `None` to take it: a drawer that will
+            // not open must not cost the turn.
+            if name == "run_command" && allow {
+                let command = command_of(&arguments);
+                if !command.is_empty() {
+                    if let Some(task) = start_in_terminal(state, &call_id, &command) {
+                        return task;
+                    }
+                }
+            }
             Task::batch([
                 iced::widget::operation::snap_to_end(transcript_id()),
                 Task::perform(
@@ -2476,6 +2518,86 @@ fn start_turn(
     // exists.
     Task::perform(async move { crate::coder_git::ensure_repo(&root).await }, Message::Baselined)
         .chain(turn)
+}
+
+/// Run the agent's command in the drawer the user can see.
+///
+/// `None` when it cannot be done — no folder, or the terminal would not open —
+/// and the caller falls back to the headless executor, which is what this
+/// screen did for every command before now.
+///
+/// The command is written into the *user's* shell, so two things follow. The
+/// dock switches to it, because a command running somewhere the user is not
+/// looking is the spinner this replaces; and the row says where it went, since
+/// otherwise a command whose output arrives from an unfamiliar place looks like
+/// the agent's, not theirs.
+fn start_in_terminal(state: &mut State, call_id: &str, command: &str) -> Option<Task<Message>> {
+    // The mark rides in a shell string, so it is the call id with anything a
+    // shell could read stripped out of it.
+    let mark: String = call_id.chars().filter(char::is_ascii_alphanumeric).take(16).collect();
+    if mark.is_empty() {
+        return None;
+    }
+    let focus = match state.term.is_some() {
+        true => Task::none(),
+        false => state.open_terminal(),
+    };
+    let session = state.term.as_mut()?;
+    crate::coder_term::send_line(session, &crate::coder_term::wrap(&mark, command));
+    if let Some(Turn::Tool { label, result: None }) = state.turns.last_mut() {
+        label.push_str(" — in the terminal");
+    }
+    state.term_run = Some(TermRun { call_id: call_id.to_string(), mark, waited: 0 });
+    state.dock = Dock::Terminal;
+    Some(Task::batch([focus, iced::widget::operation::snap_to_end(transcript_id())]))
+}
+
+/// Watch the drawer for the end of the agent's command, once a second.
+///
+/// Every path out of here answers the call or keeps waiting — the server is
+/// blocked on it, so a poll that quietly gives up stalls the turn for the full
+/// delegation timeout.
+fn poll_terminal_run(state: &mut State) -> Task<Message> {
+    let Some(run) = state.term_run.as_mut() else { return Task::none() };
+    run.waited += 1;
+    let (mark, call_id, waited) = (run.mark.clone(), run.call_id.clone(), run.waited);
+
+    // The drawer was closed under it. The shell went with it, so nothing is ever
+    // going to write the closing marker.
+    let Some(session) = state.term.as_ref() else {
+        state.term_run = None;
+        return Task::done(Message::ToolRan {
+            call_id,
+            result: "(the terminal was closed before the command finished)".into(),
+        });
+    };
+    if let Some(out) = crate::coder_term::scrape(&crate::coder_term::text(session), &mark) {
+        state.term_run = None;
+        let mut text = match out.text.trim().is_empty() {
+            true => "(no output)".to_string(),
+            false => out.text,
+        };
+        if out.code != 0 {
+            text.push_str(&format!("
+(exit code {})", out.code));
+        }
+        return Task::done(Message::ToolRan {
+            call_id,
+            result: crate::assistant::cap_output(text),
+        });
+    }
+    if waited >= TERM_RUN_TIMEOUT {
+        state.term_run = None;
+        // Not killed: it is in the user's shell and it is theirs to stop. The
+        // model is told where it went rather than that it vanished.
+        return Task::done(Message::ToolRan {
+            call_id,
+            result: format!(
+                "(timed out after {TERM_RUN_TIMEOUT}s — the command is still running in the terminal)"
+            ),
+        });
+    }
+    Task::none()
 }
 
 /// Inline every `@path` the message mentions, so the model reads the file it
