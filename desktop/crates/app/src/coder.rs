@@ -801,7 +801,7 @@ impl State {
     fn set_todos(&mut self, args: &serde_json::Value) -> String {
         let items = parse_todos(args);
         if items.is_empty() {
-            return "Error: update_todos needs a non-empty `items` array of                     {text, done} objects."
+            return "Error: update_todos needs a non-empty `items` array of {text, done} objects."
                 .to_string();
         }
         let (done, total) = (items.iter().filter(|t| t.done).count(), items.len());
@@ -2061,7 +2061,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
                 TurnKind::Handoff => {
                     let Some(summary) = said.filter(|s| !s.is_empty()) else {
                         state.error = Some(
-                            "The handoff came back empty, so the session was left alone.                              Try again, or start a new one and say where you got to."
+                            "The handoff came back empty, so the session was left alone. Try again, or start a new one and say where you got to."
                                 .into(),
                         );
                         return load_threads(state, client);

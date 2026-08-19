@@ -1453,11 +1453,11 @@ fn local_llm_card(_app: &App) -> Element<'_, Message> {
                 ui::badge_icon(Icon::Info, "Not built into this copy", Tone::Neutral),
             ),
             ui::caption(
-                "llama.cpp is linked in behind a cargo feature, off by default because it                  needs an accelerator SDK to be worth running. Rebuild with it to get the                  GGUF picker, the Hugging Face downloader and the VRAM controls:",
+                "llama.cpp is linked in behind a cargo feature, off by default because it needs an accelerator SDK to be worth running. Rebuild with it to get the GGUF picker, the Hugging Face downloader and the VRAM controls:",
             ),
             ui::mono("cargo run -p agent-platform-desktop --features cuda"),
             ui::caption(
-                "`--features local-llm` builds without CUDA and runs on the CPU — measured                  at 11 tok/s against 123 on the GPU, so it is a fallback, not a default.                  Until then every turn goes to the server and its providers.",
+                "`--features local-llm` builds without CUDA and runs on the CPU — measured at 11 tok/s against 123 on the GPU, so it is a fallback, not a default. Until then every turn goes to the server and its providers.",
             ),
         ]),
     )
@@ -1757,7 +1757,7 @@ fn logs_view(app: &App) -> Element<'_, Message> {
     ui::page_fixed(
         "Logs",
         Some(ui::muted(
-            "Server output, including startup and migrations — visible before the API answers.              Click lines to select them, then copy.",
+            "Server output, including startup and migrations — visible before the API answers. Click lines to select them, then copy.",
         )),
         None,
         column![toolbar, ui::code(body)].spacing(space::MD).height(Length::Fill),
