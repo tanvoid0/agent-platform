@@ -976,7 +976,6 @@ fn status_view(app: &App) -> Element<'_, Message> {
 
     blocks.push(server_card(app));
     blocks.push(startup_card(app));
-    #[cfg(feature = "local-llm")]
     blocks.push(local_llm_card(app));
     blocks.push(api_card(app));
     blocks.push(version_card(app));
@@ -1165,6 +1164,35 @@ fn local_llm_card(app: &App) -> Element<'_, Message> {
             ui::caption(
                 "A new model, context or port takes effect when the app restarts. The weights \
                  themselves unload after five idle minutes.",
+            ),
+        ]),
+    )
+}
+
+/// The same card in a build that has no engine to configure.
+///
+/// It renders rather than vanishing on purpose: a card that is simply absent
+/// reads as "this app cannot do that", when the truth is one cargo feature —
+/// and nothing else in the UI mentions in-process inference exists.
+#[cfg(not(feature = "local-llm"))]
+fn local_llm_card(_app: &App) -> Element<'_, Message> {
+    ui::card_with_header(
+        "Local model",
+        Some(ui::muted(
+            "Answer this app's own chat in-process instead of through the server.",
+        )),
+        None,
+        ui::stack(vec![
+            ui::field(
+                "State",
+                ui::badge_icon(Icon::Info, "Not built into this copy", Tone::Neutral),
+            ),
+            ui::caption(
+                "llama.cpp is linked in behind a cargo feature, off by default because it                  needs an accelerator SDK to be worth running. Rebuild with it to get the                  GGUF picker, the Hugging Face downloader and the VRAM controls:",
+            ),
+            ui::mono("cargo run -p agent-platform-desktop --features cuda"),
+            ui::caption(
+                "`--features local-llm` builds without CUDA and runs on the CPU — measured                  at 11 tok/s against 123 on the GPU, so it is a fallback, not a default.                  Until then every turn goes to the server and its providers.",
             ),
         ]),
     )

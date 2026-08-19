@@ -164,6 +164,10 @@ async fn fetch(
 }
 
 /// `12.3 GB` — for a progress line, not for arithmetic.
+///
+/// The only part of this module the view owns, so it is the only part a build
+/// without the engine has no caller for.
+#[cfg_attr(not(feature = "local-llm"), allow(dead_code))]
 pub fn human(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut n = bytes as f64;

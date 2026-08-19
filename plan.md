@@ -3624,6 +3624,15 @@ Ordered by what unblocks what:
    cargo test -p agent-platform-desktop model_download -- --ignored --nocapture
    ```
 
+   **The card renders in a default build too**, as "Not built into this copy"
+   plus the cargo line — it used to be `#[cfg]`'d away entirely, and a card
+   that is simply absent reads as "this app cannot do that" when the truth is
+   one feature flag. Nothing else in the UI mentions in-process inference
+   exists: the Providers screen lists the *server's* catalog (Ollama, LM
+   Studio, AIMLAPI…), and the in-process engine is deliberately not in it —
+   it answers the desktop's own chat through `inference.rs`, and only reaches
+   the server at all through `local_server_port`.
+
 *The pre-desktop refactor checklist (`docs/refactor-handoff-followup.md`) is
 complete and the file is deleted: services extracted (`app/services/`),
 `datetime.utcnow()` gone, route layers thinned; its frontend items died with
