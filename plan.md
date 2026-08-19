@@ -3624,6 +3624,16 @@ Ordered by what unblocks what:
    cargo test -p agent-platform-desktop model_download -- --ignored --nocapture
    ```
 
+   **The engine is a pick in the chat header now.** It was reachable only by
+   leaving *both* header boxes empty — which is what `inference::chat_stream`
+   routes on, and which nothing on screen said. E.V.'s provider box lists
+   `local` first when the engine can answer (feature in, GGUF configured, file
+   present — the same condition the router uses), picking it clears both fields
+   rather than storing an id the proxy would 400 on, and the model box goes
+   empty because the local engine ignores `model` and setting one would send
+   the turn to the server. The Coder screen's picker is untouched: its agent
+   loop runs on the server, so in-process is not a choice there.
+
    **The card renders in a default build too**, as "Not built into this copy"
    plus the cargo line — it used to be `#[cfg]`'d away entirely, and a card
    that is simply absent reads as "this app cannot do that" when the truth is

@@ -37,6 +37,26 @@ pub fn chat_stream(client: Client, body: ChatCompletionBody) -> impl Stream<Item
     sse::chat_stream(client, body)
 }
 
+/// What the chat header calls the in-process engine. Not a provider the proxy
+/// knows about — picking it means *unsetting* both fields, which is the only
+/// state [`chat_stream`] routes here. It is listed anyway because "leave both
+/// boxes empty" is not a thing anyone can see, and a local engine nobody can
+/// select is a local engine nobody uses.
+pub const LOCAL_ID: &str = "local";
+
+/// Whether [`LOCAL_ID`] is worth offering: the feature is in, a GGUF is
+/// configured, and the file is there. Same condition [`chat_stream`] routes on,
+/// deliberately — a listed choice that silently answers elsewhere is worse than
+/// no choice at all.
+pub fn local_available() -> bool {
+    #[cfg(feature = "local-llm")]
+    {
+        crate::local_llm::available()
+    }
+    #[cfg(not(feature = "local-llm"))]
+    false
+}
+
 /// Which side answered last, for the Settings badge: `0` nothing yet, `1` here,
 /// `2` the server. Written where the choice is made, which is above.
 #[cfg(feature = "local-llm")]

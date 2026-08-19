@@ -266,9 +266,10 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Elemen
     // five equal-weight widgets — but the tab strip above already names the
     // assistant, and the HUD says which mode it is in. Both were repeating
     // something on screen; the model was not.
+    let selected = state.selected_provider();
     let mut head: Vec<Element<'_, Message>> = vec![ui::model_pickers(
         state.provider_ids(),
-        &state.provider,
+        &selected,
         Message::ProviderChanged,
         state.model_options(),
         &state.model,

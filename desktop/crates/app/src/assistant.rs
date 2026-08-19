@@ -646,12 +646,37 @@ impl State {
     }
 
     pub fn provider_ids(&self) -> Vec<String> {
-        self.catalog.iter().map(|p| p.id.clone()).collect()
+        // The in-process engine leads the list when it can answer: it is the
+        // one upstream that is already on this machine.
+        let local = crate::inference::local_available()
+            .then(|| crate::inference::LOCAL_ID.to_string());
+        local.into_iter().chain(self.catalog.iter().map(|p| p.id.clone())).collect()
+    }
+
+    /// What the provider box shows. Both fields empty *is* the local route, so
+    /// with an engine available that state is drawn as [`LOCAL_ID`] rather than
+    /// as an empty box the user has to know the meaning of.
+    ///
+    /// [`LOCAL_ID`]: crate::inference::LOCAL_ID
+    pub fn selected_provider(&self) -> String {
+        if self.provider.is_empty()
+            && self.model.is_empty()
+            && crate::inference::local_available()
+        {
+            return crate::inference::LOCAL_ID.to_string();
+        }
+        self.provider.clone()
     }
 
     /// Models the chosen provider offers; every provider's models when no
     /// provider is picked (the proxy resolves an alias to its provider).
     pub fn model_options(&self) -> Vec<String> {
+        // The local engine ignores `model` — whatever GGUF is configured
+        // answers — and *setting* one would route the turn to the server
+        // instead. An empty list is the honest one.
+        if self.selected_provider() == crate::inference::LOCAL_ID {
+            return Vec::new();
+        }
         self.catalog
             .iter()
             .filter(|p| self.provider.is_empty() || p.id == self.provider)
@@ -1175,6 +1200,13 @@ pub fn update(
         Message::TraceLogs(_) => Task::none(),
         Message::DraftChanged(v) => {
             state.draft = v;
+            Task::none()
+        }
+        Message::ProviderChanged(v) if v == crate::inference::LOCAL_ID => {
+            // Not a provider the proxy can be told about: the local route is
+            // both fields unset, which is exactly what Default does.
+            state.provider.clear();
+            state.model.clear();
             Task::none()
         }
         Message::ProviderChanged(v) => {
@@ -1879,6 +1911,35 @@ mod tests {
     /// loop, not the store, and one that writes nowhere real is enough.
     fn mem() -> crate::memory::Store {
         crate::memory::Store::load(&std::env::temp_dir().join("ev-assistant-test-memory"))
+    }
+
+    /// Picking the in-process engine is not "set provider = local" — the proxy
+    /// has never heard of it, and `inference::chat_stream` routes on *both*
+    /// fields being unset. If this ever starts storing the id, every turn goes
+    /// to the server with a 400 for an unknown provider.
+    #[test]
+    fn picking_the_local_engine_clears_both_fields() {
+        let mut s = State { provider: "ollama".into(), model: "llama3".into(), ..State::new() };
+        let _ = update(
+            &mut s,
+            &client(),
+            &mut mem(),
+            Message::ProviderChanged(crate::inference::LOCAL_ID.into()),
+        );
+        assert!(s.provider.is_empty(), "provider was {:?}", s.provider);
+        assert!(s.model.is_empty(), "model was {:?}", s.model);
+    }
+
+    /// The box has to read back what was picked, and a real provider must not
+    /// be redrawn as the local one.
+    #[test]
+    fn a_chosen_provider_still_shows_itself() {
+        let s = State { provider: "ollama".into(), ..State::new() };
+        assert_eq!(s.selected_provider(), "ollama");
+        // Without the engine available there is nothing to draw for the empty
+        // state either — that is the server default, and it stays blank.
+        let s = State::new();
+        assert_eq!(s.selected_provider().is_empty(), !crate::inference::local_available());
     }
 
     #[test]
