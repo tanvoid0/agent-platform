@@ -71,7 +71,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Screen::Agenda => crate::agenda_view::view(&app.agenda, &app.settings.theme.resolve())
             .map(Message::Agenda),
         Screen::Coder => {
-            crate::coder_view::view(&app.coder, &app.settings.theme.resolve()).map(Message::Coder)
+            crate::coder_board::view(&app.coder, &app.settings.theme.resolve()).map(Message::Coder)
         }
         Screen::Search => crate::search_view::view(&app.search).map(Message::Search),
         Screen::Studio => crate::studio_view::view(&app.studio).map(Message::Studio),

@@ -228,9 +228,9 @@ outside that crate can read the grid. The ways through are a vendored
 rather than a screen change. Not worked around — a second command-output panel
 beside the terminal we already have is the run bar step 5 deleted.
 
-## Phase 5 — Multi-session board *(the Cursor Agents Window; biggest lift)*
+## Phase 5 — Multi-session board *(the Cursor Agents Window; biggest lift)* — **landed 2026-08-19**
 
-**5.1 Concurrent sessions with a status board — XL.**
+**5.1 Concurrent sessions with a status board — XL. — landed 2026-08-19.**
 Refactor `coder::State` into `Session` (per-thread: turns, pending, stream,
 checkpoints, queue, todos) + screen state; N sessions run concurrently, each
 its own SSE stream and delegated executor (the invariant holds per-thread —
@@ -239,6 +239,19 @@ already safe server-side). Sessions pane becomes the board: ● running /
 ⏸ awaiting approval / ✓ idle per row; switching sessions is a tab switch;
 OS-level notification (tray exists) when a background session finishes or
 parks on approval.
+**Landed, and not as an XL.** `coder::State` was already one session's worth of
+state, so nothing was split out of it: `coder_board.rs` holds `Vec<Slot>` and
+**derefs to the active session**, which leaves `main.rs`, `coder_view` and the
+4000-line `update` reading the tab in front exactly as they did. What the sketch
+above missed is the part that had to be built: routing. Every task a session
+starts is tagged `Message::For(id, …)` and routed back to it, an untagged
+message goes to the active session, and a frame for a closed session is
+**dropped** — without that a background stream writes its transcript into
+whichever tab is in front. The parallel-stream safety this item asked to verify
+holds server-side (`(thread_id, call_id)`), but the *checkpoint* repo is one per
+folder: a turn is refused while another session is mid-turn in the same
+checkout, and mid-turn includes parked on the approval card, where `sending` is
+false and the commit has not been taken.
 **5.2 Worktree isolation option — M.** Per-session checkbox: run in
 `git worktree add .agent/worktrees/<thread>` when the workspace is a real
 repo; session's root points there; a Merge-back action surfaces `git diff`
@@ -253,7 +266,11 @@ in the old thread as its last row. `TurnKind` gained a fourth member for it.
 An empty summary leaves the session standing and says why; throwing a session
 away on a failed call is the one failure here that loses work.
 *Accept (5.1): two sessions on two folders run simultaneously; approving in
-one doesn't touch the other; a finished background session notifies.*
+one doesn't touch the other; a finished background session notifies.* — **met
+live**, `llama3.1:8b` over Ollama on a sandboxed daemon: one session parked on
+an approval in the project while a second streamed in its own worktree, *Run*
+resumed only the first, and a turn finishing while the user was on Home posted a
+toast naming the session. See plan.md.
 
 ## Deliberately not doing
 
@@ -277,7 +294,7 @@ one doesn't touch the other; a finished background session notifies.*
 | 2 | plan gate, todos | M+M | none |
 | 3 | edit_file, @-mentions, AGENTS.md | L+M+S | edit_file only |
 | 4 | autonomy tiers ✓, review pass ✓, terminal runs (blocked) | M+S+L | none |
-| 5 | session board, worktrees, handoff | XL+M+S | none (verify parallel-stream safety) |
+| 5 | session board ✓, worktrees ✓, handoff ✓ | S+M+S | none (parallel streams verified) |
 
 Each item ships alone: own commit(s), driven live before claimed done,
 `plan.md` updated as steps land. Phases 1–2 are the daily-driver threshold;

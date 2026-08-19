@@ -13,7 +13,8 @@
 //! labels, "why did that fail" needs the text. A transcript that inlines every
 //! `read_file` result is one where the model's own reasoning is unfindable.
 
-use crate::coder::{Autonomy, Dock, Message, Pane, PlanMode, State, Turn};
+use crate::coder::{Autonomy, Dock, Message, Pane, PlanMode, State, Status, Turn};
+use crate::coder_board::Row as SessionRow;
 use crate::coder_browser;
 use crate::ui::{self, space, Icon, Tone};
 use iced::widget::{
@@ -27,11 +28,18 @@ use iced::{Element, Length, Padding, Theme};
 /// ever needs to differ per tab.
 const DOCK_HEIGHT: f32 = 300.0;
 
-pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
+/// `board` is every live session, not just the one `state` is — the sessions
+/// pane draws them all and this is the only region that knows there is more
+/// than one. See [`crate::coder_board`].
+pub fn view<'a>(
+    state: &'a State,
+    iced_theme: &Theme,
+    board: &'a [SessionRow],
+) -> Element<'a, Message> {
     let mut panes: Vec<Element<'a, Message>> = vec![
         rail(state),
         ui::separator_vertical(),
-        sidebar(state),
+        sidebar(state, board),
         ui::separator_vertical(),
         container(ui::page_custom(header(state), body(state, iced_theme)))
             .width(Length::Fill)
@@ -77,11 +85,11 @@ fn rail(state: &State) -> Element<'_, Message> {
     .into()
 }
 
-fn sidebar(state: &State) -> Element<'_, Message> {
-    let (head, items): (Element<'_, Message>, Vec<Element<'_, Message>>) = match state.pane {
+fn sidebar<'a>(state: &'a State, board: &'a [SessionRow]) -> Element<'a, Message> {
+    let (head, items): (Element<'a, Message>, Vec<Element<'a, Message>>) = match state.pane {
         Pane::Sessions => (
             pane_head("Sessions", None),
-            sessions(state),
+            sessions(state, board),
         ),
         Pane::Files => (
             pane_head(
@@ -114,17 +122,43 @@ fn pane_head<'a>(label: &'a str, action: Option<Element<'a, Message>>) -> Elemen
     ui::cluster(items).into()
 }
 
-/// Past sessions, newest first — read from the server rather than a local file:
-/// coder threads are persisted server-side already, and a second copy here
-/// would be the one that goes stale.
-fn sessions(state: &State) -> Vec<Element<'_, Message>> {
-    let mut items: Vec<Element<'_, Message>> =
-        vec![ui::button_secondary(Icon::Plus, "New session", Message::New)];
+/// The board on top — every session open right now, with what each is doing —
+/// and the server's past threads under it.
+///
+/// The two lists are not the same thing and the divider says so: a row above it
+/// is a session with a transcript and possibly a turn in flight, a row below it
+/// is a conversation to reopen.
+fn sessions<'a>(state: &'a State, board: &'a [SessionRow]) -> Vec<Element<'a, Message>> {
+    let mut items: Vec<Element<'a, Message>> = Vec::new();
+    for row in board {
+        let (glyph, note) = match row.status {
+            Status::Running => (Icon::Activity, "running"),
+            Status::Awaiting => (Icon::Pause, "waiting"),
+            Status::Idle => (Icon::Check, ""),
+        };
+        items.push(
+            ui::cluster(vec![
+                container(ui::nav_item(
+                    glyph,
+                    row.title.as_str(),
+                    row.active,
+                    Message::SelectSession(row.id),
+                ))
+                .width(Length::Fill)
+                .into(),
+                ui::caption(note),
+                ui::icon_tip(Icon::X, "Close session", Message::CloseSession(row.id)),
+            ])
+            .into(),
+        );
+    }
+    items.push(ui::button_secondary(Icon::Plus, "New session", Message::New));
     // Only once there is something to hand over. The pair reads as one choice —
     // start clean, or start clean carrying what this session learned.
     if state.thread_id.is_some() {
         items.push(ui::button_ghost(Icon::ArrowRight, "Hand off to a new one", Message::Fork));
     }
+    items.push(ui::caption("Past sessions"));
     if state.threads.is_empty() {
         items.push(if state.threads_loading {
             ui::caption(format!("{} Loading past sessions…", ui::spinner_char(state.frame)))

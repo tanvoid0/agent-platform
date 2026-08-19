@@ -25,6 +25,7 @@ mod bubble_shader;
 mod chat;
 mod chat_view;
 mod coder;
+mod coder_board;
 mod coder_browser;
 mod coder_files;
 mod coder_git;
@@ -258,7 +259,7 @@ pub struct App {
     pub workflows: workflows::State,
     pub todos: todos::State,
     pub agenda: agenda::State,
-    pub coder: coder::State,
+    pub coder: coder_board::Board,
     pub search: search::State,
     pub studio: studio::State,
     pub apidocs: apidocs::State,
@@ -683,7 +684,12 @@ fn boot() -> (App, Task<Message>) {
 
     // Built before the struct, because the struct takes `settings` by move and
     // this reads most of its own state off it.
-    let coder = coder::State::restored(&settings, coder_provider, coder_model, coder_plan_mode);
+    let coder = coder_board::Board::new(coder::State::restored(
+        &settings,
+        coder_provider,
+        coder_model,
+        coder_plan_mode,
+    ));
 
     let app = App {
         shell: sh,
@@ -1759,23 +1765,36 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                     | coder::Message::ToggleFollow(_)
                     | coder::Message::SetAutonomy(_)
                     | coder::Message::AlwaysAllow
+                    // Switching tabs changes which folder and model are "the
+                    // open one", which is the whole of what gets saved here.
+                    | coder::Message::SelectSession(_)
             );
-            let was_sending = app.coder.sending;
-            let task = coder::update(&mut app.coder, &app.client, msg).map(Message::Coder);
+            let was_running = app.coder.running();
+            let task = coder_board::update(&mut app.coder, &app.client, msg).map(Message::Coder);
             // Same as the assistant: the turn outlives the visit to the screen.
             // An approval pause counts as finishing — that one is *waiting* on
             // the user, so it is the toast that matters most.
-            if was_sending && !app.coder.sending {
-                match &app.coder.pending {
+            //
+            // Per session rather than per screen, because with a board the turn
+            // that ends is often not the one on screen — and that is the one the
+            // user most needs telling about.
+            let running = app.coder.running();
+            for id in was_running.into_iter().filter(|id| !running.contains(id)) {
+                let Some(session) = app.coder.get(id) else { continue };
+                let title = session.title();
+                match &session.pending {
                     Some(p) => notify::review(
                         "coder",
                         "Coder",
-                        &format!("Waiting for approval: {}", p.command),
+                        &format!("{title} — waiting for approval: {}", p.command),
                     ),
                     None => notify::away(
                         "coder",
                         "Coder",
-                        &preview(app.coder.error.as_deref(), app.coder.last_reply()),
+                        &format!(
+                            "{title} — {}",
+                            preview(session.error.as_deref(), session.last_reply())
+                        ),
                     ),
                 }
             }
@@ -1973,7 +1992,7 @@ fn subscription(app: &App) -> Subscription<Message> {
     // The Coder screen's clock. A turn in flight, or one parked on the approval
     // gate — both are waits the user is sitting through. Otherwise nothing is
     // counting, and a permanent 1s timer would wake the app for no reason.
-    if app.coder.sending || app.coder.pending.is_some() {
+    if app.coder.any_busy() {
         subs.push(
             iced::time::every(std::time::Duration::from_secs(1))
                 .map(|_| Message::Coder(coder::Message::Tick)),
@@ -1983,11 +2002,7 @@ fn subscription(app: &App) -> Subscription<Message> {
     // wider: it also runs for a sidebar fetch, which has no seconds worth
     // counting but still needs to say "in progress" as something other than a
     // blank list.
-    if app.coder.sending
-        || app.coder.pending.is_some()
-        || app.coder.threads_loading
-        || app.coder.checkpoints_loading
-    {
+    if app.coder.any_busy() {
         subs.push(
             iced::time::every(std::time::Duration::from_millis(90))
                 .map(|_| Message::Coder(coder::Message::AnimTick)),

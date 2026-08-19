@@ -270,11 +270,30 @@ pub enum Dock {
     Diff,
 }
 
+/// What a session is doing, for the board's rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Running,
+    /// Parked on the approval card or the plan gate — waiting on a person,
+    /// which is the state a board exists to make visible.
+    Awaiting,
+    Idle,
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     /// The folder the agent works in. Every path it asks for is resolved
     /// against this and refused if it escapes.
     pub root: Option<PathBuf>,
+    /// Checkouts another live session is mid-turn in, refreshed by
+    /// [`crate::coder_board`] before every message it hands down.
+    ///
+    /// The checkpoint repo is one per folder, so two turns writing the same
+    /// checkout would interleave `commit_all` and each checkpoint would hold
+    /// the other session's changes — the one thing checkpoints exist to rule
+    /// out. A session sharing a root with a running one waits; a session in its
+    /// own worktree has a root of its own and never sees this.
+    pub busy_roots: Vec<PathBuf>,
     /// Server-side thread. Opened before the first turn streams, because
     /// answering a tool call needs the id the turn would otherwise carry.
     pub thread_id: Option<i64>,
@@ -594,6 +613,39 @@ impl State {
         }
     }
 
+    /// What this session is doing, for the board's status dot. The same
+    /// ordering as [`Self::activity`]: a wait on the user outranks a wait on the
+    /// model, because it is the one that will not clear on its own.
+    pub fn status(&self) -> Status {
+        if self.pending.is_some() || self.plan_card.is_some() {
+            Status::Awaiting
+        } else if self.sending {
+            Status::Running
+        } else {
+            Status::Idle
+        }
+    }
+
+    /// What the board calls this session. The server's own title once a thread
+    /// exists — it is the one the history list shows, so a session must not be
+    /// named one thing while running and another once it is past.
+    pub fn title(&self) -> String {
+        if let Some(t) = self
+            .thread_id
+            .and_then(|id| self.threads.iter().find(|t| t.id == id))
+            .filter(|t| !t.title.trim().is_empty())
+        {
+            return t.title.clone();
+        }
+        match self.turns.iter().find_map(|t| match t {
+            Turn::User(text) => Some(text.trim()),
+            _ => None,
+        }) {
+            Some(first) => first.chars().take(60).collect(),
+            None => "New session".to_string(),
+        }
+    }
+
     /// The last thing the agent actually said, for a completion toast.
     pub fn last_reply(&self) -> &str {
         self.turns
@@ -851,6 +903,18 @@ pub enum Message {
     MergeBack,
     MergedBack(Result<(), String>),
     New,
+    /// A message for a session other than the one on screen — the board's
+    /// routing envelope. Every task a session's own message produces is tagged
+    /// with the session's id, so a background stream's frames land in the
+    /// transcript they belong to rather than in whichever tab is in front.
+    ///
+    /// Handled entirely in [`crate::coder_board`]; a session never sees one.
+    For(u64, Box<Message>),
+    /// Bring a session to the front.
+    SelectSession(u64),
+    /// End a session and take it off the board. Its turn is stopped first, so
+    /// the call the server is parked on gets answered rather than abandoned.
+    CloseSession(u64),
     /// "Carry on in a new session": one tool-free turn writes the handoff, and
     /// its answer opens a fresh thread with that text already in the composer.
     Fork,
@@ -2083,10 +2147,6 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.error = Some(format!("Could not merge that session back: {e}"));
             Task::none()
         }
-        Message::New => {
-            reset_session(state);
-            Task::none()
-        }
         // Amp's `/handoff`, and the thing it is actually for: a thread that has
         // been going long enough to be expensive is also one whose context is
         // mostly dead ends. Restarting by hand means re-typing everything the
@@ -2097,6 +2157,14 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             }
             start_turn(state, client, HANDOFF_ASK.to_string(), TurnKind::Handoff)
         }
+        // The board owns these four; they are in this enum because the whole
+        // screen speaks one message type. `New` is one of them because a new
+        // session is a session *beside* this one now — see
+        // [`crate::coder_board`].
+        Message::New
+        | Message::For(..)
+        | Message::SelectSession(_)
+        | Message::CloseSession(_) => Task::none(),
         Message::LinkClicked(url) => {
             if url.starts_with("http://") || url.starts_with("https://") {
                 crate::shell::reveal_path(&url);
@@ -2263,40 +2331,50 @@ fn mode_instruction(state: &State) -> Option<String> {
     Some(block.chars().take(MAX_MODE_INSTRUCTION).collect())
 }
 
-/// Start a new conversation in the same folder.
+/// A fresh conversation in the same folder, with everything around the
+/// conversation carried over and nothing of the conversation itself.
 ///
-/// Two callers — the New button and the handoff, which is that button with the
-/// old session's summary already typed into it. The root survives and so does
-/// everything around the conversation; the conversation does not.
-fn reset_session(state: &mut State) {
-    *state = State {
+/// Clones rather than moves because it has two shapes of caller: the handoff
+/// replaces the session it is called on ([`reset_session`]), and the board opens
+/// a second one beside it — same folder, same model, same rules, its own thread.
+pub fn fresh_from(state: &State) -> State {
+    State {
         root: state.root.clone(),
         // A new conversation in the same checkout, isolated or not — the
         // worktree belongs to the folder the user is working in, not to the
         // thread that happened to make it.
         main_root: state.main_root.clone(),
         git_repo: state.git_repo,
+        // The chip is the folder's fact, not the thread's; recomputing it costs
+        // a `refresh_tree` the new session has no other reason to run.
+        agents_md: state.agents_md,
         autonomy: state.autonomy,
-        allowlist: std::mem::take(&mut state.allowlist),
+        allowlist: state.allowlist.clone(),
         plan_mode: state.plan_mode,
         follow: state.follow,
-        catalog: std::mem::take(&mut state.catalog),
-        provider: std::mem::take(&mut state.provider),
-        model: std::mem::take(&mut state.model),
-        threads: std::mem::take(&mut state.threads),
+        catalog: state.catalog.clone(),
+        provider: state.provider.clone(),
+        model: state.model.clone(),
+        threads: state.threads.clone(),
         // A new *conversation*, not a new folder: the file history and the tree
         // are the folder's, and outlive any session in it.
-        checkpoints: std::mem::take(&mut state.checkpoints),
+        checkpoints: state.checkpoints.clone(),
         files_open: state.files_open,
         pane: state.pane,
         dock: state.dock,
         browser_open: state.browser_open,
-        browser_url: std::mem::take(&mut state.browser_url),
-        browser_draft: std::mem::take(&mut state.browser_draft),
-        tree: std::mem::take(&mut state.tree),
-        expanded: std::mem::take(&mut state.expanded),
+        browser_url: state.browser_url.clone(),
+        browser_draft: state.browser_draft.clone(),
+        tree: state.tree.clone(),
+        expanded: state.expanded.clone(),
         ..State::default()
-    };
+    }
+}
+
+/// Start a new conversation in place — the handoff, which is the New button with
+/// the old session's summary already typed into it.
+fn reset_session(state: &mut State) {
+    *state = fresh_from(state);
 }
 
 /// What the handoff turn asks for. It is a message rather than a
@@ -2347,6 +2425,17 @@ fn start_turn(
     kind: TurnKind,
 ) -> Task<Message> {
     let Some(root) = state.root.clone() else { return Task::none() };
+    // One turn per checkout at a time — see [`State::busy_roots`]. Said rather
+    // than queued: the other session is somebody else's window on this screen,
+    // and a turn that starts minutes later without being asked for again is
+    // worse than one that did not start.
+    if state.busy_roots.contains(&root) {
+        state.error = Some(
+            "Another session is running a turn in this folder. Wait for it, or run this one in its own checkout with Isolate."
+                .into(),
+        );
+        return Task::none();
+    }
     // The row and the message are the same string, mentions and all — see
     // [`expand_mentions`]. Not for a review: that prompt is a diff this screen
     // built, and `@@ -1,7 +1,7 @@` is not somebody pointing at a file.

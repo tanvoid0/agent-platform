@@ -38,7 +38,7 @@ than died, is the section below.
 | LLM proxy, BYOK, providers | `llm.rs` (routes), `llm_config.rs`, `byok.rs`, `provider_catalog.rs`, `model_capabilities.rs`, `model_catalog.rs`, `upstream_http.rs`, `usage.rs`; admin surface in `llm_admin.rs`, `config.yaml` validation in `config_schema.rs` |
 | Assistant "E.V." + planning chat | `{assistant,assistant_turn,clarifying_form}.rs`; desktop `assistant.rs`/`assistant_view.rs` + `stt.rs`, and `agenda.rs`/`agenda_view.rs` (board) + `agenda_chat.rs`/`agenda_chat_view.rs` (chat pane) |
 | Chat | `{chat,chat_usage,chat_thread_title,context_budget}.rs` |
-| Coder agent | `{coder,coder_loop,coder_tools}.rs`; desktop `coder.rs` + `coder_view.rs` + `coder_tools.rs` (the desktop-side executor) + `coder_notes.rs` + `coder_git.rs` (checkpoints) + `coder_files.rs` (tree, viewer) + `coder_term.rs` (PTY terminal) |
+| Coder agent | `{coder,coder_loop,coder_tools}.rs`; desktop `coder.rs` (one session) + `coder_board.rs` (N of them) + `coder_view.rs` + `coder_tools.rs` (the desktop-side executor) + `coder_notes.rs` + `coder_git.rs` (checkpoints) + `coder_files.rs` (tree, viewer) + `coder_term.rs` (PTY terminal) |
 | Todos / boards | `todos.rs`; the agent routes in `action_orchestrator.rs` |
 | Workflows engine + assist | `workflows.rs` + `workflow_engine.rs` (and its interval scheduler) |
 | Teams, projects | `teams.rs`, `projects.rs` |
@@ -3612,7 +3612,7 @@ questioning before starting — 4 was, and came back half yes:
    the runner only if iced grows a webview, which would bring the preview back
    and with it every part listed above.
 
-### Coder → daily driver (2026-08-19) — Phases 1–4 landed and driven, 5.3 with them
+### Coder → daily driver (2026-08-19) — all five phases landed and driven
 
 The hearth migration made this a working agent. Making it the screen coding
 actually happens in is a second body of work, planned in
@@ -3620,8 +3620,9 @@ actually happens in is a second body of work, planned in
 what Cursor 2/3, Claude Code, Junie, Zed and Windsurf ship today. The field has
 converged on one pipeline — **editable plan gate → streaming loop with
 queue/steer → aggregated diff review → checkpoint rewind → verify** — and the
-plan is five phases along it. Phase 5 is in that doc and not started; one item
-of Phase 4 is blocked on the terminal crate and says so below.
+plan is five phases along it. All five have landed; the one thing outstanding on
+this screen is Phase 4's third item, blocked on the terminal crate rather than
+deferred, and it says so below.
 
 **Phase 1 — trust the loop — is done.** Four items, all client-side; the wire
 protocol was not touched:
@@ -3912,15 +3913,100 @@ a scratch folder that may not exist — so `project_root()` is what gets written
   Windows can rewrite line endings. That is git doing what it does to every
   commit in that repo, and the test asserts on trimmed content for it.
 
-**5.1 is not started, and it is the reason 5.2 came first.** The
-sessions board (5.1) shares one shadow-git repo per folder, so two sessions
-running in the same folder would interleave `commit_all` and a checkpoint would
-hold the other session's changes — which is the thing checkpoints exist to rule
-out. 5.1's own accept criterion says "two sessions **on two folders**", so the
-plan already assumes the isolation 5.2 provides. Whichever is done first, the
-constraint is the same: concurrent turns need either different roots or a
-worktree each, and `root` has to move into the per-session struct with the
-checkpoints, the tree and the viewer that hang off it.
+**5.1 — the sessions board — landed 2026-08-19, and Phase 5 is closed with it.**
+N sessions run at once, each its own thread, transcript, stream, queue, tier and
+checkpoints; the Sessions pane is the board, one row per live session with
+`● running / ⏸ waiting / ✓ idle` beside it, and the server's past threads under a
+divider below. [`coder_board.rs`](desktop/crates/app/src/coder_board.rs) is the
+whole of it — 200 lines beside a 4000-line screen, and the shape is why:
+
+- **`coder::State` did not move.** It was already one session's worth of state;
+  what it lacked was a *second* one. `Board` holds `Vec<Slot>` and derefs to the
+  active session, so `state.sending`, `state.pending`, `state.root` still read
+  the session on screen from `main.rs`, from `coder_view` and from the 4000-line
+  `update` — none of which learned there is more than one. The plan called this
+  an XL refactor of `State` into `Session` + screen state; a `Deref` made it an
+  S. What that costs is a struct that is not a smart pointer pretending to be
+  one, and the payment is that the field names are unambiguous — an inherent
+  field on `Board` wins over the session's, and there are none that collide.
+- **Every task a session starts is tagged with that session's id**
+  (`Message::For(u64, Box<Message>)`), and routed back to it. Without it a
+  background stream's frames land in whichever tab is in front — one transcript
+  written into another, which is the failure mode a board has and a single
+  session cannot. An **untagged** message goes to the active session, which is
+  exactly right for the ones `main` starts on entering the screen.
+- **A frame for a session that has been closed is dropped**, not applied to the
+  active one. Ids are handed out and never reused, so a late frame cannot land in
+  the session that took its place in the list. Closing answers the parked call
+  first (`Message::Stop`, then remove) — a stream dropped while the server is
+  blocked on it stalls that turn for the full 300s delegation timeout.
+- **One turn per checkout, refused rather than queued.** The shadow-git repo is
+  one per folder, so two turns writing it would interleave `commit_all` and each
+  checkpoint would hold the other session's work. `State::busy_roots` is
+  refreshed by the board before every message it hands down, and `start_turn`
+  refuses with the way out named: *"Another session is running a turn in this
+  folder. Wait for it, or run this one in its own checkout with Isolate."* That
+  is 5.2 doing the job 5.1's accept criterion assumed it would.
+- **The clock and the spinner are the board's, not the tab's.** `Tick` and
+  `AnimTick` are broadcast to every session, and `main`'s subscription gates on
+  `Board::any_busy` — otherwise switching back to a background turn shows one
+  that has apparently been running for no time at all.
+- **The completion toast is per session and names it.** `main` diffs
+  `Board::running()` across the update and posts for whichever session left it,
+  because with a board the turn that ends is usually *not* the one on screen.
+- **An allowlist rule is copied to every session on save.** The rules are the
+  folder's, and `main` persists the tab in front — a rule left in one tab is one
+  the next save drops.
+- **New session opens a tab beside this one**; the handoff still replaces in
+  place, because it is the same work carried over and two tabs for it would
+  leave a dead one behind. Closing the last session starts a fresh one rather
+  than leaving the screen with nothing behind it.
+
+Checks: `two_sessions_on_two_folders_each_run_their_own_turn`,
+`a_second_session_will_not_run_a_turn_in_a_folder_already_working`,
+`a_session_waiting_on_an_approval_still_holds_its_checkout`,
+`a_frame_for_a_closed_session_lands_nowhere`,
+`closing_the_last_session_starts_a_fresh_one_instead`,
+`an_always_allow_rule_reaches_every_session`,
+`selecting_a_session_puts_it_on_screen`.
+
+**Known, and left:** the terminal drawer subscribes only to the session on
+screen, so a background session's PTY takes no input while it is behind. One
+shell at a time is what the drawer already was; a second one is a dock change,
+not a board change.
+
+##### Driven live, 2026-08-19 — `llama3.1:8b` over Ollama, sandboxed daemon
+
+`AGENT_PLATFORM_APP_DIR` again, port 18499, two scratch workspaces. What the
+screen actually did:
+
+- **Two sessions, two checkouts, at the same time.** Session one parked on the
+  approval card for `python main.py` in the project; session two, *Isolate* on,
+  streaming in `.agent/worktrees/<n>` with its own tool rows. The board read
+  `⏸ waiting` and `● running` on the two rows, and the header showed a
+  different root for each. That is 5.1's accept criterion on screen.
+- **Approving in one did not touch the other.** *Run* resumed session one's turn
+  into session one's transcript; session two kept its own, and its thread is a
+  separate row in Past sessions.
+- **The refusal fires on the real screen.** With session one parked, a turn in a
+  second session on the *same* folder was refused and nothing ran — no row, no
+  thread. A parked turn is what found the bug in it: `sending` is false there,
+  so the first cut of `busy_roots` let a second turn start beside a turn whose
+  checkpoint had not been taken. It counts `pending` too now.
+- **A background session's clock keeps counting** — the parked session read
+  *waiting for you… 156s* on the way back to it, having been off screen for most
+  of that.
+- **The completion toast names the session**: *Coder — read main.py and summarise
+  it in one line — The main.py file…*, with the badge on the Coder nav item, for
+  a turn that finished while the user was on Home.
+
+Two things worth knowing for the next person driving this app, on top of the
+ALT-tap and the `CopyFromScreen` traps already recorded: **`cargo test` does not
+rebuild the `.exe`** — twenty minutes went into a guard that "did not fire"
+against a binary built before the guard existed; and **a clicker that clicks
+twice to beat the eaten-first-click will hit whatever the first click reflowed
+into that position** — that is how *New session* became *Hand off to a new one*
+and ran a handoff turn nobody asked for. Single click, screenshot, then click.
 
 #### Driven live, 2026-08-19 — `qwen3-coder:30b` over Ollama
 
