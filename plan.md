@@ -3886,7 +3886,33 @@ anyone would look for it. `TurnKind` gained a fourth member; an empty summary
 leaves the session standing and says why, because throwing a session away on a
 failed call is the only failure here that loses work.
 
-**5.1 and 5.2 are not started, and the order they are written in is wrong.** The
+**5.2 — worktree isolation — landed first, because the order in the plan is
+wrong.** An *Isolate* toggle in the header, drawn only for a real git
+repository, runs the session in `git worktree add --detach .agent/worktrees/<n>`
+and points `root` at it. That one swap *is* the feature: the tools already
+resolve against `root`, the tree already walks it, the checkpoints already live
+in it, so nothing downstream learns a new concept. What must not follow `root`
+is `settings.json` — a saved workspace pointing at a worktree reopens the app in
+a scratch folder that may not exist — so `project_root()` is what gets written.
+
+- **`.agent/` goes in `.git/info/exclude`, not `.gitignore`.** The ignore file
+  is the project's and belongs to whoever owns the project; `info/exclude` is
+  this clone's alone. Without it the worktree is untracked junk in the user's
+  own `git status`.
+- **Merge back stages first.** `git add -A` then `git diff --cached`, because a
+  file the agent *created* is untracked and a plain `git diff` would not mention
+  it — which is most of what an agent does. Applied with `git apply --3way`, so
+  it lands whole or refuses whole.
+- **Turning it off does not delete the checkout.** Work that has not been merged
+  is not the toggle's to throw away.
+- A header badge says *isolated checkout* whenever `main_root` is set: working
+  somewhere other than the folder the user opened is the one state this screen
+  must not be quiet about.
+- Known: `git apply` runs the repo's own `core.autocrlf`, so a merge back on
+  Windows can rewrite line endings. That is git doing what it does to every
+  commit in that repo, and the test asserts on trimmed content for it.
+
+**5.1 is not started, and it is the reason 5.2 came first.** The
 sessions board (5.1) shares one shadow-git repo per folder, so two sessions
 running in the same folder would interleave `commit_all` and a checkpoint would
 hold the other session's changes — which is the thing checkpoints exist to rule

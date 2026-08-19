@@ -1780,8 +1780,11 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                 }
             }
             if persist {
+                // The *project*, never the isolated checkout it may be working
+                // in — a settings file pointing at a worktree reopens the app in
+                // a scratch folder that may not exist any more.
                 app.settings.coder_workspace =
-                    app.coder.root.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                    app.coder.project_root().map(|p| p.display().to_string()).unwrap_or_default();
                 app.settings.coder_provider = app.coder.provider.clone();
                 app.settings.coder_model = app.coder.model.clone();
                 app.settings.coder_plan_mode = Some(app.coder.plan_mode);

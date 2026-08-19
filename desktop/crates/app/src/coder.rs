@@ -382,6 +382,16 @@ pub struct State {
     /// Cached off [`Self::refresh_tree`] rather than stat'd per frame — the view
     /// runs at 60fps and this is a file that changes about once a project.
     pub agents_md: bool,
+    /// The folder is a git repository of the user's own, so a session can be
+    /// isolated in a worktree. Cached beside [`Self::agents_md`] and for the
+    /// same reason: it gates a header control the view draws every frame.
+    pub git_repo: bool,
+    /// The project, when [`Self::root`] is a worktree rather than the project
+    /// itself. `Some` *is* the isolation: everything downstream — the tools,
+    /// the tree, the checkpoints, the terminal — reads `root` and needs to know
+    /// nothing about this, and the one thing that must not follow `root` is the
+    /// folder written back to `settings.json`.
+    pub main_root: Option<PathBuf>,
     /// The tree as drawn: only what is expanded, re-walked rather than cached
     /// (see [`crate::coder_files`]). A turn writes files, so a cache here would
     /// need invalidating on every event that matters.
@@ -492,6 +502,7 @@ impl State {
             agents_md: root
                 .as_ref()
                 .is_some_and(|r| r.join(crate::coder_notes::AGENTS_PATH).is_file()),
+            git_repo: root.as_deref().is_some_and(crate::coder_git::is_repo),
             root,
             ..Self::default()
         }
@@ -569,6 +580,11 @@ impl State {
             .filter(|p| self.provider.is_empty() || p.id == self.provider)
             .flat_map(|p| p.models.options.iter().cloned())
             .collect()
+    }
+
+    /// The folder the user opened, whichever checkout the agent is working in.
+    pub fn project_root(&self) -> Option<&PathBuf> {
+        self.main_root.as_ref().or(self.root.as_ref())
     }
 
     pub fn root_label(&self) -> String {
@@ -828,6 +844,12 @@ pub enum Message {
     /// One frame of the spinner shown while a turn, a tool, or a sidebar fetch
     /// is in flight — see [`State::frame`].
     AnimTick,
+    /// Run this session in its own checkout, or put it back in the project's.
+    ToggleWorktree(bool),
+    WorktreeReady(Result<PathBuf, String>),
+    /// Apply the isolated session's work to the real checkout.
+    MergeBack,
+    MergedBack(Result<(), String>),
     New,
     /// "Carry on in a new session": one tool-free turn writes the handoff, and
     /// its answer opens a fresh thread with that text already in the composer.
@@ -2004,6 +2026,63 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             }
             Task::none()
         }
+        // Isolation is a property of the *checkout*, so it is one swap of
+        // `root` and nothing else changes: the tools already resolve against
+        // it, the tree already walks it, the checkpoints already live in it.
+        Message::ToggleWorktree(on) => {
+            if state.sending {
+                return Task::none();
+            }
+            if !on {
+                // Back to the project. The checkout stays on disk — dropping it
+                // would throw away work the user has not merged.
+                if let Some(main) = state.main_root.take() {
+                    state.root = Some(main);
+                    state.refresh_tree();
+                }
+                return Task::none();
+            }
+            let Some(root) = state.root.clone().filter(|_| state.main_root.is_none()) else {
+                return Task::none();
+            };
+            // Named by the clock rather than by the thread: isolation is worth
+            // choosing *before* the first turn, and there is no thread yet then.
+            let name = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_else(|_| "session".to_string());
+            Task::perform(
+                async move { crate::coder_git::worktree_add(&root, &name).await },
+                Message::WorktreeReady,
+            )
+        }
+        Message::WorktreeReady(Ok(worktree)) => {
+            state.main_root = state.root.replace(worktree);
+            state.error = None;
+            state.refresh_tree();
+            Task::none()
+        }
+        Message::WorktreeReady(Err(e)) => {
+            state.error = Some(format!("Could not make an isolated checkout: {e}"));
+            Task::none()
+        }
+        Message::MergeBack => {
+            let (Some(main), Some(worktree)) = (state.main_root.clone(), state.root.clone()) else {
+                return Task::none();
+            };
+            Task::perform(
+                async move { crate::coder_git::worktree_merge(&main, &worktree).await },
+                Message::MergedBack,
+            )
+        }
+        Message::MergedBack(Ok(())) => {
+            state.error = None;
+            Task::none()
+        }
+        Message::MergedBack(Err(e)) => {
+            state.error = Some(format!("Could not merge that session back: {e}"));
+            Task::none()
+        }
         Message::New => {
             reset_session(state);
             Task::none()
@@ -2192,6 +2271,11 @@ fn mode_instruction(state: &State) -> Option<String> {
 fn reset_session(state: &mut State) {
     *state = State {
         root: state.root.clone(),
+        // A new conversation in the same checkout, isolated or not — the
+        // worktree belongs to the folder the user is working in, not to the
+        // thread that happened to make it.
+        main_root: state.main_root.clone(),
+        git_repo: state.git_repo,
         autonomy: state.autonomy,
         allowlist: std::mem::take(&mut state.allowlist),
         plan_mode: state.plan_mode,

@@ -313,6 +313,11 @@ fn header(state: &State) -> Element<'_, Message> {
     if state.agents_md {
         top_row.push(ui::badge_icon(Icon::Scroll, "AGENTS.md", Tone::Info));
     }
+    // Working somewhere other than the folder the user opened is the one state
+    // this screen must never be quiet about.
+    if state.main_root.is_some() {
+        top_row.push(ui::badge_icon(Icon::Copy, "isolated checkout", Tone::Warning));
+    }
     let top = row![
         Row::with_children(top_row).spacing(space::SM).align_y(iced::Alignment::Center),
         space_widget::horizontal(),
@@ -325,7 +330,7 @@ fn header(state: &State) -> Element<'_, Message> {
     // Three states, not a checkbox: see [`PlanMode`]. A segmented control
     // rather than a third toggle beside the other two, because Off/Inline/Gate
     // are one choice and the toggles next to it are three separate ones.
-    let budget = ui::cluster(vec![
+    let mut budget = ui::cluster(vec![
         ui::segmented(
             PlanMode::ALL.map(|m| (m.label(), state.plan_mode == m, Message::SetPlanMode(m))),
         ),
@@ -339,6 +344,21 @@ fn header(state: &State) -> Element<'_, Message> {
         // belongs beside the other two: all three are "how this turn behaves".
         ui::toggle(Icon::Eye, "Follow", state.follow, Message::ToggleFollow(!state.follow)),
     ]);
+    // Only for a real repository: a worktree of a folder that is not one is a
+    // git error the user cannot act on.
+    if state.git_repo {
+        let isolated = state.main_root.is_some();
+        let mut cells = vec![ui::toggle(
+            Icon::Copy,
+            "Isolate",
+            isolated,
+            Message::ToggleWorktree(!isolated),
+        )];
+        if isolated {
+            cells.push(ui::button_secondary(Icon::Check, "Merge back", Message::MergeBack));
+        }
+        budget = ui::cluster(vec![budget.into(), ui::cluster(cells).into()]);
+    }
     // `.wrap()` is a safety net for a narrower window, not the layout itself —
     // a `Length::Fill` child (a spacer, a rule) does not survive it in this
     // iced, measured against the row's full unwrapped extent rather than one

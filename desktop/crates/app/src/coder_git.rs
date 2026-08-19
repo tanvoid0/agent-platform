@@ -21,7 +21,7 @@
 //!   model's, but a commit message *is* the user's prompt, and it goes in as one
 //!   argument that nothing parses.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The checkpoint repo, relative to the workspace root. Beside
 /// [`crate::coder_notes::REL_PATH`], because both are the agent's own state
@@ -121,6 +121,133 @@ async fn git(root: &Path, args: &[&str]) -> Result<Output, String> {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     })
+}
+
+/// The user's *own* git, run in `cwd` — not the checkpoint repo [`git`] drives.
+///
+/// Worktrees are the one thing here that touches the project's real history, so
+/// they go through their own door rather than borrowing a helper wired to
+/// `--git-dir=.agent/git`.
+async fn user_git(cwd: &Path, args: &[&str]) -> Result<Output, String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("could not run git ({e}) — is it installed and on PATH?"))?;
+    Ok(Output {
+        ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// Where a session's isolated checkout lives, relative to the project.
+const REL_WORKTREES: &str = ".agent/worktrees";
+
+/// Whether the folder is inside a git repository of the user's own.
+///
+/// Synchronous and shallow on purpose: it gates a header control, so it is
+/// re-read with the tree rather than awaited per frame. The checkpoint repo is
+/// `.agent/git` and never a `.git`, so it cannot answer yes by accident.
+pub fn is_repo(root: &Path) -> bool {
+    let mut dir = Some(root);
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
+}
+
+/// Give a session its own checkout, so what the agent does is not in the
+/// user's working tree until they say so.
+///
+/// `--detach` rather than a branch: a session is not a branch, and one that
+/// made a branch would leave it behind after the checkout was dropped.
+///
+/// The checkout goes under `.agent/`, which is already ours — and `.agent/` is
+/// written into the repo's **`.git/info/exclude`** rather than its
+/// `.gitignore`: the ignore file is the project's and belongs to whoever owns
+/// the project, `info/exclude` is this clone's alone. Without it a worktree
+/// shows up as untracked junk in the user's own `git status`.
+pub async fn worktree_add(root: &Path, name: &str) -> Result<PathBuf, String> {
+    let dir = root.join(REL_WORKTREES).join(name);
+    if dir.exists() {
+        return Ok(dir);
+    }
+    exclude_agent_dir(root).await;
+    std::fs::create_dir_all(root.join(REL_WORKTREES)).map_err(|e| e.to_string())?;
+    let out = user_git(root, &["worktree", "add", "--detach", &plain(&dir)]).await?;
+    if !out.ok {
+        return Err(failed("worktree add", &out));
+    }
+    Ok(dir)
+}
+
+/// Add `.agent/` to this clone's own exclude list. Best effort: a repo whose
+/// `.git` is a file (a worktree itself) or is read-only still gets a session,
+/// it just also gets noise in `git status`.
+async fn exclude_agent_dir(root: &Path) {
+    let Ok(out) = user_git(root, &["rev-parse", "--git-common-dir"]).await else { return };
+    if !out.ok {
+        return;
+    }
+    let git_dir = PathBuf::from(out.stdout.trim());
+    let git_dir = if git_dir.is_absolute() { git_dir } else { root.join(git_dir) };
+    let exclude = git_dir.join("info").join("exclude");
+    let current = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if current.lines().any(|l| l.trim() == ".agent/") {
+        return;
+    }
+    let _ = std::fs::create_dir_all(git_dir.join("info"));
+    let sep = if current.is_empty() || current.ends_with('\n') { "" } else { "\n" };
+    let _ = std::fs::write(&exclude, format!("{current}{sep}.agent/
+"));
+}
+
+/// Everything the session changed in its checkout, as a patch.
+///
+/// Staged first, because a file the agent *created* is untracked and a plain
+/// `git diff` would not mention it — which is most of what an agent does. The
+/// checkout is a scratch one, so staging in it costs nothing.
+pub async fn worktree_diff(worktree: &Path) -> Result<String, String> {
+    let add = user_git(worktree, &["add", "-A"]).await?;
+    if !add.ok {
+        return Err(failed("add", &add));
+    }
+    let out = user_git(worktree, &["diff", "--cached", "--binary"]).await?;
+    if !out.ok {
+        return Err(failed("diff", &out));
+    }
+    Ok(out.stdout)
+}
+
+/// Put the session's work into the real checkout.
+///
+/// `git apply` rather than a merge: the session is detached and uncommitted, so
+/// there is no commit to merge — and apply either lands whole or refuses whole,
+/// which is what a user pressing "merge back" is entitled to assume.
+pub async fn worktree_merge(main: &Path, worktree: &Path) -> Result<(), String> {
+    let patch = worktree_diff(worktree).await?;
+    if patch.trim().is_empty() {
+        return Err("that session has not changed anything yet".to_string());
+    }
+    let file = main.join(REL_WORKTREES).join("merge.patch");
+    std::fs::create_dir_all(file.parent().unwrap_or(main)).map_err(|e| e.to_string())?;
+    std::fs::write(&file, &patch).map_err(|e| e.to_string())?;
+    let out = user_git(main, &["apply", "--3way", &plain(&file)]).await?;
+    let _ = std::fs::remove_file(&file);
+    if !out.ok {
+        return Err(failed("apply", &out));
+    }
+    Ok(())
 }
 
 fn failed(what: &str, out: &Output) -> String {
@@ -321,6 +448,66 @@ pub async fn restore(root: &Path, sha: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// A worktree is only worth anything if the work lands back in the real
+    /// checkout, new files included — which is most of what an agent produces,
+    /// and which a plain `git diff` would not have mentioned.
+    #[tokio::test]
+    async fn a_session_works_in_its_own_checkout_and_merges_back() {
+        let root = std::env::temp_dir().join("coder-worktree-test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: Vec<&'static str>| {
+            let root = root.clone();
+            async move { super::user_git(&root, &args).await.unwrap() }
+        };
+        if !run(vec!["init", "-q"]).await.ok {
+            return; // no git on this machine; the other tests already say so
+        }
+        let _ = run(vec!["config", "user.email", "t@example.com"]).await;
+        let _ = run(vec!["config", "user.name", "t"]).await;
+        std::fs::write(root.join("kept.txt"), "one
+").unwrap();
+        assert!(run(vec!["add", "-A"]).await.ok);
+        assert!(run(vec!["commit", "-qm", "base"]).await.ok);
+        assert!(super::is_repo(&root), "a folder with a .git in it is a repo");
+
+        let wt = super::worktree_add(&root, "s1").await.expect("worktree add");
+        assert!(wt.join("kept.txt").is_file(), "the checkout has the project in it");
+
+        // What an agent does: change one file, create another.
+        std::fs::write(wt.join("kept.txt"), "two
+").unwrap();
+        std::fs::write(wt.join("made.txt"), "new
+").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("kept.txt")).unwrap(),
+            "one
+",
+            "the project is untouched until it is merged — the whole point"
+        );
+
+        super::worktree_merge(&root, &wt).await.expect("merge back");
+        // Trimmed, not exact: `git apply` runs the repo's own `core.autocrlf`, so a
+        // merge back on Windows can hand the file over with CRLF endings. That is
+        // git doing what it does to every commit here, not the patch losing
+        // anything — and asserting on the bytes would fail on one machine and
+        // pass on the next.
+        assert_eq!(std::fs::read_to_string(root.join("kept.txt")).unwrap().trim(), "two");
+        assert_eq!(
+            std::fs::read_to_string(root.join("made.txt")).unwrap().trim(),
+            "new",
+            "a file the agent created has to arrive too"
+        );
+
+        // `.agent/` is this clone's business, not the project's.
+        let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).unwrap_or_default();
+        assert!(exclude.lines().any(|l| l.trim() == ".agent/"), "got {exclude:?}");
+        assert!(
+            !root.join(".gitignore").exists(),
+            "the project's own ignore file is not ours to write"
+        );
+    }
+
     use super::*;
     use std::path::PathBuf;
 
