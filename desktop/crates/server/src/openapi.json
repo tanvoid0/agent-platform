@@ -12579,6 +12579,182 @@
      }
     }
    }
+  },
+  "/api/v1/media/status": {
+   "get": {
+    "tags": [
+     "media"
+    ],
+    "summary": "Whether local media generation is reachable, and what it has installed",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/api/v1/media/generate": {
+   "post": {
+    "tags": [
+     "media"
+    ],
+    "summary": "Queue an image or video job",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/MediaGenerateRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MediaJobOut"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/api/v1/media/suggest": {
+   "get": {
+    "tags": [
+     "media"
+    ],
+    "summary": "A prompt suggestion for the given kind",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/api/v1/media/requirements": {
+   "get": {
+    "tags": [
+     "media"
+    ],
+    "summary": "Which models a kind needs, and which of them are present",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/api/v1/media/jobs": {
+   "get": {
+    "tags": [
+     "media"
+    ],
+    "summary": "Jobs, newest first",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "$ref": "#/components/schemas/MediaJobOut"
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/api/v1/media/jobs/{job_id}": {
+   "get": {
+    "tags": [
+     "media"
+    ],
+    "summary": "One job",
+    "parameters": [
+     {
+      "name": "job_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "integer",
+       "title": "Job Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MediaJobOut"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/api/v1/media/jobs/{job_id}/file": {
+   "get": {
+    "tags": [
+     "media"
+    ],
+    "summary": "The job's output file",
+    "parameters": [
+     {
+      "name": "job_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "integer",
+       "title": "Job Id"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The generated image or video",
+      "content": {
+       "application/octet-stream": {
+        "schema": {
+         "type": "string",
+         "format": "binary"
+        }
+       }
+      }
+     }
+    }
+   }
   }
  },
  "components": {
@@ -19030,6 +19206,173 @@
      "item"
     ],
     "title": "ApplyActionsResponse"
+   },
+   "MediaGenerateRequest": {
+    "properties": {
+     "kind": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Kind",
+      "description": "'image' or 'video'; defaults to image."
+     },
+     "prompt": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Prompt"
+     },
+     "negative": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Negative"
+     },
+     "width": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Width",
+      "description": "Clamped rather than rejected."
+     },
+     "height": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Height",
+      "description": "Clamped rather than rejected."
+     },
+     "length": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Length",
+      "description": "Video only: frame count at 24 fps. Ignored for images."
+     },
+     "enhance": {
+      "anyOf": [
+       {
+        "type": "boolean"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Enhance",
+      "description": "Expand the prompt through the LLM proxy first. A model failure degrades to the prompt as typed (ADR 0009)."
+     }
+    },
+    "type": "object",
+    "title": "MediaGenerateRequest"
+   },
+   "MediaJobOut": {
+    "properties": {
+     "id": {
+      "type": "integer",
+      "title": "Id"
+     },
+     "kind": {
+      "type": "string",
+      "title": "Kind"
+     },
+     "prompt": {
+      "type": "string",
+      "title": "Prompt"
+     },
+     "status": {
+      "type": "string",
+      "title": "Status"
+     },
+     "width": {
+      "type": "integer",
+      "title": "Width"
+     },
+     "height": {
+      "type": "integer",
+      "title": "Height"
+     },
+     "length": {
+      "type": "integer",
+      "title": "Length"
+     },
+     "seed": {
+      "type": "integer",
+      "title": "Seed"
+     },
+     "created_at": {
+      "type": "string",
+      "title": "Created At"
+     },
+     "updated_at": {
+      "type": "string",
+      "title": "Updated At"
+     },
+     "enhanced_prompt": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Enhanced Prompt"
+     },
+     "error": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Error"
+     },
+     "file_name": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "File Name"
+     }
+    },
+    "type": "object",
+    "title": "MediaJobOut"
    }
   }
  }
