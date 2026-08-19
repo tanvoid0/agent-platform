@@ -48,6 +48,10 @@ const MAX_LISTED: usize = 50;
 /// would put all of it on one row.
 const MAX_SUBJECT: usize = 120;
 
+/// Files listed for one checkpoint. The baseline holds the entire project, so
+/// without a cap the panel would try to draw a row per file in the repo.
+const MAX_CHANGED: usize = 200;
+
 /// One commit in the timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Checkpoint {
@@ -217,6 +221,89 @@ pub async fn diff(root: &Path, sha: &str) -> Result<String, String> {
     Ok(if text.is_empty() { "(this checkpoint changed nothing)".to_string() } else { text })
 }
 
+/// One file a checkpoint touched, and what it did to it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Change {
+    /// git's own letter: `A`, `M`, `D`. Rename detection is off (see
+    /// [`changes`]), so those three are all that appear.
+    pub status: char,
+    /// Repo-relative, as git spells it — which is what [`revert_file`] takes.
+    pub path: String,
+}
+
+/// What one checkpoint touched, file by file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Changes {
+    pub files: Vec<Change>,
+    /// Whether there is a commit before this one. **False for the baseline**, and
+    /// that is the case this field exists for: "revert this file to before the
+    /// baseline" would delete a file the user had before the agent ever ran.
+    pub revertable: bool,
+    /// Files beyond [`MAX_CHANGED`], so a truncated list can say so rather than
+    /// read as the whole of it.
+    pub hidden: usize,
+}
+
+/// The files in one checkpoint, plus whether reverting one is meaningful.
+///
+/// `--no-renames` on purpose: with detection on, a rename is one `R` row naming
+/// two paths, and reverting "the file" would have to put the old name back as
+/// well as remove the new one. Off, the same change is a `D` and an `A` — two
+/// rows, each of which reverts correctly on its own.
+pub async fn changes(root: &Path, sha: &str) -> Result<Changes, String> {
+    let parent = format!("{sha}^");
+    // `-q` so the baseline's miss is not noise on stderr.
+    let revertable = git(root, &["rev-parse", "--verify", "-q", &parent]).await?.ok;
+    let out = git(root, &["show", "--format=", "--name-status", "--no-renames", sha]).await?;
+    if !out.ok {
+        return Err(failed("show", &out));
+    }
+    let all: Vec<Change> = out
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.trim_end_matches('\r').split('\t');
+            let status = fields.next()?.chars().next()?;
+            let path = fields.next_back()?.trim();
+            (!path.is_empty()).then(|| Change { status, path: path.to_string() })
+        })
+        .collect();
+    let hidden = all.len().saturating_sub(MAX_CHANGED);
+    Ok(Changes { files: all.into_iter().take(MAX_CHANGED).collect(), revertable, hidden })
+}
+
+/// Put **one file** back to how it was before this checkpoint.
+///
+/// The narrow half of [`restore`]: it touches the named path and nothing else,
+/// so the rest of the turn — and everything since it — stays. There is no patch
+/// matcher behind this and it needs none, because a checkpoint holds whole file
+/// contents; that is also why the unit here is a file rather than a hunk.
+///
+/// Two cases, and the second is why this is not one `git checkout`:
+///
+/// * the file existed before the checkpoint → check that version out;
+/// * it did not → the checkpoint *created* it, so reverting means removing it.
+pub async fn revert_file(root: &Path, sha: &str, path: &str) -> Result<(), String> {
+    let parent = format!("{sha}^");
+    if !git(root, &["rev-parse", "--verify", "-q", &parent]).await?.ok {
+        return Err("this is the baseline — there is nothing before it to go back to".into());
+    }
+    if git(root, &["cat-file", "-e", &format!("{parent}:{path}")]).await?.ok {
+        let out = git(root, &["checkout", &parent, "--", path]).await?;
+        return if out.ok { Ok(()) } else { Err(failed("checkout", &out)) };
+    }
+    // Created by this checkpoint. Deleted through the filesystem rather than
+    // `git rm`, which would also stage the removal — the next turn's `add -A`
+    // records it either way, and this keeps the index the commit's alone.
+    match std::fs::remove_file(root.join(path)) {
+        Ok(()) => Ok(()),
+        // Already gone — a later turn deleted it, or the user did. The tree is
+        // in the state the revert asked for, which is what was wanted.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not delete {path}: {e}")),
+    }
+}
+
 /// Put the work tree back to how it looked at this checkpoint.
 ///
 /// Destructive by design, and only to what git tracks: untracked files (build
@@ -296,6 +383,54 @@ mod tests {
         std::fs::write(root.join("app.py"), "print('v3')\n").unwrap();
         restore(&root, &checkpoints[1].sha).await.unwrap();
         assert_eq!(std::fs::read_to_string(root.join("app.py")).unwrap(), "print('v1')\n");
+    }
+
+    /// Reverting one file out of a turn, against real git. The three cases that
+    /// matter are all here: a file the turn *changed* goes back, a file it
+    /// *created* goes away, and the rest of the turn stays exactly as it was —
+    /// which is the whole point of per-file over whole-checkpoint restore.
+    #[tokio::test]
+    async fn one_file_reverts_out_of_a_turn_and_the_rest_of_it_stays() {
+        if !have_git().await {
+            eprintln!("skipped: no git on PATH");
+            return;
+        }
+        let root = scratch("revert-one");
+        std::fs::write(root.join("kept.py"), "keep = 1\n").unwrap();
+        std::fs::write(root.join("undone.py"), "old = 1\n").unwrap();
+        ensure_repo(&root).await.unwrap();
+
+        // One turn: edits both files and adds a third.
+        std::fs::write(root.join("kept.py"), "keep = 2\n").unwrap();
+        std::fs::write(root.join("undone.py"), "new = 2\n").unwrap();
+        std::fs::write(root.join("added.py"), "fresh = 1\n").unwrap();
+        assert!(commit_all(&root, "a turn").await.unwrap());
+        let turn = list(&root).await.unwrap()[0].sha.clone();
+
+        let changed = changes(&root, &turn).await.unwrap();
+        assert!(changed.revertable, "a turn on top of the baseline has something to go back to");
+        let mut listed: Vec<(char, &str)> =
+            changed.files.iter().map(|c| (c.status, c.path.as_str())).collect();
+        listed.sort();
+        assert_eq!(listed, vec![('A', "added.py"), ('M', "kept.py"), ('M', "undone.py")]);
+
+        // A modified file goes back to the version before the turn.
+        revert_file(&root, &turn, "undone.py").await.unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("undone.py")).unwrap(), "old = 1\n");
+        // A file the turn created has no earlier version, so reverting removes it.
+        revert_file(&root, &turn, "added.py").await.unwrap();
+        assert!(!root.join("added.py").exists());
+        // Twice is not an error: the tree is already how the revert asked for it.
+        revert_file(&root, &turn, "added.py").await.unwrap();
+        // And the file nobody reverted is untouched.
+        assert_eq!(std::fs::read_to_string(root.join("kept.py")).unwrap(), "keep = 2\n");
+
+        // The baseline holds the project as it was *before* the agent ran, so
+        // "revert to before it" would delete files the user already had.
+        let baseline = list(&root).await.unwrap().last().unwrap().sha.clone();
+        assert!(!changes(&root, &baseline).await.unwrap().revertable);
+        assert!(revert_file(&root, &baseline, "kept.py").await.is_err());
+        assert!(root.join("kept.py").exists(), "and it did not touch the file on its way out");
     }
 
     /// The user's own `.git` must come out of a turn untouched — that is the

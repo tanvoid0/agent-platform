@@ -55,6 +55,8 @@ pub struct Store {
     dir: PathBuf,
     /// Conversation each tab is currently on; absent = a fresh thread.
     current: HashMap<String, u64>,
+    /// First press arms, second deletes — same two-press as Coder sessions.
+    pub delete_armed: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +81,13 @@ impl Store {
         }
         let next_id =
             saved.next_id.max(saved.items.iter().map(|c| c.id + 1).max().unwrap_or(1)).max(1);
-        Self { items: saved.items, next_id, dir: dir.to_path_buf(), current: HashMap::new() }
+        Self {
+            items: saved.items,
+            next_id,
+            dir: dir.to_path_buf(),
+            current: HashMap::new(),
+            delete_armed: None,
+        }
     }
 
     /// Failures are silent, like the memory harvester's: chat history that nags
@@ -164,7 +172,19 @@ impl Store {
     pub fn delete(&mut self, id: u64) {
         self.items.retain(|c| c.id != id);
         self.current.retain(|_, cur| *cur != id);
+        self.delete_armed = None;
         self.save();
+    }
+
+    /// First press arms, second deletes. Returns whether it actually deleted.
+    pub fn request_delete(&mut self, id: u64) -> bool {
+        if self.delete_armed == Some(id) {
+            self.delete(id);
+            true
+        } else {
+            self.delete_armed = Some(id);
+            false
+        }
     }
 
     /// The sidebar's rows: this tab's conversations, most recently touched first.
@@ -281,6 +301,17 @@ mod tests {
         assert_eq!(reopened.current("run 7"), None, "deleting the open chat closes it");
         assert_eq!(Store::load(&dir).items.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_chat_takes_two_presses() {
+        let mut s = store();
+        s.autosave("E.V.", &thread("keep me"), &[], "", "");
+        let id = s.items[0].id;
+        assert!(!s.request_delete(id), "first press only arms");
+        assert_eq!(s.items.len(), 1);
+        assert!(s.request_delete(id), "second press deletes");
+        assert!(s.items.is_empty());
     }
 
     #[test]

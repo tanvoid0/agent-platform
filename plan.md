@@ -44,7 +44,9 @@ than died, is the section below.
 | Teams, projects | `teams.rs`, `projects.rs` |
 | Workspaces, files, documents | `workspaces.rs`, `workspace_files.rs`, `documents.rs` (upload ingest + PDF extraction) |
 | Model ops (Ollama, registry, build jobs) | `model_ops.rs` — all seventeen routes and the stage runner; the pipeline itself is `worker/model_ops/pipeline/` |
+| Image/video generation (ComfyUI) | `media.rs` + `media_templates/*.json`; desktop `studio.rs`/`studio_view.rs` ([ADR 0009](docs/adr/0009-local-media-generation.md)) |
 | Logs, status | `observability.rs` (the ring `logd!` writes to), `system.rs` (`/system/status`, `/system/logs`) |
+| Resource modes, AI-call priority | `resources.rs` (`Limits`, the two lanes, `/system/resources`); gated at `llm::complete_internal` and `llm::chat_completions`; desktop Settings → Performance and the sidebar monitor in `screen.rs` ([ADR 0010](docs/adr/0010-resource-modes-and-ai-call-priority.md)) |
 | Env seeding, correlation ids | `dotenv.rs`, `request_id.rs` |
 | Shared shapes | `wire.rs`, `error.rs` |
 | Desktop HTTP/SSE client | `desktop/crates/client/` (`enums.rs` is hand-maintained now — the generator went with `app/shared_enums.py`) |
@@ -90,6 +92,137 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
   `GET /processes/{id}`. Desktop gates its detail polling on the stream.
 
 ## Backlog
+
+- **Resource modes and AI-call priority — landed 2026-08-19.**
+  [ADR 0010](docs/adr/0010-resource-modes-and-ai-call-priority.md).
+
+  **The pitfall was one line.** `executor::max_concurrent_tasks()` returned
+  `None` unless an operator set `AGENT_PLATFORM_DAG_MAX_CONCURRENT_TASKS`, and
+  `None` means unbounded — while the planner prompt asks the model for "many
+  small parallel subagents". A forty-node ready wave was forty simultaneous
+  model calls, two concurrent processes were eighty, and a 429 turned each of
+  them into six retries. The interactive chat the user was actually watching
+  queued behind all of it.
+
+  What landed: `resources.rs` holds a process-wide `Limits` with **two
+  semaphore lanes** — interactive (a ceiling against pathology) and background
+  (the throttle). `Mode` is `eco | balanced | turbo | auto`; `auto` resolves per
+  acquire to Turbo while the desktop window is in front, Balanced for 60 s after
+  the last interactive call, Eco once nobody is looking. `max_concurrent_tasks`
+  now falls back to the resolved background width, so the wave stops being
+  *created* too wide. The gate sits on **`llm::complete_internal`**, which took a
+  required `Priority` parameter — eleven internal callers, and the compiler is
+  what stops a twelfth from silently joining the wrong lane.
+
+  Desktop: **Settings → Performance** (the picker plus what `Auto` currently
+  resolves to) and a **sidebar monitor** above the utility strip. The monitor
+  owns no timer and no sampler — it rides the health poll that was already
+  running, at a rate that follows the mode (20 s in Eco, 5 s in Turbo,
+  `resource_poll_every`), and every number it draws is an atomic read on the
+  server. Host CPU/memory is deliberately absent: it needs a per-platform
+  dependency and a polling thread, for a number the user cannot act on from
+  there.
+
+  Three smaller fixes in the same pass: `coder_tools::search`/`repo_map` moved
+  to `spawn_blocking` in **both** crates (a synchronous whole-workspace walk on a
+  tokio worker — and on the app side that runtime also draws the UI), the
+  model-catalog refresh backs off 30 s → 5 min once both
+  local backends come back empty, and `StatusTick` drops to 30 s with no window
+  open.
+
+  **Not done, and why:** the SQLite pool keeps sqlx's defaults — 10 connections
+  contending was a symptom of the 40-wide wave, not a cause. The tokio runtime
+  still starts a worker per core in every mode; it cannot be resized after
+  `Runtime::new()` and idle workers park rather than spin.
+
+- **Local image and video generation — landed 2026-08-19.**
+  [ADR 0009](docs/adr/0009-local-media-generation.md). A **Studio** screen
+  (`studio.rs`/`studio_view.rs`) over a new server domain (`media.rs`,
+  migration `0003_media_jobs.sql`), generating on this machine through
+  **ComfyUI** over loopback.
+
+  **Why ComfyUI and not Ollama, checked rather than assumed.** Ollama grew
+  image generation in January 2026 and `x/flux2-klein` was *already pulled on
+  this machine* — but it is **macOS only**. Driven here: `/api/generate`
+  answers `"image generation models are not currently supported"` and there is
+  no `/v1/images/generations` route at all. LM Studio does not generate.
+  sd.cpp does images but not video. ComfyUI is the only backend that does both
+  on Windows today, and its HTTP API (`/prompt`, `/history/{id}`, `/view`) is
+  the whole integration. When Ollama's Windows support lands it slots in behind
+  the **already existing** `/v1/images/generations` capability registry in
+  `llm.rs` — which is why that route was left alone rather than extended: it is
+  synchronous, image-only and base64-in-JSON, and forcing video jobs through it
+  would make it OpenAI-shaped in name only.
+
+  - **A generation is a job, not a request.** Diffusion is seconds to minutes,
+    so `POST /media/generate` answers once ComfyUI *accepts* the graph and a
+    background task polls `/history`. The desktop ticks only while something is
+    running (`studio::State::polling` gates the subscription) — a settled
+    gallery costs nothing. `media::spawn_startup_recovery` fails orphaned rows
+    at boot for the same reason `executor`'s does: the watcher is a task in
+    this process, so a restart would leave a spinner nothing will ever stop.
+  - **Templates are data.** Two checked-in ComfyUI graphs with `__AGP_*__`
+    placeholders (`media_templates/`), and a user file at
+    `<media dir>/templates/*.json` overrides either — the escape hatch for a
+    node rename or a different model family, without waiting for this crate.
+    The image template resolves its checkpoint against `/object_info` rather
+    than hard-coding one, preferring known text-to-image families.
+    Substitution is textual and quote-aware (`"__AGP_WIDTH__"` → a bare
+    number), so a prompt carrying quotes, backslashes or newlines is escaped
+    through `serde_json` rather than concatenated — pinned by a test.
+  - **The server's first raw-binary route.** `GET /media/jobs/{id}/file`;
+    `workspace_files::get_file` is a *text* extractor and could not serve a
+    PNG. The desktop caches decoded bytes per finished job — a view runs every
+    frame, so re-fetching a picture sixty times a second is a denial of service
+    against your own server.
+  - **Video does not play in-app, and that ceiling is written where it is
+    cut.** iced has no decoder, so a finished clip gets a card with *Play*,
+    which writes the bytes to temp and hands them to the default player.
+  - **Unconfigured is a first-class state, again.** No ComfyUI means an
+    informational card naming the port it looked at and a *Get ComfyUI* button
+    — never a red banner, never in place of the composer. Confirmed in the
+    running app: the card renders on a machine with no ComfyUI, and **removes
+    itself** on Refresh once a backend answers.
+  - **E.V. needed no new tool.** `POST /api/v1/media/generate` is a write, so
+    `api_write` already parks it behind the one confirm card; reads come free
+    through `api_get`. Both are named in the tool spec, along with `studio` in
+    `open_screen`'s list — a capability the model is not told about is one it
+    never reaches for.
+
+  **One real bug, found by driving it and not by the tests.** The `INSERT`
+  named eleven columns and bound ten values: `kind` was never bound, so every
+  column shifted by one and the statement died on `NOT NULL prompt`. Nothing
+  pure could have caught it — the module's seven unit tests all passed — so the
+  regression check is `tests/media_routes.rs`, which runs the whole lifecycle
+  (probe → generate → poll → bytes) against a stub ComfyUI built from `axum`
+  inside the test binary. It also asserts the *submitted graph*, so a template
+  that stops carrying the prompt fails there rather than in a picture nobody
+  looks at.
+
+  **Driven end to end** against a stub speaking ComfyUI's API: status probe,
+  job created (`width: 1000` snapping to 992), the running → completed
+  transition, the PNG copied into the media dir and served back byte-identical
+  as `image/png`, plus the video kind and both 400s. **Not** driven: pressing
+  *Generate* in the app itself — the window kept moving between screenshot and
+  click and the clicker landed on the wrong control twice, so the desktop half
+  is proven by its unit tests and by the screen rendering, not by a click.
+  604 tests green, hygiene and `check_openapi_request_drift.py` clean.
+
+  **Style presets — landed 2026-08-19.** A `Style` chip row in the composer
+  (`studio::PRESETS`): Pixel art, Logo mark, Icon, Sticker, Isometric, Photo
+  for images, Cinematic and Seamless loop for video. A preset is client-side
+  only — no route, no template, no column. Picking one fills the *Avoid* box
+  and the size chip and appends its keyword string to whatever the user typed
+  at generate time, with the exact appended words shown under the chips. Only
+  the current kind's presets are offered, and a kind change drops the
+  selection because the size index belongs to the other table.
+
+  Open, and deliberately: no cancel button (ComfyUI's `/interrupt` exists —
+  nothing calls it), no image-to-image or upscale, no inline results in the
+  E.V. transcript (chat has no attachment plumbing at all — Studio is the
+  surface, and inline is the obvious second slice), and the video template
+  hard-codes the Wan 2.2 5B file names, so a user without those files gets
+  ComfyUI's own error rather than a check up front.
 
 - **Start at login — landed 2026-08-15.** Settings → Status grows a **Startup**
   card: one toggle writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
@@ -3478,6 +3611,398 @@ questioning before starting — 4 was, and came back half yes:
    the runner has no remaining purpose, and Problems/LSP stays deferred. Revisit
    the runner only if iced grows a webview, which would bring the preview back
    and with it every part listed above.
+
+### Coder → daily driver (2026-08-19) — Phases 1–4 landed and driven, 5.3 with them
+
+The hearth migration made this a working agent. Making it the screen coding
+actually happens in is a second body of work, planned in
+[`docs/coder-daily-driver-plan.md`](docs/coder-daily-driver-plan.md) against
+what Cursor 2/3, Claude Code, Junie, Zed and Windsurf ship today. The field has
+converged on one pipeline — **editable plan gate → streaming loop with
+queue/steer → aggregated diff review → checkpoint rewind → verify** — and the
+plan is five phases along it. Phase 5 is in that doc and not started; one item
+of Phase 4 is blocked on the terminal crate and says so below.
+
+**Phase 1 — trust the loop — is done.** Four items, all client-side; the wire
+protocol was not touched:
+
+1. **Stop.** The composer's Stop, and Esc on this screen (above the assistant's
+   abort in `main::EscapePressed` — on Coder the agent turn is the work being
+   watched, and the one that writes files). The ordering inside it is the whole
+   feature: **answer the parked call, then drop the stream.** The server blocks
+   on a future keyed `(thread_id, call_id)`, so a stream dropped while it holds
+   one does not end the turn — it stalls for the full 300s delegation timeout and
+   the thread refuses the next send until then. `State::outstanding` is the
+   call_id owed; Stop posts `"Error: stopped by the user."` for it, and the
+   loop's next emit then fails against a client that is gone, which is how a
+   turn ends server-side.
+   - **A stopped turn is checkpointed** exactly as a finished one is. A stop
+     with no undo behind it is the worst of both.
+   - `State::stopped` drops the frames already in the runtime's queue when the
+     abort lands. Without it a late `Done` raised *"the model ended the turn
+     without replying"* for a turn the user themselves ended — the same shape as
+     the four bugs above: a state the UI rendered as a failure it wasn't.
+   - `close_open_tools` takes its reason now: "stopped by you", not "the turn
+     ended before this call was answered".
+2. **Per-file revert.** `coder_git::{changes, revert_file}` plus a file list
+   above the patch in the Diff dock tab. No patch matcher needed and none
+   written: a checkpoint holds whole file contents, which is also why the unit
+   is a file and not a hunk. `--no-renames` on purpose — with detection on, a
+   rename is one row naming two paths and reverting "the file" would have to put
+   the old name back too; off, it is a `D` and an `A` that each revert correctly.
+   - **The baseline is not revertable** (`Changes::revertable`, off when the
+     commit has no parent) — "revert to before the baseline" would delete files
+     the user had before the agent ever ran. The button is not drawn, and
+     `revert_file` refuses it as well.
+   - **A checkpoint is taken before the revert**, so one click is enough: the
+     file as it is *now* may hold edits made since, and the way back exists
+     before the thing that needs one.
+   - Also a **"changed files" bar above the composer** after a turn commits, so
+     a turn says it touched files where the user already is rather than only in
+     a sidebar pane they may not have open.
+3. **Queue + steer.** Enter during a turn queues instead of erroring; chips
+   above the composer, and pressing one takes it back into the box — the queue's
+   only exit, which is why it needs no separate remove. **Stop & send** puts the
+   correction at the front of the queue.
+   - **The queue advances off the checkpoint, not off `Done`.** Same ordering
+     rule as the baseline, from the other end: a next turn that starts writing
+     before the last turn's commit is taken puts its changes in that commit.
+   - **A stop does not drain the queue.** The user ended the work; what is
+     behind it waits as chips.
+4. **Follow mode.** Header toggle (`coder_follow` in `settings.json`, off by
+   default), and a `write_file` that succeeded opens that file in the File dock
+   tab. After the result, never on the call — opening on the call shows the
+   version being replaced. Writes only; following every `read_file` moves the
+   dock under the user for each file the agent skims.
+
+Checks: `stopping_closes_the_open_row_and_clears_what_the_turn_was_holding`,
+`stopping_does_nothing_while_a_decision_is_outstanding`,
+`follow_ups_typed_during_a_turn_run_in_order_after_it`,
+`a_stop_leaves_the_queue_alone_and_a_chip_goes_back_to_the_composer`,
+`stop_and_send_puts_the_correction_at_the_front`,
+`follow_mode_opens_the_file_the_turn_just_wrote`, and
+`one_file_reverts_out_of_a_turn_and_the_rest_of_it_stays` (real git). **Not yet
+driven live** — the four bugs above all came out of running it, so it needs a
+session with a tool-capable model before this is claimed working.
+
+**Phase 2 — the plan gate and the live checklist — is done.** Both items are
+client-only again; `SendRequest.tools` and `plan` already carried them, so the
+wire contract was not touched and `portal_desktop` is unaffected.
+
+1. **Plan as an editable, gated artifact.** The header's plan checkbox is a
+   three-state control now — `PlanMode::{Off, Inline, Gate}`. `Inline` is what
+   the checkbox was (the server's own PLAN step, plan and execute in one turn);
+   `Gate` sends a **tool-free** first turn (`tools: []`, which the server reads
+   as "no tools" rather than "use the defaults"), and its answer lands in an
+   editable `text_editor` card with **Run** and **Discard**.
+   - **The ask rides in `mode_instruction`, not on the message.** Appending
+     "write the plan and nothing else" to what the user typed would persist it,
+     and the row a reopened session rebuilds is the message that was *sent* —
+     the transcript would stop showing what the user actually wrote. That field
+     is `max_length=4096` and a longer one is a 422 (no turn at all), so
+     `coder_notes`' own cap came down to 3800 to leave the ask room, and
+     `mode_instruction()` caps the sum as belt and braces.
+   - **Run sends the edited plan as the instruction** (`Carry out this plan: …`)
+     rather than nudging the model back at the plan already in its history: the
+     edit is the entire reason the gate costs a round trip, and an unedited plan
+     re-sent verbatim is the same turn for a few hundred tokens.
+   - **The plan turn ends on the card, not on a checkpoint.** Nothing ran, so
+     there is nothing to commit — and the queue does *not* drain behind it, or a
+     follow-up would start while the plan it belongs to is still being read.
+   - It also writes `.agent/plan.md` (Windsurf's trick — a file the user can
+     open in their own editor), best effort: a read-only workspace must not cost
+     the turn.
+   - The card is **live-only state**. The plan itself is an ordinary assistant
+     message, so a reopened session renders it as a row; what it does not render
+     is a card asking a question that was answered hours ago.
+2. **Live todo list.** A client-supplied `update_todos` spec goes out in
+   `SendRequest.tools`, and `coder::update` answers that call itself — the
+   checklist is screen state, so the arguments *are* the result and it never
+   reaches the executor. Rendered as a pinned strip of badges above the
+   transcript, ticking as the turn goes.
+   - **The client now ships the whole spec list.** `tools` *replaces* the
+     server's set, so the six have to travel with the seventh:
+     `coder_tools::TOOL_SPECS_JSON` mirrors `server/src/coder.rs`'s constant
+     verbatim, and both copies change together — a spec added server-side and
+     not there is one this screen's turns never see. That is the one real cost
+     of Phase 2, and it is what Phase 3's `edit_file` has to remember.
+   - **The nudge lives in the tool's own description**, not in
+     `mode_instruction` — the field with the 4096 cap the gate is already using,
+     and the description is where a model actually reads it.
+   - Rebuild: `rebuild_todos` reads the last `update_todos` arguments out of the
+     persisted log, so a reopened session shows the list the turn ended on. A
+     mangled call leaves the last good list up rather than blanking the panel,
+     live and on rebuild alike.
+
+**The server's iteration cap went 15 → 40** (`CODER_MAX_ITERATIONS`, still an
+env override). One iteration is one LLM call plus the tools it asked for;
+Python's 15 was sized for a local model that loses the thread after a handful of
+rounds, and a frontier model spends that many just reading. Hitting the cap
+mid-edit leaves the workspace half-changed, which is the worst way for a turn to
+end — 40 is high enough that stopping there means the model is looping rather
+than working.
+
+Checks: `the_gate_plans_tool_free_then_runs_the_edited_plan` (real temp
+workspace, including `.agent/plan.md`),
+`the_notes_and_the_plan_ask_together_still_fit_the_field`,
+`the_checklist_is_answered_here_and_rebuilds_from_the_log`, and
+`the_advertised_tools_are_the_ones_something_can_run`. **Not yet driven live**,
+for Phase 1's reason.
+
+**Phase 3 — precise edits and context — is done.** One item touches the server,
+and it does so without changing the wire contract.
+
+1. **`edit_file`.** Exact-match replace (`path`, `old_text`, `new_text`) in
+   **both** executors, byte-identical wording — `server/src/coder_tools.rs` and
+   `app/src/coder_tools.rs`. The match must be unique; an `old_text` that appears
+   twice is refused with the count, and nothing is written. One fallback and only
+   one: **trailing** whitespace per line is ignored, because a model re-typing a
+   block loses it constantly. Leading whitespace is not — a helpful re-indent is
+   a silent corruption in Python and YAML.
+   - **The splice works on byte ranges, not on rejoined lines.** `lines()` +
+     `join("
+")` rewrites every CRLF in the file, and a one-line edit that
+     reports as a whole-file diff is worse than no edit tool: the checkpoint
+     stops being readable, which is the feature this was for.
+   - **Advertised from the desktop only.** It is in the app's `TOOL_SPECS_JSON`,
+     not in the server's default `tool_specs()` — portal_desktop delegates and
+     has no `edit_file` yet, so the default list would hand their models a tool
+     their machine cannot run. Both executors already answer it, so promoting it
+     later is one constant. Recorded in `docs/coder-delegation-protocol.md`,
+     which now has a section on the caller-supplied tool list.
+   - Follow mode and the transcript row treat it exactly as `write_file`.
+2. **@-mentions.** `@path` in a message is expanded before it is sent —
+   resolved through the same `resolve_in_root` the tools use, read with the
+   viewer's cap, deduplicated, 32 KB per message.
+   - **Expansion happens on the message, not beside it.** The transcript row and
+     the persisted message are the same string, or a reopened session would show
+     something other than what the model was asked. The view folds the tail away
+     behind `MENTION_MARKER`, live and on rebuild alike, so the row still reads
+     as a sentence.
+   - **An `@` that is not a file is prose.** `ask @tanveer` inlines nothing and
+     sends fine. There is no picker yet: typing the path works, and the picker is
+     a convenience over a thing that already answers "read this file for me".
+3. **AGENTS.md.** Loaded into `mode_instruction` after the agent's own notes and
+   before the turn's ask — last thing written is what a model weights hardest,
+   and the turn's instruction has to be last. A header chip says the workspace
+   has one, because rules you cannot see steering a turn you did not expect is
+   the whole complaint about agent memory.
+   - That field is `max_length=4096` and now carries three things, so the notes
+     came down to 1600 chars (block cap 2400) and `AGENTS.md` gets 1200. Each
+     piece says out loud when it truncates.
+   - Read, never written. The agent's own memory is `.agent/notes.md`; a tool
+     that edits the file the humans instruct it with can instruct itself.
+
+Checks: `an_edit_replaces_one_block_and_refuses_an_ambiguous_one` (in **both**
+crates, CRLF preservation included),
+`a_mentioned_file_rides_in_the_message_it_was_mentioned_in`,
+`agents_md_is_carried_when_the_project_has_one`, and the spec-list test that
+names every advertised tool. **Not yet driven live**, for Phase 1's reason.
+
+**Phase 4 — graduated autonomy and a second reader — is two of three.** Both
+landed items are client-only; the wire protocol still has not moved since the
+hearth migration.
+
+1. **Autonomy tiers and the command allowlist.** The header's Commands checkbox
+   is a four-state control now — `Autonomy::{Off, Ask, Allowlist, Auto}`. `Off`
+   is what the checkbox's off was (the model is offered no `run_command` at
+   all), `Ask` is its on, `Auto` sets the `auto_approve_commands` the server has
+   always had and this screen has always pinned false, and `Allowlist` is the
+   one worth building: a command matching a saved rule is answered here, without
+   a card, and the turn never stops.
+   - **The rules are the desktop's, not the server's.** `auto_approve_commands`
+     is `Auto` and nothing else — below that tier the server keeps pausing on
+     every command and the allowlist answers the pause on this side. A server
+     that pre-approved them would be trusting a list it cannot see, and the list
+     lives in `settings.json` next to the workspace it belongs to.
+   - **Per workspace, keyed by root path.** `cargo test` in a repo you own is
+     not the same permission as `cargo test` in one you cloned this morning. The
+     whole map is in `State`, so opening another folder picks up that folder's
+     rules with no reload path of its own.
+   - **A rule allows a program, not a line that starts with one.** `cargo test`
+     matches `cargo test --lib` and not `cargo testbed` (a word boundary, not a
+     prefix), and **never** a command carrying a shell operator — `;`, `&`, `|`,
+     a backtick, `$(`, a redirect, a newline. `cargo test; rm -rf /` starts with
+     `cargo test` and is not the command the rule was written for. That is the
+     whole security value of the tier, and the one check in this phase that had
+     to exist.
+   - **"Always allow" writes the verb, not the line.** `cargo test --lib` saves
+     `cargo test`; `ls -la` saves `ls`, because a flag is not a subcommand and
+     nor is a path. The whole line would only ever match the command it came
+     from; the program alone would let `cargo` come to mean `cargo publish`. The
+     button spells the rule out — "Always allow cargo test" — rather than saving
+     an invisible one, and it moves the tier to `Allowlist` with it, since a
+     rule nothing consults is a button that does nothing.
+   - **A row nobody read says so.** The resumed turn emits the real `tool_call`
+     for whatever a rule answered, and that row is the only place the user ever
+     sees the command — unmarked, an approval gate nobody saw looks exactly like
+     one somebody read. It reads `$ cargo test --lib — allowed by rule`.
+   - The tier switch carries the warning this file wrote when checkpoints
+     landed: undo does not cover `pip install`, or a write outside the root.
+2. **Review pass.** *Ask the model* on the "changed files" bar sends that
+   checkpoint's diff back as a fresh tool-free turn — Amp's Oracle in its
+   minimum viable form, and the header's model picker is already the "review it
+   with something stronger" half. No new protocol, no second thread.
+   - **A third turn kind, not a second bool.** `planning: bool` became
+     `TurnKind::{Work, Plan, Review}`: two of the three run no tools and they
+     are not the same thing — the gate's plan ends on a card asking to be run, a
+     review ends like any other answer — and "tool-free *and* a plan" is a state
+     two bools could not rule out.
+   - **The review's `@`s are left alone.** It is the one turn whose prompt this
+     screen builds rather than the user typing it, and `@@ -1,7 +1,7 @@` is not
+     somebody pointing at a file. The patch is capped at 48k chars and says out
+     loud when it was cut.
+   - It waits for the turn it is about: a review asked for mid-turn does
+     nothing, because the turn still running is still changing the files the
+     diff describes.
+3. **Agent commands in the visible terminal — blocked on `iced_term`, not
+   deferred by choice.** The plan was sentinel echo: write `<cmd>; echo <mark>$?`
+   into the PTY drawer and scrape the result off the grid. `iced_term` 0.8 has
+   the scraper — `Backend::selectable_content()` — but `Terminal::backend` is
+   `pub(crate)`, so nothing outside that crate can reach it, and `Terminal`
+   exposes no content accessor of its own (`new`, `widget_id`, `subscription`,
+   `handle`, and that is the whole surface). The ways through are a vendored
+   `iced_term` carrying one `pub fn`, or an upstream PR — a dependency decision
+   rather than a screen change, which is why this stops here instead of growing
+   a second command-output panel beside the terminal that already exists.
+
+Checks: `a_rule_does_not_stretch_past_the_command_it_names` (word boundaries and
+every shell operator), `the_saved_rule_is_the_program_and_its_verb`,
+`an_allowed_command_runs_without_a_card_and_the_row_says_which_rule`,
+`always_allow_saves_the_rule_for_this_folder_and_turns_the_tier_on`,
+`the_review_pass_hands_the_diff_back_tool_free`, and
+`the_review_pass_waits_for_the_turn_it_is_about`. **Not yet driven live**, for
+Phase 1's reason — which now covers four phases and is the largest thing owed on
+this screen.
+
+**Phase 5.3 — fork / handoff — landed ahead of the rest of the phase**, which it
+does not depend on. *Hand off to a new one*, beside *New session*, spends one
+tool-free turn asking the model to write instructions for whoever picks the work
+up, then opens a fresh thread in the same folder with that text **in the
+composer**. Not sent: a handoff nobody read is the restart tax with extra steps,
+and this is the one place the user gets to correct what the model thinks it was
+doing. The summary also stays in the old thread as its last row, which is where
+anyone would look for it. `TurnKind` gained a fourth member; an empty summary
+leaves the session standing and says why, because throwing a session away on a
+failed call is the only failure here that loses work.
+
+**5.1 and 5.2 are not started, and the order they are written in is wrong.** The
+sessions board (5.1) shares one shadow-git repo per folder, so two sessions
+running in the same folder would interleave `commit_all` and a checkpoint would
+hold the other session's changes — which is the thing checkpoints exist to rule
+out. 5.1's own accept criterion says "two sessions **on two folders**", so the
+plan already assumes the isolation 5.2 provides. Whichever is done first, the
+constraint is the same: concurrent turns need either different roots or a
+worktree each, and `root` has to move into the per-session struct with the
+checkpoints, the tree and the viewer that hang off it.
+
+#### Driven live, 2026-08-19 — `qwen3-coder:30b` over Ollama
+
+The debt every phase above carried ("not yet driven live") is **partly paid**.
+An isolated daemon (`AGENT_PLATFORM_PORT=18499`, its own SQLite file, so none of
+this touched the real install) and a scratch workspace, driven through the real
+`/coder/chat/{stream,approve,tool-result}` with a Python stand-in for the desktop
+executor — the protocol and the model are real, the iced app is not.
+
+What that proved, none of which the unit tests can:
+
+- **`edit_file` is used by a real model and lands surgically.** Asked for one
+  change in `main.py`, the model went `read_file → edit_file` and the file
+  differs by one line. Phase 3.1's whole case.
+- **The client's 8-spec list is accepted and `tools` really does replace the
+  server's set** — `edit_file` and `update_todos` are only callable because the
+  desktop sent them.
+- **`tools: []` is genuinely tool-free.** The same ask that produced a
+  `list_dir` with the list attached produced no calls at all with `[]`. The plan
+  gate (2.1), the review pass (4.2) and the handoff (5.3) are all built on that
+  one behaviour, and none of them had ever been watched doing it.
+- **`mode_instruction` reaches the model.** A turn carrying "reply with exactly
+  one word: BANANA" replied BANANA. The agent's notes, `AGENTS.md` and the
+  plan-gate ask all ride in that field, so this was the single load-bearing
+  assumption in Phases 2 and 3.
+- **The approval pause and its resume behave as the code assumes.**
+  `approval_required` arrives carrying `{"command": "python main.py"}` — what
+  the card shows — and approving **re-emits the call as an ordinary
+  `tool_call`**, which is the only place a row for it ever comes from and
+  therefore where 4.1 hangs its "allowed by rule" label.
+- **`auto_approve_commands: true` never pauses**, and the command runs.
+  `Autonomy::Auto` is real rather than a field nobody had set.
+
+**One real defect, and it is the shape this screen keeps producing.**
+`qwen3-coder:30b` emitted `run_command {}` — the call with no command in it —
+then corrected itself on the next step. Two things were wrong with that:
+
+- The desktop executor **spawned a shell to run nothing**, where the server's
+  executor has always answered `Error: run_command requires a non-empty
+  command`. Two executors that are supposed to be identical, constant for
+  constant, differed on the one input a model actually produces. The guard went
+  into `assistant::run_command` — the function *both* the Coder screen and E.V.
+  route through — with the server's wording verbatim, rather than into
+  `coder_tools::execute` where only one caller would have been fixed.
+- The transcript row for it read **`$ `**. Under `Ask` the card catches an
+  unreadable call and offers no Run button, but under `Autonomy::Auto` there is
+  no card and that row is the only thing the user sees. It says
+  `run_command (unreadable)` now, the same words the refusal already used.
+
+Checks: `a_command_with_nothing_in_it_is_refused_rather_than_spawned`,
+`a_command_with_nothing_in_it_still_names_itself`.
+
+**The checklist, and the one invariant it could have broken.** A three-step task
+(`add subtract`, `add multiply`, `docstring both`) went
+`read_file → edit_file × 3 → read_file → update_todos` — three consecutive
+surgical edits, and the first time a real model has called `update_todos` at
+all. On one- and two-step tasks it does not, which is what its description asks
+for and why this needed a task big enough to earn a list.
+
+Reading that thread back is where the interesting part was: the live `tool_call`
+frame carries `arguments` as an **object**, and the very same call read back out
+of `GET /coder/chat/thread` carries it as a **JSON string**. `call_args` already
+unwraps both, so the panel does agree with itself — but that was design, not
+evidence, and "rebuild == live" is the constraint the whole screen is built on.
+`the_checklist_rebuilds_from_the_shape_the_server_actually_stores` now pins it
+against the bytes the server actually wrote, captured from that turn.
+
+Also seen, not a bug and not new: the model leaking `</tool_call>` into its
+prose — the thing the unreadable-command card was built for, still live on a
+30B coder model.
+
+**Then the app itself, which needed a way to run it that is not the user's own
+data.** `AGENT_PLATFORM_APP_DIR` now moves the whole data root — database,
+`settings.json`, `master.key`, chats, memories. `AGENT_PLATFORM_PORT` moves only
+the port, and setting `%APPDATA%` does nothing, because `dirs::config_dir` asks
+Win32 for the known folder rather than reading the variable. That gap is why
+every previous "drive it live" meant driving over live data, and the run that
+closed it was a run that could not start at all: **the installed database was
+corrupt** — the main file passes `integrity_check`, the 383 KB `-wal` replayed
+does not (duplicate page references, three indexes with wrong entry counts), so
+`GET /system/status` 500s and every gated screen stays padlocked. Left alone,
+not repaired.
+
+On a clean data root, with `qwen3-coder:30b` behind it, the screen renders and
+behaves:
+
+- the four-way tier control sits beside the three-way plan control without
+  breaking the header row, and a settings file carrying the **legacy
+  `coder_plan: true` with no `coder_plan_mode`** comes back as *Plan first* —
+  the migration path, on a real file, for the first time
+- the approval card draws **No / Always allow `<rule>` / Run**, and pressing the
+  middle one flips the tier to *Allowlist* and puts
+  `$ python main.py — allowed by rule` in the transcript. 4.1 end to end,
+  on screen
+- the composer becomes *Queue a follow-up* with `waiting for you… 25s` beside it
+  while the card is up — 1.3's queue mode and `activity()`, both live
+- the header's `AGENTS.md` chip is not decoration: the reply ended **BANANA**,
+  which is 3.3's accept criterion ("a rule in AGENTS.md observably steers a
+  turn") and had never been watched happening
+- *Hand off to a new one* appears beside *New session* once a thread exists (5.3)
+
+**Fixed from what the screen showed:** the card offered *Always allow python
+main.py*. `rule_for` rejected a path with a separator in it but not a bare
+filename, so the saved rule only ever matched that one script. A dot is the
+test — `cargo test` and `npm run` have none, `main.py` and `app.js` do.
+
+Still not driven: Stop mid-command, the todo strip, the changed-files bar and
+follow mode moving the dock.
 
 Deliberately deferred rather than listed above: **Problems / LSP.** Hearth talks
 to `tsserver` directly and its "not checked ≠ no errors" rule is load-bearing —

@@ -5,7 +5,7 @@ use crate::domain::{self, BoardColumn, BoardRow};
 use crate::processes::{Message, State, ViewMode};
 use crate::ui::{self, space, Icon, Tone};
 use agent_platform_client::types::{ProcessRecord, ReviewDecision, TaskNodeRecord};
-use iced::widget::{checkbox, column, container, row, scrollable};
+use iced::widget::{column, container, row, scrollable, text_editor};
 use iced::{Element, Length, Theme};
 
 pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
@@ -18,7 +18,7 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
     // The review modal is an overlay, shadcn `Dialog`-style.
     match &state.review {
         None => main.into(),
-        Some(draft) => ui::modal(main, review_modal(draft), 680.0),
+        Some(draft) => ui::modal(main, review_modal(state, draft), 720.0),
     }
 }
 
@@ -26,7 +26,8 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
 // Left: composer + run list
 // ---------------------------------------------------------------------------
 
-fn run_list(state: &State) -> Element<'_, Message> {
+/// Start-a-run form. Shared with Home so the inbox is not a dead end.
+pub(crate) fn new_run_composer(state: &State) -> Element<'_, Message> {
     let team_names: Vec<String> = state.teams.iter().map(|t| t.name.clone()).collect();
     let selected_team = state
         .composer
@@ -48,36 +49,53 @@ fn run_list(state: &State) -> Element<'_, Message> {
     let projects_by_name: Vec<(String, i64)> =
         state.projects.iter().map(|p| (p.name.clone(), p.id)).collect();
 
-    let composer = ui::card(
-        ui::stack(vec![
+    ui::card(ui::stack(vec![
             ui::heading("New run"),
-            ui::input_icon(Icon::Sparkles, "What should the team accomplish?", &state.composer.goal, Message::GoalChanged),
-            ui::select("Team template", team_names, selected_team, move |name: String| {
-                let id = teams_by_name
-                    .iter()
-                    .find(|(n, _)| *n == name)
-                    .map(|(_, id)| *id)
-                    .unwrap_or_default();
-                Message::TeamPicked(id)
-            }),
-            ui::select("Project", project_names, selected_project, move |name: String| {
-                Message::ProjectPicked(
-                    projects_by_name.iter().find(|(n, _)| *n == name).map(|(_, id)| *id),
-                )
-            }),
-            checkbox(state.composer.auto_approve)
-                .label("Auto-approve the plan")
-                .on_toggle(Message::ToggleAutoApprove)
-                .size(16)
-                .text_size(ui::font::SM)
-                .into(),
-            if state.composer.submitting {
-                ui::button_sized(Some(Icon::Clock), "Starting…", ui::ButtonVariant::Default, ui::Size::Sm, None)
-            } else {
-                ui::button_default(Icon::Play, "Start run", Message::Submit)
-            },
-        ]),
-    );
+            ui::caption("A goal, a team, then a plan you approve — unless auto-approve is on."),
+        ui::input_icon(
+            Icon::Sparkles,
+            "What should the team accomplish?",
+            &state.composer.goal,
+            Message::GoalChanged,
+        ),
+        ui::select("Team template", team_names, selected_team, move |name: String| {
+            let id = teams_by_name
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, id)| *id)
+                .unwrap_or_default();
+            Message::TeamPicked(id)
+        }),
+        ui::select("Project", project_names, selected_project, move |name: String| {
+            Message::ProjectPicked(
+                projects_by_name.iter().find(|(n, _)| *n == name).map(|(_, id)| *id),
+            )
+        }),
+        ui::stack(vec![
+            ui::checkbox(
+                "Auto-approve the plan",
+                state.composer.auto_approve,
+                Message::ToggleAutoApprove,
+            ),
+            ui::caption("Skips the plan gate. Task review still pauses the run."),
+        ])
+        .into(),
+        if state.composer.submitting {
+            ui::button_sized(
+                Some(Icon::Clock),
+                "Starting…",
+                ui::ButtonVariant::Default,
+                ui::Size::Sm,
+                None,
+            )
+        } else {
+            ui::button_default(Icon::Play, "Start run", Message::Submit)
+        },
+    ]))
+}
+
+fn run_list(state: &State) -> Element<'_, Message> {
+    let composer = new_run_composer(state);
 
     let items: Vec<Element<'_, Message>> = state
         .processes
@@ -86,13 +104,13 @@ fn run_list(state: &State) -> Element<'_, Message> {
         .collect();
 
     let list: Element<'_, Message> = if items.is_empty() {
-        ui::empty_state_icon(Icon::Activity, "No runs in this scope yet.")
+        ui::empty_state_icon(Icon::Activity, "No runs yet. Start one above.")
     } else {
         scrollable(ui::stack(items)).height(Length::Fill).into()
     };
 
     container(
-        column![composer, ui::caption("RECENT RUNS"), list]
+        column![composer, ui::caption("Recent runs"), list]
             .spacing(space::MD)
             .padding(space::MD),
     )
@@ -105,20 +123,23 @@ const UNASSIGNED: &str = "Unassigned";
 
 fn run_list_item(p: &ProcessRecord, selected: bool) -> Element<'_, Message> {
     let when = domain::relative_time(&p.created_at).unwrap_or_default();
-    ui::list_item(
-        ui::stack(vec![
-            ui::cluster(vec![
-                ui::badge(p.status.as_str(), domain::process_status_tone(p.status.as_str())),
-                ui::caption(format!("#{}", p.id)),
-                ui::spacer(),
-                ui::caption(when),
-            ])
-            .into(),
-            ui::body(truncate(&p.goal, 90)),
-        ]),
-        selected,
-        Message::Select(p.id),
-    )
+    let mut lines = vec![
+        ui::cluster(vec![
+            ui::badge(
+                domain::process_status_label(p.status.as_str()),
+                domain::process_status_tone(p.status.as_str()),
+            ),
+            ui::caption(format!("#{}", p.id)),
+            ui::spacer(),
+            ui::caption(when),
+        ])
+        .into(),
+        ui::body(truncate(&p.goal, 90)),
+    ];
+    if let Some(hint) = domain::process_waiting_hint(p.status.as_str()) {
+        lines.push(ui::caption(hint));
+    }
+    ui::list_item(ui::stack(lines), selected, Message::Select(p.id))
 }
 
 // ---------------------------------------------------------------------------
@@ -136,11 +157,11 @@ fn detail_pane<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message>
         blocks.push(if state.selected.is_some() {
             ui::empty_state_icon(Icon::Clock, "Loading run…")
         } else {
-            ui::empty_state_icon(Icon::Activity, "Nothing selected.")
+            ui::empty_state_icon(Icon::Activity, "Pick a run from the list, or start a new one.")
         });
         return ui::page(
             "Processes",
-            Some(ui::muted("Pick a run, or start a new one.")),
+            Some(ui::muted("A team run: a goal, a plan you approve, then the work.")),
             None,
             ui::stack_lg(blocks),
         );
@@ -223,7 +244,7 @@ fn chat_card<'a>(state: &'a State, iced_theme: &Theme) -> Option<Element<'a, Mes
 
 fn summary_card<'a>(state: &'a State, process: &'a ProcessRecord) -> Element<'a, Message> {
     let mut stats = vec![
-        ui::stat(Icon::Activity, "Status", process.status.as_str().to_string()),
+        ui::stat(Icon::Activity, "Status", domain::process_status_label(process.status.as_str()).to_string()),
         ui::stat(Icon::Cpu, "Tokens", process.total_tokens.to_string()),
         ui::stat(Icon::Gauge, "Cost", format!("${:.4}", process.total_cost)),
     ];
@@ -258,7 +279,7 @@ fn graph_view(state: &State) -> Element<'_, Message> {
     // The lineage filter only means something once a sub-DAG has nested tasks.
     let tasks = state.detail.as_ref().map(|d| d.tasks.as_slice()).unwrap_or_default();
     if crate::graph::max_lineage_depth(tasks) > 0 {
-        controls.push(ui::caption("LINEAGE"));
+        controls.push(ui::caption("Show"));
         controls.push(ui::segmented(
             crate::graph::Lineage::ALL.map(|l| (l.label(), state.lineage == l, Message::SetLineage(l))),
         ));
@@ -294,12 +315,11 @@ fn board_toolbar(state: &State) -> Element<'_, Message> {
         ))
         .width(280)
         .into(),
-        checkbox(state.needs_attention_only)
-            .label("Needs attention")
-            .on_toggle(Message::ToggleNeedsAttention)
-            .size(16)
-            .text_size(ui::font::SM)
-            .into(),
+        ui::checkbox(
+            "Needs attention",
+            state.needs_attention_only,
+            Message::ToggleNeedsAttention,
+        ),
     ])
     .into()
 }
@@ -548,17 +568,21 @@ fn inspector<'a>(state: &'a State, uuid: &'a str) -> Element<'a, Message> {
 // Review modal
 // ---------------------------------------------------------------------------
 
-fn review_modal(draft: &crate::processes::ReviewDraft) -> Element<'_, Message> {
-    let dialog = ui::card_with_header(
+fn review_modal<'a>(state: &'a State, draft: &'a crate::processes::ReviewDraft) -> Element<'a, Message> {
+    ui::card_with_header(
         format!("Review: {}", draft.role),
-        Some(ui::muted("Approve the output, request changes, or reject the task.")),
+        Some(ui::muted("Approve the output, request changes, or reject the task. Esc closes.")),
         None,
         ui::stack(vec![
-            ui::caption("OUTPUT (edited on approve)"),
-            ui::input("Output", &draft.output, Message::ReviewOutputChanged),
-            ui::caption("FEEDBACK"),
+            ui::caption("Output — edited on approve"),
+            ui::code(
+                text_editor(&state.review_output)
+                    .on_action(Message::ReviewOutputEdited)
+                    .height(220),
+            ),
+            ui::caption("Feedback"),
             ui::input("Why?", &draft.feedback, Message::ReviewFeedbackChanged),
-            ui::caption("REVISED INSTRUCTIONS (request changes)"),
+            ui::caption("Revised instructions (request changes)"),
             ui::input("New instructions", &draft.instructions, Message::ReviewInstructionsChanged),
             ui::cluster(vec![
                 ui::button_default(Icon::Check, "Approve", Message::SubmitReview(ReviewDecision::Approve)),
@@ -573,7 +597,5 @@ fn review_modal(draft: &crate::processes::ReviewDraft) -> Element<'_, Message> {
             ])
             .into(),
         ]),
-    );
-
-    dialog
+    )
 }

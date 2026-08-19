@@ -319,6 +319,28 @@ impl Client {
         self.get_json(&format!("/api/v1/system/logs?after={after}")).await
     }
 
+    pub async fn resources(&self) -> Result<ResourcesView> {
+        self.get_json("/api/v1/system/resources").await
+    }
+
+    /// Set the resource mode, tell the server whether the user is at the window,
+    /// or both. `None` leaves that half alone, so a window event does not have to
+    /// restate a setting it did not change.
+    ///
+    /// The response is the new state, so the caller that pushed a mode gets the
+    /// resolved tier back without a second round trip.
+    pub async fn set_resources(
+        &self,
+        mode: Option<&str>,
+        user_present: Option<bool>,
+    ) -> Result<ResourcesView> {
+        self.put_json(
+            "/api/v1/system/resources",
+            &serde_json::json!({ "mode": mode, "user_present": user_present }),
+        )
+        .await
+    }
+
     /// One read of an arbitrary REST route, returned as raw JSON. This is what
     /// backs the assistant's `api_get` tool, so the path comes from a language
     /// model rather than from this codebase — it is a trust boundary, and the
@@ -801,6 +823,55 @@ impl Client {
     /// own workspace server-side).
     pub async fn clear_search_history(&self) -> Result<()> {
         self.delete_json::<serde::de::IgnoredAny>("/api/v1/search/history").await.map(|_| ())
+    }
+
+    // -- Media generation (`/api/v1/media/*`, ADR 0009) ----------------------
+
+    /// Whether the local ComfyUI backend is answering. Not reachable is the
+    /// ordinary state, not an error — see [`crate::types::MediaStatus`].
+    pub async fn media_status(&self) -> Result<MediaStatus> {
+        self.get_json("/api/v1/media/status").await
+    }
+
+    /// Starts a generation. Answers as soon as ComfyUI has *accepted* the
+    /// workflow, with a job in `running` — the picture does not exist yet, and
+    /// [`Client::media_jobs`] is how the caller finds out that it does.
+    pub async fn generate_media(&self, req: &MediaGenerateRequest) -> Result<MediaJob> {
+        self.post_json("/api/v1/media/generate", req).await
+    }
+
+    pub async fn media_jobs(&self) -> Result<MediaJobsResponse> {
+        self.get_json("/api/v1/media/jobs").await
+    }
+
+    /// What the video template needs, what ComfyUI already has, and where a
+    /// download may be written. See [`MediaRequirements`].
+    pub async fn media_requirements(&self) -> Result<MediaRequirements> {
+        self.get_json("/api/v1/media/requirements").await
+    }
+
+    /// One invented prompt to try, from the same local model the `enhance`
+    /// toggle uses. Errors when no provider answers — the caller keeps its
+    /// prompt box either way.
+    pub async fn suggest_media_prompt(&self, kind: &str) -> Result<MediaSuggestion> {
+        self.get_json(&format!("/api/v1/media/suggest?kind={kind}")).await
+    }
+
+    /// The finished bytes of one job — a PNG or an MP4, straight from the
+    /// server's media folder. Not `get_json`: this is the one route in the API
+    /// that answers binary (ADR 0009).
+    pub async fn media_file(&self, job_id: i64) -> Result<Vec<u8>> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!("/api/v1/media/jobs/{job_id}/file"))))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Reuse the JSON path's error shaping: a failure here answers the
+            // ordinary `ApiError` envelope, same as every other route.
+            return Self::handle::<serde::de::IgnoredAny>(resp).await.map(|_| Vec::new());
+        }
+        Ok(resp.bytes().await?.to_vec())
     }
 }
 

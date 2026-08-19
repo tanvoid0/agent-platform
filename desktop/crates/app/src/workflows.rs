@@ -69,6 +69,14 @@ pub struct State {
     pub busy: bool,
     pub error: Option<String>,
     pub notice: crate::domain::Toast,
+    /// A workflow delete waiting on the in-app confirm dialog.
+    pub confirm: Option<Confirm>,
+}
+
+/// What the confirm dialog is asking about, and the message a Yes sends.
+#[derive(Debug, Clone)]
+pub struct Confirm {
+    pub then: Message,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +90,8 @@ pub enum Message {
     RanNow(Result<Box<WorkflowRunInfo>, String>),
     SetEnabled(i64, bool),
     Delete(i64),
+    DeleteConfirmed(i64),
+    CancelConfirm,
     Mutated(Result<(), String>),
     New,
     Edit(i64),
@@ -257,6 +267,15 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             )
         }
         Message::Delete(id) => {
+            state.confirm = Some(Confirm { then: Message::DeleteConfirmed(id) });
+            Task::none()
+        }
+        Message::CancelConfirm => {
+            state.confirm = None;
+            Task::none()
+        }
+        Message::DeleteConfirmed(id) => {
+            state.confirm = None;
             let client = client.clone();
             Task::perform(
                 async move { err_string(client.delete_workflow(id).await).map(|_| ()) },

@@ -157,8 +157,8 @@ fn memory_row<'a>(store: &'a Store, m: &'a Memory) -> Element<'a, crate::memory:
             .spacing(space::XS)
             .width(Length::Fill),
             ui::cluster(vec![
-                ui::icon_button(Icon::Pencil, Message::StartEdit(m.id)),
-                ui::icon_button(Icon::Trash, Message::Delete(m.id)),
+                ui::icon_tip(Icon::Pencil, "Edit", Message::StartEdit(m.id)),
+                ui::icon_tip(Icon::Trash, "Delete", Message::Delete(m.id)),
             ]),
         ]
         .spacing(space::SM)

@@ -277,6 +277,19 @@ pub(crate) async fn run_command(
     cwd: Option<std::path::PathBuf>,
     timeout: std::time::Duration,
 ) -> String {
+    // A `run_command` call with no command in it. Seen live from
+    // `qwen3-coder:30b`, which emitted `run_command {}` and then corrected
+    // itself on the next step — so this string is what makes that recovery
+    // possible, and the alternative is spawning a shell to run nothing.
+    //
+    // Word for word what the server's own executor answers
+    // (`server/src/coder_tools.rs`): the two run the same tools and the model
+    // must not be able to tell which side it reached. The guard is here rather
+    // than in `coder_tools::execute` because E.V. calls this too and its models
+    // make the same malformed call.
+    if command.trim().is_empty() {
+        return "Error: run_command requires a non-empty command".to_string();
+    }
     let mut cmd = if cfg!(windows) {
         let mut c = tokio::process::Command::new("powershell");
         c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
@@ -2637,6 +2650,18 @@ mod tests {
         assert_eq!(turn.role, "assistant");
         assert_eq!(turn.content, "");
         assert!(turn.tool_calls.is_some());
+    }
+
+    /// The other half of the row above: the call is answered rather than run.
+    /// Word for word the server executor's answer, so a model cannot tell which
+    /// side it reached — and readable enough that it corrects itself, which is
+    /// what it did live.
+    #[tokio::test]
+    async fn a_command_with_nothing_in_it_is_refused_rather_than_spawned() {
+        for empty in ["", "   ", "\n"] {
+            let out = run_command(empty.into(), None, std::time::Duration::from_secs(5)).await;
+            assert_eq!(out, "Error: run_command requires a non-empty command", "{empty:?}");
+        }
     }
 
     #[tokio::test]

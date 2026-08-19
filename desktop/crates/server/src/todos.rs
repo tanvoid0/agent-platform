@@ -2703,7 +2703,7 @@ async fn agent_chat(
     // line. Python's `httpx.RequestError` branch guarded the loopback hop, which
     // no longer exists: a vendor transport failure is a 502 from the proxy
     // either way, and reads as `LLM proxy returned HTTP 502` on both servers.
-    let data = crate::llm::complete_internal(&state, payload).await.map_err(|e| {
+    let data = crate::llm::complete_internal(&state, payload, crate::resources::Priority::Interactive).await.map_err(|e| {
         ApiError::new(
             StatusCode::BAD_GATEWAY,
             format!("LLM proxy returned HTTP {}", e.status.as_u16()),

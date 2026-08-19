@@ -22,6 +22,14 @@ pub struct State {
     pub new_board: Option<String>,
     pub busy: bool,
     pub error: Option<String>,
+    /// A board delete waiting on the in-app confirm dialog.
+    pub confirm: Option<Confirm>,
+}
+
+/// What the confirm dialog is asking about, and the message a Yes sends.
+#[derive(Debug, Clone)]
+pub struct Confirm {
+    pub then: Message,
 }
 
 impl State {
@@ -62,6 +70,8 @@ pub enum Message {
     CancelNewBoard,
     CreateBoard,
     DeleteBoard(i64),
+    DeleteBoardConfirmed(i64),
+    CancelConfirm,
 
     DraftChanged(String),
     AddItem,
@@ -154,6 +164,15 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             )
         }
         Message::DeleteBoard(id) => {
+            state.confirm = Some(Confirm { then: Message::DeleteBoardConfirmed(id) });
+            Task::none()
+        }
+        Message::CancelConfirm => {
+            state.confirm = None;
+            Task::none()
+        }
+        Message::DeleteBoardConfirmed(id) => {
+            state.confirm = None;
             state.busy = true;
             if state.selected == Some(id) {
                 state.selected = None;

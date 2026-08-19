@@ -24,7 +24,7 @@ pub fn view(state: &State, kind: Kind) -> Element<'_, Message> {
         ),
         Kind::Teams => (
             "Teams",
-            "Reusable rosters the planner draws subagents from.",
+            "Reusable teams the planner picks subagents from.",
             "New team",
             Message::NewTeam,
         ),
@@ -76,12 +76,16 @@ fn project_list(state: &State) -> Element<'_, Message> {
         return ui::card(ui::empty_state_icon(Icon::Clock, "Loading…"));
     };
     if projects.is_empty() {
-        return ui::card(ui::empty_state_icon(Icon::Folder, "No projects yet."));
+        return ui::card(ui::empty_state_action(
+            Icon::Folder,
+            "No projects yet. A project keeps related runs together.",
+            ui::button_default(Icon::Plus, "New project", Message::NewProject),
+        ));
     }
     let rows: Vec<Element<'_, Message>> = projects
         .iter()
         .map(|p| {
-            ui::card(ui::cluster(vec![
+            ui::tile(ui::cluster(vec![
                 ui::stack(vec![
                     ui::body(p.name.clone()),
                     ui::caption(p.description.clone().unwrap_or_else(|| "—".into())),
@@ -90,7 +94,7 @@ fn project_list(state: &State) -> Element<'_, Message> {
                 ui::spacer(),
                 ui::caption(domain::relative_time(&p.updated_at).unwrap_or_default()),
                 ui::button_outline(Icon::Pencil, "Edit", Message::EditProject(p.id)),
-                ui::button_destructive(Icon::Trash, "Delete", Message::DeleteProject(p.id)),
+                ui::button_ghost(Icon::Trash, "Delete", Message::DeleteProject(p.id)),
             ]))
         })
         .collect();
@@ -104,7 +108,7 @@ fn team_presets<'a>() -> Element<'a, Message> {
         .iter()
         .enumerate()
         .map(|(i, preset)| {
-            ui::card(ui::stack(vec![
+            ui::tile(ui::stack(vec![
                 ui::body(preset.name),
                 ui::caption(preset.description),
                 ui::button_outline(Icon::Plus, "Use", Message::NewTeamFromPreset(i)),
@@ -124,7 +128,7 @@ fn team_list(state: &State) -> Element<'_, Message> {
     };
     if teams.is_empty() {
         return ui::stack_lg(vec![
-            ui::card(ui::empty_state_icon(Icon::Users, "No teams yet.")),
+            ui::card(ui::empty_state_icon(Icon::Users, "No teams yet. Start from a template below.")),
             team_presets(),
         ])
         .into();
@@ -132,7 +136,7 @@ fn team_list(state: &State) -> Element<'_, Message> {
     let rows: Vec<Element<'_, Message>> = teams
         .iter()
         .map(|t| {
-            ui::card(ui::cluster(vec![
+            ui::tile(ui::cluster(vec![
                 ui::stack(vec![
                     ui::body(t.name.clone()),
                     ui::caption(t.description.clone().unwrap_or_else(|| "—".into())),
@@ -142,7 +146,7 @@ fn team_list(state: &State) -> Element<'_, Message> {
                 ui::caption(domain::relative_time(&t.updated_at).unwrap_or_default()),
                 ui::badge(ui::count(t.role_count as usize, "role", "roles"), Tone::Neutral),
                 ui::button_outline(Icon::Pencil, "Edit", Message::EditTeam(t.id)),
-                ui::button_destructive(Icon::Trash, "Delete", Message::DeleteTeam(t.id)),
+                ui::button_ghost(Icon::Trash, "Delete", Message::DeleteTeam(t.id)),
             ]))
         })
         .collect();
@@ -202,7 +206,7 @@ fn team_editor(state: &State) -> Element<'_, Message> {
 
     let layout = state.roster_layout();
     let canvas: Element<'_, Message> = if layout.nodes.is_empty() {
-        ui::empty_state_icon(Icon::Users, "No roles yet.")
+        ui::empty_state_icon(Icon::Users, "No roles yet. Add one with the button above.")
     } else {
         iced::widget::canvas(crate::graph::DagCanvas {
             layout,

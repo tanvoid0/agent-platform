@@ -33,11 +33,12 @@ pub fn view(state: &State) -> Element<'_, Message> {
     let list: Element<'_, Message> = if !state.loaded {
         ui::empty_state_icon(Icon::Clock, "Loading workflows…")
     } else if state.items.is_empty() {
-        ui::empty_state_icon(
+        ui::empty_state_action(
             Icon::Zap,
             "No workflows yet. A workflow is a fixed list of HTTP or action steps \
              the server runs for you — on demand, on a timer, or when another app \
              calls its run endpoint.",
+            ui::button_default(Icon::Plus, "New workflow", Message::New),
         )
     } else {
         ui::stack(state.items.iter().map(|wf| workflow_card(state, wf)).collect()).into()
@@ -56,11 +57,10 @@ pub fn view(state: &State) -> Element<'_, Message> {
         }
     }
 
-    ui::page(
+    let page = ui::page(
         "Workflows",
         Some(ui::muted(
-            "Your own automations: fixed steps, run by hand, on a schedule, or \
-             from other apps over the API.",
+            "Fixed automations on a timer or the API. A team run belongs on Processes.",
         )),
         Some(
             ui::cluster(vec![
@@ -70,7 +70,22 @@ pub fn view(state: &State) -> Element<'_, Message> {
             .into(),
         ),
         ui::stack_lg(blocks),
-    )
+    );
+    match &state.confirm {
+        None => page,
+        Some(confirm) => ui::modal(
+            page,
+            ui::confirm_dialog(
+                "Delete this workflow?",
+                "This cannot be undone.",
+                vec![
+                    ui::button_ghost(Icon::X, "Cancel", Message::CancelConfirm),
+                    ui::button_destructive(Icon::Trash, "Delete", confirm.then.clone()),
+                ],
+            ),
+            420.0,
+        ),
+    }
 }
 
 fn editor_card<'a>(state: &'a State, editor: &'a crate::workflows::Editor) -> Element<'a, Message> {
@@ -140,9 +155,9 @@ fn editor_card<'a>(state: &'a State, editor: &'a crate::workflows::Editor) -> El
 
 fn workflow_card<'a>(state: &'a State, wf: &'a WorkflowInfo) -> Element<'a, Message> {
     let mut badges = vec![if wf.enabled {
-        ui::badge("enabled", Tone::Success)
+        ui::badge("Enabled", Tone::Success)
     } else {
-        ui::badge("disabled", Tone::Neutral)
+        ui::badge("Disabled", Tone::Neutral)
     }];
     badges.push(ui::badge(ui::count(wf.steps.len(), "step", "steps"), Tone::Neutral));
     if let Some(seconds) = wf.interval_seconds {
@@ -180,12 +195,12 @@ fn workflow_card<'a>(state: &'a State, wf: &'a WorkflowInfo) -> Element<'a, Mess
                 Message::SetEnabled(wf.id, !wf.enabled),
             ),
             ui::spacer(),
-            ui::button_destructive(Icon::Trash, "Delete", Message::Delete(wf.id)),
+            ui::button_ghost(Icon::Trash, "Delete", Message::Delete(wf.id)),
         ])
         .into(),
     );
 
-    ui::card(ui::stack(lines))
+    ui::tile(ui::stack(lines))
 }
 
 fn runs_view(state: &State) -> Element<'_, Message> {
@@ -208,7 +223,7 @@ fn run_row<'a>(state: &'a State, run: &'a WorkflowRunInfo) -> Element<'a, Messag
     let expanded = state.expanded_run == Some(run.id);
 
     let mut lines: Vec<Element<'a, Message>> = vec![row![
-        ui::badge(run.status.clone(), tone),
+        ui::badge(status_label(&run.status), tone),
         ui::muted(format!("#{} · {} · {}", run.id, run.trigger, human_time(&run.started_at))),
         ui::spacer(),
         ui::button_ghost(
@@ -228,7 +243,7 @@ fn run_row<'a>(state: &'a State, run: &'a WorkflowRunInfo) -> Element<'a, Messag
         lines.push(ui::code(ui::stack(run.steps.iter().map(step_row).collect())));
     }
 
-    ui::card(ui::stack(lines))
+    ui::tile(ui::stack(lines))
 }
 
 fn step_row<'a>(
@@ -253,6 +268,16 @@ fn step_row<'a>(
         cells.push(container(ui::muted(truncate(&text, 160))).width(Length::Fill).into());
     }
     column![ui::cluster(cells)].padding(iced::Padding::from([2.0, 0.0])).into()
+}
+
+fn status_label(status: &str) -> &str {
+    match status {
+        "succeeded" => "Succeeded",
+        "failed" => "Failed",
+        "running" => "Running",
+        "cancelled" => "Cancelled",
+        other => other,
+    }
 }
 
 fn human_secs(seconds: i64) -> String {

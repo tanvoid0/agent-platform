@@ -258,6 +258,12 @@ async fn execute_local(root: &Path, tool: &str, args: &Value, allow_commands: bo
     match tool {
         "read_file" => read_file(root, &arg("path")),
         "write_file" => write_file(root, &arg("path"), &arg("content")),
+        // Not in this crate's `tool_specs`, so the local executor is never
+        // asked for it today — the desktop advertises it and runs its own copy.
+        // It lives here anyway because the two executors have to stay identical
+        // constant for constant: the day the default list grows it, this side
+        // must already answer the same way.
+        "edit_file" => edit_file(root, &arg("path"), &arg("old_text"), &arg("new_text")),
         "list_dir" => {
             let path = match args.get("path") {
                 None => ".".to_string(),
@@ -265,10 +271,33 @@ async fn execute_local(root: &Path, tool: &str, args: &Value, allow_commands: bo
             };
             list_dir(root, &path)
         }
-        "search" => search(root, &arg("query")),
-        "repo_map" => repo_map(root),
+        // Off the async runtime (ADR 0010). Both walk the whole workspace with
+        // `read_dir` and then read every file they found — seconds of a tokio
+        // worker parked in the kernel on a real repo, and with N workers, N
+        // concurrent searches stall everything including `/health`.
+        "search" => {
+            let (root, query) = (root.to_path_buf(), arg("query"));
+            blocking(move || search(&root, &query)).await
+        }
+        "repo_map" => {
+            let root = root.to_path_buf();
+            blocking(move || repo_map(&root)).await
+        }
         "run_command" => run_command(root, &arg("command"), allow_commands).await,
         other => format!("Error: unknown tool '{other}'."),
+    }
+}
+
+/// Run a filesystem walk on the blocking pool and report a panic as the tool
+/// error it is, rather than letting `JoinError` become a 500 with no tool result
+/// — the loop that called it is waiting for a string either way.
+async fn blocking<F>(f: F) -> String
+where
+    F: FnOnce() -> String + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(out) => out,
+        Err(e) => format!("Error: the workspace scan failed ({e})."),
     }
 }
 
@@ -352,6 +381,102 @@ fn write_file(root: &Path, rel: &str, content: &str) -> String {
         // `len(content.encode("utf-8"))` — bytes, which is what `str::len` is.
         Ok(()) => format!("Wrote {} bytes to {rel}", content.len()),
         Err(e) => format!("Error: {e}"),
+    }
+}
+
+/// Replace one exact block of text, rather than rewriting the file around it.
+///
+/// `write_file` stays for new files and for a rewrite that really is the whole
+/// file; this is what makes a three-line change cost three lines of tokens
+/// instead of a thousand, and it is what makes the checkpoint diff readable.
+///
+/// The match must be **unique**. An `old_text` that appears twice is a model
+/// that did not read enough context, and picking one of them is how an agent
+/// silently edits the wrong function.
+///
+/// One fallback, and only one: trailing whitespace per line is ignored, because
+/// a model re-typing a block drops it constantly. Leading whitespace is not —
+/// indentation is meaning in Python and YAML, and a helpful re-indent is a
+/// silent corruption. Nothing is written unless exactly one place matched.
+fn edit_file(root: &Path, rel: &str, old: &str, new: &str) -> String {
+    if old.is_empty() {
+        return "Error: edit_file requires old_text. Use write_file to create a file."
+            .to_string();
+    }
+    let path = match resolve_in_root(root, rel) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if !path.is_file() {
+        return format!("Error: File not found: {rel}");
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => return format!("Error: {e}"),
+    };
+    let updated = match replace_block(&text, old, new) {
+        Ok(t) => t,
+        Err(0) => {
+            return format!(
+                "Error: edit_file found no match in {rel}. Read the file and copy old_text \
+                 exactly, including indentation. Nothing was changed."
+            )
+        }
+        Err(n) => {
+            return format!(
+                "Error: old_text appears {n} times in {rel}. Include more of the surrounding \
+                 lines so it matches once. Nothing was changed."
+            )
+        }
+    };
+    match std::fs::write(&path, &updated) {
+        Ok(()) => format!(
+            "Edited {rel}: {} lines replaced with {}.",
+            old.lines().count(),
+            new.lines().count()
+        ),
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
+/// The splice behind [`edit_file`]. `Err(n)` is how many places matched when
+/// that was not exactly one.
+///
+/// The fallback works on byte ranges rather than on a rebuilt `Vec<&str>` so
+/// the file's own line endings survive: rejoining `lines()` with `\n` rewrites
+/// every CRLF in the file, and a one-line edit that reports as a whole-file
+/// diff is worse than no edit tool at all.
+fn replace_block(text: &str, old: &str, new: &str) -> Result<String, usize> {
+    match text.matches(old).count() {
+        1 => return Ok(text.replacen(old, new, 1)),
+        0 => {}
+        n => return Err(n),
+    }
+    let needle: Vec<&str> = old.lines().map(str::trim_end).collect();
+    if needle.is_empty() {
+        return Err(0);
+    }
+    // Start offset of every line, plus a sentinel past the end.
+    let mut starts: Vec<usize> = vec![0];
+    starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+    let content_end = |line: usize| -> usize {
+        let end = starts.get(line + 1).copied().unwrap_or(text.len());
+        text[..end].trim_end_matches(['\n', '\r']).len().max(starts[line])
+    };
+    if needle.len() > starts.len() {
+        return Err(0);
+    }
+    let hits: Vec<usize> = (0..=starts.len() - needle.len())
+        .filter(|&i| {
+            (0..needle.len()).all(|k| text[starts[i + k]..content_end(i + k)].trim_end() == needle[k])
+        })
+        .collect();
+    match hits.len() {
+        1 => {
+            let (from, to) = (starts[hits[0]], content_end(hits[0] + needle.len() - 1));
+            Ok(format!("{}{new}{}", &text[..from], &text[to..]))
+        }
+        n => Err(n),
     }
 }
 
@@ -605,6 +730,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         strip_verbatim(std::fs::canonicalize(&dir).unwrap())
+    }
+
+    /// The four outcomes that matter, and the one that is easy to get wrong:
+    /// a file with CRLF endings must come back with CRLF endings, or a one-line
+    /// edit reports as a whole-file diff and the checkpoint is unreadable.
+    #[test]
+    fn an_edit_replaces_one_block_and_refuses_an_ambiguous_one() {
+        let root = scratch("edit");
+        let path = root.join("app.rs");
+        std::fs::write(&path, "fn a() {\r\n    let x = 1;\r\n}\r\nfn b() {\r\n    let x = 1;\r\n}\r\n")
+            .unwrap();
+
+        // Two identical blocks: the model did not read enough, and guessing is
+        // how the wrong function gets edited.
+        let out = edit_file(&root, "app.rs", "    let x = 1;", "    let x = 2;");
+        assert!(out.contains("appears 2 times"), "{out}");
+        assert!(out.contains("Nothing was changed"), "{out}");
+
+        // Enough context to be unique.
+        let out = edit_file(&root, "app.rs", "fn b() {\r\n    let x = 1;", "fn b() {\r\n    let x = 2;");
+        assert!(out.starts_with("Edited app.rs"), "{out}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "fn a() {\r\n    let x = 1;\r\n}\r\nfn b() {\r\n    let x = 2;\r\n}\r\n");
+
+        // Trailing whitespace is the one thing a re-typed block loses; leading
+        // whitespace is not, because indentation is meaning.
+        let out = edit_file(&root, "app.rs", "fn a() {   ", "fn c() {");
+        assert!(out.starts_with("Edited app.rs"), "{out}");
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("fn c() {\r\n"));
+        // …and the fallback still requires the indentation to be right: a tab
+        // where the file has spaces is not the same line, because a helpful
+        // re-indent is a silent corruption.
+        let out = edit_file(&root, "app.rs", "\tlet x = 2;\r\n}", "\tlet x = 4;\r\n}");
+        assert!(out.contains("no match"), "{out}");
+
+        assert!(edit_file(&root, "nope.rs", "a", "b").contains("File not found"));
+        assert!(edit_file(&root, "app.rs", "", "b").contains("requires old_text"));
     }
 
     #[test]

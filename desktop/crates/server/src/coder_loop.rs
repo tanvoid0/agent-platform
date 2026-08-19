@@ -48,12 +48,20 @@ const PLAN_ACK: &str =
 const APPROVAL_REQUIRED_TOOLS: [&str; 1] = ["run_command"];
 
 /// `_max_iterations`, `CODER_MAX_ITERATIONS`.
+///
+/// The cap is on *steps*, not on tools: one iteration is one LLM call plus the
+/// calls it asked for. Python's 15 was sized for a local model that loses the
+/// thread after a handful of rounds; a frontier model given a real task spends
+/// that many just reading, and hitting the cap mid-edit leaves the workspace
+/// half-changed — the worst way for a turn to end. 40 is high enough that
+/// stopping there means the model is looping rather than working, and low
+/// enough to still be a backstop.
 fn max_iterations() -> usize {
     match crate::env_opt("CODER_MAX_ITERATIONS").as_deref().map(str::parse::<i64>) {
         Some(Ok(n)) => n.max(1) as usize,
         // Unparseable falls back to the default, exactly as the `except
         // ValueError` does — including a float, which `int()` also rejects.
-        _ => 15,
+        _ => 40,
     }
 }
 
@@ -359,7 +367,7 @@ async fn call_llm_step(
     // failures arrive here as an `ApiError` carrying the status the public
     // route would have answered with. The body snippet Python appends is the
     // one thing lost — the status is what callers branch on.
-    let data = crate::llm::complete_internal(state, payload).await.map_err(|e| {
+    let data = crate::llm::complete_internal(state, payload, crate::resources::Priority::Interactive).await.map_err(|e| {
         ApiError::new(
             StatusCode::BAD_GATEWAY,
             format!("LLM proxy returned HTTP {}", e.status.as_u16()),

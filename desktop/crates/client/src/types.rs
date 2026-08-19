@@ -410,6 +410,21 @@ pub struct SystemPaths {
     pub model_ops_data: Option<String>,
 }
 
+/// `GET|PUT /system/resources` — how much of the machine the server may use, and
+/// how much of that is in use right now (ADR 0010).
+///
+/// `mode` is what the user picked and `resolved` is what it currently means;
+/// under `auto` the two differ, which is the whole reason both are on the wire.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResourcesView {
+    pub mode: String,
+    pub resolved: String,
+    pub background_limit: usize,
+    pub background_in_flight: usize,
+    pub interactive_in_flight: usize,
+    pub cpus: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SystemStatus {
     pub service: String,
@@ -1224,6 +1239,127 @@ pub struct SearchHistoryEntry {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchHistoryResponse {
     pub history: Vec<SearchHistoryEntry>,
+}
+
+// -- Media generation (`/api/v1/media/*`, ADR 0009) --------------------------
+
+/// Whether the local ComfyUI backend is answering, and what it can draw with.
+/// `reachable: false` is the ordinary state on an install that has not set it
+/// up — the Studio screen renders an install pointer, never an error.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaStatus {
+    pub reachable: bool,
+    pub base: String,
+    #[serde(default)]
+    pub checkpoints: Vec<String>,
+    /// The checkpoint the server would use for the next image, chosen from
+    /// `checkpoints` — `None` when none is installed.
+    pub image_model: Option<String>,
+}
+
+/// One row of `media_jobs` — mirrors `server/src/media.rs`'s `MediaJobOut`.
+/// `status` is queued | running | completed | failed; `file_name` is set only
+/// once the output has been copied into the server's media folder, and the
+/// bytes come from `GET /api/v1/media/jobs/{id}/file`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaJob {
+    pub id: i64,
+    pub kind: String,
+    pub prompt: String,
+    pub enhanced_prompt: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub width: i64,
+    pub height: i64,
+    pub length: i64,
+    pub seed: i64,
+    pub file_name: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl MediaJob {
+    pub fn is_video(&self) -> bool {
+        self.kind == "video"
+    }
+
+    /// Still working — the desktop polls while any job says so.
+    pub fn is_running(&self) -> bool {
+        self.status == "queued" || self.status == "running"
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.status == "completed" && self.file_name.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaJobsResponse {
+    pub jobs: Vec<MediaJob>,
+}
+
+/// One file `text_to_video.json` names by hand, and whether ComfyUI has it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaRequirement {
+    /// The ComfyUI models subfolder it belongs in (`vae`, `diffusion_models`,
+    /// `text_encoders`) — also the directory a download writes to.
+    pub folder: String,
+    pub file_name: String,
+    pub url: String,
+    pub size_bytes: i64,
+    pub installed: bool,
+}
+
+/// The body of `GET /api/v1/media/requirements`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaRequirements {
+    /// ComfyUI's `models/` directory, or `None` when the server could not
+    /// establish it — nothing may be written anywhere in that case.
+    pub models_root: Option<String>,
+    pub items: Vec<MediaRequirement>,
+}
+
+impl MediaRequirements {
+    /// Everything still to fetch, in the order the server listed it.
+    pub fn missing(&self) -> impl Iterator<Item = &MediaRequirement> {
+        self.items.iter().filter(|i| !i.installed)
+    }
+
+    /// Bytes the user would be spending, for the confirm step.
+    pub fn missing_bytes(&self) -> i64 {
+        self.missing().map(|i| i.size_bytes).sum()
+    }
+
+    /// Whether a download may even be offered: something to fetch, and a
+    /// verified directory to put it in.
+    pub fn can_install(&self) -> bool {
+        self.models_root.is_some() && self.missing().next().is_some()
+    }
+}
+
+/// The body of `GET /api/v1/media/suggest` — one ready-to-run prompt.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaSuggestion {
+    pub kind: String,
+    pub prompt: String,
+}
+
+/// The body of `POST /api/v1/media/generate` — mirrors `media.rs`'s
+/// `GenerateRequest`. Omitted fields take the server's per-kind defaults
+/// (1024² for an image, 832×480 and 49 frames for a video).
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaGenerateRequest {
+    pub kind: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub negative: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<i64>,
+    pub enhance: bool,
 }
 
 #[cfg(test)]

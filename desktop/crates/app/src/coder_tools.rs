@@ -40,6 +40,39 @@ const MAP_MAX_FILES: usize = 400;
 pub(crate) const SKIP_DIRS: [&str; 7] =
     ["node_modules", "target", "dist", "build", "__pycache__", "venv", "site-packages"];
 
+/// The tool list this screen advertises, as `SendRequest.tools`.
+///
+/// Six of these mirror the server's own `TOOL_SPECS_JSON` verbatim
+/// (`server/src/coder.rs`), because sending `tools` **replaces** the list for
+/// the whole turn — the additions cannot travel on their own. So both copies
+/// change together: a spec added server-side and not here is one this screen's
+/// turns never see, even though its executor would run it.
+///
+/// Two are this side's own:
+///
+/// * `update_todos` never reaches [`execute`] at all — the checklist is screen
+///   state, so `coder::update` answers that call itself.
+/// * `edit_file` is implemented in *both* executors but advertised only here.
+///   That is the gate: the wire contract is shared with portal_desktop, which
+///   delegates and has no `edit_file` yet, so putting it in the server's default
+///   list would send their models a tool their machine cannot run. Advertising
+///   it from the client that has it keeps the rollout to the client that has it.
+const TOOL_SPECS_JSON: &str = r#"[
+  {"type": "function", "function": {"name": "read_file", "description": "Read a text file from the workspace. Path is relative to the workspace root.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Relative file path, e.g. 'src/app.py'"}}, "required": ["path"]}}},
+  {"type": "function", "function": {"name": "write_file", "description": "Create or overwrite a text file in the workspace. Parent directories are created automatically.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Relative file path"}, "content": {"type": "string", "description": "Full new file content"}}, "required": ["path", "content"]}}},
+  {"type": "function", "function": {"name": "edit_file", "description": "Change part of an existing file: replace old_text with new_text, once. Prefer this over write_file for any file you did not just create — it is cheaper and the change is easier to review. old_text must appear exactly once, so include enough surrounding lines to be unique, and copy it exactly, indentation included.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Relative file path"}, "old_text": {"type": "string", "description": "The exact text to replace, copied from the file"}, "new_text": {"type": "string", "description": "What to put in its place; empty deletes it"}}, "required": ["path", "old_text", "new_text"]}}},
+  {"type": "function", "function": {"name": "list_dir", "description": "List entries in a workspace directory. Directories end with '/'.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Relative directory path; omit or '.' for the root"}}, "required": []}}},
+  {"type": "function", "function": {"name": "search", "description": "Find which files contain a literal string, case-insensitively. Use this to locate code instead of reading files one at a time.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Literal text to find, e.g. 'def send_message'"}}, "required": ["query"]}}},
+  {"type": "function", "function": {"name": "repo_map", "description": "List the top-level definitions of every source file in the workspace (Python, Rust, JavaScript/TypeScript). Use this to see what exists and where a name lives before reading anything.", "parameters": {"type": "object", "properties": {}, "required": []}}},
+  {"type": "function", "function": {"name": "run_command", "description": "Run a shell command in the workspace root and return stdout/stderr. Only available when command execution is enabled for the session.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Shell command, e.g. 'pytest -q'"}}, "required": ["command"]}}},
+  {"type": "function", "function": {"name": "update_todos", "description": "Show the user your checklist for this task. Call it once you know the steps, and again each time one is finished. Send the whole list every time — it replaces the last one. Use it for anything that takes more than one step; it is how the user follows what you are doing.", "parameters": {"type": "object", "properties": {"items": {"type": "array", "description": "The whole checklist, in order", "items": {"type": "object", "properties": {"text": {"type": "string", "description": "One step, short, e.g. 'add the migration'"}, "done": {"type": "boolean", "description": "Whether that step is finished"}}, "required": ["text", "done"]}}}, "required": ["items"]}}}
+]"#;
+
+/// The tool list for a turn, parsed once per send.
+pub fn tool_specs() -> Vec<serde_json::Value> {
+    serde_json::from_str(TOOL_SPECS_JSON).expect("TOOL_SPECS_JSON is valid JSON")
+}
+
 /// Resolve a model-supplied path against the workspace root, refusing anything
 /// that leaves it.
 ///
@@ -84,6 +117,18 @@ pub fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Run a workspace walk on the blocking pool. A panic in there is reported as
+/// the tool error it is — the agent loop is waiting for a string either way.
+async fn blocking<F>(f: F) -> String
+where
+    F: FnOnce() -> String + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(out) => out,
+        Err(e) => format!("Error: the workspace scan failed ({e})."),
+    }
+}
+
 /// Run one delegated tool call and return what the model should see.
 pub async fn execute(
     root: &Path,
@@ -95,9 +140,20 @@ pub async fn execute(
     match tool {
         "read_file" => read_file(root, &arg("path")),
         "write_file" => write_file(root, &arg("path"), &arg("content")),
+        "edit_file" => edit_file(root, &arg("path"), &arg("old_text"), &arg("new_text")),
         "list_dir" => list_dir(root, &arg("path")),
-        "search" => search(root, &arg("query")),
-        "repo_map" => repo_map(root),
+        // Off the async runtime (ADR 0010). Both walk the whole workspace with
+        // `read_dir` and then read every file they found — seconds of a parked
+        // tokio worker on a real repo, and this runs on the app's runtime, which
+        // is also what draws the UI.
+        "search" => {
+            let (root, query) = (root.to_path_buf(), arg("query"));
+            blocking(move || search(&root, &query)).await
+        }
+        "repo_map" => {
+            let root = root.to_path_buf();
+            blocking(move || repo_map(&root)).await
+        }
         "run_command" if !allow_commands => "Error: command execution is disabled for this \
              session. Ask the user to enable it (allow_commands) if a command is required."
             .to_string(),
@@ -150,6 +206,102 @@ fn write_file(root: &Path, rel: &str, content: &str) -> String {
     match std::fs::write(&path, content) {
         Ok(()) => format!("Wrote {} bytes to {rel}", content.len()),
         Err(e) => format!("Error: {e}"),
+    }
+}
+
+/// Replace one exact block of text, rather than rewriting the file around it.
+///
+/// `write_file` stays for new files and for a rewrite that really is the whole
+/// file; this is what makes a three-line change cost three lines of tokens
+/// instead of a thousand, and it is what makes the checkpoint diff readable.
+///
+/// The match must be **unique**. An `old_text` that appears twice is a model
+/// that did not read enough context, and picking one of them is how an agent
+/// silently edits the wrong function.
+///
+/// One fallback, and only one: trailing whitespace per line is ignored, because
+/// a model re-typing a block drops it constantly. Leading whitespace is not —
+/// indentation is meaning in Python and YAML, and a helpful re-indent is a
+/// silent corruption. Nothing is written unless exactly one place matched.
+fn edit_file(root: &Path, rel: &str, old: &str, new: &str) -> String {
+    if old.is_empty() {
+        return "Error: edit_file requires old_text. Use write_file to create a file."
+            .to_string();
+    }
+    let path = match resolve_in_root(root, rel) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if !path.is_file() {
+        return format!("Error: File not found: {rel}");
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => return format!("Error: {e}"),
+    };
+    let updated = match replace_block(&text, old, new) {
+        Ok(t) => t,
+        Err(0) => {
+            return format!(
+                "Error: edit_file found no match in {rel}. Read the file and copy old_text \
+                 exactly, including indentation. Nothing was changed."
+            )
+        }
+        Err(n) => {
+            return format!(
+                "Error: old_text appears {n} times in {rel}. Include more of the surrounding \
+                 lines so it matches once. Nothing was changed."
+            )
+        }
+    };
+    match std::fs::write(&path, &updated) {
+        Ok(()) => format!(
+            "Edited {rel}: {} lines replaced with {}.",
+            old.lines().count(),
+            new.lines().count()
+        ),
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
+/// The splice behind [`edit_file`]. `Err(n)` is how many places matched when
+/// that was not exactly one.
+///
+/// The fallback works on byte ranges rather than on a rebuilt `Vec<&str>` so
+/// the file's own line endings survive: rejoining `lines()` with `\n` rewrites
+/// every CRLF in the file, and a one-line edit that reports as a whole-file
+/// diff is worse than no edit tool at all.
+fn replace_block(text: &str, old: &str, new: &str) -> Result<String, usize> {
+    match text.matches(old).count() {
+        1 => return Ok(text.replacen(old, new, 1)),
+        0 => {}
+        n => return Err(n),
+    }
+    let needle: Vec<&str> = old.lines().map(str::trim_end).collect();
+    if needle.is_empty() {
+        return Err(0);
+    }
+    // Start offset of every line, plus a sentinel past the end.
+    let mut starts: Vec<usize> = vec![0];
+    starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+    let content_end = |line: usize| -> usize {
+        let end = starts.get(line + 1).copied().unwrap_or(text.len());
+        text[..end].trim_end_matches(['\n', '\r']).len().max(starts[line])
+    };
+    if needle.len() > starts.len() {
+        return Err(0);
+    }
+    let hits: Vec<usize> = (0..=starts.len() - needle.len())
+        .filter(|&i| {
+            (0..needle.len()).all(|k| text[starts[i + k]..content_end(i + k)].trim_end() == needle[k])
+        })
+        .collect();
+    match hits.len() {
+        1 => {
+            let (from, to) = (starts[hits[0]], content_end(hits[0] + needle.len() - 1));
+            Ok(format!("{}{new}{}", &text[..from], &text[to..]))
+        }
+        n => Err(n),
     }
 }
 
@@ -399,6 +551,73 @@ mod tests {
         std::fs::canonicalize(&dir).unwrap()
     }
 
+    /// The list is a copy of the server's, so the check that matters is that it
+    /// still parses and still names every tool one of the two sides can run —
+    /// a mangled edit here silently sends a turn with the wrong tools.
+    #[test]
+    fn the_advertised_tools_are_the_ones_something_can_run() {
+        let specs = tool_specs();
+        let names: Vec<String> = specs
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "list_dir",
+                "search",
+                "repo_map",
+                "run_command",
+                // Answered by `coder::update`, not by `execute` — see the
+                // constant's own note.
+                "update_todos",
+            ]
+        );
+        for spec in &specs {
+            assert!(spec["function"]["parameters"].is_object(), "{spec} has no parameters");
+        }
+    }
+
+    /// The four outcomes that matter, and the one that is easy to get wrong:
+    /// a file with CRLF endings must come back with CRLF endings, or a one-line
+    /// edit reports as a whole-file diff and the checkpoint is unreadable.
+    #[test]
+    fn an_edit_replaces_one_block_and_refuses_an_ambiguous_one() {
+        let root = scratch("edit");
+        let path = root.join("app.rs");
+        std::fs::write(&path, "fn a() {\r\n    let x = 1;\r\n}\r\nfn b() {\r\n    let x = 1;\r\n}\r\n")
+            .unwrap();
+
+        // Two identical blocks: the model did not read enough, and guessing is
+        // how the wrong function gets edited.
+        let out = edit_file(&root, "app.rs", "    let x = 1;", "    let x = 2;");
+        assert!(out.contains("appears 2 times"), "{out}");
+        assert!(out.contains("Nothing was changed"), "{out}");
+
+        // Enough context to be unique.
+        let out = edit_file(&root, "app.rs", "fn b() {\r\n    let x = 1;", "fn b() {\r\n    let x = 2;");
+        assert!(out.starts_with("Edited app.rs"), "{out}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "fn a() {\r\n    let x = 1;\r\n}\r\nfn b() {\r\n    let x = 2;\r\n}\r\n");
+
+        // Trailing whitespace is the one thing a re-typed block loses; leading
+        // whitespace is not, because indentation is meaning.
+        let out = edit_file(&root, "app.rs", "fn a() {   ", "fn c() {");
+        assert!(out.starts_with("Edited app.rs"), "{out}");
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("fn c() {\r\n"));
+        // …and the fallback still requires the indentation to be right: a tab
+        // where the file has spaces is not the same line, because a helpful
+        // re-indent is a silent corruption.
+        let out = edit_file(&root, "app.rs", "\tlet x = 2;\r\n}", "\tlet x = 4;\r\n}");
+        assert!(out.contains("no match"), "{out}");
+
+        assert!(edit_file(&root, "nope.rs", "a", "b").contains("File not found"));
+        assert!(edit_file(&root, "app.rs", "", "b").contains("requires old_text"));
+    }
+
     #[test]
     fn a_path_climbing_out_of_the_root_is_refused() {
         let root = scratch("escape");
@@ -521,5 +740,32 @@ mod tests {
             execute(&root, "nonesuch", &serde_json::json!({}), true).await,
             "Error: unknown tool 'nonesuch'."
         );
+    }
+
+    /// `search` and `repo_map` are dispatched through `spawn_blocking` (ADR
+    /// 0010), which is the only tool arm that hands its work to another thread.
+    /// The risk is not the walk — that is unit-tested directly below — it is the
+    /// wiring: a wrong closure, a dropped argument, or a join error swallowed as
+    /// an empty string all still compile and all return something the model
+    /// would read as "no matches".
+    #[tokio::test]
+    async fn the_offloaded_walks_return_what_the_direct_call_does() {
+        let root = scratch("offload");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.rs"), "fn tidepool() {}
+").unwrap();
+
+        let hit = execute(&root, "search", &serde_json::json!({ "query": "tidepool" }), false).await;
+        assert_eq!(hit, search(&root, "tidepool"), "offloaded search drifted from the direct call");
+        assert!(hit.contains("src/app.rs:1"), "{hit}");
+
+        let map = execute(&root, "repo_map", &serde_json::json!({}), false).await;
+        assert_eq!(map, repo_map(&root));
+        assert!(map.contains("tidepool"), "{map}");
+
+        // A query that matches nothing still has to come back as the walk's own
+        // "no matches" string, not as a swallowed join error.
+        let miss = execute(&root, "search", &serde_json::json!({ "query": "zzz" }), false).await;
+        assert_eq!(miss, search(&root, "zzz"));
     }
 }

@@ -2,31 +2,46 @@
 //! `ui` kit — no raw widget styling here.
 
 use crate::ui::{self, space, Icon, Tone};
+use crate::shell::ResourceMode;
 use crate::{App, HudStyle, Message, Screen, ServerState, SettingsTab, ThemeMode};
 use agent_platform_client::types::ReadinessReport;
 use iced::widget::{column, container, row, scrollable, Column};
 use iced::{Element, Length, Padding};
 
-/// The sidebar: two short groups of things you *work in*. Everything you
-/// configure or inspect is one entry below them, on its own tabbed page — so
-/// the top level is five destinations rather than nine.
+/// The sidebar: short groups of things you work in. Settings stays in the
+/// footer — it is where you change the app, not where you use it.
 const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
     (
-        "WORKSPACE",
+        "WORK",
         &[
-            (Screen::Dashboard, Icon::Gauge, "Dashboard"),
+            (Screen::Dashboard, Icon::House, "Home"),
             (Screen::Processes, Icon::Activity, "Processes"),
+            (Screen::Coder, Icon::Cpu, "Coder"),
+        ],
+    ),
+    (
+        "ASSIST",
+        &[
+            (Screen::Assistant, Icon::Message, "Assistants"),
+            (Screen::Studio, Icon::Image, "Studio"),
+        ],
+    ),
+    (
+        "LIBRARY",
+        &[
             (Screen::Projects, Icon::Folder, "Projects"),
             (Screen::Teams, Icon::Users, "Teams"),
+        ],
+    ),
+    (
+        "TOOLS",
+        &[
             (Screen::Workflows, Icon::Zap, "Workflows"),
             (Screen::Plans, Icon::ListChecks, "Plans"),
             (Screen::Agenda, Icon::Clock, "Agenda"),
-            (Screen::Coder, Icon::Cpu, "Coder"),
             (Screen::Search, Icon::Search, "Search"),
         ],
     ),
-    // One entry, two tabs: see [`chat_view`].
-    ("ASSISTANTS", &[(Screen::Assistant, Icon::Message, "Assistants")]),
 ];
 
 /// The chat tab strip: the assistant, and what it remembers about you. Text and
@@ -59,6 +74,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             crate::coder_view::view(&app.coder, &app.settings.theme.resolve()).map(Message::Coder)
         }
         Screen::Search => crate::search_view::view(&app.search).map(Message::Search),
+        Screen::Studio => crate::studio_view::view(&app.studio).map(Message::Studio),
         Screen::Assistant | Screen::Memory => chat_view(app),
     };
 
@@ -101,6 +117,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let shell = match app.notifications_open {
         false => shell,
         true => ui::modal(shell, notifications_panel(), 560.0),
+    };
+    let shell = match app.help_open {
+        false => shell,
+        true => ui::modal(shell, help_panel(), 520.0),
     };
 
     // Close-button prompt: drawn in-app so quitting looks like the rest of the
@@ -229,6 +249,14 @@ fn sidebar(app: &App) -> Element<'_, Message> {
             // their place in a short window.
             scrollable(Column::with_children(items).spacing(2.0)).height(Length::Fill),
             ui::separator(),
+            // Above the utility strip, so the last thing before the controls is
+            // what the app is currently costing. Absent, not blank, when there
+            // is nothing to report — an empty gauge reads as "idle", which is a
+            // different claim from "no server".
+            match resource_monitor(app) {
+                Some(monitor) => monitor,
+                None => ui::spacer(),
+            },
             // Settings sits with the window controls, not in the groups above:
             // it is where you go to change the app, not to use it. It never
             // locks — Status and Logs live inside it. Icon-only like its two
@@ -249,7 +277,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
 /// the mic indicator is conditional, and an always-present placeholder would
 /// leave its gap in the row on every launch that never turns the mic on.
 fn footer_controls(app: &App) -> Vec<Element<'_, Message>> {
-    let mut controls: Vec<Element<'_, Message>> = Vec::with_capacity(6);
+    let mut controls: Vec<Element<'_, Message>> = Vec::with_capacity(8);
     // Wake-word standby holds the mic open across every screen, with no HUD
     // anywhere reporting it. The composer says so on the one screen that has a
     // composer; this says so on all of them, and clicking it is the off switch
@@ -272,12 +300,18 @@ fn footer_controls(app: &App) -> Vec<Element<'_, Message>> {
             app.assistant_open,
             Message::ToggleAssistant,
         ),
-                ui::nav_icon_button(
-                    Icon::Settings,
-                    "Settings",
-                    app.screen == Screen::Settings,
-                    Message::Nav(Screen::Settings),
-                ),
+        ui::nav_icon_button(
+            Icon::Info,
+            "Shortcuts (Ctrl+/)",
+            app.help_open,
+            Message::ToggleHelp,
+        ),
+        ui::nav_icon_button(
+            Icon::Settings,
+            "Settings",
+            app.screen == Screen::Settings,
+            Message::Nav(Screen::Settings),
+        ),
                 ui::nav_icon_button(
                     Icon::Scroll,
                     "Logs",
@@ -297,35 +331,31 @@ fn footer_controls(app: &App) -> Vec<Element<'_, Message>> {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard — E.V. front and center, the platform's vitals around it
+// Home — compact HUD, start a run, anything waiting on you
 // ---------------------------------------------------------------------------
 
-/// The landing page: E.V.'s live HUD with a way in, then stat tiles fed by the
-/// same global status poll every other screen uses. Renders with the server
-/// down — the server tile is then exactly the thing worth looking at.
+/// The landing page: a compact HUD, the same start-a-run form as Processes,
+/// then the runs that have stopped for a human. Stats stay as a thin row so
+/// the inbox is the thing you actually look at.
 fn dashboard_view(app: &App) -> Element<'_, Message> {
     let mode = app.assistant.mode();
     let (mode_label, mode_tone) = match mode {
-        crate::assistant::Mode::Idle => ("SYSTEMS NOMINAL", Tone::Success),
-        crate::assistant::Mode::Armed => ("MIC LIVE · MONITORING", Tone::Info),
-        crate::assistant::Mode::Listening => ("LISTENING", Tone::Danger),
-        crate::assistant::Mode::Thinking => ("ANALYZING", Tone::Warning),
-        crate::assistant::Mode::Speaking => ("TRANSMITTING", Tone::Info),
+        crate::assistant::Mode::Idle => (crate::assistant_view::mode_label(mode), Tone::Success),
+        crate::assistant::Mode::Armed => (crate::assistant_view::mode_label(mode), Tone::Info),
+        crate::assistant::Mode::Listening => (crate::assistant_view::mode_label(mode), Tone::Danger),
+        crate::assistant::Mode::Thinking => (crate::assistant_view::mode_label(mode), Tone::Warning),
+        crate::assistant::Mode::Speaking => (crate::assistant_view::mode_label(mode), Tone::Info),
     };
     let (srv_label, srv_tone) = server_label(app.server_state());
 
     let mut blocks: Vec<Element<'_, Message>> = vec![
-        // Takes the leftover height so the page does not end halfway down, but
-        // stops at a panel's worth: the canvas paints a fixed dark palette in
-        // either theme, and an unbounded one becomes a black slab across a
-        // light page.
-        // Big enough to be the landing page's headline, bounded on purpose: the
-        // canvas paints a fixed dark palette in either theme, so a HUD that took
-        // the window's leftover height became a black slab across a light page.
-        // Whatever is left below is ordinary background, and the page scrolls if
-        // the window is too short for the tiles.
-        crate::assistant_view::hud(&app.assistant, 420.0, app.settings.hud_style, &app.settings.theme.resolve())
-            .map(Message::Assistant),
+        crate::assistant_view::hud(
+            &app.assistant,
+            180.0,
+            app.settings.hud_style,
+            &app.settings.theme.resolve(),
+        )
+        .map(Message::Assistant),
         ui::cluster(vec![
             ui::badge(mode_label, mode_tone),
             ui::badge(srv_label, srv_tone),
@@ -344,34 +374,32 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
         "Memories",
         app.memory.items.len().to_string(),
     )];
-    // The five server tiles are always pushed — as "—" until status lands — so the
-    // row keeps its shape instead of snapping from one full-width tile to six.
     match &app.status {
         Some(status) => {
-            let ok = |r: &ReadinessReport| {
-                format!("{}/{}", r.checks.iter().filter(|c| c.ok).count(), r.checks.len())
-            };
-            tiles.extend([
-                ui::stat(Icon::Activity, "Active processes", status.processes.active.to_string()),
-                ui::stat(Icon::Scroll, "Total processes", status.processes.total.to_string()),
-                ui::stat(Icon::Clock, "Uptime", uptime(status.uptime_seconds)),
-                ui::stat(Icon::CheckCircle, "Readiness", ok(&status.readiness)),
-                ui::stat(Icon::Plug, "LLM proxy", ok(&status.llm_proxy)),
-            ]);
+            tiles.push(ui::stat(
+                Icon::Activity,
+                "Active processes",
+                status.processes.active.to_string(),
+            ));
+            tiles.push(ui::stat(Icon::Server, "Server", srv_label));
         }
-        None => tiles.extend([
-            ui::stat(Icon::Activity, "Active processes", "—"),
-            ui::stat(Icon::Scroll, "Total processes", "—"),
-            ui::stat(Icon::Clock, "Uptime", "—"),
-            ui::stat(Icon::CheckCircle, "Readiness", "—"),
-            ui::stat(Icon::Plug, "LLM proxy", "—"),
-        ]),
+        None => {
+            tiles.push(ui::stat(Icon::Activity, "Active processes", "—"));
+            tiles.push(ui::stat(Icon::Server, "Server", srv_label));
+        }
     }
     blocks.push(ui::cluster(tiles).into());
+    blocks.push(
+        ui::cluster(vec![
+            ui::caption("Also"),
+            ui::button_ghost(Icon::ListChecks, "Plans", Message::Nav(Screen::Plans)),
+            ui::button_ghost(Icon::Zap, "Workflows", Message::Nav(Screen::Workflows)),
+            ui::button_ghost(Icon::Clock, "Agenda", Message::Nav(Screen::Agenda)),
+        ])
+        .into(),
+    );
 
     if app.status.is_none() {
-        // Say *why* there are no stats — a port conflict and a stopped server are
-        // not "any moment now".
         blocks.push(match app.server_state() {
             ServerState::Conflict => ui::empty_state_icon(
                 Icon::Alert,
@@ -388,13 +416,69 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
         });
     }
 
+    if app.server_ready() {
+        blocks.push(
+            crate::processes_view::new_run_composer(&app.processes).map(Message::Processes),
+        );
+        let waiting: Vec<_> = app
+            .processes
+            .processes
+            .iter()
+            .filter(|p| crate::processes::needs_user(p.status))
+            .collect();
+        let inbox: Element<'_, Message> = if waiting.is_empty() {
+            ui::empty_state_action(
+                Icon::Inbox,
+                "No runs waiting on you.",
+                ui::button_outline(Icon::Activity, "All runs", Message::Nav(Screen::Processes)),
+            )
+        } else {
+            ui::stack(
+                waiting
+                    .iter()
+                    .map(|p| {
+                        let mut lines = vec![
+                            ui::cluster(vec![
+                                ui::badge(
+                                    crate::domain::process_status_label(p.status.as_str()),
+                                    crate::domain::process_status_tone(p.status.as_str()),
+                                ),
+                                ui::caption(format!("#{}", p.id)),
+                                ui::spacer(),
+                                ui::caption(
+                                    crate::domain::relative_time(&p.created_at)
+                                        .unwrap_or_default(),
+                                ),
+                            ])
+                            .into(),
+                            ui::body(crate::domain::truncate(&p.goal, 90)),
+                        ];
+                        if let Some(hint) = crate::domain::process_waiting_hint(p.status.as_str()) {
+                            lines.push(ui::caption(hint));
+                        }
+                        ui::list_item(ui::stack(lines), false, Message::OpenRun(p.id))
+                    })
+                    .collect(),
+            )
+            .into()
+        };
+        blocks.push(ui::card_with_header(
+            "Needs you",
+            Some(ui::muted(
+                "Plan approval or task review — the run will not move until you answer.",
+            )),
+            None,
+            inbox,
+        ));
+    }
+
     ui::page(
-        "Dashboard",
+        "Home",
         Some(ui::muted(format!(
-            "{} and the platform's vitals at a glance.",
+            "Start a run, or pick up anything waiting on you. {} is standing by.",
             crate::assistant::name()
         ))),
-        None,
+        Some(ui::button_ghost(Icon::Activity, "All runs", Message::Nav(Screen::Processes))),
         ui::stack_lg(blocks),
     )
 }
@@ -409,13 +493,13 @@ fn uptime(seconds: f64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Settings — one page, four tabs
+// Settings — one page, six tabs
 // ---------------------------------------------------------------------------
 
-/// The four back-of-house screens on one page. Providers and Model ops are what
-/// you change; Status and Logs are what you read when a change did not take.
-/// Each tab keeps its own server gate, so the page opens even when nothing else
-/// does and lands you on the two tabs that still work.
+/// Providers and Model ops are what you change; Status and Logs are what you
+/// read when a change did not take. Appearance, Performance and API sit with
+/// them. Each tab keeps its own server gate, so the page opens even when
+/// nothing else does and lands you on the tabs that still work.
 fn settings_view(app: &App) -> Element<'_, Message> {
     let ready = app.server_ready();
     let tabs = ui::segmented(SettingsTab::ALL.map(|tab| {
@@ -433,6 +517,7 @@ fn settings_view(app: &App) -> Element<'_, Message> {
                 crate::modelops_view::view(&app.modelops).map(Message::ModelOps)
             }
             SettingsTab::Appearance => appearance_view(app),
+            SettingsTab::Performance => performance_view(app),
             SettingsTab::Status => status_view(app),
             SettingsTab::Api => {
                 crate::apidocs_view::view(&app.apidocs, &app.shell.origin(), &app.shell.key)
@@ -520,8 +605,13 @@ fn history_panel<'a>(app: &'a App, source: &str) -> Element<'a, Message> {
                 ))
                 .width(Length::Fill)
                 .into(),
-                ui::icon_button(
+                ui::icon_tip(
                     Icon::Trash,
+                    if app.history.delete_armed == Some(c.id) {
+                        "Click again to delete"
+                    } else {
+                        "Delete chat"
+                    },
                     Message::History(crate::history::Message::Delete(c.id)),
                 ),
             ])
@@ -666,7 +756,7 @@ fn notifications_panel<'a>() -> Element<'a, Message> {
                     ))
                     .width(Length::Fill)
                     .into(),
-                    ui::icon_button(Icon::X, Message::DismissNote(note.id)),
+                    ui::icon_tip(Icon::X, "Dismiss", Message::DismissNote(note.id)),
                 ])
                 .into()
             })
@@ -681,6 +771,43 @@ fn notifications_panel<'a>() -> Element<'a, Message> {
     ))
     .height(460)
     .into()
+}
+
+/// Shortcuts, a jump list, and how a run works. The missing first-run and the
+/// missing palette in one sheet — Ctrl+/ or the footer.
+fn help_panel<'a>() -> Element<'a, Message> {
+    ui::card_with_header(
+        "Shortcuts",
+        Some(ui::muted("Ctrl+/ closes this sheet. Esc does too.")),
+        Some(ui::button_ghost(Icon::X, "Close", Message::ToggleHelp)),
+        ui::stack_lg(vec![
+            ui::stack(vec![
+                ui::caption("Ctrl+K — ask the assistant from any screen"),
+                ui::caption("Ctrl+/ — this sheet"),
+                ui::caption("Esc — close a dialog, stop a reply, or cancel"),
+            ])
+            .into(),
+            ui::heading("Go to"),
+            ui::cluster(vec![
+                ui::button_ghost(Icon::House, "Home", Message::Nav(Screen::Dashboard)),
+                ui::button_ghost(Icon::Activity, "Processes", Message::Nav(Screen::Processes)),
+                ui::button_ghost(Icon::Cpu, "Coder", Message::Nav(Screen::Coder)),
+                ui::button_ghost(Icon::Message, "Assistants", Message::Nav(Screen::Assistant)),
+            ])
+            .into(),
+            ui::heading("How a run works"),
+            ui::stack(vec![
+                ui::body("1. Write a goal and pick a team."),
+                ui::body("2. Approve the plan — or turn on auto-approve to skip that gate."),
+                ui::body("3. Review a task if the run pauses again."),
+                ui::caption(
+                    "Lists you move by hand are Plans. Recurring steps are Workflows. \
+                     Agenda is your day.",
+                ),
+            ])
+            .into(),
+        ]),
+    )
 }
 
 fn server_label(state: ServerState) -> (&'static str, Tone) {
@@ -941,6 +1068,144 @@ fn appearance_view(app: &App) -> Element<'_, Message> {
         ]),
     )
 }
+
+/// Settings → Performance. One knob, and enough of the machine's answer to it
+/// that the knob is legible rather than magic (ADR 0010).
+fn performance_view(app: &App) -> Element<'_, Message> {
+    let picked = app.settings.resource_mode;
+    // What the server says it is doing, when it has said anything. `Auto` is the
+    // reason this is on screen at all: without it the user picks a mode whose
+    // effect they cannot see.
+    let live: Element<'_, Message> = match app.resources.as_ref() {
+        // Three rows, not one: the badge line says which mode is in force, the
+        // meter says how full the lane is, and the caption says it in numbers.
+        // The limit is stated once, in the caption — carrying it in the badge
+        // row too is what made this card read as two half-sentences.
+        Some(r) => ui::stack(vec![
+            row![
+                ui::badge(
+                    match picked {
+                        ResourceMode::Auto => format!("Auto \u{2192} {}", r.resolved),
+                        _ => r.resolved.clone(),
+                    },
+                    tier_tone(&r.resolved),
+                ),
+                ui::muted(ui::count(r.cpus, "core", "cores")),
+            ]
+            .spacing(space::MD)
+            .align_y(iced::Alignment::Center)
+            .into(),
+            ui::meter(r.background_in_flight, r.background_limit, tier_tone(&r.resolved)),
+            ui::caption(format!(
+                "{} of {} background calls in flight, {} interactive.",
+                r.background_in_flight, r.background_limit, r.interactive_in_flight
+            )),
+        ])
+        .into(),
+        None => ui::muted("Waiting for the server.").into(),
+    };
+
+    ui::page(
+        "Performance",
+        Some(ui::muted(
+            "How much of this machine the server may spend on model calls. Interactive \
+             work — chat, Coder, the assistant — is never queued behind background work \
+             whatever this says; the setting is what bounds the background half.",
+        )),
+        None,
+        ui::stack_lg(vec![
+            ui::card_with_header(
+                "Resource mode",
+                Some(ui::muted(match picked {
+                    ResourceMode::Auto => {
+                        "Turbo while you are at the window, and Eco once you have been away \
+                         for a minute. The default."
+                    }
+                    ResourceMode::Eco => {
+                        "One background model call at a time, always. Pick this when you \
+                         need the machine for something else."
+                    }
+                    ResourceMode::Balanced => "Half the machine, whether or not you are watching.",
+                    ResourceMode::Turbo => {
+                        "As much as is useful, whether or not you are watching. Runs finish \
+                         soonest and everything else on the machine feels it."
+                    }
+                })),
+                None,
+                ui::stack(vec![
+                    ui::segmented(
+                        ResourceMode::ALL
+                            .map(|m| (m.label(), picked == m, Message::SetResourceMode(m))),
+                    ),
+                    ui::caption(
+                        "This bounds model calls, not the whole process — a build job or a \
+                         local model runs at its own pace.",
+                    ),
+                ]),
+            ),
+            ui::card_with_header(
+                "Right now",
+                Some(ui::muted("The same numbers the sidebar monitor draws.")),
+                None,
+                live,
+            ),
+        ]),
+    )
+}
+
+/// Eco is not a warning and Turbo is not an error — the scale is "how loud", so
+/// it runs neutral to warning and never reaches danger.
+fn tier_tone(tier: &str) -> Tone {
+    match tier {
+        "turbo" => Tone::Warning,
+        "balanced" => Tone::Info,
+        _ => Tone::Neutral,
+    }
+}
+
+/// The sidebar's resource monitor, between the nav list and the utility strip.
+///
+/// **It must not become the thing it reports on.** So it owns no timer and no
+/// sampler: every number here already exists as an atomic in the server, and it
+/// is read on the health poll the app was running anyway, at a rate that follows
+/// the mode (`App::resource_poll_every` — 20 s in Eco, 5 s in Turbo). Nothing is
+/// drawn when the server is not answering, which is also when there is nothing
+/// true to say.
+///
+/// What it shows is the load the user can actually act on: model calls in
+/// flight against the limit their setting chose. Host CPU and memory are
+/// deliberately absent — sampling them needs a per-platform dependency and a
+/// thread that wakes to poll, and the number it produces is one the user cannot
+/// do anything about from here.
+fn resource_monitor(app: &App) -> Option<Element<'_, Message>> {
+    let r = app.resources.as_ref()?;
+    let tone = tier_tone(&r.resolved);
+    let busy = r.background_in_flight + r.interactive_in_flight;
+    let label = if busy == 0 {
+        "idle".to_string()
+    } else {
+        ui::count(busy, "AI call", "AI calls")
+    };
+    Some(
+        // Left-aligned, both labels together. Pushing the tier to the right edge
+        // needs a Fill that survives from the sidebar's fixed width down through
+        // four nested widgets, and it does not — the innermost row resolves to
+        // its minimum and the label lands mid-row looking like a bug. Reading
+        // "idle · turbo" as one phrase is what it is anyway.
+        container(
+            column![
+                row![ui::caption(label), ui::mono_toned(r.resolved.clone(), tone)]
+                    .spacing(space::SM)
+                    .align_y(iced::Alignment::Center),
+                ui::meter(r.background_in_flight, r.background_limit, tone),
+            ]
+            .spacing(space::XS),
+        )
+        .width(Length::Fill)
+        .into(),
+    )
+}
+
 
 // ---------------------------------------------------------------------------
 // Status
@@ -1640,5 +1905,24 @@ mod tests {
             vec![("request_id", "def"), ("trace_id", "abc")]
         );
         assert_eq!(plain.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec!["duration_ms"]);
+    }
+
+    #[test]
+    fn nav_groups_stay_short_and_home_is_first() {
+        for (name, entries) in NAV {
+            assert!(
+                entries.len() <= 4,
+                "{name} has {} entries — split the group rather than dump",
+                entries.len()
+            );
+        }
+        let labels: Vec<&str> = NAV
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|(_, _, label)| *label))
+            .collect();
+        assert_eq!(labels[0], "Home");
+        assert!(!labels.contains(&"Dashboard"));
+        assert!(labels.contains(&"Processes"));
+        assert!(labels.contains(&"Assistants"));
     }
 }

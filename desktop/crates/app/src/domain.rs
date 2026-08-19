@@ -70,6 +70,33 @@ pub fn process_status_tone(status: &str) -> Tone {
     }
 }
 
+/// Wire status → label a person can read. Unknown values pass through so a
+/// newer server string still shows rather than going blank.
+pub fn process_status_label(status: &str) -> &str {
+    match status {
+        "pending" => "Pending",
+        "planning" => "Planning",
+        "approval_required" => "Needs plan approval",
+        "approved" => "Approved",
+        "task_review_required" => "Needs task review",
+        "running" => "Running",
+        "completed" => "Done",
+        "failed" => "Failed",
+        "cancelled" => "Cancelled",
+        other => other,
+    }
+}
+
+/// What the user must do for the run to move again. `None` while the engine
+/// is still working or the run is finished.
+pub fn process_waiting_hint(status: &str) -> Option<&'static str> {
+    match status {
+        "approval_required" => Some("Approve the plan to continue"),
+        "task_review_required" => Some("Review a task to continue"),
+        _ => None,
+    }
+}
+
 /// A planner subagent joined to its task row (absent until the task exists).
 #[derive(Debug, Clone)]
 pub struct BoardRow {
@@ -379,6 +406,23 @@ mod tests {
     fn unknown_status_is_pending() {
         assert_eq!(normalize_task_status("weird"), BoardColumn::Pending);
         assert_eq!(normalize_task_status("AWAITING_REVIEW"), BoardColumn::AwaitingReview);
+    }
+
+    #[test]
+    fn process_status_label_humanizes_the_wire() {
+        assert_eq!(process_status_label("task_review_required"), "Needs task review");
+        assert_eq!(process_status_label("approval_required"), "Needs plan approval");
+        assert_eq!(process_status_label("completed"), "Done");
+        assert_eq!(process_status_label("mystery_status"), "mystery_status");
+        assert_eq!(
+            process_waiting_hint("approval_required"),
+            Some("Approve the plan to continue")
+        );
+        assert_eq!(
+            process_waiting_hint("task_review_required"),
+            Some("Review a task to continue")
+        );
+        assert_eq!(process_waiting_hint("running"), None);
     }
 
     #[test]

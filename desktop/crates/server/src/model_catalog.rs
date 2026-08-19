@@ -17,6 +17,12 @@ use crate::llm_config::{lm_studio_api_base, lm_studio_api_key, ollama_api_base};
 use crate::upstream_http::send_with_retry;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// What the loop waits instead once *both* backends have come back empty. On the
+/// overwhelming majority of installs neither Ollama nor LM Studio is running, and
+/// the loop was paying two 8-second-timeout HTTP attempts every 30 seconds for
+/// the life of the process to re-learn that (ADR 0010). An install with a backend
+/// is unaffected: one non-empty list puts it straight back on the fast interval.
+const IDLE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Python gives the same fetch a different budget depending on who is waiting:
 /// the background cache and `/v1/models` take 8s, the local-backend coercion and
@@ -44,12 +50,18 @@ impl CatalogCache {
     /// place: a backend that just restarted should not empty the catalog.
     pub fn spawn_refresh(self: Arc<Self>, http: reqwest::Client) {
         tokio::spawn(async move {
+            let mut wait = REFRESH_INTERVAL;
             loop {
-                tokio::time::sleep(REFRESH_INTERVAL).await;
+                tokio::time::sleep(wait).await;
                 let (tags, models) = tokio::join!(
                     fetch_ollama_tags(&http, QUICK_TIMEOUT),
                     fetch_lm_studio_models(&http, QUICK_TIMEOUT)
                 );
+                wait = if tags.is_empty() && models.is_empty() {
+                    IDLE_INTERVAL
+                } else {
+                    REFRESH_INTERVAL
+                };
                 let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
                 if !tags.is_empty() {
                     inner.ollama_tags = tags;

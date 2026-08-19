@@ -147,7 +147,7 @@ impl std::fmt::Display for AddField {
 #[derive(Default)]
 pub struct State {
     pub ask: String,
-    /// The rendered dork, editable. Always what the "Dork query" box shows.
+    /// The rendered query, editable. Always what the Query box shows.
     pub query_text: String,
     pub mode: Mode,
     pub engine: SearchEngine,

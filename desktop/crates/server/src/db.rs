@@ -249,6 +249,14 @@ pub async fn backup(pool: &AnyPool, db_path: &std::path::Path) {
     // string literals have, and the path is ours rather than a caller's.
     let literal = target.display().to_string().replace('\'', "''");
     if let Err(e) = sqlx::query(&format!("VACUUM INTO '{literal}'")).execute(pool).await {
+        // `VACUUM INTO` creates the file and *then* fails, so a failed backup
+        // leaves an empty one behind — and an empty one still matches the glob
+        // [`prune_backups`] counts, so three failures in a row are three
+        // generations of nothing and the last real backup ages out of the
+        // window. Seen on this machine: nine 0-byte `.bak` files beside one
+        // good one, written while the database was corrupt — which is the exact
+        // moment the good one matters.
+        let _ = std::fs::remove_file(&target);
         logd!("backup failed: {e}");
         return;
     }
@@ -271,6 +279,12 @@ fn prune_backups(dir: &std::path::Path, stem: &str) {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with(&format!("{stem}.")) && n.ends_with(".bak"))
         })
+        // An empty file is not a generation. `backup` deletes the one a failed
+        // `VACUUM INTO` leaves, but the window is only three deep and the whole
+        // point of it is to survive the run of failures a corrupting database
+        // produces — so anything that ever lands here empty must not be allowed
+        // to push the last usable backup out.
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
         .collect();
     if backups.len() <= BACKUP_GENERATIONS {
         return;
@@ -374,7 +388,26 @@ mod schema_tests {
             std::fs::rename(&made, dir.join(format!("agent_platform.db.2026010100000{n}.bak")))
                 .unwrap();
         }
+        // The run of empties a corrupting database produces. Nine of these were
+        // sitting beside one good backup on a real install, written while
+        // `VACUUM INTO` failed on a malformed WAL — so the case is not
+        // hypothetical, and the good one is what must survive.
+        for n in 6..12 {
+            std::fs::write(dir.join(format!("agent_platform.db.202601010000{n}.bak")), b"").unwrap();
+        }
         prune_backups(&dir, "agent_platform.db");
+
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".bak"))
+                .any(|e| e.metadata().is_ok_and(|m| m.len() > 0)),
+            "a run of empty backups pushed every usable one out of the window"
+        );
+        for n in 6..12 {
+            let _ = std::fs::remove_file(dir.join(format!("agent_platform.db.202601010000{n}.bak")));
+        }
 
         let mut kept: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()

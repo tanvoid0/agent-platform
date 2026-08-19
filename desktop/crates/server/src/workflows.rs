@@ -898,7 +898,7 @@ async fn assist(
     // ponytail: Python prefixes this with "LLM proxy request failed with HTTP
     // {status}." because it read an HTTP response off its own loopback. There is
     // no hop here, and `e.message` already says what went wrong.
-    let data = crate::llm::complete_internal(&state, payload)
+    let data = crate::llm::complete_internal(&state, payload, crate::resources::Priority::Interactive)
         .await
         .map_err(|e| unavailable(e.message))?;
 

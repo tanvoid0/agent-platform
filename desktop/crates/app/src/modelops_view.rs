@@ -4,7 +4,7 @@
 use crate::domain;
 use crate::modelops::{Message, State, STAGES};
 use crate::ui::{self, space, Icon, Tone};
-use iced::widget::{checkbox, column, container, scrollable};
+use iced::widget::{column, container, scrollable};
 use iced::{Element, Length};
 
 pub fn view(state: &State) -> Element<'_, Message> {
@@ -104,17 +104,12 @@ fn projects_card(state: &State) -> Element<'_, Message> {
         .iter()
         .map(|stage| {
             let on = state.stages.iter().any(|s| s == stage);
-            checkbox(on)
-                .label(*stage)
-                .on_toggle(move |v| Message::ToggleStage(stage.to_string(), v))
-                .size(16)
-                .text_size(ui::font::SM)
-                .into()
+            ui::checkbox(*stage, on, move |v| Message::ToggleStage(stage.to_string(), v))
         })
         .collect();
 
     let launcher = ui::stack(vec![
-        ui::caption("PIPELINE STAGES"),
+        ui::caption("Pipeline stages"),
         ui::cluster(stage_toggles).into(),
         ui::cluster(vec![
             container(ui::input(
@@ -158,7 +153,7 @@ fn job_card<'a>(
 
     let mut body = vec![
         ui::cluster(vec![
-            ui::badge_icon(ui::tone_icon(tone), job.status.clone(), tone),
+            ui::badge_icon(ui::tone_icon(tone), job_status_label(&job.status), tone),
             ui::caption(format!("job #{} · {}", job.id, job.job_type)),
             ui::spacer(),
             ui::caption(job.stages.join(" → ")),
@@ -253,7 +248,7 @@ fn registry_card(state: &State) -> Element<'_, Message> {
                         cells.push(ui::caption(format!("eval {score:.3}")));
                     }
                     if e.is_active {
-                        cells.push(ui::badge("active", Tone::Success));
+                        cells.push(ui::badge("Active", Tone::Success));
                     }
                     ui::cluster(cells).into()
                 })
@@ -269,4 +264,15 @@ fn registry_card(state: &State) -> Element<'_, Message> {
 /// Kept beside the registry table so job timestamps read the same as elsewhere.
 pub fn job_age(job: &agent_platform_client::types::ModelBuildJob) -> String {
     domain::relative_time(&job.created_at).unwrap_or_default()
+}
+
+fn job_status_label(status: &str) -> &str {
+    match status {
+        "completed" => "Completed",
+        "failed" => "Failed",
+        "cancelled" => "Cancelled",
+        "running" => "Running",
+        "queued" => "Queued",
+        other => other,
+    }
 }

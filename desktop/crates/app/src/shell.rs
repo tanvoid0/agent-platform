@@ -124,6 +124,46 @@ impl HudStyle {
     }
 }
 
+/// How much of the machine the server may spend on model calls (ADR 0010).
+///
+/// The app only stores and displays this; the meaning lives in the server's
+/// `resources::Mode`, and the wire form is the lowercase name. `Auto` is the
+/// default because a knob most users never touch only helps the ones who already
+/// knew they had a problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceMode {
+    Eco,
+    Balanced,
+    Turbo,
+    #[default]
+    Auto,
+}
+
+impl ResourceMode {
+    pub const ALL: [ResourceMode; 4] =
+        [ResourceMode::Auto, ResourceMode::Eco, ResourceMode::Balanced, ResourceMode::Turbo];
+
+    /// The wire value. Must match the server's `resources::Mode::as_str`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResourceMode::Eco => "eco",
+            ResourceMode::Balanced => "balanced",
+            ResourceMode::Turbo => "turbo",
+            ResourceMode::Auto => "auto",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ResourceMode::Eco => "Eco",
+            ResourceMode::Balanced => "Balanced",
+            ResourceMode::Turbo => "Turbo",
+            ResourceMode::Auto => "Auto",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -201,8 +241,41 @@ pub struct Settings {
     /// Ask the Coder agent for a plan before each turn's tool loop. On by
     /// default: it costs one extra call and is the largest quality difference
     /// available on the local models this screen mostly runs.
+    ///
+    /// Superseded by [`Self::coder_plan_mode`], and still written so a file
+    /// shared with an older build keeps its off/on setting. Read only when the
+    /// mode is absent.
     #[serde(default = "default_true")]
     pub coder_plan: bool,
+    /// The three-state form of the above (`off` / `inline` / `gate`). Absent in
+    /// a settings file written before the gate existed, which is what
+    /// `coder_plan` is still there to answer.
+    #[serde(default)]
+    pub coder_plan_mode: Option<crate::coder::PlanMode>,
+    /// Open each file the agent writes as it writes it. Off by default: it moves
+    /// the dock under the user mid-turn, which is what they asked for when they
+    /// turned it on and a surprise when they did not.
+    #[serde(default)]
+    pub coder_follow: bool,
+    /// How much of `run_command` the Coder agent may do unasked — see
+    /// [`crate::coder::Autonomy`]. `Off` by default, which is the tier that
+    /// refuses commands outright.
+    #[serde(default)]
+    pub coder_autonomy: crate::coder::Autonomy,
+    /// Command prefixes approved for good, keyed by workspace root. Written by
+    /// the approval card's **Always allow** and only read in
+    /// [`crate::coder::Autonomy::Allowlist`].
+    ///
+    /// Per workspace on purpose: `cargo test` in a repo you own is not the same
+    /// permission as `cargo test` in one you cloned this morning.
+    #[serde(default)]
+    pub coder_allowlist: std::collections::BTreeMap<String, Vec<String>>,
+    /// How hard the server is allowed to work (ADR 0010). Pushed to the server
+    /// on change and on every reconnect — it is not an env var, because a
+    /// setting that needs a restart to take effect is one users toggle once and
+    /// never trust again.
+    #[serde(default)]
+    pub resource_mode: ResourceMode,
 }
 
 fn default_true() -> bool {
@@ -239,6 +312,11 @@ impl Default for Settings {
             coder_provider: String::new(),
             coder_model: String::new(),
             coder_plan: true,
+            coder_plan_mode: None,
+            coder_follow: false,
+            coder_autonomy: crate::coder::Autonomy::default(),
+            coder_allowlist: std::collections::BTreeMap::new(),
+            resource_mode: ResourceMode::default(),
         }
     }
 }
@@ -422,6 +500,10 @@ impl Shell {
             .env("AGENT_PLATFORM_DB_PATH", self.data_dir.join("agent_platform.db"))
             .env("AGENT_PLATFORM_WORKSPACE_ROOT", self.data_dir.join("workspaces"))
             .env("MODEL_OPS_DATA_DIR", self.data_dir.join("model-ops"))
+            // Generated images and video, and any workflow template the user
+            // overrides (ADR 0009). Same reason as the line above: without it
+            // the daemon writes them beside its own install.
+            .env("MEDIA_DATA_DIR", self.data_dir.join("media"))
             // BYOK/provider config must land in a user-writable dir, not the install dir.
             .env("CONFIG_DIR", self.data_dir.join("llm"))
             // A developer's .env must not point a desktop install at someone's
@@ -440,7 +522,20 @@ impl Shell {
 }
 
 /// Config/data root: `%APPDATA%/com.tanvoid0.agentplatform` (same as the Tauri shell).
+///
+/// `AGENT_PLATFORM_APP_DIR` moves the whole of it — database, `settings.json`,
+/// `master.key`, chats, memories. There is no other way to launch this app
+/// without it opening the real user's data: `AGENT_PLATFORM_PORT` moves the
+/// port only, and setting `%APPDATA%` does nothing because `dirs::config_dir`
+/// asks Win32 for the known folder rather than reading the variable.
+///
+/// Which is why this exists: driving the app to check a change meant driving it
+/// over live data, and the run that found this was a run that could not start
+/// at all because that live database was corrupt.
 pub fn app_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("AGENT_PLATFORM_APP_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join(APP_DIR)
 }
 

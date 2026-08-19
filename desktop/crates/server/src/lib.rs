@@ -32,6 +32,8 @@
 //! - **web search** — `search.rs` (the one route) over `search_dork.rs` (the
 //!   pure `DorkQuery` translator, ADR 0008). No outbound HTTP: the browser
 //!   runs the search, this server only builds the query.
+//! - **media generation** — `media.rs`: local image and video through ComfyUI
+//!   over loopback (ADR 0009), as background jobs against `media_jobs`.
 //!
 //! Cross-cutting: `db.rs` (the SQLite/Postgres choke point, and the schema
 //! bootstrap that replaced Alembic), `wire.rs` and `error.rs` (shared shapes
@@ -80,6 +82,7 @@ pub mod executor;
 pub mod llm;
 pub mod llm_admin;
 pub mod llm_config;
+pub mod media;
 pub mod model_capabilities;
 pub mod model_catalog;
 pub mod model_ops;
@@ -88,6 +91,7 @@ pub mod processes;
 pub mod projects;
 pub mod provider_catalog;
 pub mod request_id;
+pub mod resources;
 pub mod search;
 pub mod search_dork;
 pub mod system;
@@ -217,6 +221,9 @@ pub struct AppState {
     /// on a backend. Empty until `serve` starts the refresh loop, which is what a
     /// test harness gets — and what Python reports for its own first 30 seconds.
     pub catalog: Arc<model_catalog::CatalogCache>,
+    /// How much of this machine the server may use, and who gets it first
+    /// (ADR 0010). Set by `PUT /system/resources`; read at every model call.
+    pub limits: resources::Limits,
 }
 
 impl AppState {
@@ -249,6 +256,7 @@ impl AppState {
             coder_pending: Mutex::new(HashMap::new()),
             model_jobs: Mutex::new(HashMap::new()),
             catalog: Arc::new(model_catalog::CatalogCache::default()),
+            limits: resources::Limits::default(),
         }
     }
 }
@@ -489,8 +497,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(chat::routes())
         .merge(llm::routes())
         .merge(llm_admin::routes())
+        .merge(media::routes())
         .merge(model_ops::routes())
         .merge(processes::routes())
+        .merge(resources::routes())
         .merge(search::routes())
         .merge(system::routes())
         .merge(projects::routes())
@@ -553,6 +563,9 @@ pub async fn serve(cfg: Config) -> Result<(), BoxError> {
     // the same rows this process was recovering, and it stays as the operator
     // control for "start without replaying anything".
     executor::spawn_startup_recovery(state.clone());
+    // Same reason, different table: a media job's watcher is a task in this
+    // process, so a restart leaves its row running forever (`media.rs`).
+    media::spawn_startup_recovery(state.clone());
 
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;

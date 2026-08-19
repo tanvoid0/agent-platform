@@ -91,13 +91,7 @@ pub fn panel<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Eleme
     // Only meaningful in voice mode: every line of it reports the mic.
     let status = || -> Element<'_, Message> { ui::cluster(vec![
         ui::badge(
-            match mode {
-                Mode::Idle => "SYSTEMS NOMINAL",
-                Mode::Armed => "MIC LIVE · MONITORING",
-                Mode::Listening => "LISTENING",
-                Mode::Thinking => "ANALYZING",
-                Mode::Speaking => "TRANSMITTING",
-            },
+            mode_label(mode),
             match mode {
                 Mode::Idle => Tone::Success,
                 Mode::Armed => Tone::Info,
@@ -135,7 +129,7 @@ pub fn panel<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Eleme
 
     let transcript: Element<'_, Message> = if state.messages.is_empty() {
         ui::empty_state(if state.voice {
-            "Web-shooters primed. What do you need?".to_string()
+            format!("Listening. Ask {} out loud, or type below.", crate::assistant::name())
         } else {
             format!("Ask {} anything.", crate::assistant::name())
         })
@@ -207,10 +201,7 @@ pub fn panel<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Eleme
             let note: Element<'_, Message> = ui::cluster(vec![
                 ui::badge_icon(
                     Icon::Mic,
-                    format!(
-                        "MIC LIVE · WAITING FOR “{}”",
-                        crate::assistant::name().to_uppercase()
-                    ),
+                    format!("Mic live — waiting for “{}”", crate::assistant::name()),
                     Tone::Warning,
                 ),
                 ui::caption("Anything else it hears is dropped.".to_string()),

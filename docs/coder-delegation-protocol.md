@@ -30,6 +30,25 @@ Without delegation the server executes the same six tools itself against a
 produce. The tool set is identical on both sides on purpose: a model must not be
 able to tell which machine ran a tool.
 
+## The tool list is the caller's, if it sends one
+
+`SendRequest.tools` (also on `/retry` and `/approve`) **replaces** the server's
+list for every step of that turn. Two consequences a delegating client has to
+know:
+
+- `[]` means *no tools this turn*, not "use the defaults" — that is how the iced
+  app's plan gate gets a tool-free turn.
+- A name the executor does not know is answered `"Error: unknown tool '…'."` as
+  a tool result, not as a failed turn. So a client may advertise tools of its
+  own: the iced app adds `update_todos` (a checklist it renders and answers
+  itself) and `edit_file`.
+- **`edit_file` is implemented in both in-tree executors but is not in the
+  server's default list**, because portal_desktop delegates and does not have
+  it yet. When it does, moving the spec into `tool_specs()` is the whole change.
+  Its arguments are `{path, old_text, new_text}`; `old_text` must match exactly
+  once (trailing whitespace per line is the only slack), and a miss is a tool
+  result the model can recover from, never a write.
+
 ## The frames
 
 `event: <name>` / `data: <json>`, blank-line separated. Emitted by

@@ -2626,7 +2626,7 @@ async fn chat_only(
         payload.insert("model".into(), json!(sm));
     }
 
-    let data = crate::llm::complete_internal(state, payload).await.map_err(|e| {
+    let data = crate::llm::complete_internal(state, payload, crate::resources::Priority::Interactive).await.map_err(|e| {
         ApiError::new(StatusCode::BAD_GATEWAY, format!("LLM proxy returned HTTP {}", e.status.as_u16()))
     })?;
     let usage = crate::chat_usage::parse_llm_usage(&data, Some("chat_only"));

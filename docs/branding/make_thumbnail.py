@@ -51,9 +51,9 @@ d.rectangle([0, 0, 10, H], fill=accent)
 
 # text block
 d.text((90, 120), "AGENT PLATFORM", font=f_title, fill=white)
-d.text((90, 200), "Multi-Agent AI Orchestration API", font=f_sub, fill=gray)
+d.text((90, 200), "Multi-agent orchestration", font=f_sub, fill=gray)
 
-tags = ["FastAPI", "React", "Docker", "BYOK Security", "Multi-Tenant"]
+tags = ["Rust", "iced", "Native", "BYOK", "Multi-agent"]
 tx = 90
 ty = 280
 for tag in tags:

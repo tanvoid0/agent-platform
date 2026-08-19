@@ -3,10 +3,9 @@
 //! Semantic names (`background`, `card`, `muted_foreground`, `border`, …) and the
 //! spacing/radius/type scales below are shadcn's, not iced's — screens use these,
 //! never raw colors. The light block is still shadcn's default (zinc) `:root`
-//! verbatim; the dark block is not, because the two design languages disagree
-//! about depth. shadcn leans on shadows, LM Studio on flat fills separated by a
-//! hairline — so the dark ramp is retuned for the latter and [`card`] casts no
-//! shadow at all. See [`dark_tokens`].
+//! verbatim. Dark fills still step up (canvas → card → popover) so a panel has
+//! somewhere to sit; [`card`] lifts off the canvas with a shadow, not a hairline.
+//! Inputs and separators keep the hairline. See [`dark_tokens`].
 
 use iced::widget::{button, container, text, text_input};
 use iced::{Background, Border, Color, Shadow, Theme, Vector};
@@ -25,6 +24,7 @@ pub mod radius {
     pub const SM: f32 = 4.0; // calc(var(--radius) - 4px)
     pub const MD: f32 = 6.0; // calc(var(--radius) - 2px)
     pub const LG: f32 = 8.0; // var(--radius)
+    pub const XL: f32 = 12.0; // elevated surfaces (cards)
     pub const PILL: f32 = 999.0;
 }
 
@@ -35,6 +35,15 @@ pub mod font {
     pub const BASE: f32 = 16.0;
     pub const LG: f32 = 18.0; // card titles
     pub const XL2: f32 = 24.0; // page titles
+
+    /// Page and card titles. Body stays `Font::DEFAULT` so weight, not size,
+    /// is what separates a heading from a sentence.
+    pub const SEMIBOLD: iced::Font = iced::Font {
+        family: iced::font::Family::SansSerif,
+        weight: iced::font::Weight::Semibold,
+        stretch: iced::font::Stretch::Normal,
+        style: iced::font::Style::Normal,
+    };
 }
 
 fn hsl(h: f32, s: f32, l: f32) -> Color {
@@ -93,47 +102,47 @@ pub struct Tokens {
 /// shadcn default (zinc) — `:root`.
 fn light_tokens() -> Tokens {
     Tokens {
-        background: hsl(0.0, 0.0, 100.0),
+        // Off-white canvas so a white card can actually lift. Pure white-on-white
+        // made the shadow the only edge, and it vanished in daylight.
+        background: hsl(240.0, 6.0, 95.0),
         foreground: hsl(240.0, 10.0, 3.9),
         card: hsl(0.0, 0.0, 100.0),
         card_foreground: hsl(240.0, 10.0, 3.9),
         popover: hsl(0.0, 0.0, 100.0),
         primary: hsl(240.0, 5.9, 10.0),
         primary_foreground: hsl(0.0, 0.0, 98.0),
-        secondary: hsl(240.0, 4.8, 95.9),
+        secondary: hsl(240.0, 5.0, 92.0),
         secondary_foreground: hsl(240.0, 5.9, 10.0),
-        muted: hsl(240.0, 4.8, 95.9),
-        muted_foreground: hsl(240.0, 3.8, 46.1),
-        accent: hsl(240.0, 4.8, 95.9),
-        destructive: hsl(0.0, 84.2, 60.2),
+        muted: hsl(240.0, 5.0, 92.0),
+        muted_foreground: hsl(240.0, 4.0, 40.0),
+        accent: hsl(240.0, 5.0, 90.0),
+        destructive: hsl(0.0, 72.0, 40.0),
         destructive_foreground: hsl(0.0, 0.0, 98.0),
-        // Not in shadcn's base set; taken from the Tailwind ramp it ships with.
         success: hsl(142.1, 76.2, 36.3),
         warning: hsl(37.7, 92.1, 50.2),
         info: hsl(221.2, 83.2, 53.3),
-        border: hsl(240.0, 5.9, 90.0),
-        input: hsl(240.0, 5.9, 90.0),
-        ring: hsl(240.0, 10.0, 3.9),
+        border: hsl(240.0, 5.9, 50.0),
+        input: hsl(240.0, 5.9, 50.0),
+        ring: hsl(221.2, 83.2, 53.3),
         dark: false,
     }
 }
 
-/// LM Studio-style dark: a near-neutral canvas, flat elevation steps, and a
-/// border lighter than every fill so panels are separated by a hairline instead
-/// of a shadow.
+/// Dark canvas with stepped fills. Cards lift with a shadow; inputs still use
+/// the hairline (`border` lighter than every fill) so a field does not look
+/// like a panel.
 ///
 /// shadcn's `.dark` collapses `border`, `muted`, `secondary` and `accent` onto a
-/// single value. That is fine when cards cast shadows, but this language has no
-/// shadows to fall back on — a card's edge and a hovered row would be the same
-/// color, leaving panels with no visible boundary. Hence the split, and the test
-/// below that keeps it.
+/// single value. That is fine when cards cast shadows, but a hovered row and an
+/// input edge would then be the same color. Hence the split, and the test below
+/// that keeps it.
 fn dark_tokens() -> Tokens {
     Tokens {
         background: hsl(240.0, 5.0, 7.0), // canvas
         foreground: hsl(0.0, 0.0, 98.0),
-        card: hsl(240.0, 5.0, 10.0), // panel on the canvas
+        card: hsl(240.0, 5.0, 11.0), // panel — one clear step off the canvas
         card_foreground: hsl(0.0, 0.0, 98.0),
-        popover: hsl(240.0, 5.0, 12.0), // floats above a panel, so one step up again
+        popover: hsl(240.0, 5.0, 14.0), // floats above a panel
         primary: hsl(0.0, 0.0, 98.0),
         primary_foreground: hsl(240.0, 5.9, 10.0),
         secondary: hsl(240.0, 4.0, 15.0),
@@ -147,12 +156,14 @@ fn dark_tokens() -> Tokens {
         warning: hsl(47.9, 95.8, 53.1),
         // Restrained blue rather than Tailwind's blue-500: at this canvas
         // lightness a fully saturated accent is the only thing the eye lands on.
-        info: hsl(217.0, 78.0, 58.0),
-        border: hsl(240.0, 4.0, 20.0), // the hairline — lighter than any fill
-        input: hsl(240.0, 4.0, 20.0),
+        info: hsl(217.0, 78.0, 62.0),
+        // 20% L was a 1.3:1 ghost line on the card. 44% L is the UI 3:1 floor
+        // and still sits above every fill, so depth stays a hairline not a shadow.
+        border: hsl(240.0, 5.0, 44.0),
+        input: hsl(240.0, 5.0, 44.0),
         // Focus reads as the accent. shadcn's near-white ring is a second bright
         // value competing with `foreground` on every focused field.
-        ring: hsl(217.0, 78.0, 58.0),
+        ring: hsl(217.0, 78.0, 62.0),
         dark: true,
     }
 }
@@ -242,16 +253,36 @@ pub fn text_tone(tone: Tone) -> impl Fn(&Theme) -> text::Style {
 
 // -- surfaces ---------------------------------------------------------------
 
-/// shadcn `Card`: bg-card, rounded-lg, border — but no shadow. Depth comes from
-/// the fill stepping up off the canvas and the border catching the edge; a card
-/// is inline, not floating, so it has nothing to cast onto. Overlays that really
-/// do float ([`select_menu`]) keep theirs.
+/// A card sits on the canvas: fill one step up, 12px corners, a real drop
+/// shadow (offset + blur). No 1px border — that plus a shadow is the ghost card.
 pub fn card(theme: &Theme) -> container::Style {
     let t = tokens(theme);
     container::Style {
         background: Some(Background::Color(t.card)),
         text_color: Some(t.card_foreground),
-        border: Border { color: t.border, width: 1.0, radius: radius::LG.into() },
+        border: Border { color: Color::TRANSPARENT, width: 0.0, radius: radius::XL.into() },
+        shadow: Shadow {
+            color: alpha(Color::BLACK, if t.dark { 0.50 } else { 0.10 }),
+            offset: Vector::new(0.0, 6.0),
+            blur_radius: if t.dark { 20.0 } else { 16.0 },
+        },
+        ..container::Style::default()
+    }
+}
+
+/// A stacked list row: same fill as [`card`], quieter shadow so a column of
+/// them does not look like a pile of floating panels.
+pub fn tile(theme: &Theme) -> container::Style {
+    let t = tokens(theme);
+    container::Style {
+        background: Some(Background::Color(t.card)),
+        text_color: Some(t.card_foreground),
+        border: Border { color: Color::TRANSPARENT, width: 0.0, radius: radius::LG.into() },
+        shadow: Shadow {
+            color: alpha(Color::BLACK, if t.dark { 0.28 } else { 0.06 }),
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: if t.dark { 10.0 } else { 8.0 },
+        },
         ..container::Style::default()
     }
 }
@@ -283,6 +314,25 @@ pub fn badge(tone: Tone) -> impl Fn(&Theme) -> container::Style {
         container::Style {
             background: Some(Background::Color(alpha(color, if t.dark { 0.18 } else { 0.12 }))),
             border: Border { color: alpha(color, 0.35), width: 1.0, radius: radius::PILL.into() },
+            ..container::Style::default()
+        }
+    }
+}
+
+/// One segment of [`crate::ui::meter`]. `on` is the tone at full strength; `off`
+/// is the same hue at the alpha a badge uses for its fill, so an idle meter
+/// reads as a track rather than as five empty boxes.
+pub fn meter_cell(tone: Tone, on: bool) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let t = tokens(theme);
+        let color = tone_color(&t, tone);
+        container::Style {
+            background: Some(Background::Color(if on {
+                color
+            } else {
+                alpha(t.muted_foreground, if t.dark { 0.20 } else { 0.15 })
+            })),
+            border: Border { radius: 1.0.into(), ..Border::default() },
             ..container::Style::default()
         }
     }
@@ -413,38 +463,51 @@ pub fn button_style(variant: ButtonVariant) -> impl Fn(&Theme, button::Status) -
     }
 }
 
-/// Sidebar nav entry: active = `bg-accent`, hover = `bg-accent/50`.
+/// Sidebar nav entry: selected/hover use the info accent so "here" is not
+/// another grey fill in a grey shell. Hairline, not a 2px rail — the kit
+/// already owns 1px borders.
 pub fn nav_item(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let t = tokens(theme);
         let hovered = matches!(status, button::Status::Hovered);
+        let fill = |a: f32| Some(Background::Color(alpha(t.info, a)));
         button::Style {
-            background: match (selected, hovered) {
-                (true, _) => Some(Background::Color(t.accent)),
-                (false, true) => Some(Background::Color(alpha(t.accent, 0.5))),
+            background: match (selected, hovered, t.dark) {
+                (true, _, true) => fill(0.18),
+                (true, _, false) => fill(0.12),
+                (false, true, true) => fill(0.10),
+                (false, true, false) => fill(0.08),
                 _ => None,
             },
             text_color: if selected { t.foreground } else { t.muted_foreground },
-            border: Border { radius: radius::MD.into(), ..Border::default() },
+            border: Border {
+                color: if selected { alpha(t.info, 0.40) } else { Color::TRANSPARENT },
+                width: 1.0,
+                radius: radius::MD.into(),
+            },
             ..button::Style::default()
         }
     }
 }
 
-/// Selectable row in a list (run lists, rosters).
+/// Selectable row in a list (run lists, rosters). Same selection language as
+/// [`nav_item`] so a highlighted run and a highlighted tab agree.
 pub fn list_item(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let t = tokens(theme);
         let hovered = matches!(status, button::Status::Hovered);
+        let fill = |a: f32| Some(Background::Color(alpha(t.info, a)));
         button::Style {
-            background: match (selected, hovered) {
-                (true, _) => Some(Background::Color(t.accent)),
-                (false, true) => Some(Background::Color(alpha(t.accent, 0.5))),
+            background: match (selected, hovered, t.dark) {
+                (true, _, true) => fill(0.18),
+                (true, _, false) => fill(0.12),
+                (false, true, true) => fill(0.10),
+                (false, true, false) => fill(0.08),
                 _ => None,
             },
             text_color: t.foreground,
             border: Border {
-                color: if selected { t.border } else { Color::TRANSPARENT },
+                color: if selected { alpha(t.info, 0.40) } else { Color::TRANSPARENT },
                 width: 1.0,
                 radius: radius::MD.into(),
             },
@@ -470,6 +533,33 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
         placeholder: t.muted_foreground,
         value: t.foreground,
         selection: alpha(t.info, 0.35),
+    }
+}
+
+/// shadcn `Checkbox`: 16px, info fill when on, hairline when off.
+pub fn checkbox(theme: &Theme, status: iced::widget::checkbox::Status) -> iced::widget::checkbox::Style {
+    use iced::widget::checkbox::Status;
+    let t = tokens(theme);
+    let (checked, hovered, disabled) = match status {
+        Status::Active { is_checked } => (is_checked, false, false),
+        Status::Hovered { is_checked } => (is_checked, true, false),
+        Status::Disabled { is_checked } => (is_checked, false, true),
+    };
+    iced::widget::checkbox::Style {
+        background: Background::Color(if checked {
+            t.info
+        } else if hovered {
+            t.accent
+        } else {
+            t.background
+        }),
+        icon_color: if t.dark { t.foreground } else { Color::WHITE },
+        border: Border {
+            color: if checked { t.info } else { t.input },
+            width: 1.0,
+            radius: radius::SM.into(),
+        },
+        text_color: Some(if disabled { alpha(t.foreground, 0.5) } else { t.foreground }),
     }
 }
 
@@ -572,8 +662,89 @@ mod tests {
     }
 
     #[test]
+    fn cards_elevate_without_a_hairline() {
+        let dark = card(&dark_theme());
+        assert_eq!(dark.border.width, 0.0);
+        assert!(dark.shadow.offset.y > 0.0, "shadow needs an offset, not a glow");
+        assert!(dark.shadow.blur_radius >= 12.0);
+        let light = card(&light_theme());
+        assert_eq!(light.border.width, 0.0);
+        assert!(light.shadow.offset.y > 0.0);
+        assert!(light.shadow.blur_radius >= 12.0);
+    }
+
+    #[test]
+    fn tiles_sit_quieter_than_cards() {
+        let dark_card = card(&dark_theme());
+        let dark_tile = tile(&dark_theme());
+        assert_eq!(dark_tile.border.width, 0.0);
+        assert!(dark_tile.shadow.offset.y > 0.0);
+        assert!(dark_tile.shadow.blur_radius < dark_card.shadow.blur_radius);
+        assert!(dark_tile.shadow.offset.y < dark_card.shadow.offset.y);
+        let light_tile = tile(&light_theme());
+        assert_eq!(light_tile.border.width, 0.0);
+        assert!(light_tile.shadow.offset.y > 0.0);
+    }
+
+    #[test]
+    fn light_canvas_lets_white_cards_lift() {
+        let t = light_tokens();
+        assert!(rel_lum(t.background) < 0.97, "canvas must not be pure white");
+        assert!(rel_lum(t.card) > rel_lum(t.background));
+        assert_eq!(t.ring, t.info, "focus ring is the info blue, not near-black");
+    }
+
+    #[test]
     fn tokens_follow_active_theme() {
         assert!(!tokens(&light_theme()).dark);
         assert!(tokens(&dark_theme()).dark);
+    }
+
+    fn rel_lum(c: Color) -> f32 {
+        let lin = |ch: f32| {
+            if ch <= 0.04045 {
+                ch / 12.92
+            } else {
+                ((ch + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+    }
+
+    fn contrast(a: Color, b: Color) -> f32 {
+        let (l1, l2) = (rel_lum(a), rel_lum(b));
+        let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn hairlines_and_destructive_meet_aa() {
+        let dark = dark_tokens();
+        assert!(
+            contrast(dark.border, dark.card) >= 3.0,
+            "dark hairline vs card {}",
+            contrast(dark.border, dark.card)
+        );
+        assert!(
+            contrast(dark.destructive_foreground, dark.destructive) >= 4.5,
+            "dark destructive {}",
+            contrast(dark.destructive_foreground, dark.destructive)
+        );
+        let light = light_tokens();
+        assert!(
+            contrast(light.border, light.background) >= 3.0,
+            "light hairline vs canvas {}",
+            contrast(light.border, light.background)
+        );
+        assert!(
+            contrast(light.destructive_foreground, light.destructive) >= 4.5,
+            "light destructive {}",
+            contrast(light.destructive_foreground, light.destructive)
+        );
+        assert!(
+            contrast(light.muted_foreground, light.background) >= 4.5,
+            "light muted {}",
+            contrast(light.muted_foreground, light.background)
+        );
     }
 }

@@ -13,10 +13,12 @@
 //! labels, "why did that fail" needs the text. A transcript that inlines every
 //! `read_file` result is one where the model's own reasoning is unfindable.
 
-use crate::coder::{Dock, Message, Pane, State, Turn};
+use crate::coder::{Autonomy, Dock, Message, Pane, PlanMode, State, Turn};
 use crate::coder_browser;
 use crate::ui::{self, space, Icon, Tone};
-use iced::widget::{column, container, markdown, row, scrollable, space as space_widget, Row};
+use iced::widget::{
+    column, container, markdown, row, scrollable, space as space_widget, text_editor, Row,
+};
 use iced::{Element, Length, Padding, Theme};
 
 /// How tall the bottom dock is. Fixed rather than draggable: iced does not
@@ -86,7 +88,7 @@ fn sidebar(state: &State) -> Element<'_, Message> {
                 "Files",
                 // The turn refreshes this on its own; the button is for the
                 // other writer — the user's own editor, or their git.
-                Some(ui::icon_button(Icon::Refresh, Message::RefreshTree)),
+                Some(ui::icon_tip(Icon::Refresh, "Refresh files", Message::RefreshTree)),
             ),
             files(state),
         ),
@@ -118,6 +120,11 @@ fn pane_head<'a>(label: &'a str, action: Option<Element<'a, Message>>) -> Elemen
 fn sessions(state: &State) -> Vec<Element<'_, Message>> {
     let mut items: Vec<Element<'_, Message>> =
         vec![ui::button_secondary(Icon::Plus, "New session", Message::New)];
+    // Only once there is something to hand over. The pair reads as one choice —
+    // start clean, or start clean carrying what this session learned.
+    if state.thread_id.is_some() {
+        items.push(ui::button_ghost(Icon::ArrowRight, "Hand off to a new one", Message::Fork));
+    }
     if state.threads.is_empty() {
         items.push(if state.threads_loading {
             ui::caption(format!("{} Loading past sessions…", ui::spinner_char(state.frame)))
@@ -136,7 +143,15 @@ fn sessions(state: &State) -> Vec<Element<'_, Message>> {
                 ))
                 .width(Length::Fill)
                 .into(),
-                ui::icon_button(Icon::Trash, Message::DeleteThread(t.id)),
+                ui::icon_tip(
+                    Icon::Trash,
+                    if state.delete_armed == Some(t.id) {
+                        "Click again to delete"
+                    } else {
+                        "Delete session"
+                    },
+                    Message::DeleteThread(t.id),
+                ),
             ])
             .into(),
         );
@@ -225,9 +240,9 @@ fn checkpoints(state: &State) -> Vec<Element<'_, Message>> {
 fn browser(state: &State) -> Element<'_, Message> {
     let bar = container(
         ui::cluster(vec![
-            ui::icon_button(Icon::ArrowLeft, Message::BrowserBack),
-            ui::icon_button(Icon::ArrowRight, Message::BrowserForward),
-            ui::icon_button(Icon::Refresh, Message::BrowserReload),
+            ui::icon_tip(Icon::ArrowLeft, "Back", Message::BrowserBack),
+            ui::icon_tip(Icon::ArrowRight, "Forward", Message::BrowserForward),
+            ui::icon_tip(Icon::Refresh, "Reload", Message::BrowserReload),
             container(ui::input_submit(
                 "localhost:3000",
                 &state.browser_draft,
@@ -236,7 +251,7 @@ fn browser(state: &State) -> Element<'_, Message> {
             ))
             .width(Length::Fill)
             .into(),
-            ui::icon_button(Icon::X, Message::ToggleBrowser),
+            ui::icon_tip(Icon::X, "Close browser", Message::ToggleBrowser),
         ]),
     )
     // `center_y(Fill)` would *set* the height to Fill and hand the bar half the
@@ -292,9 +307,14 @@ fn header(state: &State) -> Element<'_, Message> {
     // a spacer safely pushes "Open folder" to the right here (`Length::Fill` is
     // fine in a plain row — see the wrap note below) and nothing here competes
     // with the folder path for room.
+    let mut top_row: Vec<Element<'_, Message>> = vec![ui::title("Coder"), folder];
+    // Rules that steer a turn have to be visible, or the turn that follows them
+    // looks like a model with opinions.
+    if state.agents_md {
+        top_row.push(ui::badge_icon(Icon::Scroll, "AGENTS.md", Tone::Info));
+    }
     let top = row![
-        ui::title("Coder"),
-        folder,
+        Row::with_children(top_row).spacing(space::SM).align_y(iced::Alignment::Center),
         space_widget::horizontal(),
         ui::button_outline(Icon::FolderOpen, "Open folder", Message::PickRoot),
     ]
@@ -302,14 +322,22 @@ fn header(state: &State) -> Element<'_, Message> {
     .align_y(iced::Alignment::Center);
     // What the turn is allowed to spend before it starts. The panel toggles
     // that used to sit here live in the rail now, so this line is config only.
+    // Three states, not a checkbox: see [`PlanMode`]. A segmented control
+    // rather than a third toggle beside the other two, because Off/Inline/Gate
+    // are one choice and the toggles next to it are three separate ones.
     let budget = ui::cluster(vec![
-        ui::toggle(Icon::ListChecks, "Plan first", state.plan, Message::TogglePlan(!state.plan)),
-        ui::toggle(
-            Icon::Zap,
-            "Commands",
-            state.allow_commands,
-            Message::ToggleCommands(!state.allow_commands),
+        ui::segmented(
+            PlanMode::ALL.map(|m| (m.label(), state.plan_mode == m, Message::SetPlanMode(m))),
         ),
+        // The old Commands checkbox, grown a middle: Off/Ask/Allowlist/Auto is
+        // one choice about how far the agent goes on its own, so it is one
+        // control — see [`Autonomy`].
+        ui::segmented(
+            Autonomy::ALL.map(|a| (a.label(), state.autonomy == a, Message::SetAutonomy(a))),
+        ),
+        // Not config exactly — it changes what the dock does mid-turn — but it
+        // belongs beside the other two: all three are "how this turn behaves".
+        ui::toggle(Icon::Eye, "Follow", state.follow, Message::ToggleFollow(!state.follow)),
     ]);
     // `.wrap()` is a safety net for a narrower window, not the layout itself —
     // a `Length::Fill` child (a spacer, a rule) does not survive it in this
@@ -326,10 +354,11 @@ fn header(state: &State) -> Element<'_, Message> {
 
 fn body<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
     let transcript: Element<'_, Message> = if state.root.is_none() {
-        ui::empty_state_icon(
+        ui::empty_state_action(
             Icon::Folder,
             "Open a folder to code in. The agent reads and writes inside it and \
              nowhere else.",
+            ui::button_default(Icon::FolderOpen, "Open folder", Message::PickRoot),
         )
     } else if state.turns.is_empty() {
         ui::empty_state_icon(
@@ -347,11 +376,22 @@ fn body<'a>(state: &'a State, iced_theme: &Theme) -> Element<'a, Message> {
     if let Some(err) = &state.error {
         blocks.push(ui::error_bar(err, Message::TraceLogs, Message::DismissError, Vec::new()));
     }
+    // Pinned above the transcript rather than inline in it: the point of the
+    // list is that it stays readable while the rows it describes scroll away.
+    if !state.todos.is_empty() {
+        blocks.push(todos(state));
+    }
     blocks.push(container(transcript).height(Length::Fill).into());
+    if let Some(plan) = state.plan_card.as_ref() {
+        blocks.push(plan_card(plan));
+    }
     // `pending` outlives the decision being sent (so a failed send can put the
     // card back), so the card itself is gated on nothing being in flight.
     if let Some(pending) = state.pending.as_ref().filter(|_| !state.sending) {
-        blocks.push(approval(&pending.command));
+        blocks.push(approval(state, &pending.command));
+    }
+    if let Some(sha) = state.last_turn.as_deref() {
+        blocks.push(turn_review(state, sha));
     }
     if let Some(dock) = state.dock_shown() {
         blocks.push(dock_panel(state, dock));
@@ -466,7 +506,79 @@ fn review<'a>(state: &'a State, sha: &'a str, diff: Option<&'a String>) -> Eleme
             .height(Length::Fill)
             .into(),
     };
-    column![head, body].spacing(space::XS).height(Length::Fill).into()
+    let mut rows = column![head].spacing(space::XS);
+    if let Some(changes) = state.changes.as_ref() {
+        rows = rows.push(changed_files(changes));
+    }
+    rows.push(body).height(Length::Fill).into()
+}
+
+/// The files one checkpoint touched, each with the way to undo just that one.
+///
+/// Above the patch rather than inside it: the patch answers "what changed", this
+/// answers "keep which of it" — and keeping most of a turn while dropping one
+/// file is the common shape of reviewing an agent's work.
+fn changed_files(changes: &crate::coder_git::Changes) -> Element<'_, Message> {
+    let mut items: Vec<Element<'_, Message>> = Vec::new();
+    for change in &changes.files {
+        let (tone, verb) = match change.status {
+            'A' => (Tone::Success, "added"),
+            'D' => (Tone::Danger, "deleted"),
+            _ => (Tone::Info, "changed"),
+        };
+        let mut cells: Vec<Element<'_, Message>> = vec![
+            ui::badge(verb, tone),
+            ui::mono(change.path.as_str()).into(),
+            space_widget::horizontal().into(),
+        ];
+        // The baseline has nothing before it: "revert to before the baseline"
+        // would delete files the user had before the agent ever ran.
+        if changes.revertable {
+            cells.push(ui::button_ghost(
+                Icon::RotateCcw,
+                "Revert",
+                Message::RevertFile(change.path.clone()),
+            ));
+        }
+        items.push(ui::cluster(cells).into());
+    }
+    if changes.hidden > 0 {
+        items.push(ui::caption(ui::count(changes.hidden, "more file", "more files")));
+    }
+    // Bounded, and scrolls: a turn can touch more files than the dock is tall.
+    scrollable(column(items).spacing(2.0)).height(Length::Fixed(96.0)).into()
+}
+
+/// "That turn changed files" — one line above the composer, gone once it has
+/// been looked at or dismissed.
+///
+/// The timeline in the sidebar says the same thing, but only to someone with the
+/// Checkpoints pane open; this says it where the user already is, which is the
+/// composer they are about to type the next prompt into.
+fn turn_review<'a>(state: &'a State, sha: &'a str) -> Element<'a, Message> {
+    let when = state
+        .checkpoints
+        .iter()
+        .find(|c| c.sha == sha)
+        .map(|c| c.message.as_str())
+        .unwrap_or("the last turn");
+    let bar: Element<'a, Message> = ui::cluster(vec![
+        ui::badge_icon(Icon::Clock, "changed files", Tone::Info),
+        ui::caption(when),
+        space_widget::horizontal().into(),
+        ui::button_secondary(
+            Icon::Eye,
+            "Review changes",
+            Message::ReviewCheckpoint(sha.to_string()),
+        ),
+        // The other reader. Pick a stronger model in the header first and this
+        // is a second opinion on a cheap model's work, which is the whole point
+        // of it being a button rather than something typed.
+        ui::button_ghost(Icon::Search, "Ask the model", Message::ReviewTurn(sha.to_string())),
+        ui::button_ghost(Icon::X, "Dismiss", Message::CloseReview),
+    ])
+    .into();
+    ui::card(bar)
 }
 
 /// The gate in front of `run_command`. It shows the command, not the tool's
@@ -477,7 +589,7 @@ fn review<'a>(state: &'a State, sha: &'a str, diff: Option<&'a String>) -> Eleme
 /// that leaks its tool syntax as prose gets salvaged server-side with whatever
 /// arguments survived — seen live producing an empty command under a live Run
 /// button, which is the one thing this card must never be.
-fn approval(command: &str) -> Element<'_, Message> {
+fn approval<'a>(state: &'a State, command: &'a str) -> Element<'a, Message> {
     let unreadable = command.is_empty();
     let body: Element<'_, Message> = if unreadable {
         ui::muted(
@@ -486,46 +598,155 @@ fn approval(command: &str) -> Element<'_, Message> {
     } else {
         ui::code(ui::mono(command.to_string()))
     };
-    ui::approval(
+    // What the "always" would actually be, spelled out. A button that saves an
+    // invisible rule is one people press once and then cannot explain their
+    // agent with — and the rule is wider than the command it came from.
+    let rule = crate::coder::rule_for(command);
+    let always = (!unreadable && state.autonomy != Autonomy::Auto && !rule.is_empty())
+        .then(|| ui::button_secondary(Icon::Check, format!("Always allow {rule}"), Message::AlwaysAllow));
+    ui::approval_extra(
         if unreadable { "Unreadable command" } else { "Run this command?" },
         if unreadable { Tone::Danger } else { Tone::Warning },
         vec![body],
         if unreadable { "Dismiss" } else { "No" },
         Message::Decide(false),
         (!unreadable).then_some(Message::Decide(true)),
+        always,
+    )
+}
+
+/// The agent's own checklist, as `update_todos` last posted it. Badges in a
+/// wrapping row rather than a column of lines: this sits above the transcript
+/// on every turn that has one, and five vertical rows there is five rows the
+/// conversation does not get.
+fn todos(state: &State) -> Element<'_, Message> {
+    let done = state.todos.iter().filter(|t| t.done).count();
+    let mut cells: Vec<Element<'_, Message>> =
+        vec![ui::caption(format!("{done}/{} done", state.todos.len()))];
+    for item in &state.todos {
+        let mut label: String = item.text.chars().take(48).collect();
+        if label.chars().count() < item.text.chars().count() {
+            label.push('…');
+        }
+        cells.push(match item.done {
+            true => ui::badge_icon(Icon::Check, label, Tone::Success),
+            false => ui::badge_icon(Icon::Clock, label, Tone::Neutral),
+        });
+    }
+    ui::card(Row::with_children(cells).spacing(space::XS).align_y(iced::Alignment::Center).wrap())
+}
+
+/// The plan gate: what the agent says it will do, before it can do any of it.
+///
+/// Editable, which is the whole reason this costs a round trip over
+/// [`PlanMode::Inline`] — the text in the box is what the next turn is handed,
+/// so a wrong step is fixed here instead of being undone afterwards.
+fn plan_card(content: &text_editor::Content) -> Element<'_, Message> {
+    let head = ui::cluster(vec![
+        ui::badge_icon(Icon::ListChecks, "Plan", Tone::Info),
+        space_widget::horizontal().into(),
+        ui::button_ghost(Icon::X, "Discard", Message::PlanDiscard),
+        ui::button_default(Icon::Play, "Run", Message::PlanRun),
+    ]);
+    ui::card(
+        column![
+            head,
+            ui::caption("Edit it before it runs — this text is what the agent is handed."),
+            ui::code(text_editor(content).on_action(Message::PlanEdited).height(180.0)),
+        ]
+        .spacing(space::SM),
     )
 }
 
 fn composer(state: &State) -> Element<'_, Message> {
-    let can_send = state.root.is_some() && !state.sending && state.pending.is_none();
+    let typed = !state.draft.trim().is_empty();
     // Same composer as E.V.'s, with a different trailing control: this one can
     // also be waiting on a folder or on an approval, which "Send" would lie about.
+    // Stop sits beside the spinner rather than replacing it: what is running and
+    // the way to end it are two facts, and a control that swaps between them
+    // makes the user wait to find out which one they are looking at.
+    let trailing: Vec<Element<'_, Message>> = if state.sending {
+        let mut controls = vec![ui::badge_spinner(state.frame, "working…", Tone::Info)];
+        // Only with something typed: "Stop & send" over an empty box would send
+        // nothing, which is a slower Stop.
+        if typed {
+            controls.push(ui::button_secondary(Icon::Send, "Stop & send", Message::StopAndSend));
+        }
+        controls.push(ui::button_destructive(Icon::Stop, "Stop", Message::Stop));
+        controls
+    } else if state.root.is_none() {
+        vec![ui::badge("waiting", Tone::Neutral)]
+    } else if state.would_queue() {
+        // Parked on a decision: Enter still takes a follow-up, it just goes
+        // behind the turn that is waiting on the user.
+        vec![ui::button_secondary(Icon::Plus, "Queue", Message::Send)]
+    } else {
+        vec![ui::button_default(Icon::Send, "Send", Message::Send)]
+    };
     let input = ui::composer(
-        if state.root.is_some() { "What should change?" } else { "Open a folder first…" },
+        match (state.root.is_some(), state.would_queue()) {
+            (false, _) => "Open a folder first…",
+            // Naming what Enter does now, because it does something different.
+            (true, true) => "Queue a follow-up…",
+            (true, false) => "What should change?",
+        },
         &state.draft,
         Message::DraftChanged,
         Message::Send,
-        vec![if state.sending {
-            ui::badge_spinner(state.frame, "working…", Tone::Info)
-        } else if can_send {
-            ui::button_default(Icon::Send, "Send", Message::Send)
-        } else {
-            ui::badge("waiting", Tone::Neutral)
-        }],
+        trailing,
     );
-    if !state.sending && state.pending.is_none() {
-        return ui::card(input);
+    let mut rows = column![].spacing(space::XS);
+    if !state.queue.is_empty() {
+        rows = rows.push(queued(state));
+    }
+    rows = rows.push(input);
+    if !state.would_queue() {
+        return ui::card(rows);
     }
     // What it is waiting on, and for how long. A local model can spend minutes
     // inside one step, and "working…" on its own cannot tell a slow read from a
     // dead connection — the clock is what makes the difference visible.
-    let status: Element<'_, Message> = ui::caption(format!("{}… {}s", state.activity(), state.elapsed));
-    ui::card(column![input, status].spacing(space::XS))
+    let status: Element<'_, Message> =
+        ui::caption(format!("{}… {}s", state.activity(), state.elapsed));
+    ui::card(rows.push(status))
+}
+
+/// Follow-ups waiting their turn. Each is a button, and pressing it takes that
+/// one back into the composer — the queue's only exit, and the reason it needs no
+/// separate remove: nothing typed can be dropped by a misclick.
+fn queued(state: &State) -> Element<'_, Message> {
+    let mut cells: Vec<Element<'_, Message>> =
+        vec![ui::caption(ui::count(state.queue.len(), "queued", "queued"))];
+    for (i, text) in state.queue.iter().enumerate() {
+        let mut label: String = text.chars().take(48).collect();
+        if label.chars().count() < text.chars().count() {
+            label.push('…');
+        }
+        cells.push(ui::badge_button(label, Tone::Neutral, Message::Unqueue(i)));
+    }
+    // Wraps rather than scrolls: the chips are short, and a scroll region inside
+    // the composer is one the user has to find before they can read it.
+    Row::with_children(cells).spacing(space::XS).align_y(iced::Alignment::Center).wrap().into()
 }
 
 fn turn<'a>(state: &'a State, idx: usize, turn: &'a Turn, iced_theme: &Theme) -> Element<'a, Message> {
     match turn {
-        Turn::User(text) => ui::turn("You", Tone::Neutral, true, ui::body(text.as_str())),
+        Turn::User(text) => {
+            // The message that was sent carries the @mentioned files; the row
+            // shows the sentence and says the rest is there. Same split live and
+            // on rebuild, because the marker is in the persisted text.
+            let (typed, inlined) = match text.split_once(crate::coder::MENTION_MARKER) {
+                Some((head, _)) => (head, true),
+                None => (text.as_str(), false),
+            };
+            let body: Element<'_, Message> = match inlined {
+                false => ui::body(typed),
+                true => column![ui::body(typed), ui::caption("+ the @mentioned files, inlined")]
+                    .spacing(space::XS)
+                    .into(),
+            };
+            ui::turn("You", Tone::Neutral, true, body)
+        }
         Turn::Assistant { md, .. } => ui::turn(
             "Coder",
             Tone::Info,

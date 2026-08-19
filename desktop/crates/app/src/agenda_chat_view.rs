@@ -60,8 +60,8 @@ fn header(state: &State) -> Element<'_, Message> {
 
     ui::cluster(vec![
         container(picker).width(Length::Fill).into(),
-        ui::icon_button(Icon::Plus, Message::NewThread),
-        ui::icon_button(Icon::X, Message::Close),
+        ui::icon_tip(Icon::Plus, "New conversation", Message::NewThread),
+        ui::icon_tip(Icon::X, "Close", Message::Close),
     ])
     .into()
 }

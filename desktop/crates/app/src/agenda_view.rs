@@ -95,8 +95,8 @@ fn page<'a>(
     };
 
     let description = Some(ui::muted(
-        "The assistant's own board: what is due, what slipped, and what it \
-         suggests changing.",
+        "Your day: what is due and what slipped. Agent runs live on Processes; \
+         lists you move by hand live on Plans.",
     ));
     let actions = Some(
         ui::cluster(vec![

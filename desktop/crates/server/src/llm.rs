@@ -47,6 +47,7 @@ use crate::model_catalog::{
     fetch_openai_model_ids, lm_studio_headers, ollama_tag_matches, QUICK_TIMEOUT,
 };
 use crate::provider_catalog;
+use crate::resources::Priority;
 use crate::upstream_http::{classify_with_context, open_stream, send_with_retry, sse_error_chunk};
 use crate::usage::normalize_completion_body;
 use crate::{env_opt, AppState};
@@ -744,10 +745,19 @@ async fn chat_target(state: &AppState, body: &mut Map<String, Value>) -> Result<
 /// Every failure carries the status the public route would have answered with;
 /// callers that mirror a Python handler's own error mapping read `.status` and
 /// rewrite it (Python sees these as HTTP responses, not exceptions).
+///
+/// **`priority` is not optional, deliberately** (ADR 0010). This is the one
+/// place in the process a model gets called on the server's own behalf — eleven
+/// callers, from a Coder turn a human is watching to a DAG node nobody is — and
+/// making the lane a parameter is what stops a new caller from silently joining
+/// whichever one happened to be the default. The permit is held for the whole
+/// call; releasing it early is the same as not gating at all.
 pub(crate) async fn complete_internal(
     state: &AppState,
     mut body: Map<String, Value>,
+    priority: Priority,
 ) -> Result<Value, ApiError> {
+    let _permit = state.limits.acquire(priority).await;
     let target = chat_target(state, &mut body).await?;
     let payload = Value::Object(body);
 
@@ -778,6 +788,13 @@ pub(crate) async fn chat_completions(
     raw: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     principal.0.require_scope("chat:write")?;
+    // Held for the handler. On the buffered branch that is the whole call; on
+    // the streaming branch it covers opening the stream and not the body that
+    // follows, because the permit cannot outlive the handler that borrowed it.
+    // That still bounds concurrent *initiations*, which is where the pile-up
+    // forms, and the interactive lane is a pathology ceiling rather than a
+    // throttle — a human generates one of these at a time.
+    let _permit = state.limits.acquire(Priority::Interactive).await;
     let mut body = parse_object(&raw)?;
     let requested_model = string_field(&body, "model")?;
 

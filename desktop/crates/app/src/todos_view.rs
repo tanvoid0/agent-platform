@@ -56,10 +56,11 @@ pub fn view(state: &State) -> Element<'_, Message> {
     }
 
     blocks.push(if state.boards.is_empty() {
-        ui::empty_state_icon(
+        ui::empty_state_action(
             Icon::ListChecks,
             "No boards yet. A board is a list of things to do, in columns you \
              move them through.",
+            ui::button_default(Icon::Plus, "New board", Message::NewBoard),
         )
     } else {
         row![board_list(state), container(board(state)).width(Length::Fill)]
@@ -67,9 +68,11 @@ pub fn view(state: &State) -> Element<'_, Message> {
             .into()
     });
 
-    ui::page(
+    let page = ui::page(
         "Plans",
-        Some(ui::muted("Boards of things to do, moved through their columns by hand.")),
+        Some(ui::muted(
+            "Your lists — cards you move by hand. Agent runs live on Processes.",
+        )),
         Some(
             ui::cluster(vec![
                 ui::button_secondary(Icon::Refresh, "Refresh", Message::Refresh),
@@ -78,7 +81,22 @@ pub fn view(state: &State) -> Element<'_, Message> {
             .into(),
         ),
         ui::stack_lg(blocks),
-    )
+    );
+    match &state.confirm {
+        None => page,
+        Some(confirm) => ui::modal(
+            page,
+            ui::confirm_dialog(
+                "Delete this board?",
+                "This cannot be undone.",
+                vec![
+                    ui::button_ghost(Icon::X, "Cancel", Message::CancelConfirm),
+                    ui::button_destructive(Icon::Trash, "Delete", confirm.then.clone()),
+                ],
+            ),
+            420.0,
+        ),
+    }
 }
 
 /// The boards, with the open one selected. Fixed width so the columns beside it
@@ -100,7 +118,7 @@ fn board_list(state: &State) -> Element<'_, Message> {
                     ))
                     .width(Length::Fill),
                 ),
-                ui::icon_button(Icon::Trash, Message::DeleteBoard(b.id)),
+                ui::icon_tip(Icon::Trash, "Delete board", Message::DeleteBoard(b.id)),
             ])
             .into()
         })
@@ -189,14 +207,14 @@ fn card<'a>(state: &'a State, item: &'a TodoItem) -> Element<'a, Message> {
     // out rather than shown dead, so the edges of the flow are visible.
     let mut actions: Vec<Element<'a, Message>> = Vec::new();
     if shifted(&item.status, -1).is_some() {
-        actions.push(ui::icon_button(Icon::ChevronLeft, Message::MoveItem(item.id, -1)));
+        actions.push(ui::icon_tip(Icon::ChevronLeft, "Move back", Message::MoveItem(item.id, -1)));
     }
     if shifted(&item.status, 1).is_some() {
-        actions.push(ui::icon_button(Icon::ChevronRight, Message::MoveItem(item.id, 1)));
+        actions.push(ui::icon_tip(Icon::ChevronRight, "Move forward", Message::MoveItem(item.id, 1)));
     }
     actions.push(ui::spacer());
-    actions.push(ui::icon_button(Icon::Trash, Message::DeleteItem(item.id)));
+    actions.push(ui::icon_tip(Icon::Trash, "Delete item", Message::DeleteItem(item.id)));
     lines.push(ui::cluster(actions).into());
 
-    ui::card(ui::stack(lines))
+    ui::tile(ui::stack(lines))
 }

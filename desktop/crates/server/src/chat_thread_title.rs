@@ -167,7 +167,7 @@ async fn generate_smart_title(
     }
     body.insert("max_tokens".into(), json!(24));
 
-    let data = crate::llm::complete_internal(&state, body).await.ok()?;
+    let data = crate::llm::complete_internal(&state, body, crate::resources::Priority::Background).await.ok()?;
     let content = data
         .get("choices")?
         .as_array()?

@@ -418,7 +418,7 @@ async fn translate_with_model(state: &AppState, ask: &str) -> Option<DorkQuery> 
     );
     payload.insert("max_tokens".into(), json!(400));
 
-    let data = crate::llm::complete_internal(state, payload).await.ok()?;
+    let data = crate::llm::complete_internal(state, payload, crate::resources::Priority::Interactive).await.ok()?;
     let content = data.get("choices")?.as_array()?.first()?.get("message")?.get("content")?.as_str()?;
     let candidate: DorkQuery = serde_json::from_str(extract_json_object(content)?).ok()?;
     candidate.validate().ok()?;

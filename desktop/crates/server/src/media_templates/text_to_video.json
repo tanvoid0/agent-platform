@@ -1,0 +1,68 @@
+{
+  "3": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": "__AGP_SEED__",
+      "steps": 20,
+      "cfg": 5.0,
+      "sampler_name": "uni_pc",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": ["48", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["55", 0]
+    }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "__AGP_PROMPT__", "clip": ["38", 0] }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "text": "__AGP_NEGATIVE__", "clip": ["38", 0] }
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["3", 0], "vae": ["39", 0] }
+  },
+  "37": {
+    "class_type": "UNETLoader",
+    "inputs": { "unet_name": "wan2.2_ti2v_5B_fp16.safetensors", "weight_dtype": "default" }
+  },
+  "38": {
+    "class_type": "CLIPLoader",
+    "inputs": { "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default" }
+  },
+  "39": {
+    "class_type": "VAELoader",
+    "inputs": { "vae_name": "wan2.2_vae.safetensors" }
+  },
+  "48": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": { "shift": 8.0, "model": ["37", 0] }
+  },
+  "55": {
+    "class_type": "Wan22ImageToVideoLatent",
+    "inputs": {
+      "width": "__AGP_WIDTH__",
+      "height": "__AGP_HEIGHT__",
+      "length": "__AGP_LENGTH__",
+      "batch_size": 1,
+      "vae": ["39", 0]
+    }
+  },
+  "60": {
+    "class_type": "CreateVideo",
+    "inputs": { "images": ["8", 0], "fps": 24.0 }
+  },
+  "61": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["60", 0],
+      "filename_prefix": "agent-platform",
+      "format": "mp4",
+      "codec": "h264"
+    }
+  }
+}

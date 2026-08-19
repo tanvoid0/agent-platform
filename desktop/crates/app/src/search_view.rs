@@ -46,9 +46,8 @@ pub fn view(state: &State) -> Element<'_, Message> {
     ui::page(
         "Search",
         Some(ui::muted(
-            "Turns a sentence into a Google dork — site:, filetype:, intitle: and the rest \
-             — and hands it to your browser. The query is always shown so you can see what \
-             it does, and edit it yourself.",
+            "Describe what you want. We turn it into a precise query you can edit, \
+             then open it in the browser.",
         )),
         None,
         ui::stack_lg(blocks),
@@ -82,8 +81,8 @@ fn query_card(state: &State) -> Element<'_, Message> {
     // The "make that switch visible" label the plan asks for: which box the
     // next Run actually reads from.
     let mode_label = match state.mode {
-        Mode::Ask => "Next run translates the sentence above (ask=).",
-        Mode::Query => "Next run uses this query verbatim (q=).",
+        Mode::Ask => "Next search translates the sentence above.",
+        Mode::Query => "Next search uses this query as written.",
     };
 
     let mut rows: Vec<Element<'_, Message>> = vec![
@@ -133,7 +132,7 @@ fn query_card(state: &State) -> Element<'_, Message> {
     );
 
     ui::card_with_header(
-        "Dork query",
+        "Query",
         Some(ui::muted(
             "Editable — editing it (or removing a chip below) switches the next run to use \
              this text verbatim instead of re-asking above.",

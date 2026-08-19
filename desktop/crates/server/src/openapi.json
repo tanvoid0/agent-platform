@@ -12378,6 +12378,114 @@
     }
    }
   },
+  "/api/v1/system/resources": {
+   "get": {
+    "tags": [
+     "system"
+    ],
+    "summary": "Get Resources",
+    "description": "How much of the machine the server may use right now, and how much of that is in use (ADR 0010). Read by the desktop sidebar monitor, which asks on the beat it already had rather than a timer of its own.",
+    "operationId": "get_resources_api_v1_system_resources_get",
+    "parameters": [
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Authorization"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ResourcesView"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   },
+   "put": {
+    "tags": [
+     "system"
+    ],
+    "summary": "Set Resources",
+    "description": "Sets the resource mode, or reports whether the user is at the window. Either field may be omitted and an omitted field is left alone, so the desktop can push a window event without restating a setting it did not change. Pushed on change, never polled. An unknown mode is a 400.",
+    "operationId": "set_resources_api_v1_system_resources_put",
+    "parameters": [
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Authorization"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ResourcesBody"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ResourcesView"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
   "/api/v1/system/logs": {
    "get": {
     "tags": [
@@ -15846,7 +15954,79 @@
     "type": "object",
     "title": "GoalsOut"
    },
-   "HTTPValidationError": {
+   "ResourcesBody": {
+   "properties": {
+    "mode": {
+     "anyOf": [
+      {
+       "type": "string",
+       "enum": [
+        "eco",
+        "balanced",
+        "turbo",
+        "auto"
+       ]
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "title": "Mode"
+    },
+    "user_present": {
+     "anyOf": [
+      {
+       "type": "boolean"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "title": "User Present"
+    }
+   },
+   "type": "object",
+   "title": "ResourcesBody"
+  },
+  "ResourcesView": {
+   "properties": {
+    "mode": {
+     "type": "string",
+     "title": "Mode"
+    },
+    "resolved": {
+     "type": "string",
+     "title": "Resolved"
+    },
+    "background_limit": {
+     "type": "integer",
+     "title": "Background Limit"
+    },
+    "background_in_flight": {
+     "type": "integer",
+     "title": "Background In Flight"
+    },
+    "interactive_in_flight": {
+     "type": "integer",
+     "title": "Interactive In Flight"
+    },
+    "cpus": {
+     "type": "integer",
+     "title": "Cpus"
+    }
+   },
+   "type": "object",
+   "required": [
+    "mode",
+    "resolved",
+    "background_limit",
+    "background_in_flight",
+    "interactive_in_flight",
+    "cpus"
+   ],
+   "title": "ResourcesView"
+  },
+  "HTTPValidationError": {
     "properties": {
      "detail": {
       "items": {

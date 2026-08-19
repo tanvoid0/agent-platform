@@ -113,8 +113,20 @@ fn run_max_seconds() -> Option<f64> {
 }
 
 /// Cap on dependency-ready tasks per wave. Unset or non-positive is unlimited.
-fn max_concurrent_tasks() -> Option<usize> {
-    env_positive_i64("AGENT_PLATFORM_DAG_MAX_CONCURRENT_TASKS").map(|v| v as usize)
+/// How wide the next wave may be.
+///
+/// **This used to return `None` unless an operator set the env var, and `None`
+/// means unbounded** — while the planner prompt asks for "many small parallel
+/// subagents". A forty-node ready wave was forty simultaneous model calls, and
+/// two concurrent processes were eighty. That is the pitfall ADR 0010 exists
+/// for. The fallback is now the resolved background lane, so the wave stops
+/// being *created* too wide rather than being created wide and blocking 39 tasks
+/// on a semaphore. The env var still wins: an operator who pinned that number
+/// meant it.
+fn max_concurrent_tasks(state: &AppState) -> Option<usize> {
+    env_positive_i64("AGENT_PLATFORM_DAG_MAX_CONCURRENT_TASKS")
+        .map(|v| v as usize)
+        .or_else(|| Some(state.limits.background_width()))
 }
 
 /// Default > 0 so planner `subdecompose` nodes can spawn follow-on work without
@@ -350,7 +362,7 @@ async fn call_llm(
         body.insert("response_format".into(), json!({"type": "json_object"}));
     }
 
-    let data = crate::llm::complete_internal(state, body)
+    let data = crate::llm::complete_internal(state, body, crate::resources::Priority::Background)
         .await
         .map_err(|e| LlmFailure::Llm(e.message))?;
 
@@ -1701,7 +1713,7 @@ impl Executor {
                 }
             };
 
-            match plan_wave(&snapshot, max_concurrent_tasks()) {
+            match plan_wave(&snapshot, max_concurrent_tasks(&self.state)) {
                 Wave::PauseForReview => {
                     let _ = set_process_status(
                         &self.state,

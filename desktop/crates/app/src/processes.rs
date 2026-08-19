@@ -9,6 +9,7 @@ use crate::domain::{err_string, non_empty};
 use crate::domain::{self, BoardColumn, BoardRow};
 use agent_platform_client::types::*;
 use agent_platform_client::Client;
+use iced::widget::text_editor;
 use iced::Task;
 use std::time::Duration;
 
@@ -71,6 +72,9 @@ pub struct State {
     pub event_filter: String,
     pub inspecting: Option<String>,
     pub review: Option<ReviewDraft>,
+    /// Multi-line editor for [`ReviewDraft::output`]. Not on the draft: iced's
+    /// `Content` is not `Clone`, and review messages still need to be.
+    pub review_output: text_editor::Content,
     pub lineage: crate::graph::Lineage,
     pub viewport: crate::graph::Viewport,
     pub error: Option<String>,
@@ -103,6 +107,7 @@ impl Default for State {
             event_filter: String::new(),
             inspecting: None,
             review: None,
+            review_output: text_editor::Content::new(),
             lineage: crate::graph::Lineage::All,
             viewport: crate::graph::Viewport::default(),
             error: None,
@@ -300,7 +305,7 @@ pub enum Message {
     RetryTask(i64),
     OpenReview(i64),
     CloseReview,
-    ReviewOutputChanged(String),
+    ReviewOutputEdited(text_editor::Action),
     ReviewFeedbackChanged(String),
     ReviewInstructionsChanged(String),
     SubmitReview(ReviewDecision),
@@ -391,7 +396,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.detail = None;
             state.events.clear();
             state.inspecting = None;
-            state.review = None;
+            close_review(state);
             state.viewport = crate::graph::Viewport::default();
             fetch_detail(client, id)
         }
@@ -590,20 +595,23 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.review = task.map(|t| ReviewDraft {
                 task_id,
                 role: t.role.clone(),
-                // Reviewers edit the draft; fall back to final output.
                 output: t.draft_output.clone().or_else(|| t.output.clone()).unwrap_or_default(),
                 feedback: String::new(),
                 instructions: String::new(),
             });
+            state.review_output = text_editor::Content::with_text(
+                state.review.as_ref().map(|r| r.output.as_str()).unwrap_or(""),
+            );
             Task::none()
         }
         Message::CloseReview => {
-            state.review = None;
+            close_review(state);
             Task::none()
         }
-        Message::ReviewOutputChanged(v) => {
+        Message::ReviewOutputEdited(action) => {
+            state.review_output.perform(action);
             if let Some(r) = &mut state.review {
-                r.output = v;
+                r.output = state.review_output.text();
             }
             Task::none()
         }
@@ -620,9 +628,13 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             Task::none()
         }
         Message::SubmitReview(decision) => {
+            if let Some(r) = &mut state.review {
+                r.output = state.review_output.text();
+            }
             let (Some(id), Some(draft)) = (state.selected, state.review.take()) else {
                 return Task::none();
             };
+            close_review(state);
             let body = ReviewTaskBody {
                 decision,
                 output: (decision == ReviewDecision::Approve).then(|| draft.output.clone()),
@@ -674,13 +686,18 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
     }
 }
 
+fn close_review(state: &mut State) {
+    state.review = None;
+    state.review_output = text_editor::Content::new();
+}
+
 fn is_terminal_status(status: ProcessStatus) -> bool {
     matches!(status, ProcessStatus::Completed | ProcessStatus::Failed | ProcessStatus::Cancelled)
 }
 
 /// The run stopped moving on its own and is waiting for a human — the two
 /// states where the engine will not take another step until someone answers.
-fn needs_user(status: ProcessStatus) -> bool {
+pub(crate) fn needs_user(status: ProcessStatus) -> bool {
     matches!(status, ProcessStatus::ApprovalRequired | ProcessStatus::TaskReviewRequired)
 }
 

@@ -51,6 +51,7 @@ PAIRS = [
     ),
     ("coder.rs", "ToolResultRequest", "CoderToolResultRequest", set()),
     ("coder.rs", "ThreadCreateRequest", "CoderThreadCreateRequest", set()),
+    ("media.rs", "GenerateRequest", "MediaGenerateRequest", set()),
 ]
 
 _SOURCES: dict[str, str] = {}

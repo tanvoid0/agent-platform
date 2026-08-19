@@ -57,6 +57,8 @@ mod screen;
 mod search;
 mod search_view;
 mod shell;
+mod studio;
+mod studio_view;
 mod stt;
 mod ui;
 mod todos;
@@ -66,16 +68,15 @@ mod workflows;
 mod workflows_view;
 
 use agent_platform_client::sse::ChatChunk;
-use agent_platform_client::types::SystemStatus;
+use agent_platform_client::types::{ResourcesView, SystemStatus};
 use agent_platform_client::Client;
 use iced::{window, Element, Subscription, Task};
 use shell::{HudStyle, Settings, Shell, ThemeMode};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-/// Top-level destinations. Everything the user configures or inspects rather
-/// than works in lives behind [`Screen::Settings`], so the sidebar stays five
-/// entries long instead of nine.
+/// Top-level destinations. Work lives in the sidebar groups; everything you
+/// configure or inspect rather than work in lives behind [`Screen::Settings`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Dashboard,
@@ -87,6 +88,7 @@ pub enum Screen {
     Agenda,
     Coder,
     Search,
+    Studio,
     Assistant,
     Memory,
     Logs,
@@ -111,22 +113,23 @@ impl Screen {
     }
 }
 
-/// Tabs within [`Screen::Settings`]. Ordered configure-then-diagnose: the two
-/// you change, then the two you read when something is wrong.
+/// Tabs within [`Screen::Settings`]. Configure first, then diagnose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     Providers,
     ModelOps,
     Appearance,
+    Performance,
     Status,
     Api,
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 5] = [
+    pub const ALL: [SettingsTab; 6] = [
         SettingsTab::Providers,
         SettingsTab::ModelOps,
         SettingsTab::Appearance,
+        SettingsTab::Performance,
         SettingsTab::Status,
         SettingsTab::Api,
     ];
@@ -136,6 +139,7 @@ impl SettingsTab {
             SettingsTab::Providers => "Providers",
             SettingsTab::ModelOps => "Model ops",
             SettingsTab::Appearance => "Appearance",
+            SettingsTab::Performance => "Performance",
             SettingsTab::Status => "Status",
             SettingsTab::Api => "API",
         }
@@ -196,6 +200,8 @@ pub struct App {
     /// themselves live in [`notify`], not here — they are posted from module
     /// `update`s that have no `App` to write into.
     pub notifications_open: bool,
+    /// Shortcut / jump sheet. Ctrl+/ or the footer "?".
+    pub help_open: bool,
     /// Whether the window has the OS focus. Work that finishes behind another
     /// app is work the user did not see finish — see [`watching_key`].
     pub focused: bool,
@@ -213,6 +219,15 @@ pub struct App {
     pub screen: Screen,
     /// Which tab the Settings page shows; remembered across visits.
     pub settings_tab: SettingsTab,
+    /// Last answer from `/system/resources` — what the sidebar monitor draws and
+    /// what the Performance tab shows `Auto` currently resolving to. `None` until
+    /// the first read, and cleared when the server goes away, so the monitor is
+    /// absent rather than stale.
+    pub resources: Option<ResourcesView>,
+    /// Health polls since the monitor last refreshed. The monitor has no timer of
+    /// its own — it rides `StatusTick`, and this is how it rides a slower beat in
+    /// the cheaper modes. See [`App::resource_poll_every`].
+    resource_ticks: u8,
     /// Edit buffer for the local model's context size — the settings field is a
     /// `u32`, and a half-typed number is not one.
     pub local_ctx_input: String,
@@ -245,6 +260,7 @@ pub struct App {
     pub agenda: agenda::State,
     pub coder: coder::State,
     pub search: search::State,
+    pub studio: studio::State,
     pub apidocs: apidocs::State,
     /// Whether a newer build has been published. Only ever filled by the user
     /// pressing the button in Settings → Status — nothing here phones home on
@@ -312,6 +328,8 @@ pub enum Message {
     NoticeExpired,
     /// The sidebar bell: show or hide the notification panel.
     ToggleNotifications,
+    /// Footer "?" and Ctrl+/: the shortcut sheet and a jump list.
+    ToggleHelp,
     /// A row in that panel: go to the screen the note came from. Arriving there
     /// is what marks it (and the rest of that screen's) seen.
     OpenNote(u64),
@@ -320,8 +338,16 @@ pub enum Message {
     ClearNotifications,
     WindowClosed(window::Id),
     Nav(Screen),
+    /// Home inbox: open this run on the Processes screen.
+    OpenRun(i64),
     NavSettings(SettingsTab),
     StatusTick,
+    /// The Performance tab's picker. Saves, then pushes.
+    SetResourceMode(shell::ResourceMode),
+    /// One `/system/resources` read landed — the sidebar monitor's only input.
+    /// The error case is folded into `None`: a monitor that cannot read is a
+    /// monitor that should not draw, and there is no banner to show for it.
+    ResourcesLoaded(Option<ResourcesView>),
     StatusFetched(Result<SystemStatus, String>),
     LogsTick,
     ApiLogs(Result<(Vec<String>, i64, i64), String>),
@@ -395,6 +421,7 @@ pub enum Message {
     Agenda(agenda::Message),
     Coder(coder::Message),
     Search(search::Message),
+    Studio(studio::Message),
     ApiDocs(apidocs::Message),
 }
 
@@ -622,7 +649,6 @@ fn boot() -> (App, Task<Message>) {
         (settings.chat_provider.clone(), settings.chat_model.clone());
     let voice_rate = settings.voice_rate;
     let confirm_commands = settings.confirm_commands;
-    let coder_workspace = settings.coder_workspace.clone();
     // Coder keeps its own pair because it needs a model that can hold a tool
     // loop, but an unset one follows the app-wide default rather than dropping
     // to the server's `llama3`, which cannot.
@@ -630,7 +656,13 @@ fn boot() -> (App, Task<Message>) {
         true => (chat_provider.clone(), chat_model.clone()),
         false => (settings.coder_provider.clone(), settings.coder_model.clone()),
     };
-    let coder_plan = settings.coder_plan;
+    // The mode wins where it exists; the old bool is what a file written before
+    // the gate has, and dropping it would silently turn planning back on for
+    // everyone who had turned it off.
+    let coder_plan_mode = settings.coder_plan_mode.unwrap_or(match settings.coder_plan {
+        true => coder::PlanMode::Inline,
+        false => coder::PlanMode::Off,
+    });
     let local_n_ctx = settings.local_n_ctx;
     let local_server_port = settings.local_server_port;
 
@@ -649,6 +681,10 @@ fn boot() -> (App, Task<Message>) {
         }
     }
 
+    // Built before the struct, because the struct takes `settings` by move and
+    // this reads most of its own state off it.
+    let coder = coder::State::restored(&settings, coder_provider, coder_model, coder_plan_mode);
+
     let app = App {
         shell: sh,
         settings,
@@ -657,6 +693,7 @@ fn boot() -> (App, Task<Message>) {
         close_prompt: None,
         assistant_open: false,
         notifications_open: false,
+        help_open: false,
         // Corrected by the first focus event; a window that opens is focused,
         // and one that never opens is covered by `window: None`.
         focused: true,
@@ -667,6 +704,8 @@ fn boot() -> (App, Task<Message>) {
         tray_light_plate: shell::system_is_dark(),
         screen: Screen::Dashboard,
         settings_tab: SettingsTab::Providers,
+        resources: None,
+        resource_ticks: 0,
         local_ctx_input: local_n_ctx.to_string(),
         local_server_port_input: match local_server_port {
             0 => String::new(),
@@ -706,8 +745,9 @@ fn boot() -> (App, Task<Message>) {
         workflows: workflows::State::default(),
         todos: todos::State::default(),
         agenda: agenda::State::default(),
-        coder: coder::State::restored(&coder_workspace, coder_provider, coder_model, coder_plan),
+        coder,
         search: search::State::default(),
+        studio: studio::State::default(),
         apidocs: apidocs::State::default(),
         update_check: update_check::State::default(),
     };
@@ -802,7 +842,10 @@ fn enter_screen_inner(app: &mut App) -> Task<Message> {
         return Task::none();
     }
     match app.screen {
-        // Status is polled globally; the dashboard has nothing extra to fetch.
+        // Home is the run inbox; it needs the same list the Processes screen does.
+        Screen::Dashboard if app.server_ready() => {
+            Task::done(Message::Processes(processes::Message::ListTick))
+        }
         Screen::Dashboard => Task::none(),
         Screen::Processes => Task::done(Message::Processes(processes::Message::ListTick)),
         Screen::Projects | Screen::Teams => {
@@ -814,6 +857,10 @@ fn enter_screen_inner(app: &mut App) -> Task<Message> {
         // History is server-owned now (`/api/v1/search/history`) — another
         // window, or E.V., can have added to it since the last visit.
         Screen::Search => Task::done(Message::Search(search::Message::LoadHistory)),
+        // Both halves every visit: another window (or E.V., through the media
+        // routes) can have started a job, and ComfyUI can have been launched
+        // or stopped since the last look.
+        Screen::Studio => Task::done(Message::Studio(studio::Message::Refresh)),
         // Past sessions every visit — another window, or the CLI, can have
         // added one. The model dropdowns are fetched once; they change only
         // when a provider is configured, which is a different screen.
@@ -850,9 +897,59 @@ fn enter_screen_inner(app: &mut App) -> Task<Message> {
             // when the server is rebuilt, not while it runs. `Reload` on the
             // page is the way to ask again.
             SettingsTab::Api => Task::done(Message::ApiDocs(apidocs::Message::Refresh)),
+            // Opening the tab is a reason to refresh now rather than at the
+            // next beat: the numbers on it are the whole page.
+            SettingsTab::Performance => fetch_resources(&app.client),
             SettingsTab::Status | SettingsTab::Appearance => Task::none(),
         },
     }
+}
+
+/// Health polls between sidebar-monitor refreshes, from the tier the server
+/// last reported.
+///
+/// The monitor has no timer of its own — it rides `StatusTick`, which is 5 s
+/// once the server is up — so this is the whole of its cost, and it scales with
+/// the mode it is reporting on. The user who asked the app to stay out of the
+/// way did not mean "except for the widget that says so": Eco refreshes every
+/// 20 s, Balanced every 10 s, Turbo every 5 s.
+///
+/// Keyed on the *resolved* tier rather than the setting, so `Auto` follows what
+/// it actually resolved to instead of sitting at one rate.
+fn resource_poll_every(resolved: Option<&str>) -> u8 {
+    match resolved {
+        Some("turbo") => 1,
+        Some("balanced") => 2,
+        // Also the pre-first-answer case: one tick to the first read, then it
+        // settles. Guessing fast would make a cold start the most expensive
+        // moment the monitor ever has.
+        _ => 4,
+    }
+}
+
+/// One `/system/resources` read for the sidebar monitor.
+fn fetch_resources(client: &Client) -> Task<Message> {
+    let client = client.clone();
+    Task::perform(async move { client.resources().await.ok() }, Message::ResourcesLoaded)
+}
+
+/// Tell the server the mode, whether the user is at the window, or both, and
+/// keep the answer — it carries the resolved tier, so a push doubles as a read.
+///
+/// Pushed on change and never on a timer: the window events and the picker are
+/// the only things that move either value, and a poll for a value that changes a
+/// few times an hour is exactly the waste ADR 0010 is about.
+fn push_resources(
+    client: &Client,
+    mode: Option<shell::ResourceMode>,
+    user_present: Option<bool>,
+) -> Task<Message> {
+    let client = client.clone();
+    let mode = mode.map(|m| m.as_str());
+    Task::perform(
+        async move { client.set_resources(mode, user_present).await.ok() },
+        Message::ResourcesLoaded,
+    )
 }
 
 fn fetch_status(client: &Client) -> Task<Message> {
@@ -969,7 +1066,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::WindowFocus(focused) => {
             app.focused = focused;
-            Task::none()
+            // `Auto`'s strongest signal: someone is looking at this. Pushed for
+            // every mode, because the user can switch to Auto later and the
+            // server should already know.
+            push_resources(&app.client, None, Some(focused))
         }
         Message::WindowCloseRequested(id) => {
             // The prompt is drawn in-app (see `screen::view`), so the choice
@@ -994,6 +1094,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ToggleNotifications => {
             app.notifications_open = !app.notifications_open;
+            Task::none()
+        }
+        Message::ToggleHelp => {
+            app.help_open = !app.help_open;
             Task::none()
         }
         Message::OpenNote(id) => {
@@ -1031,11 +1135,20 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             if app.close_prompt.is_some() {
                 app.close_prompt = None;
                 Task::none()
+            } else if app.help_open {
+                app.help_open = false;
+                Task::none()
             } else if app.notifications_open {
                 // Above Abort: the panel is what Esc most obviously means while
                 // it is covering the screen, and it stops nothing to close it.
                 app.notifications_open = false;
                 Task::none()
+            } else if app.processes.review.is_some() {
+                update(app, Message::Processes(processes::Message::CloseReview))
+            } else if app.screen == Screen::Coder && app.coder.stoppable() {
+                // Above the assistant: on this screen the agent turn is the work
+                // the user is watching, and it is the one that writes files.
+                update(app, Message::Coder(coder::Message::Stop))
             } else if app.assistant.sending || app.assistant.speaking() {
                 // A reply that is still arriving or still being read out loud is
                 // the most urgent thing Esc could mean.
@@ -1045,6 +1158,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                 // thing to stop, and the panel is one more Esc away.
                 app.assistant_open = false;
                 Task::none()
+            } else if app.todos.confirm.is_some() {
+                update(app, Message::Todos(todos::Message::CancelConfirm))
+            } else if app.workflows.confirm.is_some() {
+                update(app, Message::Workflows(workflows::Message::CancelConfirm))
             } else {
                 update(
                     app,
@@ -1063,16 +1180,30 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::WindowClosed(id) => {
             if app.window == Some(id) {
                 app.window = None;
+                // The app is now a server host with no UI. Nobody is watching
+                // anything, whatever the last focus event said.
+                app.resources = None;
+                return push_resources(&app.client, None, Some(false));
             }
             Task::none()
         }
         Message::Nav(screen) => {
             app.screen = screen;
+            app.help_open = false;
             if screen.is_chat() {
                 app.chat_tab = screen;
             }
             app.copied = None;
             enter_screen(app)
+        }
+        Message::OpenRun(id) => {
+            app.screen = Screen::Processes;
+            app.help_open = false;
+            app.copied = None;
+            Task::batch([
+                enter_screen(app),
+                Task::done(Message::Processes(processes::Message::Select(id))),
+            ])
         }
         Message::NavSettings(tab) => {
             app.screen = Screen::Settings;
@@ -1092,7 +1223,27 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                     let _ = tray.set_icon(Some(icon));
                 }
             }
-            fetch_status(&app.client)
+            // The monitor rides this beat rather than owning one. Only while a
+            // window is open: with none there is no sidebar to draw it in.
+            app.resource_ticks = app.resource_ticks.saturating_add(1);
+            let due = app.window.is_some()
+                && app.server_ready()
+                && app.resource_ticks >= resource_poll_every(app.resources.as_ref().map(|r| r.resolved.as_str()));
+            if due {
+                app.resource_ticks = 0;
+                Task::batch([fetch_status(&app.client), fetch_resources(&app.client)])
+            } else {
+                fetch_status(&app.client)
+            }
+        }
+        Message::ResourcesLoaded(view) => {
+            app.resources = view;
+            Task::none()
+        }
+        Message::SetResourceMode(mode) => {
+            app.settings.resource_mode = mode;
+            save_settings(app);
+            push_resources(&app.client, Some(mode), Some(app.focused))
         }
         Message::StatusFetched(result) => {
             let was = app.server_state();
@@ -1113,8 +1264,22 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             // The screen the user is already looking at was blocked while the
             // server came up; load it now rather than waiting for a re-click.
             if was != ServerState::Ready && app.server_state() == ServerState::Ready {
-                enter_screen(app)
+                // A daemon that just came up knows nothing about the mode — it
+                // is process state, not a row. Restate it here, which is the one
+                // place that sees every way a server can become reachable.
+                Task::batch([
+                    enter_screen(app),
+                    push_resources(
+                        &app.client,
+                        Some(app.settings.resource_mode),
+                        Some(app.focused && app.window.is_some()),
+                    ),
+                ])
             } else {
+                if app.server_state() != ServerState::Ready {
+                    // No server, no numbers. Absent beats stale on a live gauge.
+                    app.resources = None;
+                }
                 Task::none()
             }
         }
@@ -1533,10 +1698,12 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             };
             match msg {
                 history::Message::New => {
+                    app.history.delete_armed = None;
                     app.history.close(source);
                     load(app, Vec::new(), Vec::new());
                 }
                 history::Message::Select(id) => {
+                    app.history.delete_armed = None;
                     if app.history.current(source) == Some(id) {
                         return Task::none();
                     }
@@ -1554,8 +1721,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                 }
                 history::Message::Delete(id) => {
                     let was_open = app.history.current(source) == Some(id);
-                    app.history.delete(id);
-                    if was_open {
+                    if app.history.request_delete(id) && was_open {
                         load(app, Vec::new(), Vec::new());
                     }
                 }
@@ -1589,7 +1755,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                 coder::Message::RootPicked(Some(_))
                     | coder::Message::ProviderChanged(_)
                     | coder::Message::ModelChanged(_)
-                    | coder::Message::TogglePlan(_)
+                    | coder::Message::SetPlanMode(_)
+                    | coder::Message::ToggleFollow(_)
+                    | coder::Message::SetAutonomy(_)
+                    | coder::Message::AlwaysAllow
             );
             let was_sending = app.coder.sending;
             let task = coder::update(&mut app.coder, &app.client, msg).map(Message::Coder);
@@ -1615,7 +1784,12 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                     app.coder.root.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                 app.settings.coder_provider = app.coder.provider.clone();
                 app.settings.coder_model = app.coder.model.clone();
-                app.settings.coder_plan = app.coder.plan;
+                app.settings.coder_plan_mode = Some(app.coder.plan_mode);
+                // Kept in step for an older build reading the same file.
+                app.settings.coder_plan = app.coder.plan_mode != coder::PlanMode::Off;
+                app.settings.coder_follow = app.coder.follow;
+                app.settings.coder_autonomy = app.coder.autonomy;
+                app.settings.coder_allowlist = app.coder.allowlist.clone();
                 save_settings(app);
             }
             task
@@ -1626,6 +1800,8 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Search(search::Message::TraceLogs(id)) => trace_logs_task(app, id),
         Message::Search(msg) => search::update(&mut app.search, &app.client, msg).map(Message::Search),
+        Message::Studio(studio::Message::TraceLogs(id)) => trace_logs_task(app, id),
+        Message::Studio(msg) => studio::update(&mut app.studio, &app.client, msg).map(Message::Studio),
     }
 }
 
@@ -1737,6 +1913,11 @@ fn subscription(app: &App) -> Subscription<Message> {
             ServerState::Starting | ServerState::Unreachable => {
                 std::time::Duration::from_millis(750)
             }
+            // With no window this is the only timer left running, and there is
+            // no status page reading it — the app is a server host. It still has
+            // to run (the tray line and the child-alive check hang off it), but
+            // not six times a minute. ADR 0010.
+            _ if app.window.is_none() => std::time::Duration::from_secs(30),
             ServerState::Ready | ServerState::Conflict => std::time::Duration::from_secs(5),
         })
         .map(|_| Message::StatusTick),
@@ -1750,10 +1931,23 @@ fn subscription(app: &App) -> Subscription<Message> {
     if live && app.screen == Screen::Logs && !app.logs.paused {
         subs.push(iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::LogsTick));
     }
-    if live && app.screen == Screen::Processes {
+    if app.window.is_some()
+        && app.server_ready()
+        && matches!(app.screen, Screen::Processes | Screen::Dashboard)
+    {
         subs.push(
             iced::time::every(std::time::Duration::from_secs(3))
                 .map(|_| Message::Processes(processes::Message::ListTick)),
+        );
+    }
+    // Only while something is actually rendering — a settled gallery is a
+    // still page and must not keep asking (`studio::State::polling`). Two
+    // seconds because a diffusion job takes tens of them at best; a faster
+    // tick would only produce identical rows.
+    if live && app.screen == Screen::Studio && app.studio.polling() {
+        subs.push(
+            iced::time::every(std::time::Duration::from_secs(2))
+                .map(|_| Message::Studio(studio::Message::Refresh)),
         );
     }
     // The open shell's PTY. Not gated on the screen or the window: the terminal
@@ -1888,7 +2082,26 @@ fn subscription(app: &App) -> Subscription<Message> {
         )
         .then_some(Message::ToggleAssistant)
     }));
-    if app.close_prompt.is_some() || app.library.confirm.is_some() || app.assistant_open {
+    subs.push(iced::keyboard::listen().filter_map(|event| {
+        matches!(
+            event,
+            iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Character(ref c),
+                modifiers,
+                ..
+            } if c.as_str() == "/" && modifiers.command()
+        )
+        .then_some(Message::ToggleHelp)
+    }));
+    if app.close_prompt.is_some()
+        || app.library.confirm.is_some()
+        || app.assistant_open
+        || app.help_open
+        || app.notifications_open
+        || app.processes.review.is_some()
+        || app.todos.confirm.is_some()
+        || app.workflows.confirm.is_some()
+    {
         subs.push(iced::keyboard::listen().filter_map(|event| {
             matches!(
                 event,
@@ -2096,8 +2309,26 @@ line 2");
             assert!(screen.needs_server(), "{screen:?} would render against a dead API");
         }
 
+        // Performance is in this list deliberately: a user whose machine is
+        // struggling is exactly the one who wants to set Eco, and the mode is
+        // saved locally and re-pushed on reconnect, so the picker works with no
+        // server behind it. Only the live-numbers card needs one, and it says so.
         let usable: Vec<_> =
             SettingsTab::ALL.iter().filter(|t| !t.needs_server()).map(|t| t.label()).collect();
-        assert_eq!(usable, vec!["Appearance", "Status", "API"]);
+        assert_eq!(usable, vec!["Appearance", "Performance", "Status", "API"]);
+    }
+
+    /// The monitor's whole cost is how often it rides the health poll, and the
+    /// mode it reports on is what sets that. A regression here is a widget that
+    /// polls at Turbo rate while claiming the app is in Eco.
+    #[test]
+    fn the_monitor_polls_slower_in_the_cheaper_modes() {
+        assert_eq!(resource_poll_every(Some("turbo")), 1);
+        assert_eq!(resource_poll_every(Some("balanced")), 2);
+        assert_eq!(resource_poll_every(Some("eco")), 4);
+        // No answer yet, and an unknown tier from a newer server, both take the
+        // cheap rate rather than the expensive one.
+        assert_eq!(resource_poll_every(None), 4);
+        assert_eq!(resource_poll_every(Some("ludicrous")), 4);
     }
 }

@@ -120,8 +120,8 @@ impl Pending {
 /// Screens `open_screen` will move to, and what they hold. Doubles as the
 /// enum's allowed-values list in the tool spec, so the model cannot ask for a
 /// screen that does not exist.
-const SCREENS: [(&str, Screen, &str); 13] = [
-    ("dashboard", Screen::Dashboard, "server health and the landing page"),
+const SCREENS: [(&str, Screen, &str); 14] = [
+    ("dashboard", Screen::Dashboard, "the run inbox: start a run, and anything waiting on you"),
     ("processes", Screen::Processes, "agent runs, live and past"),
     ("projects", Screen::Projects, "projects"),
     ("teams", Screen::Teams, "team templates and their rosters"),
@@ -134,6 +134,7 @@ const SCREENS: [(&str, Screen, &str); 13] = [
     ("logs", Screen::Logs, "the server log"),
     ("settings", Screen::Settings, "theme, voice, providers, model-ops"),
     ("search", Screen::Search, "web search query builder"),
+    ("studio", Screen::Studio, "generated images and video, and the jobs making them"),
 ];
 
 pub fn screen_named(name: &str) -> Option<Screen> {
@@ -200,7 +201,11 @@ pub fn tools_spec() -> Vec<serde_json::Value> {
                     (change one), POST /api/v1/assistant/items/{id}/complete {} (log a \
                     completion on the agenda), POST /api/v1/workflows/{id}/run {\"input\": {}} \
                     (run a workflow), POST /api/v1/projects/ {\"name\": \"…\"}, \
-                    POST /api/v1/teams/ {\"name\": \"…\", \"roster\": {…}}. \
+                    POST /api/v1/teams/ {\"name\": \"…\", \"roster\": {…}}, \
+                    POST /api/v1/media/generate {\"kind\": \"image\", \"prompt\": \"…\"} \
+                    (generate a picture on this machine — \"video\" for a short clip. It renders \
+                    in the background, so say it has started rather than describing what it \
+                    looks like, and read /api/v1/media/jobs to find out whether it finished). \
                     Read the matching api_get first when you need an id.",
                 "parameters": {
                     "type": "object",

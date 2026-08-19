@@ -57,6 +57,7 @@ icons! {
     Sparkles => sparkles,
     Plug => plug,
     Gauge => gauge,
+    House => house,
     Scroll => scroll_text,
     Zap => zap,
 
@@ -91,6 +92,8 @@ icons! {
     ArrowLeft => arrow_left,
     ArrowRight => arrow_right,
     Globe => globe,
+    Image => image,
+    Film => film,
 
     // theme
     Sun => sun,

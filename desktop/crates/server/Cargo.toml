@@ -19,7 +19,7 @@ path = "src/main.rs"
 # `multipart` for the two model-ops upload routes; nothing else in the crate
 # takes a file.
 axum = { version = "0.8", features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "signal", "sync"] }
 # `stream` is what keeps SSE responses unbuffered through the proxy. No gzip
 # feature on purpose: decompressing here would invalidate the headers we copy.
 # `json` is used by the lib itself; without it here only `cargo test` builds,

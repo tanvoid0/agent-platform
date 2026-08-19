@@ -27,12 +27,12 @@ pub use theme::{font, space, ButtonVariant, Tone};
 
 /// `text-2xl font-semibold` — page title.
 pub fn title<'a, M: 'a>(content: impl text::IntoFragment<'a>) -> Element<'a, M> {
-    text(content).size(font::XL2).style(theme::text_default).into()
+    text(content).size(font::XL2).font(font::SEMIBOLD).style(theme::text_default).into()
 }
 
 /// `text-lg font-semibold` — card title.
 pub fn heading<'a, M: 'a>(content: impl text::IntoFragment<'a>) -> Element<'a, M> {
-    text(content).size(font::LG).style(theme::text_default).into()
+    text(content).size(font::LG).font(font::SEMIBOLD).style(theme::text_default).into()
 }
 
 /// `text-sm` — body copy. Fills its parent so long strings wrap instead of
@@ -135,7 +135,7 @@ pub fn button_default<'a, M: 'a + Clone>(
     label: impl text::IntoFragment<'a>,
     on_press: M,
 ) -> Element<'a, M> {
-    button_sized(Some(glyph), label, ButtonVariant::Default, Size::Sm, Some(on_press))
+    button_sized(Some(glyph), label, ButtonVariant::Default, Size::Default, Some(on_press))
 }
 
 /// `<Button variant="secondary">`
@@ -174,6 +174,11 @@ pub fn icon_button<'a, M: 'a + Clone>(glyph: Icon, on_press: M) -> Element<'a, M
         .style(theme::button_style(ButtonVariant::Ghost))
         .on_press(on_press)
         .into()
+}
+
+/// [`icon_button`] with a tooltip — the default for any unlabeled control.
+pub fn icon_tip<'a, M: 'a + Clone>(glyph: Icon, label: &'a str, on_press: M) -> Element<'a, M> {
+    tooltip(icon_button(glyph, on_press), label)
 }
 
 /// shadcn `Tooltip`: a small label that appears above `content` on hover.
@@ -374,12 +379,21 @@ pub fn chips<'a, M: 'a + Clone>(
 // Card / layout
 // ---------------------------------------------------------------------------
 
-/// `<Card>` — bordered surface with shadow.
+/// `<Card>` — elevated surface, shadow instead of a hairline.
 pub fn card<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
     container(content)
         .padding(space::MD)
         .width(Length::Fill)
         .style(theme::card)
+        .into()
+}
+
+/// A quieter card for stacked rows (team list, plan items). Same fill, less lift.
+pub fn tile<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    container(content)
+        .padding(space::MD)
+        .width(Length::Fill)
+        .style(theme::tile)
         .into()
 }
 
@@ -522,25 +536,23 @@ pub fn modal<'a, M: 'a>(
 }
 
 /// `<Toaster>` — pins `toast` to the bottom-right corner over `base`. Unlike
-/// [`modal`] it lays no scrim, so the page underneath stays *readable* while
-/// the message is up.
-///
-/// It does not stay *clickable*: the positioning container fills the window,
-/// and a click anywhere over it is swallowed rather than reaching the widget
-/// beneath — measured, not assumed. That is survivable for a toast that
-/// disappears on a timer, and it is why the E.V. panel is a real column in the
-/// shell row instead of a layer (see `screen::view`).
+/// [`modal`] it lays no scrim, so the page underneath stays readable *and*
+/// clickable: [`opaque`] is only as large as the toast, and [`bottom_right`]
+/// just places it. A Fill positioning layer used to swallow every click
+/// (measured on an earlier iced); that is why the E.V. panel is still a real
+/// column of the shell row rather than a layer (see `screen::view`).
 pub fn toast_layer<'a, M: 'a>(
     base: impl Into<Element<'a, M>>,
     toast: impl Into<Element<'a, M>>,
 ) -> Element<'a, M> {
-    let layer = container(container(toast.into()).max_width(420))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(iced::Alignment::End)
-        .align_y(iced::Alignment::End)
-        .padding(space::LG);
-    iced::widget::stack![base.into(), layer].into()
+    iced::widget::stack![
+        base.into(),
+        iced::widget::bottom_right(iced::widget::opaque(
+            container(toast.into()).max_width(420),
+        ))
+        .padding(space::LG),
+    ]
+    .into()
 }
 
 /// `<Toast>` — one transient message: tone glyph, text, close button. The
@@ -555,7 +567,7 @@ pub fn toast<'a, M: 'a + Clone>(
         row![
             tone_icon(tone).glyph().size(font::SM).style(theme::text_tone(tone)),
             text(message).size(font::SM).width(Length::Fill).style(theme::text_default),
-            icon_button(Icon::X, on_dismiss),
+            tooltip(icon_button(Icon::X, on_dismiss), "Dismiss"),
         ]
         .spacing(space::SM)
         .align_y(iced::Alignment::Center),
@@ -642,6 +654,49 @@ pub fn badge_icon<'a, M: 'a>(
     .padding(Padding::from([2.0, space::SM]))
     .style(theme::badge(tone))
     .into()
+}
+
+/// A segmented bar: `filled` of `total` cells lit, in `tone`.
+///
+/// Cells rather than a continuous bar because the number it reports is small and
+/// discrete — model calls in flight against a lane's limit — and four filled
+/// blocks out of eight is a count you can read at a glance, where 50% of a
+/// smooth bar is not. Containers with a background, so it costs one quad per
+/// cell and nothing per frame; a canvas here would mean a redraw loop for a
+/// widget that changes every few seconds.
+///
+/// `total` of 0 draws nothing rather than dividing by it.
+pub fn meter<'a, M: 'a>(filled: usize, total: usize, tone: Tone) -> Element<'a, M> {
+    // A wide lane on a big machine would draw sixteen 2px slivers in a 208px
+    // sidebar. Past this the cells stop being countable, so the bar switches to
+    // proportional: same widget, `filled` scaled into the cells there is room for.
+    let Some((cells, lit)) = meter_cells(filled, total) else {
+        return space_widget::horizontal().into();
+    };
+    Row::with_children((0..cells).map(|i| {
+        container(space_widget::vertical().height(4.0))
+            .width(Length::Fill)
+            .style(theme::meter_cell(tone, i < lit))
+            .into()
+    }))
+    .spacing(2.0)
+    .into()
+}
+
+/// `(cells, lit)` for [`meter`], or `None` when there is nothing to draw.
+///
+/// Past `MAX_CELLS` the bar stops being a count and becomes proportional: a wide
+/// lane on a big machine would otherwise draw sixteen 2px slivers in a 208px
+/// sidebar, which is neither countable nor a bar. The scaling rounds *up*, so
+/// one call in flight is never drawn as an idle track.
+fn meter_cells(filled: usize, total: usize) -> Option<(usize, usize)> {
+    const MAX_CELLS: usize = 10;
+    if total == 0 {
+        return None;
+    }
+    let cells = total.min(MAX_CELLS);
+    let filled = filled.min(total);
+    Some((cells, if total <= MAX_CELLS { filled } else { (filled * cells).div_ceil(total) }))
 }
 
 /// Braille dots — the classic CLI spinner, cycled by an ever-incrementing
@@ -780,6 +835,21 @@ pub fn input<'a, M: 'a + Clone>(
         .into()
 }
 
+/// `<Checkbox>` — 16px box, body-sized label, tokens instead of iced defaults.
+pub fn checkbox<'a, M: 'a + Clone>(
+    label: impl text::IntoFragment<'a>,
+    checked: bool,
+    on_toggle: impl Fn(bool) -> M + 'a,
+) -> Element<'a, M> {
+    iced::widget::checkbox(checked)
+        .label(label)
+        .on_toggle(on_toggle)
+        .size(16)
+        .text_size(font::SM)
+        .style(theme::checkbox)
+        .into()
+}
+
 /// `<Input>` that submits on Enter — the composer of any chat box.
 pub fn input_submit<'a, M: 'a + Clone>(
     placeholder: &'a str,
@@ -881,11 +951,26 @@ pub fn approval<'a, M: 'a + Clone>(
     on_no: M,
     run: Option<M>,
 ) -> Element<'a, M> {
+    approval_extra(heading, tone, body, no_label, on_no, run, None)
+}
+
+/// [`approval`] with one more control between No and Run — the standing answer
+/// ("always allow this"), which is a third decision and not a variant of either.
+pub fn approval_extra<'a, M: 'a + Clone>(
+    heading: impl text::IntoFragment<'a>,
+    tone: Tone,
+    body: Vec<Element<'a, M>>,
+    no_label: &'a str,
+    on_no: M,
+    run: Option<M>,
+    extra: Option<Element<'a, M>>,
+) -> Element<'a, M> {
     let mut head: Vec<Element<'a, M>> = vec![
         badge_icon(Icon::Alert, heading, tone),
         spacer(),
         button_ghost(Icon::X, no_label, on_no),
     ];
+    head.extend(extra);
     if let Some(run) = run {
         head.push(button_default(Icon::Play, "Run", run));
     }
@@ -1045,16 +1130,57 @@ pub fn empty_state_icon<'a, M: 'a>(
     glyph: Icon,
     message: impl text::IntoFragment<'a>,
 ) -> Element<'a, M> {
-    container(
-        column![
-            icon::icon_large(glyph, 28.0),
-            text(message).size(font::SM).style(theme::text_muted),
-        ]
-        .spacing(space::SM)
-        .align_x(iced::Alignment::Center),
-    )
-    .padding(space::XL)
-    .width(Length::Fill)
-    .center_x(Length::Fill)
-    .into()
+    empty_state_body(glyph, message, None)
+}
+
+/// Empty state that names the next action, not just the absence.
+pub fn empty_state_action<'a, M: 'a>(
+    glyph: Icon,
+    message: impl text::IntoFragment<'a>,
+    action: Element<'a, M>,
+) -> Element<'a, M> {
+    empty_state_body(glyph, message, Some(action))
+}
+
+fn empty_state_body<'a, M: 'a>(
+    glyph: Icon,
+    message: impl text::IntoFragment<'a>,
+    action: Option<Element<'a, M>>,
+) -> Element<'a, M> {
+    let mut col = column![
+        icon::icon_large(glyph, 28.0),
+        text(message).size(font::SM).style(theme::text_muted),
+    ]
+    .spacing(space::SM)
+    .align_x(iced::Alignment::Center);
+    if let Some(action) = action {
+        col = col.push(action);
+    }
+    container(col)
+        .padding(space::XL)
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::meter_cells;
+
+    #[test]
+    fn the_meter_stays_countable_and_never_hides_live_work() {
+        // Small lanes are one cell per unit — the count you can read at a glance.
+        assert_eq!(meter_cells(0, 4), Some((4, 0)));
+        assert_eq!(meter_cells(3, 4), Some((4, 3)));
+        // Wide lanes go proportional at the cell cap.
+        assert_eq!(meter_cells(16, 16), Some((10, 10)));
+        assert_eq!(meter_cells(8, 16), Some((10, 5)));
+        // The reason it rounds up: one call in flight must not read as idle.
+        assert_eq!(meter_cells(1, 16), Some((10, 1)));
+        // More in flight than the limit is possible for one beat after a shrink;
+        // it clamps rather than overflowing the row.
+        assert_eq!(meter_cells(9, 4), Some((4, 4)));
+        // Nothing to draw is nothing drawn, not an empty track.
+        assert_eq!(meter_cells(0, 0), None);
+    }
 }

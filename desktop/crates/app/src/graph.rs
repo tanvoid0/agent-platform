@@ -76,9 +76,9 @@ impl Lineage {
 
     pub fn label(self) -> &'static str {
         match self {
-            Lineage::All => "All",
-            Lineage::DepthLe1 => "Depth ≤ 1",
-            Lineage::Roots => "Roots",
+            Lineage::All => "Everyone",
+            Lineage::DepthLe1 => "Nearby",
+            Lineage::Roots => "Top only",
         }
     }
 

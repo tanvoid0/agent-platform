@@ -308,7 +308,7 @@ async fn call_tool_proposals(
         payload.insert("model".into(), json!(model));
     }
 
-    let data = crate::llm::complete_internal(state, payload).await.map_err(|e| e.message)?;
+    let data = crate::llm::complete_internal(state, payload, crate::resources::Priority::Interactive).await.map_err(|e| e.message)?;
     // `data["choices"][0]["message"]` — a `KeyError`/`IndexError` in Python.
     let message = data
         .get("choices")
@@ -346,7 +346,7 @@ async fn call_llm(
         payload.insert("model".into(), json!(model));
     }
 
-    let data = crate::llm::complete_internal(state, payload).await.map_err(|e| e.message)?;
+    let data = crate::llm::complete_internal(state, payload, crate::resources::Priority::Interactive).await.map_err(|e| e.message)?;
     let content = data
         .get("choices")
         .and_then(Value::as_array)
