@@ -53,3 +53,8 @@ services/speech-service/voices/
 # cargo workspace with their own target dir. Nothing under `desktop/` depends on
 # it and no build touches it; it lives here to be worked on, not to be shipped.
 /orm/
+
+# `impeccable`'s critique notes. Written per run into the checkout, timestamped,
+# and about a snapshot of the code rather than the code itself — so a tracked one
+# is stale the moment the file it critiques changes.
+.impeccable/
