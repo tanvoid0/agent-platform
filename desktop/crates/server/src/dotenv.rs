@@ -102,6 +102,13 @@ fn apply_missing(values: &HashMap<String, String>, skip: &[&str]) -> usize {
         if key.is_empty() || skip.contains(&key.as_str()) {
             continue;
         }
+        // `set_var` panics on a NUL in either half, which turns a mis-encoded
+        // file into a dead server. This is the only site that calls it, so the
+        // guard belongs here rather than in each parser.
+        if key.contains('\0') || value.contains('\0') {
+            logd!("skipping env var with NUL bytes in its name or value");
+            continue;
+        }
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, value);
             applied += 1;
@@ -115,7 +122,17 @@ fn apply_missing(values: &HashMap<String, String>, skip: &[&str]) -> usize {
 /// expansion, no multi-line values. Matches every `.env` this repo ships; widen
 /// it the day one of those appears rather than porting a whole dotenv dialect.
 fn parse_file(path: &Path) -> HashMap<String, String> {
-    std::fs::read_to_string(path).map(|raw| parse_env_text(&raw)).unwrap_or_default()
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    if raw.contains('\0') {
+        logd!(
+            "{} contains NUL bytes — it was written as UTF-16 (PowerShell `>>` does this). \
+             Parsing anyway with the NULs stripped; rewrite it as UTF-8.",
+            path.display()
+        );
+    }
+    parse_env_text(&raw)
 }
 
 /// The `env:` block of `config/agent_platform.yaml`, stringified the way
@@ -186,6 +203,34 @@ mod tests {
             std::env::remove_var(key);
         }
         assert!(yaml_env_map(&dir.join("missing.yaml")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.env` that PowerShell's `>>` appended to: UTF-8 head, UTF-16LE tail,
+    /// which `read_to_string` hands back as NUL-interleaved text. It has to
+    /// parse, and a NUL must never reach `set_var` — that panics, which used to
+    /// take the whole server down at startup.
+    #[test]
+    fn nul_bearing_env_file_parses_and_never_reaches_set_var() {
+        let dir = std::env::temp_dir().join("agp-dotenv-nul-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        let utf16: String =
+            "AGP_TEST_NUL=utf16\n".chars().flat_map(|c| [c, '\0']).collect();
+        std::fs::write(&path, format!("AGP_TEST_PLAIN=utf8\n{utf16}")).unwrap();
+
+        let map = parse_file(&path);
+        assert_eq!(map["AGP_TEST_PLAIN"], "utf8");
+        assert_eq!(map["AGP_TEST_NUL"], "utf16");
+
+        let mut raw = HashMap::new();
+        raw.insert("AGP_TEST_RAW\0NUL".to_string(), "x".to_string());
+        raw.insert("AGP_TEST_RAW_VALUE".to_string(), "y\0z".to_string());
+        raw.insert("AGP_TEST_RAW_OK".to_string(), "y".to_string());
+        std::env::remove_var("AGP_TEST_RAW_OK");
+        assert_eq!(apply_missing(&raw, &[]), 1, "only the clean pair is applied");
+        std::env::remove_var("AGP_TEST_RAW_OK");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

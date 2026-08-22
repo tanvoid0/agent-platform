@@ -632,6 +632,19 @@ pub fn read_env_file() -> Arc<HashMap<String, String>> {
 pub fn parse_env_text(raw: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for line in raw.lines() {
+        // PowerShell's `>>` appends UTF-16LE, so a `.env` edited that way is
+        // half UTF-8 and half NUL-interleaved from that point on —
+        // `read_to_string` accepts it, and the NULs then ride into `set_var`,
+        // which panics on them. Strip rather than reject: the rest of the file
+        // is still the operator's configuration. `dotenv::parse_file` logs the
+        // encoding problem against the path.
+        let stripped;
+        let line = if line.contains('\0') || line.contains('\u{feff}') {
+            stripped = line.replace(['\0', '\u{feff}'], "");
+            stripped.as_str()
+        } else {
+            line
+        };
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
