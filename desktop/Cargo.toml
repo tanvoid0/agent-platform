@@ -5,12 +5,22 @@ members = ["crates/client", "crates/app", "crates/server", "crates/local-llm"]
 # llama.cpp — or a CUDA toolchain — into the app's build.
 exclude = ["spike-llama"]
 
+# The dev loop here is a release build — a debug-built iced app is not usable to
+# click through — so `release` carries the incremental cache that `dev` normally
+# would. Costs a `target/release/incremental` dir and a little optimisation
+# across codegen units; buys not recompiling the world on a one-line change.
+[profile.release]
+incremental = true
+
 # What `dist` builds release artifacts with. `release` plus thin LTO: the
 # daemon is the deployable artifact and it is downloaded far more often than it
 # is compiled. Config for `dist` itself is `../dist-workspace.toml`.
 [profile.dist]
 inherits = "release"
 lto = "thin"
+# The shipped artifact is optimised, not iterated on: incremental splits codegen
+# units and would cost thin-LTO some of its inlining.
+incremental = false
 
 # `iced_term` 0.8 can be written into but not read from: `Terminal::backend` is
 # `pub(crate)` and the widget exposes no accessor, so nothing outside that crate
