@@ -20,3 +20,13 @@ lto = "thin"
 # block comes out when that merges.
 [patch.crates-io]
 iced_term = { git = "https://github.com/tanvoid0/iced_term.git", branch = "feat/terminal-text" }
+
+# Windows MSVC writes a .pdb per crate and full debuginfo into every rlib; with
+# 1100+ dependencies that was 18G of .pdb alone in `target/debug`. Line tables
+# keep `file:line` in backtraces, which is all a panic here is read for, and
+# dependencies get nothing — nobody steps into `serde`.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
