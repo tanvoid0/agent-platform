@@ -1172,15 +1172,34 @@ workflows now, deliberately not one:
     `artifacts-*` is collected into `target/distrib/`, and a zip must have its
     files at the root rather than nested.
 
-**The app's updater is the check half only** — `update_check.rs` plus a Version
-card in Settings → Status. It asks the releases API for the newest `v*`,
-compares numerically (so `0.10.0` beats `0.9.0`), and offers to open the
-releases page. **No install button**, for two reasons: replacing a running
-`.exe` on Windows needs a rename-then-swap, and nothing has ever been published
-to test a download against. It is a button, never a poll — this app runs offline
-by design and should not phone GitHub on launch. The daemon has the real thing
-already, from `dist`. Add `self_update`/`axoupdater` to the app once a tag
-exists to point it at.
+**The app's updater is both halves now** — `update_check.rs` plus a Version
+card in Settings → Status. The **check** asks the releases API for the newest
+`v*` and compares numerically (so `0.10.0` beats `0.9.0`); it is a button, never
+a poll, because this app runs offline by design and should not phone GitHub on
+launch. The **install** landed 2026-08-22, once `v0.4.0` existed to point it at:
+it downloads that release's Windows zip, verifies the `.sha256` published beside
+it, and swaps both exes before reusing `Message::RestartApp`.
+
+- **Windows locks a running `.exe` against deletion but allows renaming it.**
+  That is the whole trick: each binary moves to `<name>.old` and the new one
+  takes the name it vacated, the process keeps executing the renamed file, and
+  `sweep_old` clears the leftovers at the next boot. No `self_update`/
+  `axoupdater` dependency was needed for it.
+- **Both exes or neither.** The app spawns the daemon from its own directory, so
+  a half-swapped install is a version skew across the wire contract. `locate`
+  proves both are in the archive before anything is touched, and a failure
+  partway rolls back what it moved — two of the module's five tests are that.
+- **The daemon goes down first**, before the download rather than between the
+  download and the swap: its exe is replaced too and a running child holds the
+  handle. A failed install starts it straight back up.
+- **Unpacking shells out to `C:\Windows\System32\tar.exe`** by absolute path,
+  for the reason `managed_server.rs` documents: a bare `tar` can resolve to the
+  GNU tar in a git-bash on PATH, which cannot read a zip.
+- The checksum is fetched from the same host as the archive, so it is an
+  integrity check and not a defence against a compromised release — it catches
+  the truncated download *before* it lands on a working install.
+- Still `dist`'s `agent-platform-server-<target>-update` for a daemon installed
+  by itself; this is the desktop pair, which moves together.
 
 - **The tag prefix is load-bearing and it changed.** While there were two
   series this filtered for `desktop-v*`; collapsing to one release left that
@@ -1210,10 +1229,34 @@ Both halves were **driven, not only unit-tested**:
   if the list was forwarded. That is also the whole protocol working: the turn
   then parked, waiting for a `tool-result` that was never sent.
 
-Borrowed from portal_desktop's pipeline and worth keeping in mind if this grows:
-its release gates a four-platform matrix behind one cheap smoke job on a single
-runner, which `dist`'s generated `plan` job already does, and it sets
-`fail-fast: false` so one platform's break does not cancel three good builds.
+**Borrowed from portal_desktop, 2026-08-22.** Two of its three habits are here
+now; the third was already true.
+
+- **`scripts/prepare_release.py`** — `patch`/`minor`/`major`/`X.Y.Z`/`current`,
+  writes both crates in lockstep, runs `cargo update --workspace --offline`,
+  *proves* Cargo.lock agrees, then commits the bump and tags it. **The commit
+  comes before the tag**, which portal's own script gets wrong: a tag cut first
+  names the commit before the bump, so the release builds a tree still carrying
+  the old version.
+- **`.github/workflows/release-smoke.yml`** — one `cargo check --locked
+  -p agent-platform-server` on ubuntu, wired in as a `dist` `plan-jobs` entry so
+  `build-local-artifacts` and the desktop job both wait on it. `dist plan`
+  validates config but compiles nothing, so it cannot see a stale lockfile;
+  every build job runs `--locked` and all four fail on one several minutes in.
+  portal lost v0.7.0 to exactly that, which is why it has this job at all.
+  `--locked` is workspace-wide regardless of `-p`, so one package catches a lock
+  that disagrees with either manifest. The app is not checked here: it is
+  Windows-only and does not build on a Linux runner.
+- `fail-fast: false` so one platform's break does not cancel three good builds —
+  `dist` already generates that.
+
+**Not borrowed: the installer.** portal ships NSIS/MSI/dmg/AppImage because
+`tauri-action` bundles them for free; this app's release is a zip of two exes,
+and `scripts/build_installer.py` (Inno Setup) still runs only on a developer's
+machine. Wiring it into `release-desktop.yml` means proving `iscc` on the runner
+and reconciling the `.iss`'s `target/release` paths with the workflow's
+`--profile dist` — worth doing when someone wants Start-menu entries and an
+uninstaller, not before.
 
 **What the first tag taught, `v0.2.0`.** It failed in every build job and
 published nothing, which is the right way for it to fail. Three separate causes,
