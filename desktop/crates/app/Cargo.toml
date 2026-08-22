@@ -1,6 +1,6 @@
 [package]
 name = "agent-platform-desktop"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Native desktop app for agent-platform (iced), owning the Python server sidecar"
 
@@ -39,6 +39,9 @@ rodio = "0.19"
 cpal = "0.15"
 whisper-rs = "0.16"
 reqwest = { version = "0.12", features = ["blocking", "stream", "rustls-tls"] }
+# Verifies the update zip against the `.sha256` published beside it before it
+# is copied over a working install. Already in the tree via the daemon.
+sha2 = "0.10"
 iced_fonts = { version = "0.3.0", features = ["lucide", "advanced_text"] }
 # Decodes the frames inside icon.ico for the window and tray icons. Already in
 # the tree via iced's svg backend, so this costs no extra build.
