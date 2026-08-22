@@ -1740,7 +1740,8 @@ fn api_card(app: &App) -> Element<'_, Message> {
 ///
 /// The check is a button, never a poll: an app that phones GitHub on every
 /// launch is one the user did not ask for, and this one runs offline by design.
-/// There is no install button — see [`crate::update_check`] for why.
+/// Installing is a second, separate press — it stops the server, replaces both
+/// exes and relaunches, which is not something to do to someone mid-sentence.
 fn version_card(app: &App) -> Element<'_, Message> {
     let state = &app.update_check;
     let mut rows: Vec<Element<'_, Message>> =
@@ -1752,27 +1753,36 @@ fn version_card(app: &App) -> Element<'_, Message> {
         rows.push(ui::alert(
             Tone::Info,
             format!("Version {newer} is available"),
-            Some(ui::muted("Download it from the releases page and unzip over this install.")),
+            Some(ui::muted(if state.installing {
+                "Downloading and replacing both binaries. The server is stopped until \
+                 the app restarts."
+            } else {
+                "Installing stops the server, swaps the app and the daemon, and restarts."
+            })),
         ));
     } else if state.checked {
         rows.push(ui::muted("Up to date."));
     }
 
-    rows.push(
-        ui::cluster(vec![
-            ui::button_secondary(
-                Icon::Refresh,
-                if state.checking { "Checking…" } else { "Check for updates" },
-                Message::CheckForUpdate,
-            ),
-            ui::button_ghost(
-                Icon::FolderOpen,
-                "Open releases",
-                Message::RevealPath(crate::update_check::RELEASES_PAGE.to_string()),
-            ),
-        ])
-        .into(),
-    );
+    let mut buttons: Vec<Element<'_, Message>> = Vec::new();
+    if let Some(newer) = &state.newer {
+        buttons.push(ui::button_default(
+            Icon::Download,
+            if state.installing { "Installing…" } else { "Install and restart" },
+            Message::InstallUpdate(newer.clone()),
+        ));
+    }
+    buttons.push(ui::button_secondary(
+        Icon::Refresh,
+        if state.checking { "Checking…" } else { "Check for updates" },
+        Message::CheckForUpdate,
+    ));
+    buttons.push(ui::button_ghost(
+        Icon::FolderOpen,
+        "Open releases",
+        Message::RevealPath(crate::update_check::RELEASES_PAGE.to_string()),
+    ));
+    rows.push(ui::cluster(buttons).into());
 
     ui::card_with_header(
         "Version",

@@ -409,6 +409,10 @@ pub enum Message {
     /// "Check for updates" in Settings → Status, and its answer.
     CheckForUpdate,
     UpdateChecked(Result<Option<String>, String>),
+    /// "Install and restart", and its answer. The version is carried rather
+    /// than re-read, so the button installs the release the card is showing.
+    InstallUpdate(String),
+    UpdateInstalled(Result<(), String>),
     Quit,
     Processes(processes::Message),
     Library(library::Message),
@@ -589,6 +593,14 @@ fn boot() -> (App, Task<Message>) {
             .push("[shell] agent-platformd is missing from the install directory".to_string());
         Default::default()
     });
+
+    // If an update ran, the binaries it replaced are sitting beside us as
+    // `.old`. This is the first moment nothing is executing them.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            update_check::sweep_old(dir);
+        }
+    }
 
     let key = shell::load_or_create_key(&app_dir).unwrap_or_else(|e| {
         log.lock().unwrap().push(format!("[shell] could not read or create the install key: {e}"));
@@ -1607,6 +1619,48 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                 Err(message) => app.update_check.error = Some(message),
             }
             Task::none()
+        }
+        Message::InstallUpdate(version) => {
+            if app.update_check.installing {
+                return Task::none();
+            }
+            // The daemon's exe is replaced too and a running child holds the
+            // handle, so it goes down before the download starts rather than
+            // between the download and the swap.
+            if !app.shell.attached {
+                app.shell.stop_server();
+                app.child_alive = false;
+            }
+            app.update_check.installing = true;
+            app.update_check.error = None;
+            app.shell.log_line(format!("[shell] installing version {version}"));
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || update_check::install(&version)).await
+                },
+                |joined| {
+                    Message::UpdateInstalled(joined.unwrap_or_else(|e| Err(e.to_string())))
+                },
+            )
+        }
+        Message::UpdateInstalled(result) => {
+            app.update_check.installing = false;
+            match result {
+                // The new binaries are on disk but this process is still the old
+                // one; `RestartApp` is what actually starts them — and it also
+                // brings the server back, which the install took down.
+                Ok(()) => update(app, Message::RestartApp),
+                Err(message) => {
+                    app.update_check.error = Some(message);
+                    // Nothing was replaced on a failure, so the sidecar this
+                    // stopped can come straight back.
+                    if !app.shell.attached {
+                        app.shell.start_server();
+                        app.child_alive = app.shell.server_running();
+                    }
+                    Task::none()
+                }
+            }
         }
         Message::Quit => quit(app),
         Message::Processes(processes::Message::TraceLogs(id))
