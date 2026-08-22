@@ -25,6 +25,9 @@ pub fn view(state: &State) -> Element<'_, Message> {
     if let Some(card) = video_models_card(state) {
         blocks.push(card);
     }
+    if let Some(card) = unsupported_kind_card(state) {
+        blocks.push(card);
+    }
     blocks.push(composer(state));
     blocks.push(gallery(state));
 
@@ -48,6 +51,77 @@ fn backend_card(state: &State) -> Option<Element<'_, Message>> {
         return None;
     }
 
+    // The sd-server backend manages itself (ADR 0011), so "not reachable" is
+    // never the whole story there — it may be downloading, unpacking, or
+    // waiting for a model. Offering "Get ComfyUI" in that state would be
+    // pointing at the wrong app entirely.
+    if status.backend == "sdcpp" {
+        let stage = status.backend_stage.as_deref().unwrap_or("");
+        let detail = status.backend_detail.clone();
+        let (tone, title, body): (Tone, &str, String) = match stage {
+            // Two different missing things, and telling them apart is the
+            // difference between "press Generate" and "go install something":
+            // `not_installed` is the 39 MB binary, which the first generation
+            // fetches on its own, while `unconfigured` is the weights, which
+            // it cannot.
+            "not_installed" => (
+                Tone::Info,
+                "Generator not fetched yet",
+                "stable-diffusion.cpp is not on disk yet. The first generation downloads                  it — about 39 MB — and starts it for you."
+                    .to_string(),
+            ),
+            "unconfigured" => (
+                Tone::Info,
+                "No model installed yet",
+                "Generation runs on stable-diffusion.cpp, which this app fetches and starts                  for you — but it needs a model to load first."
+                    .to_string(),
+            ),
+            "downloading" | "extracting" => (
+                Tone::Info,
+                "Setting up the generator",
+                "Fetching what stable-diffusion.cpp needs. This runs in the background; \n                 press Refresh for progress."
+                    .to_string(),
+            ),
+            "starting" => (
+                Tone::Info,
+                "Loading the model",
+                "stable-diffusion.cpp is reading the weights into VRAM. Large models take \n                 a few minutes on a cold start."
+                    .to_string(),
+            ),
+            "stopped" => (
+                Tone::Info,
+                "Generator is idle",
+                "The model was unloaded to free VRAM. The next generation starts it again."
+                    .to_string(),
+            ),
+            "failed" => (
+                Tone::Warning,
+                "The generator could not start",
+                "stable-diffusion.cpp exited instead of serving.".to_string(),
+            ),
+            "external" => (
+                Tone::Info,
+                "No generator answering",
+                format!(
+                    "MEDIA_API_BASE points at {}, which this app does not manage. Start it \n                     there, then press Refresh.",
+                    status.base
+                ),
+            ),
+            // `ready` with no model, or a stage a newer server added.
+            _ => (
+                Tone::Warning,
+                "The generator has no model loaded",
+                "It is running but has nothing to draw with.".to_string(),
+            ),
+        };
+        let mut rows = vec![ui::muted(body)];
+        // The backend's own words — a failed model load says which file it
+        // could not read, and that is the only actionable sentence available.
+        if let Some(detail) = detail {
+            rows.push(ui::caption(detail));
+        }
+        return Some(ui::alert(tone, title, Some(ui::stack(rows).into())));
+    }
     let (tone, title, detail): (Tone, &str, Element<'_, Message>) = if !status.reachable {
         (
             Tone::Info,
@@ -90,6 +164,47 @@ fn backend_card(state: &State) -> Option<Element<'_, Message>> {
     };
 
     Some(ui::alert(tone, title, Some(detail)))
+}
+
+/// Shown when the running backend cannot serve the *selected* kind.
+///
+/// `sd-server` binds one model at startup, so a machine set up for images
+/// genuinely cannot make a video until it restarts onto a video model — and it
+/// says so through `modes` before a job is submitted rather than after three
+/// minutes of rendering nothing.
+///
+/// **A sentence, not a greyed-out button.** Disabling the Video toggle would
+/// leave the user with a dead control and no reason for it; the toggle stays
+/// live, the card explains, and pressing Generate installs what is missing
+/// rather than failing. An older server sends no `modes` at all, and
+/// [`MediaStatus::supports`] reads that as "yes" — refusing on missing
+/// information would break a working install.
+fn unsupported_kind_card(state: &State) -> Option<Element<'_, Message>> {
+    let status = state.status.as_ref()?;
+    let wanted = if state.kind == Kind::Video { "video" } else { "image" };
+    if !status.reachable || status.supports(wanted) {
+        return None;
+    }
+    let loaded = status.image_model.as_deref().unwrap_or("the current model");
+    Some(ui::alert(
+        Tone::Info,
+        if state.kind == Kind::Video {
+            "This model makes images, not video"
+        } else {
+            "This model makes video, not images"
+        },
+        Some(
+            ui::stack(vec![
+                ui::muted(format!(
+                    "{loaded} is loaded, and one model is loaded at a time. Generating will                      swap to a {wanted} model — installing it first if it is not on disk."
+                )),
+                ui::caption(
+                    "Both cannot be resident at once on a consumer card, so the swap is the                      cost of switching, not a fault.",
+                ),
+            ])
+            .into(),
+        ),
+    ))
 }
 
 /// What video is missing, and the button that fetches it.
@@ -278,7 +393,13 @@ fn composer(state: &State) -> Element<'_, Message> {
 
     ui::card_with_header(
         "New generation",
-        Some(ui::muted("Describe it. The server builds the workflow and ComfyUI renders it.")),
+        // Naming the renderer is the point of the line, so it has to be the one
+        // that will actually render: sd-server takes flat parameters and there
+        // is no workflow graph on that path at all.
+        Some(ui::muted(match state.status.as_ref().map(|s| s.backend.as_str()) {
+            Some("sdcpp") => "Describe it. The server runs stable-diffusion.cpp on this machine.",
+            _ => "Describe it. The server builds the workflow and ComfyUI renders it.",
+        })),
         None,
         ui::stack(rows),
     )

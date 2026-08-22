@@ -922,7 +922,7 @@ fn enter_screen_inner(app: &mut App) -> Task<Message> {
 ///
 /// Keyed on the *resolved* tier rather than the setting, so `Auto` follows what
 /// it actually resolved to instead of sitting at one rate.
-fn resource_poll_every(resolved: Option<&str>) -> u8 {
+pub(crate) fn resource_poll_every(resolved: Option<&str>) -> u8 {
     match resolved {
         Some("turbo") => 1,
         Some("balanced") => 2,

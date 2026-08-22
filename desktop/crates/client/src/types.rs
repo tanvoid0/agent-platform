@@ -423,6 +423,46 @@ pub struct ResourcesView {
     pub background_in_flight: usize,
     pub interactive_in_flight: usize,
     pub cpus: usize,
+    /// The machine underneath — what the Performance page's meters draw.
+    /// `#[serde(default)]` because a server that could not sample sends nothing
+    /// rather than zeroes, and zeroes would be drawn as an idle machine.
+    #[serde(default)]
+    pub host: Option<HostView>,
+}
+
+/// One host sample from `GET /system/resources`. Mirrors the server's
+/// `resources::HostView`; see it for what each number means and why there is no
+/// GPU here.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostView {
+    pub cpu_percent: f32,
+    pub cpu_per_core: Vec<f32>,
+    pub mem_used_bytes: u64,
+    pub mem_total_bytes: u64,
+    pub swap_used_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub disk_used_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub disk_mount: String,
+    pub process_cpu_percent: f32,
+    pub process_mem_bytes: u64,
+    pub uptime_seconds: u64,
+    pub os: String,
+    /// Empty on a machine with no NVIDIA driver — the ordinary case, not
+    /// an error. See the server's `resources::GpuView`.
+    #[serde(default)]
+    pub gpus: Vec<GpuView>,
+}
+
+/// One GPU from `GET /system/resources`. NVIDIA only; see the server side
+/// for why there is no AMD or Intel branch.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GpuView {
+    pub name: String,
+    pub utilization_percent: f32,
+    pub mem_used_bytes: u64,
+    pub mem_total_bytes: u64,
+    pub temperature_c: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1243,18 +1283,57 @@ pub struct SearchHistoryResponse {
 
 // -- Media generation (`/api/v1/media/*`, ADR 0009) --------------------------
 
-/// Whether the local ComfyUI backend is answering, and what it can draw with.
+/// Whether the local media backend is answering, and what it can draw with.
 /// `reachable: false` is the ordinary state on an install that has not set it
 /// up — the Studio screen renders an install pointer, never an error.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MediaStatus {
     pub reachable: bool,
     pub base: String,
+    /// Which backend `base` is — `comfy` or `sdcpp` (ADR 0011). Defaulted
+    /// rather than required so a desktop can talk to a server that predates
+    /// the second backend.
+    #[serde(default)]
+    pub backend: String,
+    /// What the *managed* sd-server is doing, when the backend is `sdcpp`:
+    /// `external`, `unconfigured`, `not_installed`, `downloading`,
+    /// `extracting`, `starting`, `ready`, `stopped`, `failed`. `None` on the
+    /// ComfyUI backend, which the server does not manage.
+    ///
+    /// A different question from `reachable`: `downloading` and `not_installed`
+    /// are both unreachable, and the screen should say which.
+    #[serde(default)]
+    pub backend_stage: Option<String>,
+    /// One sentence expanding `backend_stage` — download progress, the missing
+    /// variable to set, or the failure. `None` when the stage speaks for itself.
+    #[serde(default)]
+    pub backend_detail: Option<String>,
     #[serde(default)]
     pub checkpoints: Vec<String>,
+    /// What the backend can be asked for right now: `img_gen`, `vid_gen`, or
+    /// both. ComfyUI loads models per graph and reports both; sd-server binds
+    /// one model at startup and reports only what that model does — which is
+    /// what lets the Studio screen disable a toggle instead of failing a video
+    /// job minutes in. Empty when unreachable, or from an older server.
+    #[serde(default)]
+    pub modes: Vec<String>,
     /// The checkpoint the server would use for the next image, chosen from
     /// `checkpoints` — `None` when none is installed.
     pub image_model: Option<String>,
+}
+
+impl MediaStatus {
+    /// Whether the backend can render this Studio kind (`"image"` / `"video"`)
+    /// at all. Unknown — an older server, or one that reported nothing — reads
+    /// as "yes": refusing on missing information would break a working
+    /// install.
+    pub fn supports(&self, kind: &str) -> bool {
+        if self.modes.is_empty() {
+            return true;
+        }
+        let wanted = if kind == "video" { "vid_gen" } else { "img_gen" };
+        self.modes.iter().any(|m| m == wanted)
+    }
 }
 
 /// One row of `media_jobs` — mirrors `server/src/media.rs`'s `MediaJobOut`.

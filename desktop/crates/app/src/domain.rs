@@ -290,12 +290,18 @@ pub fn err_string<T>(r: agent_platform_client::Result<T>) -> Result<T, String> {
     r.map_err(|e| e.to_string())
 }
 
-/// Model weights on disk, GB above a gigabyte and MB below. Shared by Model ops
-/// and the Ollama provider dialog, which list the same models.
+/// A size on disk: TB, GB or MB, whichever leaves a number you can read.
+///
+/// Shared by Model ops, the Ollama provider dialog and the machine meters. The
+/// TB arm is the meters' — model weights never reach it, but a volume does, and
+/// "1514.6 GB free" is a figure you have to divide before it means anything.
 pub fn format_size(bytes: i64) -> String {
     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const TB: f64 = GB * 1024.0;
     let b = bytes as f64;
-    if b >= GB {
+    if b >= TB {
+        format!("{:.1} TB", b / TB)
+    } else if b >= GB {
         format!("{:.1} GB", b / GB)
     } else {
         format!("{:.0} MB", b / (1024.0 * 1024.0))

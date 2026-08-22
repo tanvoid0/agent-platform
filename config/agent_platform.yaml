@@ -15,8 +15,10 @@ env:
   # You may instead set a LAN IP here (e.g. LM Studio "Serve on Local Network") — no rewrite needed.
   OLLAMA_API_BASE: "http://127.0.0.1:11434"
   LM_STUDIO_API_BASE: "http://127.0.0.1:1234"
-  # Embedded OpenAI-compatible proxy default when clients omit model / YAML has no defaults block.
-  DEFAULT_PROVIDER: "ollama"
+  # `local` is the managed llama-server the daemon fetches and runs itself
+  # (ADR 0012) — LOCAL_MODEL_PATH picks the GGUF, LOCAL_API_BASE where it binds.
+  # Falls back to Ollama (still a first-class provider) when local is unavailable.
+  DEFAULT_PROVIDER: "local"
 
   # Internal HTTP timeout to the embedded LLM proxy (seconds); aligns with long Ollama generations.
   AGENT_PLATFORM_ORCHESTRATOR_TIMEOUT_SECONDS: 600

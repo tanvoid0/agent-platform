@@ -508,8 +508,17 @@ impl Shell {
             .env("CONFIG_DIR", self.data_dir.join("llm"))
             // A developer's .env must not point a desktop install at someone's
             // Postgres. Present-but-empty wins, because load_dotenv does not override.
-            .env("DATABASE_URL", "")
-            .stdin(Stdio::piped())
+            .env("DATABASE_URL", "");
+        // The GGUF the daemon's `local` provider runs, through the
+        // `llama-server` it manages itself (ADR 0012). Empty path is omitted so
+        // a headless LOCAL_MODEL_PATH in the parent environment still reaches
+        // the child.
+        let settings = Settings::load(&self.data_dir);
+        if !settings.local_model_path.trim().is_empty() {
+            cmd.env("LOCAL_MODEL_PATH", settings.local_model_path.trim());
+            cmd.env("LOCAL_N_CTX", settings.local_n_ctx.to_string());
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(windows)]

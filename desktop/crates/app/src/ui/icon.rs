@@ -111,6 +111,11 @@ icons! {
     Terminal => terminal,
     Inbox => inbox,
     Bell => bell,
+
+    // machine resources (Settings -> Performance)
+    Database => database,
+    HardDrive => hard_drive,
+    ArrowDownUp => arrow_down_up,
 }
 
 /// Icon inheriting the surrounding widget's text color (buttons, nav items).

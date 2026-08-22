@@ -12,7 +12,7 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["ollama", "gemini", "lm_studio", "aimlapi"],
+          "enum": ["local", "ollama", "gemini", "lm_studio", "aimlapi", "anthropic"],
           "description": "Default backend when the client omits model or uses an unlisted raw id."
         },
         "model": {
@@ -32,7 +32,7 @@
         "properties": {
           "name": {
             "type": "string",
-            "enum": ["ollama", "gemini", "lm_studio", "aimlapi"],
+            "enum": ["local", "ollama", "gemini", "lm_studio", "aimlapi", "anthropic"],
             "description": "Upstream provider for all models in this block."
           },
           "models": {

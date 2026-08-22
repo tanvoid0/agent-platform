@@ -36,6 +36,7 @@ than died, is the section below.
 | Auth, tokens | `auth.rs` (verification, `last_used_at`), `api_tokens.rs` (the CRUD) — see `docs/workspace-tenancy-plan.md` |
 | Processes / orchestrator | `{processes,executor,dag_schema}.rs` — the DAG executor and all eleven process routes |
 | LLM proxy, BYOK, providers | `llm.rs` (routes), `llm_config.rs`, `byok.rs`, `provider_catalog.rs`, `model_capabilities.rs`, `model_catalog.rs`, `upstream_http.rs`, `usage.rs`; admin surface in `llm_admin.rs`, `config.yaml` validation in `config_schema.rs` |
+| Local model (provider `local`) | `llm_llama_process.rs` (fetch/launch/log/stop `llama-server`) over `managed_server.rs` (the mechanism it shares with sd-server); desktop Settings → Status card in `screen.rs` ([ADR 0012](docs/adr/0012-managed-llama-server.md)) |
 | Assistant "E.V." + planning chat | `{assistant,assistant_turn,clarifying_form}.rs`; desktop `assistant.rs`/`assistant_view.rs` + `stt.rs`, and `agenda.rs`/`agenda_view.rs` (board) + `agenda_chat.rs`/`agenda_chat_view.rs` (chat pane) |
 | Chat | `{chat,chat_usage,chat_thread_title,context_budget}.rs` |
 | Coder agent | `{coder,coder_loop,coder_tools}.rs`; desktop `coder.rs` (one session) + `coder_board.rs` (N of them) + `coder_view.rs` + `coder_tools.rs` (the desktop-side executor) + `coder_notes.rs` + `coder_git.rs` (checkpoints) + `coder_files.rs` (tree, viewer) + `coder_term.rs` (PTY terminal) |
@@ -44,9 +45,9 @@ than died, is the section below.
 | Teams, projects | `teams.rs`, `projects.rs` |
 | Workspaces, files, documents | `workspaces.rs`, `workspace_files.rs`, `documents.rs` (upload ingest + PDF extraction) |
 | Model ops (Ollama, registry, build jobs) | `model_ops.rs` — all seventeen routes and the stage runner; the pipeline itself is `worker/model_ops/pipeline/` |
-| Image/video generation (ComfyUI) | `media.rs` + `media_templates/*.json`; desktop `studio.rs`/`studio_view.rs` ([ADR 0009](docs/adr/0009-local-media-generation.md)) |
+| Image/video generation | `media.rs` (the seam + the ComfyUI adapter) + `media_templates/*.json`, `media_sdcpp.rs` (the sd-server adapter) + `media_sdcpp_process.rs` (its lifecycle, over `managed_server.rs`); desktop `studio.rs`/`studio_view.rs` ([ADR 0009](docs/adr/0009-local-media-generation.md), [ADR 0011](docs/adr/0011-stable-diffusion-cpp-media-backend.md)) |
 | Logs, status | `observability.rs` (the ring `logd!` writes to), `system.rs` (`/system/status`, `/system/logs`) |
-| Resource modes, AI-call priority | `resources.rs` (`Limits`, the two lanes, `/system/resources`); gated at `llm::complete_internal` and `llm::chat_completions`; desktop Settings → Performance and the sidebar monitor in `screen.rs` ([ADR 0010](docs/adr/0010-resource-modes-and-ai-call-priority.md)) |
+| Resource modes, AI-call priority, machine meters | `resources.rs` (`Limits`, the two lanes, the host/GPU sampler, `/system/resources`); gated at `llm::complete_internal` and `llm::chat_completions`; desktop Settings → Performance (`machine_view` in `screen.rs`) and the sidebar monitor ([ADR 0010](docs/adr/0010-resource-modes-and-ai-call-priority.md)) |
 | Env seeding, correlation ids | `dotenv.rs`, `request_id.rs` |
 | Shared shapes | `wire.rs`, `error.rs` |
 | Desktop HTTP/SSE client | `desktop/crates/client/` (`enums.rs` is hand-maintained now — the generator went with `app/shared_enums.py`) |
@@ -92,6 +93,214 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
   `GET /processes/{id}`. Desktop gates its detail polling on the stream.
 
 ## Backlog
+
+- **Settings → Performance shows the machine, not just the knob — landed 2026-08-22.**
+  The page had one meter (background model calls against the lane's limit) and
+  said nothing about the desktop it was bounding. It now opens with four dials —
+  CPU, memory, GPU, disk — a bar per logical core, and bar rows for swap, VRAM
+  and `agent-platformd`'s own slice.
+  - **`resources.rs` grew a sampler.** `sysinfo` (system + disk features) for
+    CPU/memory/swap/disk/process, `nvml-wrapper` for NVIDIA GPUs. Both are
+    sampled inside `spawn_blocking` on the `GET`/`PUT` the desktop was already
+    making — no timer, no thread, same reason the sidebar monitor never had one.
+    The `System` is a process-wide `OnceLock` because CPU percent is a diff
+    against the previous refresh, primed once with a 200 ms sleep so the first
+    reading is not a misleading 0%.
+  - **GPU is NVIDIA-only and that is the decision.** `nvml-wrapper` `dlopen`s
+    the driver's own library, so nothing in the build depends on a GPU and a
+    machine without one reports an empty list. ROCm SMI and Level Zero are two
+    more SDKs for one meter, neither testable here.
+  - **Disk is the volume the workspaces are on**, picked by longest matching
+    mount point, not a sum across every mount — a total across disks is a number
+    no path is on.
+  - **New kit widgets**: `ui::dial` (canvas, 270° arc, the only canvas here),
+    `ui::gauge`/`gauge_row` (proportional bar, where `ui::meter`'s cells are for
+    counts), `ui::core_bars`. `domain::format_size` gained a TB arm for volumes.
+  - **Agents read it through `api_get`** — the path is listed in that tool's
+    description in `assistant_tools.rs`; no new tool, the REST surface was
+    already the tool.
+- **Provider `local` is a managed `llama-server` — landed 2026-08-22.**
+  [ADR 0012](docs/adr/0012-managed-llama-server.md). The question behind it was
+  "shouldn't the LLM server run internally like the dedicated server, with its
+  own logs — same as the image/video one?", and the answer was that the image
+  one already did and the LLM one did not. `local` used to mean llama.cpp linked
+  in behind `--features local-llm`, off by default, with no log surface and no
+  lifecycle; in practice a local model meant an Ollama the user installed.
+  - **`managed_server.rs` is the shared mechanism.** Pinned GitHub release,
+    `.part` download, unpack, walk for the executable, spawn with stderr drained
+    into the `logd!` ring, health-wait that watches the child, bounded stderr
+    tail that becomes the error, loopback-only management, Windows job object.
+    `media_sdcpp_process.rs` moved onto it and lost 440 lines; policy stayed
+    behind (sd-server restarts on a modality change, llama-server on a model
+    change).
+  - **`llm_llama_process.rs` is the llama policy.** Pin `b10549`, Vulkan asset
+    (35 MB), `LOCAL_MODEL_PATH`/`LOCAL_N_CTX` → `-m -c -ngl 999 --jinja -a`,
+    `LOCAL_API_BASE` default `http://127.0.0.1:18412`, idle stop at
+    `LOCAL_LLM_IDLE_SECS` (600).
+  - **`ChatDest` is gone.** `local` resolves to an upstream URL like Ollama
+    does, so streaming, retries, usage normalisation and the capability guard
+    are the same code. `llm_local.rs` and the server's `local-llm`/`cuda`
+    features are deleted — the daemon compiles no C++ now.
+  - **The Settings card configures every build.** GGUF picker, Hugging Face
+    downloader and context box are unconditional (they set what the daemon
+    loads); only the VRAM and last-turn rows stay behind the app's `local-llm`
+    feature. ADR 0006's in-process engine is untouched for the app's own chat.
+  - **Driven end to end**, not only unit-tested. The ADR's *driven run* section
+    has the detail: the daemon fetched b10549 on the first `local` turn and
+    answered with that tag in `system_fingerprint`; nineteen `[llama-server]`
+    lines landed in `GET /system/logs` beside `[sd-server]`'s; the query was
+    sent from E.V. in the app, not curl; killing the daemon reaped both
+    children; and one Studio image came out of ComfyUI and one out of an
+    `sd-server` this daemon fetched and drove to `ready`.
+  - **Known, and not caused by this change:** a local turn on a card someone
+    else is filling runs at CPU speed with nothing in the ring to say why
+    (llama.cpp fits params to free VRAM silently; `-lv 4` shows it and costs
+    ~200 lines a load), and a turn slower than 300 s trips the proxy's upstream
+    read timeout — the same ceiling a slow Ollama has always had.
+
+- **stable-diffusion.cpp as a second media backend — seam landed 2026-08-21.**
+  [ADR 0011](docs/adr/0011-stable-diffusion-cpp-media-backend.md), which amends
+  ADR 0009. `MEDIA_BACKEND` picks between ComfyUI (default, unchanged) and
+  **`sd-server`**, the HTTP server that ships in stable-diffusion.cpp's release
+  zips. New `media_sdcpp.rs`; `media.rs` keeps every route, the row, the waiter
+  and the file writer.
+
+  **Two facts in ADR 0009 were wrong, and both were load-bearing.** ComfyUI is
+  **GPL-3.0**, not Apache-2.0 — which does not affect loopback HTTP but does
+  affect ever shipping it. And "sd.cpp does images but not video" was a year out
+  of date: Wan 2.1/2.2 landed September 2025, LTX-2.3 in May 2026, MiniMax-H3
+  this month. Both are marked inline in ADR 0009 rather than quietly edited.
+
+  The comparison that flipped it: **39 MB** (Vulkan build) or 336 MB (CUDA)
+  of MIT-licensed native binary, versus ≈3.5 GB of GPL-3.0 Python and torch,
+  for the same two modalities. Weights are gigabytes either way; what changes is
+  whether a whole interpreter rides along, and whether we would be the ones
+  distributing it.
+
+  - **The seam is three functions, not a trait.** An adapter answers `Poll::{
+    Pending, Done{bytes, file_name}, Failed}`. `Done` carries **bytes** because
+    that is exactly where the backends differ — ComfyUI names a file to fetch
+    from `/view`, sd-server returns base64 in the poll body — so there is one
+    function that writes a finished file, not two. `watch_job` lost its ComfyUI
+    specifics in the process and got shorter.
+  - **Sampling parameters are deliberately not sent.** sd-server applies the
+    defaults for whatever model it loaded. A distilled model wants `txt_cfg` 1.0
+    and ~8 steps, a full one 3.5 and ~28; pinning either would silently wreck
+    the other class. Asserted by the integration test, which checks
+    `sample_params` is *absent*.
+  - **`POST /v1/images/generations` stops answering 501 — with no adapter.**
+    sd-server serves that exact OpenAI-shaped route at the same base, so
+    `image_api_base()` falls back to the media base when the backend is `sdcpp`
+    and the existing capability registry in `llm.rs` does the rest. ComfyUI gets
+    no such fallback; a node graph would 404 an OpenAI client. That is the
+    "serve our own open-source image API" half of the ask, in five lines.
+  - **`GET /status` grew `backend` and `modes`.** sd-server binds one model at
+    startup and reports which modes it supports, so "this install cannot do
+    video right now" is answerable before a job is submitted rather than minutes
+    into one. `MediaStatus::supports` reads an empty list as "yes" so an older
+    server is not mistaken for a broken one.
+  - **Tests:** six unit tests in `media_sdcpp.rs` (b64 decode, the empty-result
+    case that would otherwise hang until the hour deadline, error extraction)
+    plus `tests/media_sdcpp_routes.rs`, the whole lifecycle against a stub
+    sd-server. Its **own** test binary, not a second test in `media_routes.rs`:
+    both drive the module through the `MEDIA_*` process environment and
+    `MEDIA_BACKEND` is precisely what they would fight over.
+
+  ### … next steps
+
+  1. ~~Lifecycle~~ — **landed 2026-08-21**, see the entry below.
+  2. ~~Model acquisition~~ — **landed 2026-08-21**, see below.
+  3. **A/B the video quality on the 5080, then flip the default.** There are
+     open complaints upstream about Wan output in sd.cpp. `--rng cpu` exists to
+     match ComfyUI's RNG, which is what makes the comparison meaningful. The
+     default does not move on a spec sheet.
+  4. ~~Desktop~~ — **landed 2026-08-21**. The Studio backend card speaks sd.cpp:
+     each `backend_stage` renders as a sentence (no model, setting up, loading,
+     idle, failed, external) with the backend's own words underneath on a
+     failure. Before this an sdcpp user saw *"ComfyUI is not running"* and a
+     **Get ComfyUI** button — pointing at the wrong app while the server was
+     busy fetching the right one. A second card covers the selected kind the
+     loaded model cannot serve. **Both are sentences, not greyed-out controls**:
+     a dead toggle with no reason is worse than a live one with an explanation,
+     and generating swaps the model rather than failing.
+
+  ### sd-server lifecycle — landed 2026-08-21
+
+  `media_sdcpp_process.rs`: fetch the pinned release, unpack, spawn,
+  health-wait, reap, stop when idle. The user installs nothing. `GET
+  /media/status` grew `backend_stage` (`external` | `unconfigured` |
+  `not_installed` | `downloading` | `extracting` | `starting` | `ready` |
+  `stopped` | `failed`) and a one-sentence `backend_detail`, so the screen can
+  distinguish "downloading" from "not installed" — both are `reachable: false`.
+
+  **Two things were wrong until they were measured against the real binary.**
+
+  - **`tar` is a PATH gamble on Windows.** bsdtar in `System32` reads zip; GNU
+    tar (git-bash, MSYS) does not — verified on this exact release zip, where
+    GNU tar 1.35 answers *"This does not look like a tar archive"*. Now named by
+    absolute path, `unzip` elsewhere.
+  - **A bad model path kills sd-server in under a second.** Polling the port
+    alone would have burned the full 300 s start timeout on a typo. `health_wait`
+    watches the child, and quotes its `[ERROR]` lines — preferred over the raw
+    tail, which is six lines of Vulkan banner that would put a graphics card in
+    front of a file error. Measured end to end: **2.5 s**, with sd-server's own
+    reason in the 502.
+
+  Also confirmed on the real 38.8 MB Vulkan zip: it unpacks **flat**
+  (`sd-server.exe` plus thirteen DLLs, `ggml-vulkan.dll` alone 50 MB), which is
+  why the child runs with `current_dir` set to the install directory; and
+  `--listen-ip` / `--listen-port` are real flags with 1234 as the default port.
+
+  **Model flags are `MEDIA_SDCPP_ARGS`, not a table in the crate** — families
+  need different ones (`-m` vs `--diffusion-model` + `--vae` + `--llm`) and
+  upstream adds families weekly, so a table here would be our own treadmill.
+  Unset is a named state with an actionable error, never a silent 39 MB download
+  that arrives at the same error.
+
+  Tests: 13 unit, plus `tests/media_sdcpp_spawn.rs` — ignored, gated on
+  `AGENT_PLATFORM_TEST_SDSERVER=<path>`, the same shape as the local-inference
+  check. It pins the fail-fast path against a **real** sd-server; the success
+  path needs multi-gigabyte weights no test should download.
+
+  ### Model catalogue — landed 2026-08-21
+
+  `GET /api/v1/media/models` lists what is worth having, what it costs and
+  what is on disk; `POST /api/v1/media/models/{id}/install` fetches the missing
+  files. Two entries, one per modality: **Z-Image Turbo** (6.7 GB across three
+  files) and **Wan 2.2 TI2V 5B** (18 GB, the same files ComfyUI's template uses).
+
+  **The table fills the launch args; it is not a second way to launch.** That
+  distinction is why `media_sdcpp_process.rs` still knows nothing about model
+  families: a stale entry costs a catalogue row, not the feature, because
+  `MEDIA_SDCPP_ARGS` still overrides everything. And **the files on disk are the
+  state** — no setting to persist, no `.env` write. Install the weights and the
+  next generate launches with them.
+
+  - **Every URL is ungated, checked rather than assumed.** sd.cpp's own Z-Image
+    doc links FLUX.1-schnell for the VAE; that repo answers **401** without a
+    token, so the Comfy-Org repackage of the same file is used instead. A
+    catalogue entry that walks the user into an auth wall is not an entry.
+  - **Sizes are real `content-length` values** from the HuggingFace API, so the
+    confirm step can say what it is about to spend.
+  - **Installed means size-matched, not present.** A half-written file from a
+    killed download would otherwise read as installed and fail at model load.
+  - **A kind change is a restart.** One model per process, so an image server
+    cannot answer `vid_gen`; `ensure_running` compares the wanted args against
+    what the running child was launched with.
+
+  **Two bugs the tests caught, both mine.** The first: asserting catalogue extra
+  args come in flag/value pairs — wrong, because sd-server mixes value flags
+  (`--cfg-scale 1.0`) with boolean ones (`--diffusion-fa`, `--vae-tiling`), so
+  the assertion failed on correct data. The second was worse and is the reason
+  the route test exists: requiring launch arguments *before* probing turned an
+  already-running, perfectly working backend into a 502, because nothing had
+  told us which model to start when nothing needed starting. **A reachable
+  server needs no launch args at all.**
+
+  **Not done, and deliberately:** weights are still the user's job on both
+  backends, there is no curated per-family table filling `MEDIA_SDCPP_ARGS`
+  yet, and ComfyUI is **kept** rather than replaced — it carries an ecosystem
+  sd.cpp does not, and new architectures reach it first.
 
 - **Resource modes and AI-call priority — landed 2026-08-19.**
   [ADR 0010](docs/adr/0010-resource-modes-and-ai-call-priority.md).
@@ -146,9 +355,10 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
   this machine* — but it is **macOS only**. Driven here: `/api/generate`
   answers `"image generation models are not currently supported"` and there is
   no `/v1/images/generations` route at all. LM Studio does not generate.
-  sd.cpp does images but not video. ComfyUI is the only backend that does both
-  on Windows today, and its HTTP API (`/prompt`, `/history/{id}`, `/view`) is
-  the whole integration. When Ollama's Windows support lands it slots in behind
+  ComfyUI's HTTP API (`/prompt`, `/history/{id}`, `/view`) is the whole
+  integration. (This entry originally said "sd.cpp does images but not video.
+  ComfyUI is the only backend that does both on Windows today" — **wrong on
+  both counts**; see ADR 0011 and the entry above.) When Ollama's Windows support lands it slots in behind
   the **already existing** `/v1/images/generations` capability registry in
   `llm.rs` — which is why that route was left alone rather than extended: it is
   synchronous, image-only and base64-in-JSON, and forcing video jobs through it
@@ -859,7 +1069,11 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
   `POST /llm-proxy/config-yaml`, and `system_routes`. **Next steps are listed
   below.**
 - **In-process inference** — [ADR 0006](docs/adr/0006-in-process-rust-core.md):
-  link llama.cpp into the desktop binary instead of shelling out to Ollama. The
+  link llama.cpp into the desktop binary instead of shelling out to Ollama.
+  **Half of this was superseded on 2026-08-22 by
+  [ADR 0012](docs/adr/0012-managed-llama-server.md):** the *server* side is a
+  managed `llama-server` subprocess now, and the in-process engine is the
+  desktop app's own chat alone. The steps below are still the app's. The
   full Rust port was reviewed and rejected; the server stays Python. The Phase 0
   spike (`desktop/spike-llama/`) is **answered and closed**: with CUDA Toolkit
   13.3 installed, `llama-cpp-2` builds on Windows and runs 123.5 tok/s against

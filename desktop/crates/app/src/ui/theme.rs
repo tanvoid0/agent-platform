@@ -338,6 +338,39 @@ pub fn meter_cell(tone: Tone, on: bool) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// The empty half of a [`crate::ui::gauge`] or [`crate::ui::core_bars`] bar.
+/// Neutral, not a tinted version of the fill: the track has to read as "this is
+/// how much there is" at every tone, including the red one.
+pub fn gauge_track(corner: f32) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        container::Style {
+            background: Some(Background::Color(track_color(&tokens(theme)))),
+            border: Border { radius: corner.into(), ..Border::default() },
+            ..container::Style::default()
+        }
+    }
+}
+
+/// The unfilled part of any meter, bar or dial. One definition so a dial's arc
+/// and the bar under it sit on the same grey — two hand-tuned alphas is how the
+/// same page ends up with two greys nobody chose.
+pub(crate) fn track_color(t: &Tokens) -> Color {
+    alpha(t.muted_foreground, if t.dark { 0.14 } else { 0.12 })
+}
+
+/// The filled half. Takes the track's radius, so a full bar and an empty
+/// one have the same silhouette and only the colour moves.
+pub fn gauge_fill(tone: Tone, corner: f32) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let t = tokens(theme);
+        container::Style {
+            background: Some(Background::Color(tone_color(&t, tone))),
+            border: Border { radius: corner.into(), ..Border::default() },
+            ..container::Style::default()
+        }
+    }
+}
+
 /// [`badge`] that is a button — a trace id in a log row, which filters to its
 /// request when clicked.
 pub fn badge_button(tone: Tone) -> impl Fn(&Theme, button::Status) -> button::Style {

@@ -1,1 +1,2 @@
 docker/*.sh text eol=lf
+desktop/crates/server/migrations/**/*.sql text eol=lf

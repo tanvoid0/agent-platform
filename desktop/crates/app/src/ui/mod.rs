@@ -13,8 +13,8 @@ pub mod icon;
 pub mod theme;
 
 use iced::widget::{
-    button, column, container, row, rule, scrollable, space as space_widget, text, text_input,
-    Column, Row,
+    button, canvas, column, container, row, rule, scrollable, space as space_widget, text,
+    text_input, Column, Row,
 };
 use iced::{Element, Length, Padding};
 
@@ -699,6 +699,277 @@ fn meter_cells(filled: usize, total: usize) -> Option<(usize, usize)> {
     Some((cells, if total <= MAX_CELLS { filled } else { (filled * cells).div_ceil(total) }))
 }
 
+/// A continuous bar for a ratio, where [`meter`] draws cells for a count.
+///
+/// The distinction is what the number *is*. "3 of 8 calls" has three real things
+/// in it and reads best as three lit blocks; 61% of memory has no things in it
+/// at all, and rounding it into ten cells answers a question nobody asked. So
+/// this is one rounded track with a rounded fill, sized by `Length::FillPortion`
+/// — no canvas, no per-frame work, the same two quads whatever the value.
+///
+/// `fraction` is clamped to 0–1; anything above zero draws at least a sliver, or
+/// a machine at 0.2% is indistinguishable from a machine nobody sampled.
+pub fn gauge<'a, M: 'a>(fraction: f32, tone: Tone) -> Element<'a, M> {
+    gauge_sized(fraction, tone, GAUGE_HEIGHT)
+}
+
+/// [`gauge`]'s track height. Thicker than [`meter`]'s 4px cells because this one
+/// is a page's headline number rather than a sidebar footnote.
+const GAUGE_HEIGHT: f32 = 8.0;
+
+/// Scale for the `FillPortion` split. 1000 makes a 0.1% step visible on a wide
+/// card without the rounding showing up as a jump.
+const GAUGE_SCALE: u16 = 1000;
+
+fn gauge_sized<'a, M: 'a>(fraction: f32, tone: Tone, height: f32) -> Element<'a, M> {
+    let lit = gauge_portion(fraction);
+    let mut bar = Row::new();
+    if lit > 0 {
+        bar = bar.push(
+            container(space_widget::vertical().height(height))
+                .width(Length::FillPortion(lit))
+                .style(theme::gauge_fill(tone, theme::radius::PILL)),
+        );
+    }
+    if lit < GAUGE_SCALE {
+        // A zero-portion child would divide the row's width by zero, so the
+        // empty half is pushed only when there is an empty half.
+        bar = bar.push(space_widget::horizontal().width(Length::FillPortion(GAUGE_SCALE - lit)));
+    }
+    container(bar).width(Length::Fill).height(height).style(theme::gauge_track(theme::radius::PILL)).into()
+}
+
+/// `fraction` as a `FillPortion` share of [`GAUGE_SCALE`].
+///
+/// The `max(12)` is the sliver rule: a real-but-tiny reading must still be
+/// visible, because a bar that rounds 0.4% down to nothing makes "barely busy"
+/// and "not measured" look identical. Exactly zero still draws an empty track.
+fn gauge_portion(fraction: f32) -> u16 {
+    if !fraction.is_finite() || fraction <= 0.0 {
+        return 0;
+    }
+    let raw = (fraction.min(1.0) * GAUGE_SCALE as f32).round() as u16;
+    raw.max(12).min(GAUGE_SCALE)
+}
+
+/// One thin vertical bar per core — the strip under the CPU gauge.
+///
+/// Worth its own widget because the average hides the shape: eight cores at 12%
+/// and one core pinned with seven idle are the same 12% and very different
+/// machines, and the second one is what a stuck single-threaded job looks like.
+pub fn core_bars<'a, M: 'a>(usage: &[f32], tone: Tone) -> Element<'a, M> {
+    const HEIGHT: f32 = 34.0;
+    if usage.is_empty() {
+        return space_widget::horizontal().into();
+    }
+    Row::with_children(usage.iter().map(|u| {
+        let lit = gauge_portion(u / 100.0);
+        let mut col = Column::new();
+        // Grown from the bottom, so the strip reads as a bar chart rather than
+        // as a column of blocks that happen to be different lengths.
+        if lit < GAUGE_SCALE {
+            col = col.push(space_widget::vertical().height(Length::FillPortion(GAUGE_SCALE - lit)));
+        }
+        if lit > 0 {
+            col = col.push(
+                container(space_widget::horizontal().width(Length::Fill))
+                    .height(Length::FillPortion(lit))
+                    .style(theme::gauge_fill(tone, theme::radius::SM)),
+            );
+        }
+        container(col.height(Length::Fill))
+            .width(Length::Fill)
+            .height(HEIGHT)
+            .style(theme::gauge_track(theme::radius::SM))
+            .into()
+    }))
+    .spacing(2.0)
+    .height(HEIGHT)
+    .into()
+}
+
+/// A labelled [`gauge`]: name on the left, value on the right, bar underneath,
+/// and an optional line of detail below that.
+///
+/// The value is `mono` so a column of these does not jitter as digits change
+/// width — the meter is meant to be watched, and text that reflows while you
+/// watch it reads as the number changing more than it did.
+pub fn gauge_row<'a, M: 'a>(
+    label: impl text::IntoFragment<'a>,
+    value: impl text::IntoFragment<'a>,
+    fraction: f32,
+    tone: Tone,
+    note: Option<Element<'a, M>>,
+) -> Element<'a, M> {
+    let mut col = column![
+        row![
+            text(label).size(font::XS).width(Length::Fill).style(theme::text_muted),
+            mono_toned(value, tone),
+        ]
+        .spacing(space::SM)
+        .align_y(iced::Alignment::Center),
+        gauge(fraction, tone),
+    ]
+    .spacing(space::XS);
+    if let Some(note) = note {
+        col = col.push(note);
+    }
+    col.into()
+}
+
+/// `0-1` as a whole-number percent. Whole numbers on purpose: a decimal place on
+/// a figure that is resampled every few seconds is precision the sample does not
+/// have, and it makes the tile flicker.
+pub fn percent(fraction: f32) -> String {
+    if !fraction.is_finite() {
+        return "--".to_string();
+    }
+    format!("{}%", (fraction.clamp(0.0, 1.0) * 100.0).round())
+}
+
+/// `used / total` as a fraction, with the divide-by-zero answered rather than
+/// produced. A total of zero is a real state here — swap turned off — and the
+/// caller draws it as "off", so it must not arrive as `NaN`.
+pub fn fraction_of(used: u64, total: u64) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (used as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// A radial gauge: a 270° arc with the percentage in the middle of it.
+///
+/// The one widget here that is worth a canvas. [`gauge`]'s bar answers "how full
+/// is this" in a row of many; a dial answers "how hard is this machine working"
+/// as the thing you look at first, and the arc's sweep reads at a glance from
+/// across a desk in a way a 6px bar does not. Cost is one geometry per redraw of
+/// a widget that changes every 5–20 s, which is why the *rows* below it are
+/// still bars — a dial per number would be a page of clocks.
+///
+/// Opening at the bottom, which is where a dial's opening goes; the arc runs
+/// clockwise from lower-left, and the canvas's y-down axis is what makes an
+/// increasing angle turn that way.
+pub fn dial<'a, M: 'a>(fraction: f32, tone: Tone) -> Element<'a, M> {
+    canvas(Dial { fraction, tone }).width(DIAL_SIZE).height(DIAL_SIZE).into()
+}
+
+const DIAL_SIZE: f32 = 116.0;
+const DIAL_STROKE: f32 = 10.0;
+/// Lower-left, in canvas radians (y down, so this points down and to the left).
+const DIAL_START: f32 = std::f32::consts::PI * 0.75;
+/// 270°, leaving the quarter at the bottom open.
+const DIAL_SWEEP: f32 = std::f32::consts::PI * 1.5;
+
+struct Dial {
+    fraction: f32,
+    tone: Tone,
+}
+
+impl<M> canvas::Program<M> for Dial {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &iced::Renderer,
+        theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let t = theme::tokens(theme);
+        let color = theme::tone_color(&t, self.tone);
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let center = iced::Point::new(bounds.width / 2.0, bounds.height / 2.0);
+        // Inset by half the stroke, or the round caps clip against the bounds.
+        let radius = (bounds.width.min(bounds.height) - DIAL_STROKE) / 2.0 - 1.0;
+        let arc = |end: f32| {
+            canvas::Path::new(|p| {
+                p.arc(canvas::path::Arc {
+                    center,
+                    radius,
+                    start_angle: iced::Radians(DIAL_START),
+                    end_angle: iced::Radians(end),
+                })
+            })
+        };
+        let stroke = |c: iced::Color| {
+            canvas::Stroke::default()
+                .with_color(c)
+                .with_width(DIAL_STROKE)
+                .with_line_cap(canvas::LineCap::Round)
+        };
+
+        frame.stroke(
+            &arc(DIAL_START + DIAL_SWEEP),
+            stroke(theme::track_color(&t)),
+        );
+        if self.fraction.is_finite() && self.fraction > 0.0 {
+            // The floor is the round cap's own width: below it the value arc is
+            // a dot that reads as an artefact rather than as a reading.
+            let filled = self.fraction.clamp(0.0, 1.0).max(0.015);
+            frame.stroke(&arc(DIAL_START + DIAL_SWEEP * filled), stroke(color));
+        }
+        frame.fill_text(canvas::Text {
+            content: percent(self.fraction),
+            position: center,
+            color,
+            size: 24.0.into(),
+            font: font::SEMIBOLD,
+            align_x: iced::alignment::Horizontal::Center.into(),
+            align_y: iced::alignment::Vertical::Center,
+            ..canvas::Text::default()
+        });
+        vec![frame.into_geometry()]
+    }
+}
+
+/// A [`dial`] with its name and one line of detail: the page's headline unit.
+pub fn dial_tile<'a, M: 'a>(
+    glyph: Icon,
+    label: &'a str,
+    fraction: f32,
+    note: impl text::IntoFragment<'a>,
+) -> Element<'a, M> {
+    let tone = load_tone(fraction);
+    container(
+        column![
+            row![
+                glyph.glyph().size(font::XS).style(theme::text_tone(tone)),
+                text(label).size(font::XS).style(theme::text_muted),
+            ]
+            .spacing(space::XS)
+            .align_y(iced::Alignment::Center),
+            dial(fraction, tone),
+            text(note).size(font::XS).style(theme::text_muted),
+        ]
+        .spacing(space::SM)
+        .align_x(iced::Alignment::Center),
+    )
+    .padding(space::MD)
+    .width(Length::Fill)
+    .style(theme::card)
+    .into()
+}
+
+/// The tone a load reads at. Green until the machine has real headroom gone,
+/// amber where another job would start to hurt, red where it already does.
+///
+/// Not a warning system — nothing here is broken at 95% CPU, it is a machine
+/// doing what it was told. The colour is the same "how loud" scale the resource
+/// tiers use, one step further along.
+pub fn load_tone(fraction: f32) -> Tone {
+    if !fraction.is_finite() {
+        Tone::Neutral
+    } else if fraction >= 0.90 {
+        Tone::Danger
+    } else if fraction >= 0.70 {
+        Tone::Warning
+    } else {
+        Tone::Success
+    }
+}
+
 /// Braille dots — the classic CLI spinner, cycled by an ever-incrementing
 /// frame counter (see `coder::Message::AnimTick`). Text, not an icon glyph: it
 /// draws in any monospace font, so it costs nothing beyond what [`badge_icon`]
@@ -1165,7 +1436,7 @@ fn empty_state_body<'a, M: 'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::meter_cells;
+    use super::{fraction_of, gauge_portion, meter_cells, percent, GAUGE_SCALE};
 
     #[test]
     fn the_meter_stays_countable_and_never_hides_live_work() {
@@ -1182,5 +1453,30 @@ mod tests {
         assert_eq!(meter_cells(9, 4), Some((4, 4)));
         // Nothing to draw is nothing drawn, not an empty track.
         assert_eq!(meter_cells(0, 0), None);
+    }
+    /// The gauge's two edge cases: a real-but-tiny reading has to be visible, and
+    /// nothing-at-all has to stay an empty track. Between them is the difference
+    /// between "barely busy" and "not measured", which the page draws as the same
+    /// thing if this rounds a sliver away.
+    #[test]
+    fn a_gauge_shows_a_sliver_for_a_live_reading_and_nothing_for_none() {
+        assert_eq!(gauge_portion(0.0), 0, "an idle machine is an empty track");
+        assert_eq!(gauge_portion(1.0), GAUGE_SCALE);
+        assert_eq!(gauge_portion(0.5), GAUGE_SCALE / 2);
+        assert!(gauge_portion(0.0004) >= 12, "0.04% still has to draw");
+        // Out of range at both ends, and the value a divide-by-zero would leave.
+        assert_eq!(gauge_portion(2.0), GAUGE_SCALE);
+        assert_eq!(gauge_portion(-1.0), 0);
+        assert_eq!(gauge_portion(f32::NAN), 0);
+    }
+
+    /// Swap turned off is a total of zero, and it reaches this as a division.
+    #[test]
+    fn a_zero_total_is_answered_rather_than_divided_by() {
+        assert_eq!(fraction_of(0, 0), 0.0);
+        assert_eq!(fraction_of(1, 4), 0.25);
+        assert_eq!(fraction_of(9, 4), 1.0, "used past total clamps rather than overflowing");
+        assert_eq!(percent(0.615), "62%");
+        assert_eq!(percent(f32::NAN), "--");
     }
 }

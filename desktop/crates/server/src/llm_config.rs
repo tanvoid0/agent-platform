@@ -94,6 +94,19 @@ use Modality::{Chat, Embeddings, ImageGeneration, Speech, VisionInput};
 /// SPEECH_PROVIDER_IDS`, which is what Python's capability router sorts — stably
 /// — by `sort_order`, so the two share a preference order for free.
 pub const PROVIDERS: &[ProviderSpec] = &[
+    // `llama-server`, run by this daemon (ADR 0012). Preferred when
+    // LOCAL_MODEL_PATH names a GGUF; Ollama stays below as an explicit
+    // optional upstream for someone who would rather run their own.
+    ProviderSpec {
+        id: "local",
+        api_key_env: None,
+        base_url_env: Some("LOCAL_API_BASE"),
+        label: "Local (llama.cpp)",
+        registry: Registry::Chat,
+        default_model: "local",
+        modalities: &[Chat],
+        sort_order: 0,
+    },
     ProviderSpec {
         id: "ollama",
         api_key_env: None,
@@ -102,7 +115,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         registry: Registry::Chat,
         default_model: "llama3",
         modalities: &[Chat, VisionInput],
-        sort_order: 0,
+        sort_order: 1,
     },
     ProviderSpec {
         id: "lm_studio",
@@ -112,7 +125,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         registry: Registry::Chat,
         default_model: "google/gemma-4-e4b",
         modalities: &[Chat, VisionInput, Embeddings],
-        sort_order: 1,
+        sort_order: 2,
     },
     ProviderSpec {
         id: "aimlapi",
@@ -122,7 +135,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         registry: Registry::Chat,
         default_model: "openai/gpt-4.1-mini",
         modalities: &[Chat, Embeddings],
-        sort_order: 2,
+        sort_order: 3,
     },
     ProviderSpec {
         // Claude's OpenAI-compatible surface has no embeddings endpoint; it does
@@ -134,7 +147,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         registry: Registry::Chat,
         default_model: "",
         modalities: &[Chat, VisionInput],
-        sort_order: 3,
+        sort_order: 4,
     },
     ProviderSpec {
         id: "gemini",
@@ -144,7 +157,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         registry: Registry::Chat,
         default_model: "gemini-2.0-flash",
         modalities: &[Chat, VisionInput, Embeddings],
-        sort_order: 4,
+        sort_order: 5,
     },
     ProviderSpec {
         id: "image_local",
@@ -223,6 +236,23 @@ pub fn from_env_or_dotenv(key: &str) -> String {
     read_env_file().get(key).map(|v| v.trim().to_string()).unwrap_or_default()
 }
 
+/// Where provider `local` is served. Loopback by default, and a loopback base
+/// is the one this daemon manages itself — fetching, launching and stopping
+/// `llama-server` (ADR 0012). Point it at another machine and it becomes an
+/// ordinary upstream we only ever probe.
+///
+/// 18412 rather than 18410 or 18411: the daemon has the first, and the desktop
+/// app's own OpenAI surface has the second.
+pub fn local_api_base() -> String {
+    let explicit = from_env_or_dotenv("LOCAL_API_BASE");
+    let trimmed = explicit.trim();
+    if trimmed.is_empty() {
+        "http://127.0.0.1:18412".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn ollama_api_base() -> String {
     let explicit = from_env_or_dotenv("OLLAMA_API_BASE");
     let base = if explicit.is_empty() { DEFAULT_OLLAMA_BASE } else { &explicit };
@@ -289,13 +319,23 @@ pub fn anthropic_version_header() -> String {
 /// Base URL of the local image service. Empty means not configured — unlike the
 /// chat backends there is no loopback default, so image generation only lights
 /// up once an operator points at something.
+/// The upstream for `POST /v1/images/generations`.
+///
+/// Falls back to the media backend when that backend is `sd-server` (ADR
+/// 0011), which serves an OpenAI-shaped `/v1/images/generations` of its own at
+/// the same base. That fallback is the whole of what makes the route stop
+/// answering 501 on an sd.cpp install — there is no adapter here, because the
+/// two contracts are already the same one. ComfyUI gets no such fallback: its
+/// API is a node graph, and pointing an OpenAI client at it would 404.
 pub fn image_api_base() -> String {
     let base = from_env_or_dotenv("IMAGE_API_BASE");
-    if base.is_empty() {
-        String::new()
-    } else {
-        rewrite_upstream_localhost_for_docker(base.trim_end_matches('/'))
+    if !base.is_empty() {
+        return rewrite_upstream_localhost_for_docker(base.trim_end_matches('/'));
     }
+    if crate::media::media_backend() == crate::media::MediaBackend::Sdcpp {
+        return rewrite_upstream_localhost_for_docker(&crate::media::media_api_base());
+    }
+    String::new()
 }
 
 pub fn image_default_model() -> String {
@@ -339,9 +379,11 @@ pub fn speech_default_format() -> String {
 /// Whether this specific backend's requirements are met.
 fn spec_configured(spec: &ProviderSpec) -> bool {
     match spec.id {
-        // Both local chat backends have a loopback default, so these are always
-        // true — matching Python, where "configured" means "we know a URL to
-        // try", not "something is listening". Reachability is a separate probe.
+        // In-process engine: configured only when a GGUF path resolves (env or
+        // `configure`) *and* this binary was built with `local-llm`.
+        "local" => local_provider_configured(),
+        // Loopback URL defaults — "configured" means we know a URL to try, not
+        // that something is listening. Reachability is a separate probe.
         "ollama" => !ollama_api_base().is_empty(),
         "lm_studio" => !lm_studio_api_base().is_empty(),
         "aimlapi" => !aimlapi_api_key().is_empty(),
@@ -351,6 +393,10 @@ fn spec_configured(spec: &ProviderSpec) -> bool {
         "speech_local" => !speech_api_base().is_empty(),
         _ => true,
     }
+}
+
+fn local_provider_configured() -> bool {
+    crate::llm_llama_process::configured()
 }
 
 /// The *chat*-registry configured check, as `llm.py` calls it.

@@ -43,6 +43,7 @@ const GEMINI_TIMEOUT: Duration = Duration::from_secs(20);
 /// can explain a stale or empty list without guessing.
 fn discovery(provider: &str) -> Value {
     let (primary, fallbacks): (&str, &[&str]) = match provider {
+        "local" => ("local_gguf", &["provider_default"]),
         "ollama" => ("ollama_tags", &["config_aliases", "ui_fallback_models", "provider_default"]),
         "lm_studio" => (
             "lm_studio_models",
@@ -305,6 +306,10 @@ async fn discovered_with_source(
     provider: &str,
 ) -> (Option<Vec<String>>, Option<&'static str>) {
     let (ids, source): (Vec<String>, Option<&'static str>) = match provider {
+        "local" => {
+            let ids = crate::llm_llama_process::model_id().into_iter().collect();
+            (ids, Some("local_gguf"))
+        }
         "ollama" => (ollama_tag_names(http).await, Some("ollama_tags")),
         "lm_studio" => {
             // Both URLs are the same host and port, so probing together costs one
@@ -596,7 +601,7 @@ pub async fn build_admin(http: &reqwest::Client) -> Value {
         // A local backend that is not running has no models, imaginary or
         // otherwise — the alias/UI-fallback/provider-default ladder below exists
         // for a cloud provider having a bad moment, not for "go start the app".
-        let is_local = matches!(*provider, "ollama" | "lm_studio");
+        let is_local = matches!(*provider, "local" | "ollama" | "lm_studio");
         let offline_local = is_local && configured && !discovered_any;
 
         if !offline_local {
@@ -645,7 +650,7 @@ pub async fn build_admin(http: &reqwest::Client) -> Value {
             "id": provider,
             "label": provider_label(provider),
             "configured": configured,
-            "local": matches!(*provider, "ollama" | "lm_studio"),
+            "local": matches!(*provider, "local" | "ollama" | "lm_studio"),
             "capabilities": provider_capabilities(provider),
             "models": {
                 "options": dedupe(options),

@@ -1,15 +1,23 @@
-//! `/api/v1/media/*` — local image and video generation through ComfyUI
-//! (ADR 0009).
+//! `/api/v1/media/*` — local image and video generation (ADR 0009, ADR 0011).
 //!
-//! **ComfyUI is to this module what Ollama is to the chat proxy**: an external
-//! local app the user installs, reached over loopback HTTP
-//! (`MEDIA_API_BASE`, default `http://127.0.0.1:8188`). Nothing is bundled,
-//! spawned or model-managed here — the server owns two checked-in workflow
-//! templates (`media_templates/`), fills in the prompt, size and seed, submits
-//! the graph to ComfyUI's `POST /prompt`, and polls `GET /history/{id}` until
-//! the output file exists. The finished file is copied into the server's own
-//! `media/` data dir, because ComfyUI's output directory is its own business
-//! and may be cleaned behind our back.
+//! **Two backends, one domain.** `MEDIA_BACKEND` selects between them and
+//! `MEDIA_API_BASE` says where it listens:
+//!
+//! - `comfy` (default) — ComfyUI's node-graph API, the original backend
+//!   (ADR 0009). The server owns two checked-in workflow templates
+//!   (`media_templates/`), fills in the prompt, size and seed, submits the
+//!   graph to `POST /prompt`, and polls `GET /history/{id}`.
+//! - `sdcpp` — stable-diffusion.cpp's `sd-server` (ADR 0011), in
+//!   [`crate::media_sdcpp`]. One MIT-licensed native binary, no Python; flat
+//!   parameters instead of a graph, so there is no template to break when a
+//!   node is renamed upstream.
+//!
+//! Either way it is **an external local process reached over loopback**, the
+//! way Ollama is for chat. The seam is deliberately thin: an adapter submits
+//! and answers [`Poll`], and everything else here — the row, the waiter, the
+//! deadline, prompt enhancement, the file route — is shared. The finished file
+//! is copied into the server's own `media/` data dir, because a backend's
+//! output directory is its own business and may be cleaned behind our back.
 //!
 //! **A generation is a job, not a request.** Diffusion runs seconds-to-minutes
 //! (video: minutes), so `POST /generate` answers immediately with a
@@ -62,6 +70,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/v1/media/generate", post(generate))
         .route("/api/v1/media/suggest", get(suggest))
         .route("/api/v1/media/requirements", get(requirements))
+        .route("/api/v1/media/models", get(models))
+        .route("/api/v1/media/models/{model_id}/install", post(install_model))
         .route("/api/v1/media/jobs", get(list_jobs))
         .route("/api/v1/media/jobs/{job_id}", get(get_job))
         .route("/api/v1/media/jobs/{job_id}/file", get(job_file))
@@ -79,15 +89,62 @@ pub fn media_dir() -> PathBuf {
         .unwrap_or_else(|| crate::llm_config::config_dir().join("media"))
 }
 
-/// The ComfyUI base URL. Always present — the default is where ComfyUI listens
-/// out of the box — so "configured" is never the question here; "reachable"
-/// is, and `GET /status` answers it.
+/// Which local generator `MEDIA_API_BASE` points at (ADR 0011).
+///
+/// Two adapters, one domain: everything below the wire — the job row, the
+/// waiter, the file route, prompt enhancement — is shared, and only submit,
+/// poll and probe differ. Keeping ComfyUI is the point rather than an
+/// oversight: it carries an ecosystem sd.cpp does not, and a user who already
+/// has it running should not have to give it up for this change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaBackend {
+    /// ComfyUI's node-graph API (ADR 0009). Workflow templates apply.
+    Comfy,
+    /// stable-diffusion.cpp's `sd-server` (ADR 0011). No templates, no Python.
+    Sdcpp,
+}
+
+impl MediaBackend {
+    /// The name this backend answers to in `MEDIA_BACKEND`, and what
+    /// `GET /status` reports so the desktop can label what it is talking to.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaBackend::Comfy => "comfy",
+            MediaBackend::Sdcpp => "sdcpp",
+        }
+    }
+}
+
+/// `MEDIA_BACKEND` = `comfy` (default) | `sdcpp`.
+///
+/// **ComfyUI stays the default** until sd.cpp's video output has been compared
+/// against it on real hardware — the switch is a decision to make on rendered
+/// frames, not on a spec sheet. An unrecognised value falls back rather than
+/// refusing to start: a typo here should cost a working generator, not the
+/// whole server.
+pub fn media_backend() -> MediaBackend {
+    match crate::llm_config::from_env_or_dotenv("MEDIA_BACKEND").trim().to_ascii_lowercase().as_str()
+    {
+        "sdcpp" | "sd-cpp" | "sd_cpp" | "stable-diffusion.cpp" => MediaBackend::Sdcpp,
+        "" | "comfy" | "comfyui" => MediaBackend::Comfy,
+        other => {
+            logd!("[media] unknown MEDIA_BACKEND {other:?}; using comfy");
+            MediaBackend::Comfy
+        }
+    }
+}
+
+/// The backend base URL. Always present — the default is where the selected
+/// backend listens out of the box — so "configured" is never the question
+/// here; "reachable" is, and `GET /status` answers it.
 pub fn media_api_base() -> String {
     let base = crate::llm_config::from_env_or_dotenv("MEDIA_API_BASE");
-    if base.is_empty() {
-        "http://127.0.0.1:8188".to_string()
-    } else {
-        base.trim_end_matches('/').to_string()
+    if !base.is_empty() {
+        return base.trim_end_matches('/').to_string();
+    }
+    match media_backend() {
+        MediaBackend::Comfy => "http://127.0.0.1:8188".to_string(),
+        MediaBackend::Sdcpp => crate::media_sdcpp::DEFAULT_BASE.to_string(),
     }
 }
 
@@ -104,23 +161,63 @@ async fn status(
 ) -> Result<Response, ApiError> {
     principal.require_master_key(NOT_MASTER)?;
     let base = media_api_base();
+    let backend = media_backend();
 
-    let reachable = state
-        .http
-        .get(format!("{base}/system_stats"))
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    // `modes` is what the backend can actually be asked for right now. ComfyUI
+    // loads models per graph, so it can always attempt both; sd-server binds
+    // one model at startup and says which modes that model supports — the
+    // difference the Studio screen needs in order to grey out the right toggle
+    // instead of failing a video job three minutes in.
+    let (reachable, checkpoints, modes) = match backend {
+        MediaBackend::Comfy => {
+            let reachable = state
+                .http
+                .get(format!("{base}/system_stats"))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            let checkpoints =
+                if reachable { installed_checkpoints(&state, &base).await } else { Vec::new() };
+            let modes = if reachable {
+                vec!["img_gen".to_string(), "vid_gen".to_string()]
+            } else {
+                Vec::new()
+            };
+            (reachable, checkpoints, modes)
+        }
+        MediaBackend::Sdcpp => match crate::media_sdcpp::capabilities(&state, &base).await {
+            Some(caps) => (true, caps.model.into_iter().collect::<Vec<_>>(), caps.modes),
+            None => (false, Vec::new(), Vec::new()),
+        },
+    };
 
-    let checkpoints = if reachable { installed_checkpoints(&state, &base).await } else { Vec::new() };
+    // What the *managed* sd-server is doing, which is a different question from
+    // whether one is answering: "downloading" and "not_installed" are both
+    // `reachable: false`, and the screen should say which.
+    let (stage, stage_detail) = match backend {
+        MediaBackend::Sdcpp => {
+            let (stage, detail) = crate::media_sdcpp_process::stage_report();
+            (Some(stage), detail)
+        }
+        MediaBackend::Comfy => (None, None),
+    };
 
     Ok(Json(json!({
         "reachable": reachable,
         "base": base,
+        "backend": backend.as_str(),
+        "backend_stage": stage,
+        "backend_detail": stage_detail,
         "checkpoints": checkpoints,
-        "image_model": choose_checkpoint(&checkpoints),
+        "modes": modes,
+        "image_model": match backend {
+            // sd-server's one loaded model *is* the image model; there is no
+            // choice to make and no family to prefer.
+            MediaBackend::Sdcpp => checkpoints.first().cloned(),
+            MediaBackend::Comfy => choose_checkpoint(&checkpoints),
+        },
     }))
     .into_response())
 }
@@ -179,14 +276,36 @@ struct GenerateRequest {
     enhance: Option<bool>,
 }
 
-struct JobSpec {
-    kind: &'static str,
-    prompt: String,
-    negative: String,
-    width: i64,
-    height: i64,
-    length: i64,
-    seed: i64,
+/// What a backend is asked to make. Deliberately backend-agnostic: it holds
+/// what the *user* chose and nothing about how it will be rendered, which is
+/// what lets one row and one waiter serve both adapters.
+pub(crate) struct JobSpec {
+    pub(crate) kind: &'static str,
+    pub(crate) prompt: String,
+    pub(crate) negative: String,
+    pub(crate) width: i64,
+    pub(crate) height: i64,
+    pub(crate) length: i64,
+    pub(crate) seed: i64,
+}
+
+/// One backend poll, in the only three shapes [`watch_job`] cares about.
+///
+/// `Done` carries the **bytes**, not a URL, because the two backends differ
+/// exactly there: ComfyUI reports a filename to fetch from `/view`, sd-server
+/// returns base64 in the poll body. Making the adapter hand back bytes keeps
+/// that difference inside the adapter, and leaves one place — [`save_output`]
+/// — that writes a file.
+#[derive(Debug)]
+pub(crate) enum Poll {
+    Pending,
+    Done {
+        bytes: Vec<u8>,
+        /// The backend's suggested name; the saved name is this prefixed with
+        /// the job id.
+        file_name: String,
+    },
+    Failed(String),
 }
 
 /// Defaults per kind: images at 1024², video at Wan 2.2 5B's 832×480 and ~2s.
@@ -257,8 +376,23 @@ async fn generate(
     }
 
     let base = media_api_base();
-    let graph = build_workflow(&state, &base, &spec).await?;
-    let comfy_id = submit_workflow(&state, &base, &graph).await?;
+    let backend = media_backend();
+    // The one place the two backends diverge on the way in. ComfyUI is handed
+    // a whole graph; sd-server is handed the spec's fields. Both answer with
+    // an id to poll, which is all the row stores.
+    let backend_job_id = match backend {
+        MediaBackend::Comfy => {
+            let graph = build_workflow(&state, &base, &spec).await?;
+            submit_workflow(&state, &base, &graph).await?
+        }
+        MediaBackend::Sdcpp => {
+            // The one place a generation may block on a download and a model
+            // load. Deliberately here and not in the status probe: a gallery
+            // refresh must never start a multi-gigabyte load (ADR 0011).
+            crate::media_sdcpp_process::ensure_running(&state, &base, spec.kind).await?;
+            crate::media_sdcpp::submit(&state, &base, &spec).await?
+        }
+    };
 
     let now = sql_now();
     let original_prompt = req.prompt.as_deref().unwrap_or("").trim();
@@ -275,7 +409,10 @@ async fn generate(
     .bind(spec.height)
     .bind(spec.length)
     .bind(spec.seed)
-    .bind(&comfy_id)
+    // `comfy_prompt_id` predates the second backend and now holds whichever
+    // backend's job id — renaming a column costs a migration for a name only
+    // this file reads.
+    .bind(&backend_job_id)
     .bind(&now)
     .bind(&now)
     .fetch_one(&state.any)
@@ -283,7 +420,7 @@ async fn generate(
 
     // The waiter outlives this request on purpose; the row is how anyone —
     // including a restarted app — finds out how it went.
-    tokio::spawn(watch_job(state.clone(), id, base, comfy_id));
+    tokio::spawn(watch_job(state.clone(), id, backend, base, backend_job_id));
 
     Ok((StatusCode::CREATED, Json(load_job(&state, id).await?)).into_response())
 }
@@ -353,6 +490,16 @@ async fn requirements(
     principal.require_master_key(NOT_MASTER)?;
     let base = media_api_base();
 
+    // sd-server has no shopping list, and that is a fact rather than a gap:
+    // its model is bound by the flags it was started with, so a *reachable*
+    // sd-server is by definition one whose model is already on disk. What it
+    // cannot do is loaded — `GET /status`'s `modes` answers that — and what it
+    // has not got is unreachability, which `reachable: false` answers.
+    if media_backend() == MediaBackend::Sdcpp {
+        return Ok(Json(RequirementsResponse { models_root: None, items: Vec::new() })
+            .into_response());
+    }
+
     let mut items = Vec::with_capacity(VIDEO_REQUIREMENTS.len());
     for (folder, file_name, url, size_bytes) in VIDEO_REQUIREMENTS {
         let installed = installed_models(&state, &base, folder)
@@ -363,6 +510,35 @@ async fn requirements(
 
     Ok(Json(RequirementsResponse { models_root: comfy_models_root(&state, &base).await, items })
         .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/media/models, POST /api/v1/media/models/{id}/install
+// ---------------------------------------------------------------------------
+//
+// The sd.cpp answer to what `/requirements` does for ComfyUI: what is worth
+// having, what it costs, and what is already on disk. The difference is that
+// ComfyUI owns its models folder and we can only point at it, whereas these
+// live in ours — so this pair can actually fetch them, and an installed model
+// launches with no further configuration.
+
+async fn models(principal: Principal) -> Result<Response, ApiError> {
+    principal.require_master_key(NOT_MASTER)?;
+    Ok(Json(crate::media_sdcpp_process::catalogue_report()).into_response())
+}
+
+/// Fetches every missing file for one catalogue model. Gigabytes, so it holds
+/// the response open the way a job would not — deliberately: the desktop's
+/// confirm card already quotes the total from `GET /models`, and a second job
+/// table for a download that resumes at file granularity is machinery this does
+/// not need yet.
+async fn install_model(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    PathId(model_id): PathId<String>,
+) -> Result<Response, ApiError> {
+    principal.require_master_key(NOT_MASTER)?;
+    Ok(Json(crate::media_sdcpp_process::install_model(&state, &model_id).await?).into_response())
 }
 
 /// `GET /models/{folder}` — ComfyUI's own listing for one model kind. `None`
@@ -672,42 +848,47 @@ async fn submit_workflow(state: &AppState, base: &str, graph: &Value) -> Result<
 const JOB_DEADLINE: Duration = Duration::from_secs(60 * 60);
 const POLL_EVERY: Duration = Duration::from_secs(2);
 
-/// The background half of a job: poll `/history/{id}` until ComfyUI reports
-/// the graph done, copy the output into `media_dir`, and write the row's
-/// terminal state. Every exit path updates the row — a job that can end
-/// without a status update is a spinner that never stops.
-async fn watch_job(state: Arc<AppState>, job_id: i64, base: String, comfy_id: String) {
+/// The background half of a job: poll the backend until it reports the job
+/// done, save the output into `media_dir`, and write the row's terminal state.
+/// Every exit path updates the row — a job that can end without a status
+/// update is a spinner that never stops.
+///
+/// Backend-agnostic by construction: the adapter answers [`Poll`], and the
+/// deadline, the sleep and the row update are the same either way.
+async fn watch_job(
+    state: Arc<AppState>,
+    job_id: i64,
+    backend: MediaBackend,
+    base: String,
+    backend_job_id: String,
+) {
     let started = std::time::Instant::now();
     let outcome = loop {
         if started.elapsed() > JOB_DEADLINE {
-            break Err("Timed out after an hour. Check the ComfyUI window.".to_string());
+            break Err(match backend {
+                MediaBackend::Comfy => "Timed out after an hour. Check the ComfyUI window.",
+                MediaBackend::Sdcpp => "Timed out after an hour. Check the sd-server log.",
+            }
+            .to_string());
         }
         tokio::time::sleep(POLL_EVERY).await;
 
-        let Ok(response) =
-            state.http.get(format!("{base}/history/{comfy_id}")).timeout(Duration::from_secs(10)).send().await
-        else {
-            // ComfyUI restarting mid-job: keep polling until the deadline —
-            // its queue does not survive a restart, but flapping does happen.
-            continue;
+        let poll = match backend {
+            MediaBackend::Comfy => poll_comfy(&state, &base, &backend_job_id).await,
+            MediaBackend::Sdcpp => {
+                // A running job counts as use, or the idle watchdog would stop
+                // the server out from under a five-minute video render.
+                crate::media_sdcpp_process::note_used();
+                crate::media_sdcpp::poll(&state, &base, &backend_job_id).await
+            }
         };
-        let Ok(body) = response.json::<Value>().await else { continue };
-        let Some(entry) = body.get(&comfy_id) else { continue };
-
-        let status_obj = entry.get("status").cloned().unwrap_or_default();
-        let completed = status_obj.get("completed").and_then(Value::as_bool).unwrap_or(false);
-        let errored =
-            status_obj.get("status_str").and_then(Value::as_str) == Some("error");
-        if errored {
-            break Err(history_error(&status_obj));
+        match poll {
+            Poll::Pending => continue,
+            Poll::Failed(error) => break Err(error),
+            Poll::Done { bytes, file_name } => {
+                break save_output(job_id, &file_name, bytes).await;
+            }
         }
-        if !completed {
-            continue;
-        }
-        break match first_output(entry) {
-            Some(output) => fetch_output(&state, &base, job_id, &output).await,
-            None => Err("The workflow finished but produced no output file.".to_string()),
-        };
     };
 
     let now = sql_now();
@@ -791,15 +972,47 @@ fn first_output(entry: &Value) -> Option<ComfyOutput> {
     None
 }
 
-/// `GET /view` → `media_dir/<job>_<filename>`. Copied out because ComfyUI's
-/// output folder is its own, cleaned on its own schedule; ours is the one the
-/// file route serves forever.
+/// One `GET /history/{id}`, mapped onto [`Poll`]. A transport failure is
+/// `Pending`, not a failure: ComfyUI restarting mid-job is survivable
+/// (flapping happens; its queue does not survive, and the deadline is what
+/// ends a job that never comes back).
+///
+/// Completion needs a second request, because ComfyUI reports a *filename*
+/// and serves the bytes from `/view` — the asymmetry with sd-server that
+/// [`Poll::Done`] carrying bytes exists to hide.
+async fn poll_comfy(state: &AppState, base: &str, comfy_id: &str) -> Poll {
+    let Ok(response) =
+        state.http.get(format!("{base}/history/{comfy_id}")).timeout(Duration::from_secs(10)).send().await
+    else {
+        return Poll::Pending;
+    };
+    let Ok(body) = response.json::<Value>().await else { return Poll::Pending };
+    let Some(entry) = body.get(comfy_id) else { return Poll::Pending };
+
+    let status_obj = entry.get("status").cloned().unwrap_or_default();
+    if status_obj.get("status_str").and_then(Value::as_str) == Some("error") {
+        return Poll::Failed(history_error(&status_obj));
+    }
+    if !status_obj.get("completed").and_then(Value::as_bool).unwrap_or(false) {
+        return Poll::Pending;
+    }
+    let Some(output) = first_output(entry) else {
+        return Poll::Failed("The workflow finished but produced no output file.".to_string());
+    };
+    match fetch_output(state, base, &output).await {
+        Ok(bytes) => Poll::Done { bytes, file_name: output.filename },
+        Err(error) => Poll::Failed(error),
+    }
+}
+
+/// `GET /view` → the raw bytes. Fetched rather than referenced because
+/// ComfyUI's output folder is its own, cleaned on its own schedule; the copy
+/// under `media_dir` is the one the file route serves forever.
 async fn fetch_output(
     state: &AppState,
     base: &str,
-    job_id: i64,
     output: &ComfyOutput,
-) -> Result<String, String> {
+) -> Result<Vec<u8>, String> {
     let url = format!(
         "{base}/view?filename={}&subfolder={}&type={}",
         urlencode(&output.filename),
@@ -816,8 +1029,14 @@ async fn fetch_output(
         .bytes()
         .await
         .map_err(|e| format!("The output could not be read from ComfyUI: {e}"))?;
+    Ok(bytes.to_vec())
+}
 
-    let file_name = format!("{job_id}_{}", safe_file_name(&output.filename));
+/// The one writer of a finished job's file, whichever backend produced the
+/// bytes. Returns the saved name, which is what the row stores and what
+/// `GET /jobs/{id}/file` looks up.
+async fn save_output(job_id: i64, suggested: &str, bytes: Vec<u8>) -> Result<String, String> {
+    let file_name = format!("{job_id}_{}", safe_file_name(suggested));
     let dir = media_dir();
     let path = dir.join(&file_name);
     tokio::task::spawn_blocking(move || {

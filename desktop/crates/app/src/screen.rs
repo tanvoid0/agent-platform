@@ -5,7 +5,7 @@ use crate::ui::{self, space, Icon, Tone};
 use crate::shell::ResourceMode;
 use crate::{App, HudStyle, Message, Screen, ServerState, SettingsTab, ThemeMode};
 use agent_platform_client::types::ReadinessReport;
-use iced::widget::{column, container, row, scrollable, Column};
+use iced::widget::{column, container, row, scrollable, Column, Row};
 use iced::{Element, Length, Padding};
 
 /// The sidebar: short groups of things you work in. Settings stays in the
@@ -483,12 +483,17 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
     )
 }
 
+/// Shared by the Status tab (this server's uptime) and the machine meters (the
+/// host's). The day arm is there for the second caller: a desktop left on for a
+/// week reads "168h 3m" without it, which is a number you have to do arithmetic
+/// on before it means anything.
 fn uptime(seconds: f64) -> String {
     let s = seconds as u64;
     match s {
         0..=59 => format!("{s}s"),
         60..=3599 => format!("{}m {}s", s / 60, s % 60),
-        _ => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+        0..=86399 => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+        _ => format!("{}d {}h", s / 86400, (s % 86400) / 3600),
     }
 }
 
@@ -1108,9 +1113,9 @@ fn performance_view(app: &App) -> Element<'_, Message> {
     ui::page(
         "Performance",
         Some(ui::muted(
-            "How much of this machine the server may spend on model calls. Interactive \
-             work — chat, Coder, the assistant — is never queued behind background work \
-             whatever this says; the setting is what bounds the background half.",
+            "What this machine is doing, and how much of it the server may spend on model \
+             calls. Interactive work — chat, Coder, the assistant — is never queued behind \
+             background work whatever the setting says; it bounds the background half.",
         )),
         None,
         ui::stack_lg(vec![
@@ -1144,6 +1149,14 @@ fn performance_view(app: &App) -> Element<'_, Message> {
                 ]),
             ),
             ui::card_with_header(
+                "This machine",
+                Some(ui::muted(
+                    "What the whole desktop is using right now, and how much of it is us.",
+                )),
+                None,
+                machine_view(app),
+            ),
+            ui::card_with_header(
                 "Right now",
                 Some(ui::muted("The same numbers the sidebar monitor draws.")),
                 None,
@@ -1151,6 +1164,180 @@ fn performance_view(app: &App) -> Element<'_, Message> {
             ),
         ]),
     )
+}
+
+/// Settings → Performance → "This machine": one screen of meters for what the
+/// desktop is actually spending, host-wide and this server's share of it.
+///
+/// Three widths of meter, and the choice between them is what makes the page
+/// readable rather than decorative:
+///
+/// * **Dials** for the headline four — CPU, memory, GPU, disk. These are the
+///   numbers you glance at, and an arc reads from across a desk.
+/// * **A bar per core**, because the CPU average hides the shape: eight cores at
+///   12% and one core pinned with seven idle average the same and are very
+///   different machines.
+/// * **Bar rows** for the secondary figures — swap, VRAM, this server's own
+///   slice. A dial each would be a page of clocks.
+///
+/// It rides the poll the sidebar monitor was already making — 20 s in Eco, 5 s
+/// in Turbo (`App::resource_poll_every`) — and owns no timer of its own, for the
+/// same reason the monitor does not: a resource page that wakes the machine to
+/// say the machine is busy has become part of the answer. That cadence is on the
+/// page, because a meter that updates every 20 s and does not say so looks
+/// frozen.
+fn machine_view(app: &App) -> Element<'_, Message> {
+    let Some(host) = app.resources.as_ref().and_then(|r| r.host.as_ref()) else {
+        // Not an empty set of meters: a CPU dial at 0% is a claim about the
+        // machine, and "nobody has answered yet" is a different one.
+        return ui::muted("Waiting for the server.").into();
+    };
+
+    let cpu = (host.cpu_percent / 100.0).clamp(0.0, 1.0);
+    let mem = ui::fraction_of(host.mem_used_bytes, host.mem_total_bytes);
+    let disk = ui::fraction_of(host.disk_used_bytes, host.disk_total_bytes);
+    let swap = ui::fraction_of(host.swap_used_bytes, host.swap_total_bytes);
+    let ours = (host.process_cpu_percent / 100.0).clamp(0.0, 1.0);
+
+    let mut dials = vec![
+        ui::dial_tile(
+            Icon::Cpu,
+            "CPU",
+            cpu,
+            ui::count(host.cpu_per_core.len(), "logical core", "logical cores"),
+        ),
+        ui::dial_tile(
+            Icon::Database,
+            "Memory",
+            mem,
+            format!("{} of {}", bytes(host.mem_used_bytes), bytes(host.mem_total_bytes)),
+        ),
+    ];
+    // The first card only. A second GPU is real but rare, and four dials already
+    // fill the row — the rest are listed as bars below, where they wrap.
+    if let Some(gpu) = host.gpus.first() {
+        dials.push(ui::dial_tile(
+            Icon::Zap,
+            "GPU",
+            (gpu.utilization_percent / 100.0).clamp(0.0, 1.0),
+            match gpu.temperature_c {
+                Some(c) => format!("{} · {c}°C", short_gpu(&gpu.name)),
+                None => short_gpu(&gpu.name).to_string(),
+            },
+        ));
+    }
+    dials.push(ui::dial_tile(
+        Icon::HardDrive,
+        "Disk",
+        disk,
+        format!(
+            "{} free on {}",
+            bytes(host.disk_total_bytes.saturating_sub(host.disk_used_bytes)),
+            if host.disk_mount.is_empty() { "this volume" } else { host.disk_mount.as_str() }
+        ),
+    ));
+
+    // Full width, not tucked inside the CPU card: 32 bars in a quarter-width
+    // tile are 8px each and unreadable, and the strip is the one thing here that
+    // wants every pixel of the page.
+    let cores = ui::stack(vec![
+        row![
+            ui::caption("Per core"),
+            ui::spacer(),
+            ui::caption(ui::count(host.cpu_per_core.len(), "core", "cores")),
+        ]
+        .into(),
+        ui::core_bars(&host.cpu_per_core, ui::load_tone(cpu)),
+    ]);
+
+    let mut rows = vec![ui::gauge_row(
+        "Swap",
+        if host.swap_total_bytes == 0 { "off".to_string() } else { ui::percent(swap) },
+        swap,
+        if host.swap_total_bytes == 0 { Tone::Neutral } else { ui::load_tone(swap) },
+        Some(ui::caption(if host.swap_total_bytes == 0 {
+            "No swap file on this machine.".to_string()
+        } else {
+            format!("{} of {}", bytes(host.swap_used_bytes), bytes(host.swap_total_bytes))
+        })),
+    )];
+    // Every card, including the second one the dial row had no space for. VRAM
+    // rather than load, because VRAM is the number that decides whether a local
+    // model will load at all.
+    for gpu in &host.gpus {
+        let vram = ui::fraction_of(gpu.mem_used_bytes, gpu.mem_total_bytes);
+        rows.push(ui::gauge_row(
+            format!("{} memory", short_gpu(&gpu.name)),
+            ui::percent(vram),
+            vram,
+            ui::load_tone(vram),
+            Some(ui::caption(format!(
+                "{} of {} VRAM{}",
+                bytes(gpu.mem_used_bytes),
+                bytes(gpu.mem_total_bytes),
+                if host.gpus.len() > 1 {
+                    format!(" · {}% busy", gpu.utilization_percent.round())
+                } else {
+                    String::new()
+                }
+            ))),
+        ));
+    }
+    rows.push(ui::gauge_row(
+        "agent-platformd",
+        ui::percent(ours),
+        ours,
+        ui::load_tone(ours),
+        Some(ui::caption(format!(
+            "{} resident — this server's own share of the machine.",
+            bytes(host.process_mem_bytes)
+        ))),
+    ));
+
+    // Two to a row: each is a label, a bar and a line of detail, and three
+    // across squeezes the detail into a wrap. An odd count leaves the last one
+    // half-width rather than stretched, so the column keeps one left edge.
+    let mut paired: Vec<Element<'_, Message>> = Vec::new();
+    let mut rows = rows.into_iter();
+    while let Some(first) = rows.next() {
+        let second = rows.next().unwrap_or_else(ui::spacer);
+        paired.push(row![first, second].spacing(space::LG).into());
+    }
+
+    ui::stack_lg(vec![
+        Row::with_children(dials).spacing(space::MD).into(),
+        ui::tile(cores),
+        ui::tile(ui::stack_lg(paired)),
+        ui::caption(format!(
+            "{} · up {} · refreshed every {} while this page is open.",
+            host.os,
+            uptime(host.uptime_seconds as f64),
+            refresh_cadence(app),
+        )),
+    ])
+    .into()
+}
+
+/// "NVIDIA GeForce RTX 5080" is a caption, not a paragraph. The vendor prefix is
+/// the part that carries no information on a page that has already established
+/// there is one card in this machine.
+fn short_gpu(name: &str) -> &str {
+    name.trim_start_matches("NVIDIA ").trim_start_matches("GeForce ").trim()
+}
+
+/// Bytes for a meter caption. `domain::format_size` is what Model ops and the
+/// Ollama dialog already print sizes with, so a gigabyte reads the same in both
+/// places; it takes `i64`, and a `u64` past that is a disk nobody has.
+fn bytes(n: u64) -> String {
+    crate::domain::format_size(n.min(i64::MAX as u64) as i64)
+}
+
+/// How often these numbers move, in the words of the mode that decides it. Read
+/// off the same tier the poll interval is keyed on, so the page cannot claim a
+/// cadence the app is not running.
+fn refresh_cadence(app: &App) -> String {
+    let ticks = crate::resource_poll_every(app.resources.as_ref().map(|r| r.resolved.as_str()));
+    format!("{}s", u32::from(ticks) * 5)
 }
 
 /// Eco is not a warning and Turbo is not an error — the scale is "how loud", so
@@ -1346,29 +1533,28 @@ fn startup_card(app: &App) -> Element<'_, Message> {
     )
 }
 
-/// In-process inference, per [ADR 0006](../../../../docs/adr/0006-in-process-rust-core.md).
+/// The local model, per [ADR 0012](../../../../docs/adr/0012-managed-llama-server.md).
 ///
-/// Only in a `local-llm` build: without the feature there is no engine to point
-/// at a file, and the settings keys are inert. Lives on Status rather than Model
-/// ops because it is the one model surface that works with the server down.
+/// The GGUF and the context length are **daemon** settings: `agent-platformd`
+/// hands them to the `llama-server` it fetches and runs itself, which is what
+/// provider `local` answers with. So this card configures something real in
+/// every build, rather than only in one built with an accelerator SDK.
 ///
-/// Both keys are read once, at the first local turn — a swap needs a restart,
-/// which is what the header button is for. The weights themselves come and go on
-/// their own (an idle timeout), and "Free VRAM" is the way to hurry that along
-/// before a training job wants the card.
-#[cfg(feature = "local-llm")]
+/// A `local-llm` build additionally answers *this app's own* chat in-process
+/// ([ADR 0006](../../../../docs/adr/0006-in-process-rust-core.md)) off the same
+/// two settings; the VRAM and last-turn rows come with that feature and are
+/// about the in-app engine alone.
+///
+/// Lives on Status rather than Model ops because it is the one model surface
+/// that still works with the server down.
 fn local_llm_card(app: &App) -> Element<'_, Message> {
     let path = app.settings.local_model_path.trim();
     let (state, tone) = match path {
-        "" => ("Off — every turn goes to the server", Tone::Neutral),
+        "" => ("Off — every turn goes to a configured provider", Tone::Neutral),
+        #[cfg(feature = "local-llm")]
         _ if crate::local_llm::loaded() => ("Loaded in VRAM", Tone::Success),
         p if std::path::Path::new(p).is_file() => ("Ready — loads on the next turn", Tone::Success),
         _ => ("File is missing", Tone::Danger),
-    };
-    let engine = match crate::inference::last_turn_was_local() {
-        Some(true) => ui::badge_icon(Icon::Cpu, "Answered in-process", Tone::Success),
-        Some(false) => ui::badge_icon(Icon::Plug, "Answered by the server", Tone::Neutral),
-        None => ui::muted("No turn yet this run"),
     };
 
     let mut picker = vec![ui::button_outline(Icon::FolderOpen, "Choose…", Message::PickLocalModel)];
@@ -1379,87 +1565,74 @@ fn local_llm_card(app: &App) -> Element<'_, Message> {
             Message::SetLocalModel(Some(String::new())),
         ));
     }
+    #[cfg(feature = "local-llm")]
     if crate::local_llm::loaded() {
         picker.push(ui::button_ghost(Icon::Zap, "Free VRAM", Message::UnloadLocalModel));
     }
 
-    ui::card_with_header(
-        "Local model",
-        Some(ui::muted("Answer this app's own chat in-process instead of through the server.")),
-        Some(ui::button_outline(Icon::Refresh, "Restart app", Message::RestartApp)),
-        ui::stack(vec![
-            ui::field("State", ui::badge_icon(ui::tone_icon(tone), state, tone)),
-            ui::field(
-                "GGUF",
-                ui::stack(vec![
-                    if path.is_empty() { ui::muted("—") } else { ui::mono(path.to_string()) },
-                    ui::cluster(picker).into(),
-                ]),
-            ),
-            ui::field("Download", local_model_download(app)),
-            ui::field(
-                "Context",
-                container(ui::input("8192", &app.local_ctx_input, Message::SetLocalCtx))
-                    .width(Length::Fixed(140.0)),
-            ),
-            ui::field("Last turn", engine),
-            ui::field(
-                "Serve to the server",
-                ui::stack(vec![
-                    container(ui::input(
-                        "off",
-                        &app.local_server_port_input,
-                        Message::SetLocalServerPort,
-                    ))
-                    .width(Length::Fixed(140.0))
-                    .into(),
-                    match app.settings.local_server_port {
-                        0 => ui::caption(
-                            "A port here also answers the Python side, so server-run agents \
-                             can use this model. Empty leaves it off.",
-                        ),
-                        p => ui::caption(format!(
-                            "Point the proxy's OpenAI-compatible provider at \
-                             http://127.0.0.1:{p} (LM_STUDIO_API_BASE). Loopback only, no key \
-                             — like Ollama and LM Studio.",
-                        )),
-                    },
-                ]),
-            ),
-            ui::caption(
-                "A new model, context or port takes effect when the app restarts. The weights \
-                 themselves unload after five idle minutes.",
-            ),
-        ]),
-    )
-}
+    let mut rows = vec![
+        ui::field("State", ui::badge_icon(ui::tone_icon(tone), state, tone)),
+        ui::field(
+            "GGUF",
+            ui::stack(vec![
+                if path.is_empty() { ui::muted("—") } else { ui::mono(path.to_string()) },
+                ui::cluster(picker).into(),
+            ]),
+        ),
+        ui::field("Download", local_model_download(app)),
+        ui::field(
+            "Context",
+            container(ui::input("8192", &app.local_ctx_input, Message::SetLocalCtx))
+                .width(Length::Fixed(140.0)),
+        ),
+    ];
 
-/// The same card in a build that has no engine to configure.
-///
-/// It renders rather than vanishing on purpose: a card that is simply absent
-/// reads as "this app cannot do that", when the truth is one cargo feature —
-/// and nothing else in the UI mentions in-process inference exists.
-#[cfg(not(feature = "local-llm"))]
-fn local_llm_card(_app: &App) -> Element<'_, Message> {
+    #[cfg(feature = "local-llm")]
+    {
+        rows.push(ui::field(
+            "Last turn",
+            match crate::inference::last_turn_was_local() {
+                Some(true) => ui::badge_icon(Icon::Cpu, "Answered in-process", Tone::Success),
+                Some(false) => ui::badge_icon(Icon::Plug, "Answered by the server", Tone::Neutral),
+                None => ui::muted("No turn yet this run"),
+            },
+        ));
+        rows.push(ui::field(
+            "Serve to the server",
+            ui::stack(vec![
+                container(ui::input(
+                    "off",
+                    &app.local_server_port_input,
+                    Message::SetLocalServerPort,
+                ))
+                .width(Length::Fixed(140.0))
+                .into(),
+                match app.settings.local_server_port {
+                    0 => ui::caption(
+                        "A port here serves this app's in-process engine over HTTP, so \
+                         server-run agents can use it too. Empty leaves it off.",
+                    ),
+                    p => ui::caption(format!(
+                        "Point the proxy's OpenAI-compatible provider at \
+                         http://127.0.0.1:{p} (LM_STUDIO_API_BASE). Loopback only, no key \
+                         — like Ollama and LM Studio.",
+                    )),
+                },
+            ]),
+        ));
+    }
+
+    rows.push(ui::caption(
+        "The server fetches llama-server on first use and stops it after ten idle minutes; \
+         what it says while loading is in Logs. A new model or context reaches it when the \
+         app restarts.",
+    ));
+
     ui::card_with_header(
         "Local model",
-        Some(ui::muted(
-            "Answer this app's own chat in-process instead of through the server.",
-        )),
-        None,
-        ui::stack(vec![
-            ui::field(
-                "State",
-                ui::badge_icon(Icon::Info, "Not built into this copy", Tone::Neutral),
-            ),
-            ui::caption(
-                "llama.cpp is linked in behind a cargo feature, off by default because it needs an accelerator SDK to be worth running. Rebuild with it to get the GGUF picker, the Hugging Face downloader and the VRAM controls:",
-            ),
-            ui::mono("cargo run -p agent-platform-desktop --features cuda"),
-            ui::caption(
-                "`--features local-llm` builds without CUDA and runs on the CPU — measured at 11 tok/s against 123 on the GPU, so it is a fallback, not a default. Until then every turn goes to the server and its providers.",
-            ),
-        ]),
+        Some(ui::muted("Run a GGUF on this machine, served by the daemon as provider `local`.")),
+        Some(ui::button_outline(Icon::Refresh, "Restart app", Message::RestartApp)),
+        ui::stack(rows),
     )
 }
 
@@ -1467,7 +1640,6 @@ fn local_llm_card(_app: &App) -> Element<'_, Message> {
 ///
 /// No search and no browse — the model card in the browser is a better catalog
 /// than anything this could draw, and what it gives you is a link to paste.
-#[cfg(feature = "local-llm")]
 fn local_model_download(app: &App) -> Element<'_, Message> {
     let mut bar = vec![
         container(ui::input_submit(

@@ -2,8 +2,9 @@
 //!
 //! Binds the public port and answers **everything**. It began as a reverse
 //! proxy in front of a FastAPI server, moving one domain across at a time; that
-//! server was deleted on 2026-08-07 and the fallback is now a 404. The only
-//! subprocess this process ever starts is a model-ops build stage.
+//! server was deleted on 2026-08-07 and the fallback is now a 404. It starts
+//! two kinds of subprocess: a model-ops build stage, and (ADR 0011) a managed
+//! `sd-server` for media generation.
 //!
 //! The domains, and the modules that hold them:
 //!
@@ -32,8 +33,11 @@
 //! - **web search** — `search.rs` (the one route) over `search_dork.rs` (the
 //!   pure `DorkQuery` translator, ADR 0008). No outbound HTTP: the browser
 //!   runs the search, this server only builds the query.
-//! - **media generation** — `media.rs`: local image and video through ComfyUI
-//!   over loopback (ADR 0009), as background jobs against `media_jobs`.
+//! - **media generation** — `media.rs`: local image and video over loopback,
+//!   through ComfyUI (ADR 0009) or stable-diffusion.cpp's `sd-server`
+//!   (`media_sdcpp.rs`, ADR 0011), as background jobs against `media_jobs`.
+//!   `media_sdcpp_process.rs` fetches, launches and reaps that `sd-server` —
+//!   the *second* subprocess this server starts, after a model-ops stage.
 //!
 //! Cross-cutting: `db.rs` (the SQLite/Postgres choke point, and the schema
 //! bootstrap that replaced Alembic), `wire.rs` and `error.rs` (shared shapes
@@ -82,7 +86,11 @@ pub mod executor;
 pub mod llm;
 pub mod llm_admin;
 pub mod llm_config;
+pub mod llm_llama_process;
+pub mod managed_server;
 pub mod media;
+pub mod media_sdcpp;
+pub mod media_sdcpp_process;
 pub mod model_capabilities;
 pub mod model_catalog;
 pub mod model_ops;

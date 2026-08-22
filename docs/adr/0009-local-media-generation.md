@@ -4,7 +4,15 @@ Date: 2026-08-19
 
 ## Status
 
-Accepted.
+Accepted, and amended by [ADR 0011](0011-stable-diffusion-cpp-media-backend.md),
+which adds stable-diffusion.cpp as a second backend behind the same domain. The
+`media` domain, the job shape and the ComfyUI integration described here are
+unchanged and still the default.
+
+**Two factual corrections**, both found while re-checking this decision and both
+marked inline below: ComfyUI is **GPL-3.0**, not Apache-2.0, and
+stable-diffusion.cpp has supported video since September 2025 — the survey below
+had it as images-only. The second was the sentence this ADR's choice rested on.
 
 ## Context
 
@@ -34,15 +42,21 @@ page is acceptable if it ships faster than folding it into chat.
   `127.0.0.1:8188` — `POST /prompt` takes a workflow graph in API-JSON form,
   `GET /history/{id}` reports completion, `GET /view` hands back the output
   file. It ships native workflow templates for exactly the text-to-image and
-  text-to-video cases this feature needs. Apache-2.0, installable as a desktop
-  app or a portable zip, actively maintained.
+  text-to-video cases this feature needs. Installable as a desktop
+  app or a portable zip, actively maintained. **Correction (ADR 0011):
+  GPL-3.0, not Apache-2.0** — which does not affect talking to it over
+  loopback, but does affect ever shipping it.
 - **stable-diffusion.cpp** is the sd analogue of llama.cpp: a single binary,
   GGUF weights, spawnable as a subprocess exactly like `worker/`. Images only;
-  video support is experimental at best.
+  video support is experimental at best. **Correction (ADR 0011): wrong when
+  written.** Wan 2.1/2.2 landed September 2025 and LTX-2.3 in May 2026, and it
+  ships `sd-server` with an async job API. This is the sentence the decision
+  below turned on.
 - **AUTOMATIC1111 WebUI** has the simplest REST API (`/sdapi/v1/txt2img`) but is
   in maintenance mode and does images only.
 
 Only one of these does both modalities on Windows today, and it is ComfyUI.
+**Correction (ADR 0011): two do.**
 
 ### What the server already has
 

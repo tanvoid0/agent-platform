@@ -197,12 +197,16 @@ fn alias_rows(data: &Map<String, Value>) -> Vec<(String, String)> {
 // GET /v1/models
 // ---------------------------------------------------------------------------
 
-/// The four backends that can be asked for a live list. Declaration order is the
+/// The five backends that can be asked for a live list. Declaration order is the
 /// order their models are appended in.
-const LIVE_SOURCES: [&str; 4] = ["ollama", "lm_studio", "aimlapi", "anthropic"];
+const LIVE_SOURCES: [&str; 5] = ["local", "ollama", "lm_studio", "aimlapi", "anthropic"];
 
 async fn live_model_ids(http: &reqwest::Client, provider: &str) -> Vec<String> {
     match provider {
+        // Not asked, named: a managed llama-server runs the one configured
+        // GGUF, and asking it would mean loading gigabytes into VRAM to answer
+        // a list. Same string the provider catalog shows (ADR 0012).
+        "local" => crate::llm_llama_process::model_id().into_iter().collect(),
         "ollama" => fetch_ollama_tags(http, QUICK_TIMEOUT).await,
         "lm_studio" => fetch_lm_studio_models(http, QUICK_TIMEOUT).await,
         "aimlapi" => {
@@ -372,7 +376,7 @@ async fn health(State(state): State<Arc<AppState>>, Query(query): Query<HealthQu
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "status": "error",
-                "detail": "provider must be ollama, lm_studio, gemini, or aimlapi",
+                "detail": "provider must be local, ollama, lm_studio, gemini, aimlapi, or anthropic",
             })),
         )
             .into_response();
@@ -384,13 +388,57 @@ async fn health(State(state): State<Arc<AppState>>, Query(query): Query<HealthQu
     body.insert("model".into(), json!(model));
 
     match provider.as_str() {
+        "local" => managed_local_health(&state, body, started).await,
         "ollama" | "lm_studio" => local_health(&state, &provider, &model, body, started).await,
         "aimlapi" | "anthropic" => keyed_health(&state, &provider, body, started).await,
         _ => gemini_health(&state, &model, body, started).await,
     }
 }
 
-/// The two loopback backends: probe, then answer from the cached catalog.
+/// Provider `local` is the `llama-server` this daemon runs itself (ADR 0012),
+/// so its health is where it is in its lifecycle plus a probe — and **a probe
+/// must never launch one**. A health poll that reads nine gigabytes of weights
+/// off disk is not a health poll.
+///
+/// A stopped server is reported as unhealthy with the reason, the same as a
+/// stopped Ollama: it is not answering *now*, and the next chat turn is what
+/// starts it.
+async fn managed_local_health(
+    state: &AppState,
+    mut body: Map<String, Value>,
+    started: Instant,
+) -> Response {
+    if let Some(id) = crate::llm_llama_process::model_id() {
+        body.insert("model".into(), json!(id));
+    }
+    let (stage, detail) = crate::llm_llama_process::stage_report();
+    body.insert("stage".into(), json!(stage));
+
+    if !crate::llm_llama_process::configured() {
+        return unhealthy(body, "LOCAL_MODEL_PATH is not set to an existing GGUF", started);
+    }
+
+    let base = crate::llm_config::local_api_base();
+    let url = format!("{}/health", base.trim_end_matches('/'));
+    let up = matches!(
+        state.http.get(&url).timeout(PROBE_TIMEOUT).send().await,
+        Ok(r) if r.status().is_success()
+    );
+    if up {
+        body.insert("status".into(), json!("ok"));
+        body.insert("latency_ms".into(), json!(started.elapsed().as_millis() as u64));
+        return Json(Value::Object(body)).into_response();
+    }
+    unhealthy(
+        body,
+        detail.unwrap_or_else(|| {
+            format!("no llama-server is answering at {base}; the next chat turn starts one")
+        }),
+        started,
+    )
+}
+
+
 async fn local_health(
     state: &AppState,
     provider: &str,
@@ -603,6 +651,13 @@ fn upstream_urls(provider: &str) -> Result<(String, String), ApiError> {
         (format!("{base}/chat/completions"), format!("{base}/embeddings"))
     };
     match provider {
+        // The one we run ourselves. Same OpenAI surface as the rest, which is
+        // why provider `local` is no longer a second code path (ADR 0012).
+        "local" => {
+            let base = crate::llm_config::local_api_base();
+            let base = base.trim_end_matches('/');
+            Ok((format!("{base}/v1/chat/completions"), format!("{base}/v1/embeddings")))
+        }
         "ollama" | "lm_studio" => {
             let ollama = provider == "ollama";
             let base = if ollama { ollama_api_base() } else { lm_studio_api_base() };
@@ -708,7 +763,7 @@ async fn chat_target(state: &AppState, body: &mut Map<String, Value>) -> Result<
     } else {
         if !is_supported_provider(&hint) {
             return Err(ApiError::bad_request(
-                "provider must be ollama, lm_studio, gemini, aimlapi, or anthropic",
+                "provider must be local, ollama, lm_studio, gemini, aimlapi, or anthropic",
             ));
         }
         if !provider_configured(&hint) {
@@ -724,6 +779,23 @@ async fn chat_target(state: &AppState, body: &mut Map<String, Value>) -> Result<
         };
         (hint, model)
     };
+
+    if provider == "local" {
+        // The daemon owns this one: fetch, launch and wait for `llama-server`
+        // before a body is sent at it (ADR 0012). Everything past this point is
+        // the ordinary upstream path — streaming, retries, usage normalisation
+        // — which is most of the reason `local` stopped being a second branch.
+        crate::llm_llama_process::ensure_running(state).await?;
+        crate::llm_llama_process::note_used();
+        let model = crate::llm_llama_process::model_id().unwrap_or_else(|| {
+            if resolved.is_empty() { "local".into() } else { resolved.clone() }
+        });
+        body.remove("provider");
+        body.insert("model".into(), json!(model));
+        ensure_chat_request_supported(&state.http, &provider, &model, body).await?;
+        let (chat_url, _) = upstream_urls(&provider)?;
+        return Ok(Target { url: chat_url, headers: Vec::new() });
+    }
 
     let resolved = coerce_local_model_if_needed(&state.http, &provider, &resolved).await;
     body.remove("provider");
@@ -760,7 +832,6 @@ pub(crate) async fn complete_internal(
     let _permit = state.limits.acquire(priority).await;
     let target = chat_target(state, &mut body).await?;
     let payload = Value::Object(body);
-
     let response = send_with_retry("chat_completions", true, || {
         apply(state.http.post(&target.url), &target.headers)
             .json(&payload)
@@ -780,6 +851,7 @@ pub(crate) async fn complete_internal(
         ApiError::new(StatusCode::BAD_GATEWAY, format!("Upstream returned invalid JSON: {e}"))
     })
 }
+
 
 pub(crate) async fn chat_completions(
     principal: ProxyPrincipal,
@@ -822,6 +894,7 @@ pub(crate) async fn chat_completions(
     };
 
     let streaming = is_truthy(body.get("stream"));
+
     let payload = Value::Object(body);
 
     if !streaming {
@@ -1275,5 +1348,23 @@ mod tests {
             Some(vec!["ollama".to_string(), "lm_studio".to_string()])
         );
         assert_eq!(parse_model_filter(Some("provider=Ollama")).unwrap(), Some(vec!["ollama".into()]));
+    }
+
+    /// Provider `local` is an upstream like any other now (ADR 0012) — the one
+    /// this daemon happens to have started itself. If this stops resolving, a
+    /// local turn silently goes wherever the fallback arm points.
+    #[test]
+    fn local_resolves_to_the_managed_llama_server() {
+        // SAFETY: single-threaded test; the base is read per call, not cached.
+        unsafe { std::env::remove_var("LOCAL_API_BASE") };
+        let (chat, embeddings) = upstream_urls("local").unwrap();
+        assert_eq!(chat, "http://127.0.0.1:18412/v1/chat/completions");
+        assert_eq!(embeddings, "http://127.0.0.1:18412/v1/embeddings");
+
+        // A base someone else runs is honoured verbatim, trailing slash and all.
+        unsafe { std::env::set_var("LOCAL_API_BASE", "http://box.lan:9000/") };
+        let (chat, _) = upstream_urls("local").unwrap();
+        assert_eq!(chat, "http://box.lan:9000/v1/chat/completions");
+        unsafe { std::env::remove_var("LOCAL_API_BASE") };
     }
 }

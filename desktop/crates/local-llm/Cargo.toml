@@ -1,0 +1,22 @@
+[package]
+name = "agent-platform-local-llm"
+version = "0.1.0"
+edition = "2021"
+description = "In-process llama.cpp chat engine (ADR 0006)"
+
+[dependencies]
+agent-platform-client = { path = "../client" }
+futures = "0.3"
+serde_json = "1"
+llama-cpp-2 = { version = "0.1.154", default-features = false }
+encoding_rs = "0.8.35"
+tokio = { version = "1", features = ["sync"] }
+
+[features]
+default = []
+# Desktop needs this: whisper-rs statically links ggml; two static ggmls LNK2005.
+dynamic-link = ["llama-cpp-2/dynamic-link"]
+cuda = ["llama-cpp-2/cuda"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

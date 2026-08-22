@@ -1,6 +1,6 @@
 [package]
 name = "agent-platform-desktop"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Native desktop app for agent-platform (iced), owning the Python server sidecar"
 
@@ -43,12 +43,10 @@ iced_fonts = { version = "0.3.0", features = ["lucide", "advanced_text"] }
 # Decodes the frames inside icon.ico for the window and tray icons. Already in
 # the tree via iced's svg backend, so this costs no extra build.
 png = "0.17"
-# ADR 0006: llama.cpp in-process. Optional because the feature adds a C++ build
-# (and a CUDA Toolkit for the `cuda` build) that nothing else in this crate
-# needs. `encoding_rs` is llama-cpp-2's own decoder type, so its version has to
-# match the one llama-cpp-2 pins.
-llama-cpp-2 = { version = "0.1.154", default-features = false, optional = true }
-encoding_rs = { version = "0.8.35", optional = true }
+# ADR 0006: llama.cpp in-process via the shared crate. Optional because the
+# feature adds a C++ build (and a CUDA Toolkit for `cuda`) that nothing else
+# in this crate needs.
+agent-platform-local-llm = { path = "../local-llm", optional = true }
 
 [features]
 default = []
@@ -56,11 +54,11 @@ default = []
 # of ggml statically, and two static ggmls in one binary is hundreds of
 # LNK2005s. Building llama.cpp as DLLs keeps the duplicate symbols out of the
 # link — at the cost of shipping those DLLs beside the exe.
-local-llm = ["dep:llama-cpp-2", "dep:encoding_rs", "llama-cpp-2/dynamic-link"]
+local-llm = ["dep:agent-platform-local-llm", "agent-platform-local-llm/dynamic-link"]
 # Accelerator for the above. CPU-only was measured at 11 tok/s against 123 on
 # the GPU, so a shipped build wants one of these, and each needs its own SDK
 # installed — see desktop/spike-llama/README.md.
-cuda = ["local-llm", "llama-cpp-2/cuda"]
+cuda = ["local-llm", "agent-platform-local-llm/cuda"]
 
 [dev-dependencies]
 # Validates the orb's WGSL in a test; a shader typo is otherwise a panic on

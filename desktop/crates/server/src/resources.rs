@@ -15,14 +15,16 @@
 //! window is in front of the user, and how long ago the last interactive call
 //! was. See [`Limits::resolved`].
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use axum::extract::State;
 use axum::routing::put;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use sysinfo::{Disk, Disks, ProcessesToUpdate, System};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::AppState;
@@ -301,6 +303,196 @@ fn resize(sem: &Semaphore, have: usize, want: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Host sample
+// ---------------------------------------------------------------------------
+
+/// What the machine itself is doing, alongside what this server is doing with
+/// it. Read by the Performance page's meters, and by the assistant through
+/// `api_get /api/v1/system/resources`.
+///
+/// **Sampled on demand, never on a timer.** Same rule the sidebar monitor lives
+/// by: a resource readout that wakes the machine up to report that the machine
+/// is busy has become the thing it reports on. The desktop was already polling
+/// this route every 5-20 s (see `App::resource_poll_every`), so the sample rides
+/// that request and costs nothing when nobody is looking. `sysinfo` keeps the
+/// previous CPU tick internally, so a poll that far apart yields the average
+/// over the gap rather than an instant that happened to catch a spike.
+///
+/// GPUs are NVIDIA-only and may be an empty list; see [`GpuView`] for why.
+#[derive(Serialize, Clone, Debug)]
+pub struct HostView {
+    /// Whole machine, 0-100 across all cores.
+    pub cpu_percent: f32,
+    /// One entry per logical core, in a stable order - the strip of bars under
+    /// the CPU meter. What it adds over the average: eight cores at 12% and one
+    /// core pinned at 100% are the same average and very different machines.
+    pub cpu_per_core: Vec<f32>,
+    pub mem_used_bytes: u64,
+    pub mem_total_bytes: u64,
+    /// Zero total on a machine with swap turned off, which the page draws as
+    /// "off" rather than as an empty meter.
+    pub swap_used_bytes: u64,
+    pub swap_total_bytes: u64,
+    /// The volume the workspaces live on - not a sum over every mount, because
+    /// a total across disks is a number no path is actually on.
+    pub disk_used_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub disk_mount: String,
+    /// `agent-platformd`'s own slice, normalised the same way as `cpu_percent`
+    /// (sysinfo reports a process against one core, so 400% is possible before
+    /// this divides by the core count). Here so "the machine is busy" can be
+    /// told apart from "we are busy", which is the difference between a setting
+    /// the user should change and one they should not.
+    pub process_cpu_percent: f32,
+    pub process_mem_bytes: u64,
+    /// Machine uptime, not process uptime - `/system/status` already carries
+    /// ours.
+    pub uptime_seconds: u64,
+    pub os: String,
+    /// Empty on a machine with no NVIDIA driver, which is the ordinary
+    /// case rather than an error - see [`GpuView`].
+    pub gpus: Vec<GpuView>,
+}
+
+/// One NVIDIA GPU, as NVML reports it.
+///
+/// **NVIDIA only, on purpose.** The vendor-neutral answer is three more SDKs
+/// (ROCm SMI, Level Zero, DXGI's adapter counters) each with its own runtime that
+/// may not be installed; NVML at least fails cleanly, because `nvml-wrapper`
+/// `dlopen`s `nvml.dll`/`libnvidia-ml.so` at runtime rather than linking it. So
+/// nothing about the build depends on a GPU being present, and a machine without
+/// an NVIDIA driver reports an empty list instead of failing to start. A second
+/// vendor is a second branch in [`sample_gpus`] when someone has one to test on.
+#[derive(Serialize, Clone, Debug)]
+pub struct GpuView {
+    pub name: String,
+    /// Percent of the last sampling period the GPU had work on it. NVML's own
+    /// utilisation counter, not a derived number.
+    pub utilization_percent: f32,
+    pub mem_used_bytes: u64,
+    pub mem_total_bytes: u64,
+    /// Absent on cards that do not expose a sensor, which is rarer than it
+    /// sounds but not impossible on laptop hybrids.
+    pub temperature_c: Option<u32>,
+}
+
+/// NVML's handle, initialised once. `Err` is the ordinary case on a machine with
+/// no NVIDIA driver, and it is cached as such: retrying `Nvml::init()` on every
+/// poll would be a failing `dlopen` every five seconds forever.
+static NVML: OnceLock<Option<nvml_wrapper::Nvml>> = OnceLock::new();
+
+fn sample_gpus() -> Vec<GpuView> {
+    let Some(nvml) = NVML.get_or_init(|| nvml_wrapper::Nvml::init().ok()) else {
+        return Vec::new();
+    };
+    let count = nvml.device_count().unwrap_or(0);
+    (0..count)
+        .filter_map(|i| {
+            let device = nvml.device_by_index(i).ok()?;
+            let memory = device.memory_info().ok();
+            Some(GpuView {
+                name: device.name().unwrap_or_else(|_| format!("GPU {i}")),
+                // A card that cannot report utilisation still reports its memory,
+                // and the memory bar is the half that matters when a local model
+                // is loaded — so a missing counter is a 0, not a dropped card.
+                utilization_percent: device
+                    .utilization_rates()
+                    .map(|u| u.gpu as f32)
+                    .unwrap_or(0.0),
+                mem_used_bytes: memory.as_ref().map(|m| m.used).unwrap_or(0),
+                mem_total_bytes: memory.as_ref().map(|m| m.total).unwrap_or(0),
+                temperature_c: device
+                    .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
+                    .ok(),
+            })
+        })
+        .collect()
+}
+
+/// The one `System` in the process. Held across calls because CPU percentages
+/// are a *diff* against the previous refresh: a fresh `System` per request would
+/// report 0% forever.
+static SAMPLER: OnceLock<Mutex<Sampler>> = OnceLock::new();
+
+struct Sampler {
+    sys: System,
+    disks: Disks,
+}
+
+/// Blocking. Call it from `spawn_blocking` - refreshing the CPU and disk tables
+/// is syscalls, and on Windows enumerating volumes is not fast.
+fn sample_host() -> HostView {
+    let cell = SAMPLER.get_or_init(|| {
+        let mut sys = System::new();
+        // The first CPU read has no previous tick to diff against and reports
+        // 0% - a load meter's single most misleading answer. Prime it here, at
+        // the cost of one 200 ms sleep once per process, on a blocking thread.
+        sys.refresh_cpu_usage();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        Mutex::new(Sampler { sys, disks: Disks::new_with_refreshed_list() })
+    });
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    let Sampler { sys, disks } = &mut *guard;
+
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+    let pid = sysinfo::get_current_pid().ok();
+    if let Some(pid) = pid {
+        // `Some(&[pid])`: refreshing every process on the machine to read one of
+        // them is the expensive mistake this route would make by default.
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    }
+    // `false` - sizes and free space, without re-listing the volumes. A USB
+    // stick appearing mid-session is not worth an enumeration every 5 s.
+    disks.refresh(false);
+
+    let cores = sys.cpus().len().max(1) as f32;
+    let (process_cpu_percent, process_mem_bytes) = pid
+        .and_then(|p| sys.process(p))
+        .map(|p| (p.cpu_usage() / cores, p.memory()))
+        .unwrap_or((0.0, 0));
+
+    let root = crate::workspace_files::workspace_root();
+    // Canonicalised, or a relative `data/workspaces` matches no mount point and
+    // every machine falls through to "largest disk".
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let disk = pick_disk(disks, &root);
+
+    HostView {
+        cpu_percent: sys.global_cpu_usage(),
+        cpu_per_core: sys.cpus().iter().map(|c| c.cpu_usage()).collect(),
+        mem_used_bytes: sys.used_memory(),
+        mem_total_bytes: sys.total_memory(),
+        swap_used_bytes: sys.used_swap(),
+        swap_total_bytes: sys.total_swap(),
+        disk_used_bytes: disk
+            .map(|d| d.total_space().saturating_sub(d.available_space()))
+            .unwrap_or(0),
+        disk_total_bytes: disk.map(|d| d.total_space()).unwrap_or(0),
+        disk_mount: disk.map(|d| d.mount_point().display().to_string()).unwrap_or_default(),
+        process_cpu_percent,
+        process_mem_bytes,
+        uptime_seconds: System::uptime(),
+        os: System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string()),
+        gpus: sample_gpus(),
+    }
+}
+
+/// The disk `path` sits on: the mount point that is its longest prefix.
+///
+/// Falls back to the largest disk rather than to nothing, because "no mount
+/// matched" means the path was odd (a UNC share, a symlink chain), not that the
+/// machine has no disks - and a machine with disks must not draw an empty meter.
+fn pick_disk<'a>(disks: &'a Disks, path: &Path) -> Option<&'a Disk> {
+    disks
+        .list()
+        .iter()
+        .filter(|d| path.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .or_else(|| disks.list().iter().max_by_key(|d| d.total_space()))
+}
+
+// ---------------------------------------------------------------------------
 // Route
 // ---------------------------------------------------------------------------
 
@@ -326,9 +518,13 @@ pub struct ResourcesView {
     pub background_in_flight: usize,
     pub interactive_in_flight: usize,
     pub cpus: usize,
+    /// The machine underneath, when a sample was taken. `None` rather than
+    /// zeroes if sampling ever fails: a CPU meter at 0% is a claim, and "we did
+    /// not look" is not that claim.
+    pub host: Option<HostView>,
 }
 
-fn view(limits: &Limits) -> ResourcesView {
+fn view(limits: &Limits, host: Option<HostView>) -> ResourcesView {
     let (interactive, background) = limits.in_flight();
     ResourcesView {
         mode: limits.mode().as_str(),
@@ -337,11 +533,18 @@ fn view(limits: &Limits) -> ResourcesView {
         background_in_flight: background,
         interactive_in_flight: interactive,
         cpus: limits.cpus,
+        host,
     }
 }
 
+/// One host sample, off the async workers. `None` only if the blocking task
+/// itself was cancelled or panicked, which is the case the `Option` is for.
+async fn host_sample() -> Option<HostView> {
+    tokio::task::spawn_blocking(sample_host).await.ok()
+}
+
 async fn get_resources(State(state): State<Arc<AppState>>) -> Json<ResourcesView> {
-    Json(view(&state.limits))
+    Json(view(&state.limits, host_sample().await))
 }
 
 /// Pushed on change only — mode toggled, window focused, unfocused, closed, and
@@ -363,7 +566,10 @@ async fn set_resources(
     if let Some(present) = body.user_present {
         state.limits.set_user_present(present);
     }
-    Ok(Json(view(&state.limits)))
+    // Sampled here too, not just on GET: the desktop keeps whichever answer
+    // came back last, so a PUT that returned `host: None` would blank the
+    // Performance page's meters every time the window changed focus.
+    Ok(Json(view(&state.limits, host_sample().await)))
 }
 
 #[cfg(test)]
@@ -467,5 +673,60 @@ mod tests {
         }
         assert_eq!(Mode::parse("ECO"), Some(Mode::Eco));
         assert_eq!(Mode::parse("fastest"), None);
+    }
+
+    /// The disk the workspaces are on, not the first one listed and not the sum
+    /// of all of them. `Disk` cannot be constructed outside sysinfo, so this
+    /// asserts against the real machine: whatever it picks must be a mount the
+    /// workspace root is actually under, unless nothing matched at all.
+    #[test]
+    fn the_sample_reports_a_disk_the_workspaces_are_on() {
+        let host = sample_host();
+        assert!(host.mem_total_bytes > 0, "a machine with no memory is not running this test");
+        assert!(!host.cpu_per_core.is_empty(), "one bar per core, and there is at least one core");
+        assert!(host.disk_used_bytes <= host.disk_total_bytes, "used cannot exceed the volume");
+        if !host.disk_mount.is_empty() {
+            let root = crate::workspace_files::workspace_root();
+            let root = std::fs::canonicalize(&root).unwrap_or(root);
+            let matched = root.starts_with(&host.disk_mount);
+            let only_fallback = Disks::new_with_refreshed_list()
+                .list()
+                .iter()
+                .all(|d| !root.starts_with(d.mount_point()));
+            assert!(matched || only_fallback, "picked {} for {}", host.disk_mount, root.display());
+        }
+    }
+
+    /// The second sample is the one that matters: the first primes the CPU diff,
+    /// and a percentage that stayed pinned at 0 would mean the `System` is being
+    /// rebuilt per call instead of held.
+    #[test]
+    fn a_sample_is_bounded_and_repeatable() {
+        let _ = sample_host();
+        let host = sample_host();
+        assert!((0.0..=100.5).contains(&host.cpu_percent), "cpu was {}", host.cpu_percent);
+        for (i, core) in host.cpu_per_core.iter().enumerate() {
+            assert!((0.0..=100.5).contains(core), "core {i} was {core}");
+        }
+        assert!(host.mem_used_bytes <= host.mem_total_bytes);
+        assert!(host.process_mem_bytes > 0, "this process has memory");
+    }
+
+    /// Cannot assert a GPU exists — CI has none, and an empty list is the
+    /// documented answer there. What it can assert is that a card NVML *did*
+    /// report comes back whole, rather than as a named row of zeroes.
+    #[test]
+    fn a_listed_gpu_is_a_complete_reading() {
+        for gpu in sample_gpus() {
+            assert!(!gpu.name.is_empty(), "a card NVML listed has a name");
+            assert!(
+                (0.0..=100.0).contains(&gpu.utilization_percent),
+                "{} reported {}%",
+                gpu.name,
+                gpu.utilization_percent
+            );
+            assert!(gpu.mem_used_bytes <= gpu.mem_total_bytes, "{} VRAM", gpu.name);
+            assert!(gpu.mem_total_bytes > 0, "{} has memory", gpu.name);
+        }
     }
 }

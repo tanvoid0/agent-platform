@@ -276,7 +276,7 @@ mod tests {
         let bad_provider = json!({"providers": [{"name": "groq", "models": ["x"]}]});
         assert_eq!(
             validate(&bad_provider),
-            Err("'groq' is not one of ['ollama', 'gemini', 'lm_studio', 'aimlapi']".into())
+            Err("'groq' is not one of ['local', 'ollama', 'gemini', 'lm_studio', 'aimlapi', 'anthropic']".into())
         );
 
         let missing_models = json!({"providers": [{"name": "ollama"}]});

@@ -660,10 +660,26 @@ impl State {
 
     pub fn provider_ids(&self) -> Vec<String> {
         // The in-process engine leads the list when it can answer: it is the
-        // one upstream that is already on this machine.
-        let local = crate::inference::local_available()
-            .then(|| crate::inference::LOCAL_ID.to_string());
-        local.into_iter().chain(self.catalog.iter().map(|p| p.id.clone())).collect()
+        // one upstream that is already on this machine. The catalog carries a
+        // `local` row of its own now (the daemon's managed llama-server,
+        // ADR 0012), so the two are deduplicated rather than listed twice.
+        let mut ids: Vec<String> =
+            crate::inference::local_available().then(|| crate::inference::LOCAL_ID.to_string()).into_iter().collect();
+        for p in &self.catalog {
+            if !ids.contains(&p.id) {
+                ids.push(p.id.clone());
+            }
+        }
+        ids
+    }
+
+    /// Is this turn the app's own in-process engine rather than the server?
+    ///
+    /// Both fields unset with an engine linked in, which is what
+    /// [`crate::inference::chat_stream`] routes on. `provider = "local"` is a
+    /// different thing entirely: the daemon's managed `llama-server`.
+    fn in_process_route(&self) -> bool {
+        self.provider.is_empty() && self.model.is_empty() && crate::inference::local_available()
     }
 
     /// What the provider box shows. Both fields empty *is* the local route, so
@@ -672,10 +688,7 @@ impl State {
     ///
     /// [`LOCAL_ID`]: crate::inference::LOCAL_ID
     pub fn selected_provider(&self) -> String {
-        if self.provider.is_empty()
-            && self.model.is_empty()
-            && crate::inference::local_available()
-        {
+        if self.in_process_route() {
             return crate::inference::LOCAL_ID.to_string();
         }
         self.provider.clone()
@@ -687,7 +700,7 @@ impl State {
         // The local engine ignores `model` — whatever GGUF is configured
         // answers — and *setting* one would route the turn to the server
         // instead. An empty list is the honest one.
-        if self.selected_provider() == crate::inference::LOCAL_ID {
+        if self.in_process_route() {
             return Vec::new();
         }
         self.catalog
@@ -1215,9 +1228,13 @@ pub fn update(
             state.draft = v;
             Task::none()
         }
-        Message::ProviderChanged(v) if v == crate::inference::LOCAL_ID => {
-            // Not a provider the proxy can be told about: the local route is
-            // both fields unset, which is exactly what Default does.
+        Message::ProviderChanged(v)
+            if v == crate::inference::LOCAL_ID && crate::inference::local_available() =>
+        {
+            // Not a provider the proxy can be told about: the in-process
+            // engine is both fields unset, which is exactly what Default does.
+            // Only when one is linked in — otherwise `local` is the daemon's
+            // managed llama-server and an ordinary provider (ADR 0012).
             state.provider.clear();
             state.model.clear();
             Task::none()
@@ -1926,12 +1943,16 @@ mod tests {
         crate::memory::Store::load(&std::env::temp_dir().join("ev-assistant-test-memory"))
     }
 
-    /// Picking the in-process engine is not "set provider = local" — the proxy
-    /// has never heard of it, and `inference::chat_stream` routes on *both*
-    /// fields being unset. If this ever starts storing the id, every turn goes
-    /// to the server with a 400 for an unknown provider.
+    /// Picking the in-process engine is not "set provider = local" — that
+    /// engine is not a provider the proxy has heard of, and
+    /// `inference::chat_stream` routes on *both* fields being unset.
+    ///
+    /// Without one linked in, `local` is the daemon's managed `llama-server`
+    /// (ADR 0012) and has to be stored like any other provider: clearing it
+    /// there left the box blank and the model list showing every provider's
+    /// models.
     #[test]
-    fn picking_the_local_engine_clears_both_fields() {
+    fn picking_local_clears_both_fields_only_for_the_in_process_engine() {
         let mut s = State { provider: "ollama".into(), model: "llama3".into(), ..State::new() };
         let _ = update(
             &mut s,
@@ -1939,8 +1960,14 @@ mod tests {
             &mut mem(),
             Message::ProviderChanged(crate::inference::LOCAL_ID.into()),
         );
-        assert!(s.provider.is_empty(), "provider was {:?}", s.provider);
-        assert!(s.model.is_empty(), "model was {:?}", s.model);
+        if crate::inference::local_available() {
+            assert!(s.provider.is_empty(), "provider was {:?}", s.provider);
+            assert!(s.model.is_empty(), "model was {:?}", s.model);
+        } else {
+            assert_eq!(s.provider, crate::inference::LOCAL_ID);
+            assert_eq!(s.selected_provider(), crate::inference::LOCAL_ID);
+            assert!(s.model.is_empty(), "the ollama model does not survive the switch");
+        }
     }
 
     /// The box has to read back what was picked, and a real provider must not

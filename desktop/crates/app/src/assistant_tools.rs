@@ -170,6 +170,12 @@ pub fn tools_spec() -> Vec<serde_json::Value> {
                     unassigned_only=true), \
                     /api/v1/processes/{id} (one run with its tasks), \
                     /api/v1/system/status (server health), \
+                    /api/v1/system/resources (this machine right now: host.cpu_percent, \
+                    host.mem_used_bytes and host.mem_total_bytes, host.disk_used_bytes and \
+                    host.disk_total_bytes, plus this server's own process_cpu_percent and \
+                    process_mem_bytes, and the resource mode bounding background model \
+                    calls. Read it before blaming the app for a slow machine, or before \
+                    starting work that will need the machine), \
                     /api/v1/search/dork?q=… (build a Google-dork web search query; q takes \
                     dork operators — site:, filetype:, intitle:, \"exact phrase\", -exclude — \
                     directly and is the form to prefer, since you can already write the \

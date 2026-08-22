@@ -4,7 +4,7 @@ name = "agent-platform-server"
 # `dist` derives the tag from the version, so a skew would mean two tags for
 # one product. Bumped 0.1.0 → 0.2.0 to meet the app rather than moving the app
 # backwards.
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Rust API server for agent-platform: migrated domains plus a reverse proxy to the Python server (ADR 0007)"
 # `dist` requires this to generate GitHub CI; it is also what the generated
@@ -49,6 +49,12 @@ url = "2"
 getrandom = "0.2"
 subtle = "2"
 futures = "0.3"
+# Already in the tree via rustls. Declared because sd-server returns finished
+# images and videos as base64 *inside* the poll body (ADR 0011) — megabytes of
+# it, from another process. `api_tokens.rs` hand-rolls an encoder for one
+# fixed-size token, which is a different problem: decoding arbitrary input with
+# padding and whitespace is where a hand-rolled one goes quietly wrong.
+base64 = "0.22"
 # Real BPE, not an estimate. `context_usage` is a response body field on the
 # chat routes, and the same count decides what `context_budget` drops when a
 # prompt approaches the model's window — a character heuristic would trim a
@@ -71,6 +77,26 @@ async-stream = "0.3.6"
 # preflight is where people quietly get `Vary` wrong and poison a shared cache;
 # this is the crate axum's own examples use.
 tower-http = { version = "0.6", default-features = false, features = ["cors", "timeout"] }
+# Host CPU/memory/disk for `GET /system/resources` (the Performance page's
+# meters). Sampled on demand on a request the desktop was already making, never
+# on a timer of its own. `system` + `disk` only: components (temperatures),
+# networks and the user table are three more platform surfaces to build for
+# numbers nothing reads. Pinned below 0.39 because that release needs Rust 1.95
+# and this workspace is on 1.94.
+sysinfo = { version = "0.37", default-features = false, features = ["system", "disk"] }
+# GPU load and VRAM for the same route. NVIDIA only, and that is the point:
+# `nvml-wrapper` `dlopen`s the driver's own `nvml.dll` at runtime, so the build
+# never depends on a GPU being present and a machine without one reports an
+# empty list rather than failing to start. A vendor-neutral version means ROCm
+# SMI and Level Zero too - three SDKs for one meter, and two of them untestable
+# here.
+nvml-wrapper = "0.12"
+# ADR 0012: local inference is `llama-server`, a pinned upstream binary this
+# daemon fetches and runs — no C++/CUDA toolchain in our build, and nothing to
+# link. The in-process engine (`../local-llm`) is the desktop app's alone now.
+
+[features]
+default = []
 
 [target.'cfg(windows)'.dependencies]
 # Job object with kill-on-close: the only thing that reaps the Python child when
