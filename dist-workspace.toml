@@ -28,6 +28,12 @@ ci = ["github"]
 # second tag-triggered workflow was tried first: two workflows on one tag race
 # to create the same GitHub Release. This runs inside the same one, so there is
 # nothing to race.
+# A `cargo check --locked` on one small runner, ahead of the four platform
+# builds. `dist plan` validates the config but compiles nothing, so it cannot
+# see a Cargo.lock left behind by a version bump — which fails every build job
+# several minutes in and publishes nothing. Borrowed from portal-desktop, which
+# lost a tag to exactly that.
+plan-jobs = ["./release-smoke"]
 local-artifacts-jobs = ["./release-desktop"]
 packages = ["agent-platform-server"]
 # `packages` scopes what gets *released*, not what gets *built*. Without this,

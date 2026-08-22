@@ -1,0 +1,39 @@
+# The cheap gate in front of a release, as a `dist` custom plan job.
+#
+# `dist-workspace.toml` lists this file in `plan-jobs`, so `dist` runs it in the
+# plan stage — before any of the four platform builds start. One small runner
+# either clears the tag or stops it.
+#
+# It exists for one failure in particular: **a version bumped in Cargo.toml
+# without Cargo.lock**. Every release build runs `--locked`, so a stale lock
+# fails all four of them at once, several minutes in, and the tag publishes
+# nothing — portal-desktop lost v0.7.0 that way. `cargo check --locked` here
+# says so in under a minute, and `scripts/prepare_release.py` is the other half:
+# it syncs the lock so this never has to catch it.
+#
+# **The server only.** The iced app is Windows-only (whisper.cpp through
+# bindgen, a wgpu surface) and does not build on a Linux runner at all — which
+# is the same reason it is `dist = false` and arrives through
+# `release-desktop.yml`. `--locked` is workspace-wide regardless of `-p`, so one
+# package is enough to catch a lock that disagrees with either manifest.
+name: Release smoke
+
+on:
+  workflow_call:
+
+jobs:
+  smoke:
+    name: smoke (lockfile + server)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+
+      - name: cargo check --locked
+        working-directory: desktop
+        run: cargo check --locked -p agent-platform-server
