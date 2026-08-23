@@ -106,6 +106,24 @@ pub async fn billing_portal(
     Ok(Json(json!({ "url": url })))
 }
 
+/// Which entitlement write an event kind implies. Split out so the table is
+/// checkable without a Stripe account or a database — an unknown kind must be
+/// ignored, never fall through to a write.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    Paid,
+    Blocked,
+    Ignore,
+}
+
+fn action_for(kind: &str) -> Action {
+    match kind {
+        "checkout.session.completed" | "invoice.paid" => Action::Paid,
+        "customer.subscription.deleted" | "invoice.payment_failed" => Action::Blocked,
+        _ => Action::Ignore,
+    }
+}
+
 pub async fn stripe_webhook(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -122,10 +140,10 @@ pub async fn stripe_webhook(
     let event: Value = serde_json::from_slice(&body).map_err(|_| ApiError::bad_request("Invalid JSON."))?;
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     let obj = event.get("data").and_then(|d| d.get("object")).cloned().unwrap_or(Value::Null);
-    match kind {
-        "checkout.session.completed" | "invoice.paid" => apply_paid(&state, &obj).await?,
-        "customer.subscription.deleted" | "invoice.payment_failed" => apply_blocked(&state, &obj).await?,
-        _ => {}
+    match action_for(kind) {
+        Action::Paid => apply_paid(&state, &obj).await?,
+        Action::Blocked => apply_blocked(&state, &obj).await?,
+        Action::Ignore => {}
     }
     Ok(Json(json!({ "received": true })))
 }
@@ -172,6 +190,15 @@ async fn stripe_form(
 }
 
 fn verify_stripe_sig(secret: &str, header: &str, payload: &[u8]) -> Result<(), ApiError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    verify_stripe_sig_at(secret, header, payload, now)
+}
+
+/// `now` is a parameter so the replay window is testable without waiting.
+fn verify_stripe_sig_at(secret: &str, header: &str, payload: &[u8], now: i64) -> Result<(), ApiError> {
     let mut timestamp = None;
     let mut signatures: Vec<&str> = Vec::new();
     for part in header.split(',') {
@@ -185,6 +212,15 @@ fn verify_stripe_sig(secret: &str, header: &str, payload: &[u8]) -> Result<(), A
     let t = timestamp.ok_or_else(|| {
         ApiError::coded(StatusCode::BAD_REQUEST, "SIG_INVALID", "Bad Stripe-Signature.")
     })?;
+    // A valid signature stays valid forever without this: the header's own
+    // timestamp is signed, so a captured webhook could be replayed at any time.
+    let age = t
+        .parse::<i64>()
+        .map(|sent| (now - sent).abs())
+        .map_err(|_| ApiError::coded(StatusCode::BAD_REQUEST, "SIG_INVALID", "Bad Stripe-Signature."))?;
+    if age > accounts::env_u64("STRIPE_WEBHOOK_TOLERANCE_SECS", 300) as i64 {
+        return Err(ApiError::coded(StatusCode::BAD_REQUEST, "SIG_INVALID", "Stripe signature is stale."));
+    }
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "hmac"))?;
     mac.update(t.as_bytes());
@@ -262,4 +298,56 @@ async fn apply_blocked(state: &AppState, obj: &Value) -> Result<(), ApiError> {
         .await?;
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sign(secret: &str, t: i64, payload: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(t.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(payload);
+        let hex = mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>();
+        format!("t={t},v1={hex}")
+    }
+
+    /// The money path's only lock: anyone can POST the webhook URL, so a body
+    /// that is not signed with our secret must never reach `apply_paid`.
+    #[test]
+    fn only_a_fresh_signature_over_this_exact_body_verifies() {
+        let secret = "whsec_test";
+        let body = br#"{"type":"invoice.paid"}"#;
+        let now = 1_700_000_000;
+        let header = sign(secret, now, body);
+
+        assert!(verify_stripe_sig_at(secret, &header, body, now).is_ok());
+        // Stripe sends several v1 signatures during a secret rotation.
+        let two = format!("{header},v1=deadbeef");
+        assert!(verify_stripe_sig_at(secret, &two, body, now).is_ok());
+
+        // A different secret, a tampered body, and a missing timestamp all fail.
+        assert!(verify_stripe_sig_at("whsec_other", &header, body, now).is_err());
+        assert!(verify_stripe_sig_at(secret, &header, br#"{"type":"invoice.paid","x":1}"#, now).is_err());
+        let no_t = header.split(',').nth(1).unwrap().to_string();
+        assert!(verify_stripe_sig_at(secret, &no_t, body, now).is_err());
+
+        // And a captured-but-old request is refused inside the window's edge.
+        assert!(verify_stripe_sig_at(secret, &header, body, now + 299).is_ok());
+        assert!(verify_stripe_sig_at(secret, &header, body, now + 301).is_err());
+    }
+
+    /// An event kind nobody handled must do nothing. The default arm is what
+    /// stops a future Stripe event from writing an entitlement by accident.
+    #[test]
+    fn only_the_four_known_event_kinds_write_anything() {
+        assert_eq!(action_for("checkout.session.completed"), Action::Paid);
+        assert_eq!(action_for("invoice.paid"), Action::Paid);
+        assert_eq!(action_for("customer.subscription.deleted"), Action::Blocked);
+        assert_eq!(action_for("invoice.payment_failed"), Action::Blocked);
+        assert_eq!(action_for("invoice.upcoming"), Action::Ignore);
+        assert_eq!(action_for(""), Action::Ignore);
+    }
 }

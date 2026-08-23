@@ -88,37 +88,20 @@ pub fn api_routes() -> Router<Arc<AppState>> {
 }
 
 pub fn static_router() -> Router<Arc<AppState>> {
+    // The page is one file compiled into the binary, so a cloud image needs no
+    // node toolchain and no build step. A `/accounts/*` deep link renders it and
+    // the page routes on the hash; `/accounts/api/*` that reached here matched
+    // no API route, so it answers the 404 envelope rather than HTML.
     Router::new()
         .route("/accounts", get(embedded_index))
         .route("/accounts/", get(embedded_index))
-        .route("/accounts/{*path}", get(spa_path))
+        .route("/accounts/{*path}", get(accounts_path))
 }
 
-async fn spa_path(Path(path): Path<String>) -> Response {
+async fn accounts_path(Path(path): Path<String>) -> Response {
     if path.starts_with("api/") {
         return crate::error::ApiError::not_found(format!("No route for GET /accounts/{path}"))
             .into_response();
-    }
-    let dist = env_opt("AGENT_PLATFORM_ACCOUNTS_DIST")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("accounts/dist"));
-    let candidate = dist.join(&path);
-    if candidate.is_file() {
-        if let Ok(bytes) = std::fs::read(&candidate) {
-            let ctype = match candidate.extension().and_then(|e| e.to_str()) {
-                Some("js") => "application/javascript",
-                Some("css") => "text/css",
-                Some("svg") => "image/svg+xml",
-                Some("json") => "application/json",
-                Some("html") => "text/html; charset=utf-8",
-                _ => "application/octet-stream",
-            };
-            return (
-                [(header::CONTENT_TYPE, HeaderValue::from_str(ctype).unwrap_or(HeaderValue::from_static("application/octet-stream")))],
-                bytes,
-            )
-                .into_response();
-        }
     }
     embedded_index().await.into_response()
 }

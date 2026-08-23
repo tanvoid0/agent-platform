@@ -60,9 +60,11 @@ claiming a change works; CI is the backstop, not the loop.
   `--target-dir` pointing outside the repo instead of killing the app
   (`.gitignore` pins `desktop/target/` exactly, so a sibling dir inside the repo
   shows up untracked).
-- **`agent-platformd` is SQLite-only** and refuses to start with `DATABASE_URL`
-  set. The `sqlx::Any` pool that lifts that restriction is half-converted; see
-  `AppState`.
+- **SQLite is the default; Postgres is opt-in through `DATABASE_URL`.** One
+  `sqlx::AnyPool` (`AppState::any`) serves both, so every query site goes through
+  `db::sql` for placeholder rewriting and every migration is written twice —
+  `migrations/sqlite/` and `migrations/postgres/`, same number, same order.
+  A desktop install stays SQLite; the cloud deployment is what needs the DSN.
 - **Diagnostics go through `logd!`, not `eprintln!`.** It writes the same line to
   stderr *and* into the ring `GET /system/logs` serves. There is exactly one
   `eprintln!` left in the crate, inside `observability::diagnostic`.

@@ -1,14 +1,13 @@
 # Accounts UI
 
-Hosted at `/accounts` by `agent-platformd`. Same Portal login as the store apps.
+`index.html` — one file, hash-routed, no build step. `agent-platformd` compiles
+it in (`include_str!`) and serves it at `/accounts`, so the cloud image carries
+no node toolchain.
 
-```
-pnpm install
-pnpm build
-```
+Pages: sign-in (magic link), verify, me (usage, price preview, manage billing),
+admin (grant-comp, set entitlement, revoke sessions). It talks to
+`/accounts/api/v1/*` and keeps its tokens in `localStorage`.
 
-That writes `accounts/dist`. Point the server at it with `AGENT_PLATFORM_ACCOUNTS_DIST` or keep the folder at `accounts/dist` relative to the process cwd.
-
-If `dist` is missing, the server serves the embedded `accounts/index.html` fallback so `cargo run` still works.
-
-v1 pages: sign-in (magic link), me (usage + billing), admin (grant-comp, set entitlement, revoke).
+There was a SvelteKit version of the same four screens beside it; it was deleted
+rather than finished — two implementations of one admin page, and only this one
+ships without `pnpm build`.

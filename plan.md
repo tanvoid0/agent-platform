@@ -63,9 +63,11 @@ cd desktop && cargo run -p agent-platform-desktop               # the app (spawn
 ```
 
 `agent-platformd` is self-contained: no child process, no interpreter. It
-creates its own SQLite file and runs `migrations/` on startup. It is
-SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
-`.env` sets one, so a checkout run needs `AGENT_PLATFORM_ROOT` pointed elsewhere.
+creates its own SQLite file and runs `migrations/sqlite/` on startup. Postgres
+is opt-in through `DATABASE_URL` (`migrations/postgres/`, one `sqlx::AnyPool`
+either way) and is what the cloud deployment runs — note the repo's own `.env`
+sets a DSN, so a local checkout run wants it unset or `AGENT_PLATFORM_ROOT`
+pointed elsewhere.
 
 - Desktop dev needs cmake + libclang (machine paths in
   `desktop/.cargo/config.toml`). The app spawns `agent-platformd` from its own
@@ -110,6 +112,14 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
   - **`AuthMode::UserSession` is a tenant, not the master key.**
     `require_ai_entitlement` applies to that mode only; workspace tokens, the
     master key and the local machine user skip billing as before.
+  - **The accounts page is one `include_str!`'d HTML file**, not a build
+    artifact. A SvelteKit version of the same four screens shipped beside it and
+    was never reachable — `/accounts` always served the embedded one — so it was
+    deleted rather than finished. `AGENT_PLATFORM_ACCOUNTS_DIST` is gone with it.
+  - **The Stripe webhook enforces a 300 s replay window**
+    (`STRIPE_WEBHOOK_TOLERANCE_SECS`). The header's timestamp is signed, so
+    without an age check a captured webhook stays valid forever. The signature
+    and the event-kind table are unit-tested; an unknown kind writes nothing.
   - **Magic-link verify GET answers 303** (`Redirect::to`), not 302 — the
     desktop follows any 3xx to its loopback callback, and the IPv6 loopback
     literal `http://[::1]:…` is accepted (bracket-stripped before `IpAddr`).
