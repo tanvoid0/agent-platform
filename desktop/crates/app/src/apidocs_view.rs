@@ -38,20 +38,26 @@ fn connect_card<'a>(origin: &str, key: &str) -> Element<'a, Message> {
         ui::button_secondary(Icon::Copy, "Copy key", Message::Copy("key".into(), key.to_string())),
     ];
     if key.is_empty() {
-        actions.push(ui::badge("no key set — the server is open on loopback", Tone::Warning));
+        actions.push(ui::badge("no token — open on loopback", Tone::Success));
     }
     ui::card_with_header(
         "Connect",
         Some(ui::muted(
-            "One bearer token, one base URL. The server answers on the loopback address \
-             while the app is running, and keeps answering when the window is closed.",
+            "The local API is open on loopback, like Ollama. Other apps on this machine \
+             call it with no token. A bearer is only required if you expose the server.",
         )),
         None,
         ui::stack(vec![
             ui::field("Base URL", ui::mono(origin.to_string())),
             ui::field(
                 "Auth header",
-                ui::mono("Authorization: Bearer <key>".to_string()),
+                ui::mono(
+                    if key.is_empty() {
+                        "(none on loopback)".to_string()
+                    } else {
+                        "Authorization: Bearer <key>".to_string()
+                    },
+                ),
             ),
             ui::field(
                 "Keys",

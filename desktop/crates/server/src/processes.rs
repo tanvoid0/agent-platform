@@ -320,7 +320,7 @@ async fn list_processes(
 ) -> Result<Response, ApiError> {
     principal.require_scope("process:read")?;
     let filters = list_filters(principal.workspace_id.is_some(), &q)?;
-    if let (true, Some(project_id)) = (principal.workspace_id.is_some(), filters.project_id) {
+    if let Some(project_id) = filters.project_id {
         crate::projects::assert_access(&state, &principal, project_id).await?;
     }
 

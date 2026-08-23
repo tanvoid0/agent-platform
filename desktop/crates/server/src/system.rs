@@ -105,6 +105,7 @@ async fn system_status(State(state): State<Arc<AppState>>) -> Result<Response, A
                 .unwrap_or(18410),
         },
         "auth_required": state.master_key.is_some(),
+        "auth": crate::identity::public_auth_info(&state),
         "readiness": {
             "ok": app_ok,
             "status": if app_ok { "ok" } else { "unready" },

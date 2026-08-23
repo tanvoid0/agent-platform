@@ -100,19 +100,21 @@ pub struct ProjectUpdate {
 struct ProjectOwner {
     workspace_id: Option<i64>,
     workspace_archived: Option<String>,
+    owner_user_id: Option<i64>,
 }
 
 /// `assert_token_project_access` + `require_one` in one query.
 ///
-/// 404 — never 401 — is the tenancy contract: a workspace token asking about
-/// another tenant's project must not learn that it exists.
+/// 404 — never 401 — is the tenancy contract: a workspace token or a signed-in
+/// user asking about another tenant's project must not learn that it exists.
 pub(crate) async fn assert_access(
     state: &AppState,
     principal: &Principal,
     project_id: i64,
 ) -> Result<(), ApiError> {
     let row: Option<ProjectOwner> = sqlx::query_as(&db::sql(
-        "SELECT CAST(p.workspace_id AS BIGINT) AS workspace_id, CAST(w.archived_at AS TEXT) AS workspace_archived \
+        "SELECT CAST(p.workspace_id AS BIGINT) AS workspace_id, CAST(w.archived_at AS TEXT) AS workspace_archived, \
+         CAST(w.user_id AS BIGINT) AS owner_user_id \
          FROM project p LEFT JOIN workspace w ON w.id = p.workspace_id \
          WHERE p.id = ?"
     , state.backend))
@@ -128,11 +130,18 @@ pub(crate) async fn assert_access(
     if row.workspace_id.is_none() || row.workspace_archived.is_some() {
         return Err(ApiError::not_found("Not found"));
     }
-    match principal.workspace_id {
-        None => Ok(()),
-        Some(ws) if Some(ws) == row.workspace_id => Ok(()),
-        Some(_) => Err(ApiError::not_found("Not found")),
+    if let Some(ws) = principal.workspace_id {
+        if Some(ws) != row.workspace_id {
+            return Err(ApiError::not_found("Not found"));
+        }
+        return Ok(());
     }
+    if let Some(uid) = principal.scoped_user_id() {
+        if row.owner_user_id != Some(uid) {
+            return Err(ApiError::not_found("Not found"));
+        }
+    }
+    Ok(())
 }
 
 async fn load_project(state: &AppState, project_id: i64) -> Result<ProjectOut, ApiError> {
@@ -199,16 +208,24 @@ async fn list_projects(
     State(state): State<Arc<AppState>>,
     principal: Principal,
 ) -> Result<Response, ApiError> {
-    let rows: Vec<ProjectOut> = match principal.workspace_id {
-        Some(ws) => sqlx::query_as(&db::sql(&format!(
+    let rows: Vec<ProjectOut> = match (principal.workspace_id, principal.scoped_user_id()) {
+        (Some(ws), _) => sqlx::query_as(&db::sql(&format!(
             "SELECT {PROJECT_COLUMNS} FROM project WHERE workspace_id = ? ORDER BY id ASC"
         ), state.backend))
         .bind(ws)
         .fetch_all(&state.any)
         .await?,
+        (None, Some(uid)) => sqlx::query_as(&db::sql(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM project \
+             WHERE workspace_id IN (SELECT id FROM workspace WHERE user_id = ? AND archived_at IS NULL) \
+             ORDER BY id ASC"
+        ), state.backend))
+        .bind(uid)
+        .fetch_all(&state.any)
+        .await?,
         // Master key sees every live tenant. Projects with no workspace are
         // excluded here exactly as the Python `IN (...)` excludes NULL.
-        None => sqlx::query_as(&db::sql(&format!(
+        (None, None) => sqlx::query_as(&db::sql(&format!(
             "SELECT {PROJECT_COLUMNS} FROM project \
              WHERE workspace_id IN (SELECT id FROM workspace WHERE archived_at IS NULL) \
              ORDER BY id ASC"
@@ -245,13 +262,35 @@ async fn create_project(
 
     let workspace_id = match (principal.workspace_id, req.workspace_id) {
         (Some(ws), _) => ws,
-        (None, Some(ws)) => ws,
-        (None, None) => sqlx::query_scalar::<_, i64>(&db::sql("SELECT CAST(id AS BIGINT) FROM workspace WHERE slug = 'default'", state.backend))
-            .fetch_optional(&state.any)
-            .await?
-            .ok_or_else(|| {
-                ApiError::bad_request("workspace_id is required (no Default workspace exists).")
-            })?,
+        (None, Some(ws)) => {
+            crate::identity::assert_workspace_visible(&state, &principal, ws).await?;
+            ws
+        }
+        (None, None) => {
+            if let Some(uid) = principal.user_id {
+                let username = principal
+                    .email
+                    .as_deref()
+                    .and_then(|e| e.split('@').next())
+                    .unwrap_or("user");
+                let kind = if principal.mode == crate::auth::AuthMode::OpenLocal {
+                    "local"
+                } else {
+                    "cloud"
+                };
+                crate::identity::ensure_user_workspace(&state, uid, username, kind).await?
+            } else {
+                sqlx::query_scalar::<_, i64>(&db::sql(
+                    "SELECT CAST(id AS BIGINT) FROM workspace WHERE slug = 'default'",
+                    state.backend,
+                ))
+                .fetch_optional(&state.any)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::bad_request("workspace_id is required (no Default workspace exists).")
+                })?
+            }
+        }
     };
 
     let archived: Option<Option<String>> =

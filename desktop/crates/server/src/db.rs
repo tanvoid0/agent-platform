@@ -499,10 +499,11 @@ mod schema_tests {
     }
 }
 
-/// SQLite wants a path, `Any` wants a URL. Postgres DSNs pass through untouched.
+/// SQLite wants a path, `Any` wants a URL. Postgres DSNs are normalised for
+/// sqlx (see [`normalize_database_url`]); everything else is the desktop file.
 pub fn url_for(db_path: &std::path::Path, database_url: Option<&str>) -> String {
     match database_url {
-        Some(dsn) => dsn.to_string(),
+        Some(dsn) => normalize_database_url(dsn),
         // Forward slashes: a Windows `\` is an escape inside a URL, and sqlx
         // parses this string as one. `mode=rwc` creates the file — the `Any`
         // driver takes no `create_if_missing`, and this is the pool
@@ -510,6 +511,43 @@ pub fn url_for(db_path: &std::path::Path, database_url: Option<&str>) -> String 
         // the database it is about to populate.
         None => format!("sqlite:{}?mode=rwc", db_path.display().to_string().replace('\\', "/")),
     }
+}
+
+/// Make a Postgres DSN something sqlx 0.8 will connect with.
+///
+/// Neon Console copies `channel_binding=require`. sqlx treats that as an
+/// unknown option and refuses the URL. Neon also requires TLS; without
+/// `sslmode=require` a `.neon.tech` host never handshakes. Localhost / CI
+/// Postgres is left alone so `sslmode=require` does not break `postgres:16`.
+pub fn normalize_database_url(dsn: &str) -> String {
+    if Backend::from_url(dsn) != Backend::Postgres {
+        return dsn.to_string();
+    }
+    let Ok(mut parsed) = url::Url::parse(dsn) else {
+        return dsn.to_string();
+    };
+    let neon = parsed
+        .host_str()
+        .is_some_and(|h| h.eq_ignore_ascii_case("neon.tech") || h.to_ascii_lowercase().ends_with(".neon.tech"));
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("channel_binding"))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let has_sslmode = pairs.iter().any(|(k, _)| k.eq_ignore_ascii_case("sslmode"));
+    parsed.set_query(None);
+    let add_ssl = neon && !has_sslmode;
+    // `query_pairs_mut` on an empty list still serialises a trailing `?`.
+    if !pairs.is_empty() || add_ssl {
+        let mut qp = parsed.query_pairs_mut();
+        for (k, v) in &pairs {
+            qp.append_pair(k, v);
+        }
+        if add_ssl {
+            qp.append_pair("sslmode", "require");
+        }
+    }
+    parsed.to_string()
 }
 
 #[cfg(test)]
@@ -564,6 +602,26 @@ mod tests {
         assert_eq!(
             url_for(p, Some("postgresql://u:p@h/db")),
             "postgresql://u:p@h/db"
+        );
+    }
+
+    #[test]
+    fn neon_urls_drop_channel_binding_and_require_tls() {
+        let p = std::path::Path::new("x.db");
+        assert_eq!(
+            url_for(
+                p,
+                Some("postgresql://u:p@ep-x.eu-west-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"),
+            ),
+            "postgresql://u:p@ep-x.eu-west-2.aws.neon.tech/neondb?sslmode=require"
+        );
+        assert_eq!(
+            url_for(p, Some("postgresql://u:p@ep-x.eu-west-2.aws.neon.tech/neondb")),
+            "postgresql://u:p@ep-x.eu-west-2.aws.neon.tech/neondb?sslmode=require"
+        );
+        assert_eq!(
+            url_for(p, Some("postgresql://u:p@localhost/agent_platform")),
+            "postgresql://u:p@localhost/agent_platform"
         );
     }
 

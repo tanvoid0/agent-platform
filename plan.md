@@ -33,7 +33,7 @@ than died, is the section below.
 |------|------|
 | Router, startup, the 404 fallback | `desktop/crates/server/src/lib.rs` |
 | Schema (replaced Alembic) | `desktop/crates/server/migrations/` + `db::ensure_schema` (`sqlx::migrate!`); `db.rs` is also the SQLite/Postgres choke point (placeholder rewriting, pool construction) |
-| Auth, tokens | `auth.rs` (verification, `last_used_at`), `api_tokens.rs` (the CRUD) — see `docs/workspace-tenancy-plan.md` |
+| Auth, tokens, accounts | `auth.rs`, `api_tokens.rs`, `accounts.rs` (magic-link, entitlements); desktop Settings → Account in `account.rs` / `account_view.rs` ([ADR 0013](docs/adr/0013-desktop-local-open-cloud-account.md)) |
 | Processes / orchestrator | `{processes,executor,dag_schema}.rs` — the DAG executor and all eleven process routes |
 | LLM proxy, BYOK, providers | `llm.rs` (routes), `llm_config.rs`, `byok.rs`, `provider_catalog.rs`, `model_capabilities.rs`, `model_catalog.rs`, `upstream_http.rs`, `usage.rs`; admin surface in `llm_admin.rs`, `config.yaml` validation in `config_schema.rs` |
 | Local model (provider `local`) | `llm_llama_process.rs` (fetch/launch/log/stop `llama-server`) over `managed_server.rs` (the mechanism it shares with sd-server); desktop Settings → Status card in `screen.rs` ([ADR 0012](docs/adr/0012-managed-llama-server.md)) |
@@ -93,6 +93,41 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
   `GET /processes/{id}`. Desktop gates its detail polling on the stream.
 
 ## Backlog
+
+- **User-owned data, local and cloud — landed 2026-08-23.**
+  [ADR 0014](docs/adr/0014-user-owned-data-local-and-cloud.md). Identity is
+  always a `users` row: local startup registers the OS user (`kind = local`)
+  and backfills every ownerless row to it; magic-link does the same for an
+  email. Migration `0006` adds `users.username` / `users.kind` and `user_id` on
+  workspace, coder threads, media jobs, workflows, action sets and search
+  history. Cross-user reads 404 rather than 401; the master key still sees
+  every tenant.
+  - **Auth errors name the failure.** A missing Bearer on a keyed server is
+    `AUTH_REQUIRED`, an expired JWT is `TOKEN_EXPIRED` with a refresh hint, and
+    `/health` carries `auth.required` / `auth.mode` / `auth.hint` so another app
+    can see why `/api/v1/*` started 401ing. `tests/auth_and_routing.rs` asserts
+    the split — a *wrong* token is still `TOKEN_INVALID`.
+  - **`AuthMode::UserSession` is a tenant, not the master key.**
+    `require_ai_entitlement` applies to that mode only; workspace tokens, the
+    master key and the local machine user skip billing as before.
+  - **Magic-link verify GET answers 303** (`Redirect::to`), not 302 — the
+    desktop follows any 3xx to its loopback callback, and the IPv6 loopback
+    literal `http://[::1]:…` is accepted (bracket-stripped before `IpAddr`).
+
+- **Desktop: open loopback + optional cloud account — landed 2026-08-23.**
+  [ADR 0013](docs/adr/0013-desktop-local-open-cloud-account.md). The iced app
+  no longer injects a master key when it spawns `agent-platformd` — local API
+  is open on loopback like Ollama. Settings → Account magic-links against a
+  hosted origin; the session file is provider `platform` on the local daemon.
+  SQLite and local routes never require a Portal login.
+  - **Spawn sets `AGENT_PLATFORM_MASTER_KEY` empty** so a developer `.env`
+    cannot re-arm it. `host_guard` and off-loopback-requires-key stay.
+  - **Attach-if-running** tries unauthenticated status first, then the leftover
+    install key, so an older keyed daemon is still adopted.
+  - **Magic-link `redirect_uri`** must be loopback; verify GET 303s tokens to
+    the desktop callback. Paste-the-link is the fallback.
+  - **Allowlist** includes `agent-platform-desktop`. Cloud `/v1` still gates on
+    entitlement; master / `agp_` still skip billing.
 
 - **Settings → Performance shows the machine, not just the knob — landed 2026-08-22.**
   The page had one meter (background model calls against the lane's limit) and

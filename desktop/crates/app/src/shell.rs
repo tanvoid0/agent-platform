@@ -276,6 +276,10 @@ pub struct Settings {
     /// never trust again.
     #[serde(default)]
     pub resource_mode: ResourceMode,
+    /// Last cloud origin typed in Settings → Account. Not the session — that
+    /// lives in `cloud.session.json` so a refresh token never reaches this file.
+    #[serde(default)]
+    pub cloud_url: String,
 }
 
 fn default_true() -> bool {
@@ -317,6 +321,7 @@ impl Default for Settings {
             coder_autonomy: crate::coder::Autonomy::default(),
             coder_allowlist: std::collections::BTreeMap::new(),
             resource_mode: ResourceMode::default(),
+            cloud_url: String::new(),
         }
     }
 }
@@ -495,7 +500,10 @@ impl Shell {
         // No args: everything the daemon needs comes through the environment.
         cmd.env("AGENT_PLATFORM_HOST", "127.0.0.1")
             .env("AGENT_PLATFORM_PORT", port.to_string())
-            .env("AGENT_PLATFORM_MASTER_KEY", &self.key)
+            // Empty, not omitted: load_dotenv does not override a present value,
+            // and a developer `.env` master key would otherwise lock the local
+            // API. Loopback is open like Ollama (ADR 0013).
+            .env("AGENT_PLATFORM_MASTER_KEY", "")
             .env("AGENT_PLATFORM_ENV", "development")
             .env("AGENT_PLATFORM_DB_PATH", self.data_dir.join("agent_platform.db"))
             .env("AGENT_PLATFORM_WORKSPACE_ROOT", self.data_dir.join("workspaces"))
@@ -506,6 +514,11 @@ impl Shell {
             .env("MEDIA_DATA_DIR", self.data_dir.join("media"))
             // BYOK/provider config must land in a user-writable dir, not the install dir.
             .env("CONFIG_DIR", self.data_dir.join("llm"))
+            // Hosted-account session the daemon reads as provider `platform`.
+            .env(
+                "AGENT_PLATFORM_CLOUD_SESSION",
+                crate::account::session_path(&self.data_dir),
+            )
             // A developer's .env must not point a desktop install at someone's
             // Postgres. Present-but-empty wins, because load_dotenv does not override.
             .env("DATABASE_URL", "");
@@ -675,16 +688,32 @@ pub fn health_ok(port: u16) -> bool {
     probe(port, "/health", None) == Some(200)
 }
 
-/// Decide whether the server already on the port is one we may adopt. A healthy
-/// server that rejects our key is NOT ours: attaching would point the UI at
-/// another install (or a Docker forward) that our key cannot authenticate to.
+/// Decide whether the server already on the port is one we may adopt.
+///
+/// An open loopback server (no master key, ADR 0013) answers status without a
+/// bearer and is treated as ours — one listener, like Ollama. A leftover keyed
+/// daemon from an older install still accepts this install's key. Anything else
+/// that is healthy but rejects both is foreign (a Docker forward, another
+/// product).
 pub fn port_owner(port: u16, key: &str) -> PortOwner {
     if !health_ok(port) {
         return PortOwner::Free;
     }
+    if probe(port, "/api/v1/system/status", None) == Some(200) {
+        return PortOwner::Ours;
+    }
     match probe(port, "/api/v1/system/status", Some(key)) {
         Some(200) => PortOwner::Ours,
         _ => PortOwner::Foreign,
+    }
+}
+
+/// Bearer the iced client should send. Empty when the server is open.
+pub fn client_key(port: u16, install_key: &str, owner: PortOwner) -> String {
+    match owner {
+        PortOwner::Free => String::new(),
+        PortOwner::Ours if probe(port, "/api/v1/system/status", None) == Some(200) => String::new(),
+        PortOwner::Ours | PortOwner::Foreign => install_key.to_string(),
     }
 }
 

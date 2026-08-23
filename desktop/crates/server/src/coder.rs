@@ -15,10 +15,10 @@
 //!
 //! Two things about this domain that read like bugs and are not:
 //!
-//! - **There is no project scoping anywhere.** `coder_chat_threads` has no
-//!   `project_id` and no handler calls `assert_token_project_access`, so a
-//!   workspace token holding `chat:write` sees every coder thread on the box.
-//!   Ported verbatim; narrowing it is a product decision, not a port one.
+//! - **Threads are owned by a user** (`coder_chat_threads.user_id`, ADR 0014).
+//!   A workspace token or cloud JWT only sees that user's threads; the local
+//!   machine user is the same. There is still no `project_id` — coder is not
+//!   a project-scoped domain.
 //! - **Two of the GETs write.** `_resolve_thread(None)` falls through to
 //!   `_create_thread_row`, which commits — so `GET /chat/thread` and
 //!   `GET /chat/context-usage` INSERT a `"New session"` row on an empty
@@ -69,16 +69,21 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 /// `require_scope(principal, "chat:write")` — every route in this domain
 /// checks the same one, including the reads.
-fn require_chat_write(principal: &Principal) -> Result<(), ApiError> {
-    if principal.has_scope("chat:write") {
-        return Ok(());
+fn require_chat_write<'a>(
+    state: &'a crate::AppState,
+    principal: &'a Principal,
+) -> impl std::future::Future<Output = Result<(), ApiError>> + 'a {
+    async move {
+        if !principal.has_scope("chat:write") {
+            return Err(ApiError {
+                status: StatusCode::FORBIDDEN,
+                code: "INSUFFICIENT_SCOPE",
+                message: "Token lacks required scope 'chat:write'.".to_string(),
+                extra: None,
+            });
+        }
+        crate::accounts::require_ai_entitlement(state, principal, principal.client.as_deref()).await
     }
-    Err(ApiError {
-        status: StatusCode::FORBIDDEN,
-        code: "INSUFFICIENT_SCOPE",
-        message: "Token lacks required scope 'chat:write'.".to_string(),
-        extra: None,
-    })
 }
 
 const DEFAULT_TITLE: &str = "New session";
@@ -140,10 +145,12 @@ struct ThreadRow {
     model: Option<String>,
     created_at: String,
     updated_at: String,
+    user_id: Option<i64>,
 }
 
 pub const THREAD_COLUMNS: &str = "CAST(id AS BIGINT) AS id, title, workspace_root, messages_json, pending_call_json, model, \
-     CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at";
+     CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at, \
+     CAST(user_id AS BIGINT) AS user_id";
 
 impl ThreadRow {
     /// `get_messages`: best-effort, an undecodable blob reads as empty rather
@@ -182,17 +189,19 @@ async fn create_thread_row(
     state: &AppState,
     title: Option<&str>,
     workspace_root: Option<&str>,
+    user_id: Option<i64>,
 ) -> Result<ThreadRow, ApiError> {
     let now = sql_now();
     let title = title.unwrap_or(DEFAULT_TITLE);
     let id: i64 = sqlx::query_scalar(&crate::db::sql(
-        "INSERT INTO coder_chat_threads (title, workspace_root, created_at, updated_at) \
-         VALUES (?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
+        "INSERT INTO coder_chat_threads (title, workspace_root, created_at, updated_at, user_id) \
+         VALUES (?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(title)
     .bind(workspace_root)
     .bind(&now)
     .bind(&now)
+    .bind(user_id)
     .fetch_one(&state.any)
     .await?;
     Ok(ThreadRow {
@@ -205,31 +214,48 @@ async fn create_thread_row(
         model: None,
         created_at: now.clone(),
         updated_at: now,
+        user_id,
     })
 }
 
-async fn get_thread_by_id(state: &AppState, thread_id: i64) -> Result<ThreadRow, ApiError> {
-    sqlx::query_as(&crate::db::sql(&format!("SELECT {THREAD_COLUMNS} FROM coder_chat_threads WHERE id = ?"), state.backend))
+async fn get_thread_by_id(state: &AppState, principal: &Principal, thread_id: i64) -> Result<ThreadRow, ApiError> {
+    let row: ThreadRow = sqlx::query_as(&crate::db::sql(&format!("SELECT {THREAD_COLUMNS} FROM coder_chat_threads WHERE id = ?"), state.backend))
         .bind(thread_id)
         .fetch_optional(&state.any)
         .await?
-        .ok_or_else(|| ApiError::not_found("Coder thread not found"))
+        .ok_or_else(|| ApiError::not_found("Coder thread not found"))?;
+    crate::identity::assert_user_row(principal, row.user_id)?;
+    Ok(row)
 }
 
 /// `_resolve_thread`: a named thread, else the most recently updated one, else
 /// **a freshly created row** — the insert-on-read the module docs call out.
-async fn resolve_thread(state: &AppState, thread_id: Option<i64>) -> Result<ThreadRow, ApiError> {
+async fn resolve_thread(
+    state: &AppState,
+    principal: &Principal,
+    thread_id: Option<i64>,
+) -> Result<ThreadRow, ApiError> {
     if let Some(thread_id) = thread_id {
-        return get_thread_by_id(state, thread_id).await;
+        return get_thread_by_id(state, principal, thread_id).await;
     }
-    let row: Option<ThreadRow> = sqlx::query_as(&crate::db::sql(&format!(
-        "SELECT {THREAD_COLUMNS} FROM coder_chat_threads ORDER BY updated_at DESC LIMIT 1"
-    ), state.backend))
-    .fetch_optional(&state.any)
-    .await?;
+    let owner = principal.scoped_user_id();
+    let row: Option<ThreadRow> = if let Some(uid) = owner {
+        sqlx::query_as(&crate::db::sql(&format!(
+            "SELECT {THREAD_COLUMNS} FROM coder_chat_threads WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1"
+        ), state.backend))
+        .bind(uid)
+        .fetch_optional(&state.any)
+        .await?
+    } else {
+        sqlx::query_as(&crate::db::sql(&format!(
+            "SELECT {THREAD_COLUMNS} FROM coder_chat_threads ORDER BY updated_at DESC LIMIT 1"
+        ), state.backend))
+        .fetch_optional(&state.any)
+        .await?
+    };
     match row {
         Some(row) => Ok(row),
-        None => create_thread_row(state, None, default_workspace_root().as_deref()).await,
+        None => create_thread_row(state, None, default_workspace_root().as_deref(), crate::identity::stamp_user_id(state, principal)).await,
     }
 }
 
@@ -310,12 +336,21 @@ async fn threads_list(
     State(state): State<Arc<AppState>>,
     principal: Principal,
 ) -> Result<Response, ApiError> {
-    require_chat_write(&principal)?;
-    let rows: Vec<ThreadRow> = sqlx::query_as(&crate::db::sql(&format!(
-        "SELECT {THREAD_COLUMNS} FROM coder_chat_threads ORDER BY updated_at DESC"
-    ), state.backend))
-    .fetch_all(&state.any)
-    .await?;
+    require_chat_write(&state, &principal).await?;
+    let rows: Vec<ThreadRow> = if let Some(uid) = principal.scoped_user_id() {
+        sqlx::query_as(&crate::db::sql(&format!(
+            "SELECT {THREAD_COLUMNS} FROM coder_chat_threads WHERE user_id = ? ORDER BY updated_at DESC"
+        ), state.backend))
+        .bind(uid)
+        .fetch_all(&state.any)
+        .await?
+    } else {
+        sqlx::query_as(&crate::db::sql(&format!(
+            "SELECT {THREAD_COLUMNS} FROM coder_chat_threads ORDER BY updated_at DESC"
+        ), state.backend))
+        .fetch_all(&state.any)
+        .await?
+    };
 
     let threads: Vec<Value> = rows
         .into_iter()
@@ -369,7 +404,7 @@ async fn threads_create(
     // `require_body`'s comment.
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    require_chat_write(&principal)?;
+    require_chat_write(&state, &principal).await?;
     let req: ThreadCreateRequest = parse_body_or_default(&body)?;
     let mut errors = Vec::new();
     check_len(&mut errors, "title", req.title.as_deref(), 128);
@@ -381,7 +416,13 @@ async fn threads_create(
     // `create_thread` defaults an empty title to "New session"; the workspace
     // root is *not* defaulted here, unlike the resolve-on-read path.
     let title = req.title.filter(|t| !t.is_empty());
-    let row = create_thread_row(&state, title.as_deref(), req.workspace_root.as_deref()).await?;
+    let row = create_thread_row(
+        &state,
+        title.as_deref(),
+        req.workspace_root.as_deref(),
+        crate::identity::stamp_user_id(&state, &principal),
+    )
+    .await?;
     Ok(Json(json!({
         "thread_id": row.id,
         "title": row.display_title(),
@@ -436,9 +477,9 @@ async fn context_usage(
     principal: Principal,
     Query(q): Query<ThreadIdQuery>,
 ) -> Result<Response, ApiError> {
-    require_chat_write(&principal)?;
+    require_chat_write(&state, &principal).await?;
     let thread_id = parse_thread_id(q.thread_id)?;
-    let thread = resolve_thread(&state, thread_id).await?;
+    let thread = resolve_thread(&state, &principal, thread_id).await?;
     let llm_messages = llm_messages_from_history(&thread.messages());
     Ok(Json(coder_context_usage(&llm_messages)).into_response())
 }
@@ -448,9 +489,9 @@ async fn thread_get(
     principal: Principal,
     Query(q): Query<ThreadIdQuery>,
 ) -> Result<Response, ApiError> {
-    require_chat_write(&principal)?;
+    require_chat_write(&state, &principal).await?;
     let thread_id = parse_thread_id(q.thread_id)?;
-    let thread = resolve_thread(&state, thread_id).await?;
+    let thread = resolve_thread(&state, &principal, thread_id).await?;
     let messages = thread.messages();
     let llm_messages = llm_messages_from_history(&messages);
     let usage = coder_context_usage(&llm_messages);
@@ -471,9 +512,9 @@ async fn thread_delete(
     principal: Principal,
     Path(thread_id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    require_chat_write(&principal)?;
+    require_chat_write(&state, &principal).await?;
     // 404s a missing row before deleting, the way `_get_thread_by_id` does.
-    get_thread_by_id(&state, thread_id).await?;
+    get_thread_by_id(&state, &principal, thread_id).await?;
     sqlx::query(&crate::db::sql("DELETE FROM coder_chat_threads WHERE id = ?", state.backend))
         .bind(thread_id)
         .execute(&state.any)
@@ -952,12 +993,12 @@ async fn chat_send(
     // comment.
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    require_chat_write(&principal)?;
+    require_chat_write(&state, &principal).await?;
     let body: SendRequest = require_body(&body)?;
     let message = body.validate()?.to_string();
     require_master_key_configured(&state)?;
 
-    let thread = resolve_thread(&state, body.thread_id).await?;
+    let thread = resolve_thread(&state, &principal, body.thread_id).await?;
     let mut title = thread.title.clone();
     let mut fallback_title = thread.display_title();
     let mut title_task = None;
@@ -1053,7 +1094,7 @@ async fn chat_stream(
     // comment.
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    require_chat_write(&principal)?;
+    require_chat_write(&state, &principal).await?;
     let body: SendRequest = require_body(&body)?;
     let message = body.validate()?.to_string();
     require_master_key_configured(&state)?;
@@ -1061,7 +1102,7 @@ async fn chat_stream(
     // Resolved before the response starts, exactly as `stream_message` does:
     // the row (and, on an empty database, the row's creation) has to exist
     // before the title task can name it.
-    let thread = resolve_thread(&state, body.thread_id).await?;
+    let thread = resolve_thread(&state, &principal, body.thread_id).await?;
     let mut title = thread.title.clone();
     let mut fallback_title = thread.display_title();
     let mut title_task = None;
@@ -1158,7 +1199,7 @@ async fn chat_retry(
     // comment.
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    require_chat_write(&principal)?;
+    require_chat_write(&state, &principal).await?;
     let body: RetryRequest = require_body(&body)?;
     let thread_id = require_thread_id(body.thread_id)?;
     let mut errors = Vec::new();
@@ -1177,7 +1218,7 @@ async fn chat_retry(
 
     // `stream_retry` resolves the thread by id — no insert-on-read here, and a
     // missing one is a 404 before the stream opens.
-    let thread = get_thread_by_id(&state, thread_id).await?;
+    let thread = get_thread_by_id(&state, &principal, thread_id).await?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let client_id = client_header(&headers);
     let token_id = principal.token_id;
@@ -1280,7 +1321,7 @@ async fn chat_approve(
     // comment.
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    require_chat_write(&principal)?;
+    require_chat_write(&state, &principal).await?;
     let body: ApprovalRequest = require_body(&body)?;
     let mut errors = Vec::new();
     if body.thread_id.is_none() {
@@ -1305,7 +1346,7 @@ async fn chat_approve(
     let thread_id = body.thread_id.unwrap_or_default();
     let call_id = body.call_id.clone().unwrap_or_default();
     let approve = body.approve.unwrap_or_default();
-    let thread = get_thread_by_id(&state, thread_id).await?;
+    let thread = get_thread_by_id(&state, &principal, thread_id).await?;
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let client_id = client_header(&headers);
@@ -1486,7 +1527,7 @@ async fn chat_tool_result(
     // comment.
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    require_chat_write(&principal)?;
+    require_chat_write(&state, &principal).await?;
     let body: ToolResultRequest = require_body(&body)?;
     let thread_id = require_thread_id(body.thread_id)?;
     let call_id = match body.call_id.as_deref() {
@@ -1683,6 +1724,7 @@ mod tests {
             model: None,
             created_at: String::new(),
             updated_at: String::new(),
+            user_id: None,
         };
         assert_eq!(resolve_workspace(&row(Some("/thread")), Some(" /req ")).unwrap(), "/req");
         assert_eq!(resolve_workspace(&row(Some("/thread")), Some("  ")).unwrap(), "/thread");
@@ -1704,6 +1746,7 @@ mod tests {
             model: None,
             created_at: String::new(),
             updated_at: String::new(),
+            user_id: None,
         };
         assert!(require_no_pending(&row).is_ok());
         row.pending_call_json = Some(r#"{"call_id": "c1"}"#.to_string());

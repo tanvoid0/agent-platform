@@ -119,9 +119,9 @@ async fn auth_tiers_and_unknown_paths() {
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["error"]["message"], "No route for GET /api/v1/proxy-probe");
 
-    // Missing and wrong credentials, both TOKEN_INVALID like the Python server.
+    // Missing credentials name themselves (ADR 0014); a wrong token stays TOKEN_INVALID.
     let (status, body) = get(&origin, guarded, None).await;
-    assert_eq!((status, code_of(&body).as_str()), (401, "TOKEN_INVALID"));
+    assert_eq!((status, code_of(&body).as_str()), (401, "AUTH_REQUIRED"));
     let (status, body) = get(&origin, guarded, Some("nope")).await;
     assert_eq!((status, code_of(&body).as_str()), (401, "TOKEN_INVALID"));
 
@@ -191,7 +191,7 @@ async fn every_response_carries_a_correlation_id() {
     assert_eq!(generated.len(), 36, "{generated}");
     let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(body["error"]["request_id"], generated);
-    assert_eq!(body["error"]["code"], "TOKEN_INVALID");
+    assert_eq!(body["error"]["code"], "AUTH_REQUIRED");
 
     // A caller's own id wins, and is stamped on a 404 as much as on anything
     // else — the middleware is outside the router, not inside a handler.
@@ -227,10 +227,10 @@ async fn llm_proxy_routes_authenticate_per_route() {
     assert_eq!(v["checks"][0]["name"], "provider_config");
 
     let (status, body) = get(&origin, "/v1/capabilities", None).await;
-    assert_eq!((status, code_of(&body).as_str()), (401, "TOKEN_INVALID"));
+    assert_eq!((status, code_of(&body).as_str()), (401, "AUTH_REQUIRED"));
 
     let (status, body) = get(&origin, "/v1/models", None).await;
-    assert_eq!((status, code_of(&body).as_str()), (401, "TOKEN_INVALID"));
+    assert_eq!((status, code_of(&body).as_str()), (401, "AUTH_REQUIRED"));
     let (status, body) = get(&origin, "/v1/models", Some(MASTER)).await;
     assert_eq!(status, 200, "{body}");
     let v: Value = serde_json::from_str(&body).unwrap();
@@ -240,7 +240,7 @@ async fn llm_proxy_routes_authenticate_per_route() {
     // `?live=false` keeps the catalog off every upstream, so this stays fast and
     // deterministic with no backend running.
     let (status, body) = get(&origin, "/v1/catalog?live=false", None).await;
-    assert_eq!((status, code_of(&body).as_str()), (401, "TOKEN_INVALID"));
+    assert_eq!((status, code_of(&body).as_str()), (401, "AUTH_REQUIRED"));
     let (status, body) = get(&origin, "/v1/catalog?live=false", Some(MASTER)).await;
     assert_eq!(status, 200, "{body}");
     let v: Value = serde_json::from_str(&body).unwrap();

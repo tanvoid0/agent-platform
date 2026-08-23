@@ -21,6 +21,7 @@ fn main() {
         }
     };
 
+    let args: Vec<String> = std::env::args().collect();
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -28,6 +29,17 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("grant-comp" | "set-entitlement" | "revoke-sessions" | "migrate")
+    ) {
+        if let Err(e) = runtime.block_on(agent_platform_server::cli::run(&args, &cfg)) {
+            logd!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Err(e) = runtime.block_on(serve(cfg)) {
         logd!("{e}");

@@ -1,6 +1,7 @@
 # Secrets — never commit
 .env
 .env.local
+.neon
 .env.*.local
 *.env
 !.env.example
@@ -21,6 +22,9 @@ env/
 data/
 dist/
 node_modules/
+.svelte-kit/
+accounts/node_modules/
+accounts/.svelte-kit/
 .agents/
 skills-lock.json
 

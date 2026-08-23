@@ -10,6 +10,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod account;
+mod account_view;
 mod agenda;
 mod agenda_chat;
 mod agenda_chat_view;
@@ -123,16 +125,18 @@ pub enum SettingsTab {
     Performance,
     Status,
     Api,
+    Account,
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 6] = [
+    pub const ALL: [SettingsTab; 7] = [
         SettingsTab::Providers,
         SettingsTab::ModelOps,
         SettingsTab::Appearance,
         SettingsTab::Performance,
         SettingsTab::Status,
         SettingsTab::Api,
+        SettingsTab::Account,
     ];
 
     pub fn label(self) -> &'static str {
@@ -143,6 +147,7 @@ impl SettingsTab {
             SettingsTab::Performance => "Performance",
             SettingsTab::Status => "Status",
             SettingsTab::Api => "API",
+            SettingsTab::Account => "Account",
         }
     }
 
@@ -263,6 +268,7 @@ pub struct App {
     pub search: search::State,
     pub studio: studio::State,
     pub apidocs: apidocs::State,
+    pub account: account::State,
     /// Whether a newer build has been published. Only ever filled by the user
     /// pressing the button in Settings → Status — nothing here phones home on
     /// its own.
@@ -428,6 +434,7 @@ pub enum Message {
     Search(search::Message),
     Studio(studio::Message),
     ApiDocs(apidocs::Message),
+    Account(account::Message),
 }
 
 /// One frame of the app icon as RGBA, picked by its edge in pixels.
@@ -633,16 +640,16 @@ fn boot() -> (App, Task<Message>) {
         shell::PortOwner::Ours => {
             sh.log_line(format!("[shell] found our server on port {port}; attached to it"))
         }
-        shell::PortOwner::Foreign => sh.log_line(format!(
-            "[shell] port {port} is already used by another server that rejects this \
-             install's key. Not starting a server. Set AGENT_PLATFORM_PORT or edit \
+        shell::        PortOwner::Foreign => sh.log_line(format!(
+            "[shell] port {port} is already used by another server this install cannot talk to. \
+             Not starting a server. Set AGENT_PLATFORM_PORT or edit \
              {}/settings.json to pick a free port.",
             app_dir.display()
         )),
         shell::PortOwner::Free => sh.start_server(),
     }
 
-    let client = Client::new(sh.origin(), key);
+    let client = Client::new(sh.origin(), shell::client_key(port, &key, owner));
     // Before the tray is built and before anything renders or speaks: the name
     // is read by every view and by the tray item, the voice by the first
     // sentence synthesized.
@@ -694,6 +701,7 @@ fn boot() -> (App, Task<Message>) {
         }
     }
 
+    let cloud_url = settings.cloud_url.clone();
     // Built before the struct, because the struct takes `settings` by move and
     // this reads most of its own state off it.
     let coder = coder_board::Board::new(coder::State::restored(
@@ -767,6 +775,7 @@ fn boot() -> (App, Task<Message>) {
         search: search::State::default(),
         studio: studio::State::default(),
         apidocs: apidocs::State::default(),
+        account: account::State::load(&app_dir, &cloud_url),
         update_check: update_check::State::default(),
     };
     let task = if minimized { Task::none() } else { open_window() };
@@ -918,7 +927,7 @@ fn enter_screen_inner(app: &mut App) -> Task<Message> {
             // Opening the tab is a reason to refresh now rather than at the
             // next beat: the numbers on it are the whole page.
             SettingsTab::Performance => fetch_resources(&app.client),
-            SettingsTab::Status | SettingsTab::Appearance => Task::none(),
+            SettingsTab::Status | SettingsTab::Appearance | SettingsTab::Account => Task::none(),
         },
     }
 }
@@ -1572,6 +1581,12 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             } else if !app.shell.attached {
                 app.shell.log_line("[shell] restarting the server");
                 app.shell.start_server();
+                app.client = Client::new(app.shell.origin(), String::new());
+            } else {
+                app.client = Client::new(
+                    app.shell.origin(),
+                    shell::client_key(app.shell.port, &app.shell.key, owner),
+                );
             }
             app.child_alive = app.shell.server_running();
             Task::none()
@@ -1804,6 +1819,20 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::ApiDocs(apidocs::Message::TraceLogs(id)) => trace_logs_task(app, id),
         Message::ApiDocs(msg) => {
             apidocs::update(&mut app.apidocs, &app.client, msg).map(Message::ApiDocs)
+        }
+        Message::Account(msg) => {
+            let persist = matches!(
+                msg,
+                account::Message::SendLink
+                    | account::Message::SignedIn(Ok(_))
+                    | account::Message::SignOut
+            );
+            let task = account::update(&mut app.account, msg).map(Message::Account);
+            if persist {
+                app.settings.cloud_url = app.account.url.clone();
+                save_settings(app);
+            }
+            task
         }
         Message::Coder(coder::Message::TraceLogs(id)) => trace_logs_task(app, id),
         Message::Coder(msg) => {
@@ -2387,7 +2416,7 @@ line 2");
         // server behind it. Only the live-numbers card needs one, and it says so.
         let usable: Vec<_> =
             SettingsTab::ALL.iter().filter(|t| !t.needs_server()).map(|t| t.label()).collect();
-        assert_eq!(usable, vec!["Appearance", "Performance", "Status", "API"]);
+        assert_eq!(usable, vec!["Appearance", "Performance", "Status", "API", "Account"]);
     }
 
     /// The monitor's whole cost is how often it rides the health poll, and the

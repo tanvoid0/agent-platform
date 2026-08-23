@@ -2,10 +2,11 @@
 
 Lean **AI server**: multi-agent orchestration API with an **embedded** OpenAI-compatible LLM proxy (`/v1/*` on the same process). One Rust binary, `agent-platformd` — see [ADR 0007](docs/adr/0007-strangler-rust-server.md) for how it replaced the FastAPI server it started life in front of.
 
-**Portfolio context:** The backend is the product. The UI is a native desktop app ([`desktop/`](desktop/), Rust + iced) that talks to this API — the server ships no browser UI at all.
+**Portfolio context:** The backend is the product. The operator UI is a native desktop app ([`desktop/`](desktop/), Rust + iced). Store apps and billing use the hosted **accounts** page at **`/accounts`** (magic-link login, usage, admin). Docker still ships the API only.
 
 - **API:** `http://127.0.0.1:18410` — OpenAPI document at **`/openapi.json`**, model build/train at **`/api/v1/model-ops/*`** ([`docs/model-ops-api.md`](docs/model-ops-api.md))
-- **Tokens:** issued and revoked through `/api/v1/workspaces/{id}/api-tokens`, or from the desktop app
+- **Accounts:** `http://127.0.0.1:18410/accounts` — Portal user login, trial, regional billing ([`docs/regional-billing-and-api-access.md`](docs/regional-billing-and-api-access.md), cloud: [`docs/deploy-cloud.md`](docs/deploy-cloud.md))
+- **Tokens:** workspace `agp_…` tokens through `/api/v1/workspaces/{id}/api-tokens` (your servers / local admin — never in a store binary). User sessions are JWTs from magic-link sign-in.
 - **Everything else** — runs, teams, projects, providers, model ops — lives in the desktop app
 
 Provider catalog behavior is normalized across `/api/v1/llm-proxy/ui/providers` and `/api/v1/llm-proxy/test/model-options`: each provider exposes the same capability shape (`streaming`, `tools`, `json_mode`, `model_discovery`). When a provider cannot list models live, the server falls back in order to provider aliases from `config.yaml`, then `orchestrator_ui.yaml` `fallback_models`, then the provider default model.

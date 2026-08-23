@@ -61,13 +61,14 @@ Windows CUDA: a failed configure poisons the cmake cache
 ## Runtime contract
 
 - The app spawns the daemon from its own directory, so **build both**.
-- Attach-if-running must verify the key, not just `/health`: port 18410 is often
-  held by a Docker port-forward of this same app, and attaching there points the
-  UI at a foreign DB. That is what `shell::port_owner()` → `Free`/`Ours`/`Foreign`
-  is for.
+- Attach-if-running probes unauthenticated `/api/v1/system/status` first
+  (open loopback, ADR 0013), then the leftover install key. A foreign keyed
+  server on 18410 is still `Foreign`. An open agent-platform on the port is
+  treated as ours — one listener, like Ollama.
 - Data lives in `%APPDATA%\com.tanvoid0.agentplatform` — SQLite, workspaces,
-  `settings.json`. The master key is `master.key` in that dir, **not** in
-  `settings.json`.
+  `settings.json`. The optional cloud session is `cloud.session.json` in that
+  dir (ADR 0013). A leftover `master.key` is only used when attaching to an
+  older keyed daemon; new spawns leave the local API open like Ollama.
 - **Every app-state file is rewritten whole, so write it with
   `shell::write_atomic`, never `fs::write`.** `settings.json`, `chats.json`,
   `memories.json` and `master.key` all load with a silent fallback to a default,

@@ -1,0 +1,32 @@
+# Cloud-oriented compose: the API is only reachable on the host loopback.
+# Put Caddy (see Caddyfile) or Cloudflare Tunnel in front. Never publish 18410
+# on 0.0.0.0.
+#
+#   docker compose -f docker-compose.cloud.yml up --build
+#
+# Required in `.env`: AGENT_PLATFORM_MASTER_KEY, AGENT_PLATFORM_JWT_SECRET,
+# AGENT_PLATFORM_PUBLIC_URL, and Stripe vars when you take payments.
+
+services:
+  server:
+    image: agent-platform:${AGENT_PLATFORM_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      AGENT_PLATFORM_HOST: 0.0.0.0
+      AGENT_PLATFORM_DB_PATH: /app/data/agent_platform.db
+      AGENT_PLATFORM_WORKSPACE_ROOT: /app/data/workspaces
+      CONFIG_DIR: /app/data/llm
+      CONFIG_PATH: /app/data/llm/config.yaml
+      LLM_ORCHESTRATOR_BASE_URL: http://127.0.0.1:18410/v1
+    ports:
+      - "127.0.0.1:18410:18410"
+    env_file:
+      - .env
+    volumes:
+      - agent_platform_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  agent_platform_data:

@@ -1,0 +1,5 @@
+# Replace api.example.com. agent-platformd must already be listening on 127.0.0.1:18410.
+api.example.com {
+	encode gzip
+	reverse_proxy 127.0.0.1:18410
+}

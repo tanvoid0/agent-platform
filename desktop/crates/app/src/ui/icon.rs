@@ -92,6 +92,7 @@ icons! {
     ArrowLeft => arrow_left,
     ArrowRight => arrow_right,
     Globe => globe,
+    LogOut => log_out,
     Image => image,
     Film => film,
 

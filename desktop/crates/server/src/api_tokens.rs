@@ -764,7 +764,7 @@ mod tests {
     fn only_the_master_key_may_manage_tokens() {
         assert!(require_dashboard_caller(&Principal::unrestricted()).is_ok());
         let scoped =
-            Principal { workspace_id: Some(1), token_id: Some(2), scopes: vec!["*".into()] };
+            Principal { workspace_id: Some(1), token_id: Some(2), scopes: vec!["*".into()], ..Principal::unrestricted() };
         let err = require_dashboard_caller(&scoped).unwrap_err();
         assert_eq!(err.status, StatusCode::FORBIDDEN);
         // Even a `*` scope does not help: no scope grants this.

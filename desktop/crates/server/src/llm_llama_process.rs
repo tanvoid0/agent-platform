@@ -491,6 +491,9 @@ mod tests {
     /// as prose instead of a tool call.
     #[test]
     fn the_launch_flags_come_from_the_model_settings() {
+        // `LOCAL_MODEL_PATH` makes provider `local` configured, which
+        // `llm_config`'s capability tests read — same lock, or they race.
+        let _env = crate::llm_config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = std::env::temp_dir().join("agp-llama-args-test.gguf");
         std::fs::write(&temp, b"GGUF").unwrap();
         // SAFETY: single-threaded test process; these are read through
