@@ -847,7 +847,7 @@ mod tests {
     fn only_the_master_key_reaches_operator_config() {
         assert!(Principal::unrestricted().require_master_key(NOT_A_TENANT).is_ok());
         let tenant =
-            Principal { workspace_id: Some(1), token_id: Some(2), scopes: vec!["*".into()] };
+            Principal { workspace_id: Some(1), token_id: Some(2), scopes: vec!["*".into()], ..Principal::unrestricted() };
         assert_eq!(tenant.require_master_key(NOT_A_TENANT).unwrap_err().status, StatusCode::FORBIDDEN);
     }
 

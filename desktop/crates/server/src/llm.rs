@@ -54,6 +54,8 @@ use crate::{env_opt, AppState};
 
 /// Python's health probes use 4s and its catalog reads 8s.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+const CHAT_PROVIDER_HINT: &str =
+    "provider must be local, ollama, lm_studio, gemini, aimlapi, anthropic, or platform";
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -296,10 +298,11 @@ fn parse_model_filter(query: Option<&str>) -> Result<Option<Vec<String>>, ApiErr
 }
 
 async fn list_models(
-    _principal: ProxyPrincipal,
+    principal: ProxyPrincipal,
     State(state): State<Arc<AppState>>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
+    crate::accounts::require_ai_entitlement(&state, &principal.0, principal.0.client.as_deref()).await?;
     let allowed = parse_model_filter(query.as_deref())?;
     let permitted = |provider: &str| allowed.as_ref().is_none_or(|a| a.iter().any(|p| p == provider));
 
@@ -376,7 +379,7 @@ async fn health(State(state): State<Arc<AppState>>, Query(query): Query<HealthQu
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "status": "error",
-                "detail": "provider must be local, ollama, lm_studio, gemini, aimlapi, or anthropic",
+                "detail": CHAT_PROVIDER_HINT,
             })),
         )
             .into_response();
@@ -391,6 +394,7 @@ async fn health(State(state): State<Arc<AppState>>, Query(query): Query<HealthQu
         "local" => managed_local_health(&state, body, started).await,
         "ollama" | "lm_studio" => local_health(&state, &provider, &model, body, started).await,
         "aimlapi" | "anthropic" => keyed_health(&state, &provider, body, started).await,
+        "platform" => platform_health(&state, body, started).await,
         _ => gemini_health(&state, &model, body, started).await,
     }
 }
@@ -548,6 +552,44 @@ async fn keyed_health(
     }
 }
 
+async fn platform_health(
+    state: &AppState,
+    mut body: Map<String, Value>,
+    started: Instant,
+) -> Response {
+    if !provider_configured("platform") {
+        return unhealthy(body, "Sign in under Settings → Account to use Platform AI.", started);
+    }
+    let token = match crate::accounts::ensure_platform_access(state).await {
+        Ok(t) => t,
+        Err(e) => return unhealthy(body, e.message, started),
+    };
+    let Some(session) = crate::accounts::read_cloud_session() else {
+        return unhealthy(body, "Cloud session missing.", started);
+    };
+    let url = format!("{}/v1/models", session.url.trim_end_matches('/'));
+    let response = send_with_retry("health_platform_models", false, || {
+        state
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Agent-Platform-Client", crate::accounts::DESKTOP_APP_ID)
+            .timeout(PROBE_TIMEOUT)
+    })
+    .await;
+    match response {
+        Err(e) => unhealthy(body, e.message, started),
+        Ok(r) => {
+            body.insert("upstream_status".into(), json!(r.status.as_u16()));
+            if r.is_ok() {
+                respond(StatusCode::OK, "ok", body, started)
+            } else {
+                respond(StatusCode::SERVICE_UNAVAILABLE, "unhealthy", body, started)
+            }
+        }
+    }
+}
+
 async fn gemini_health(
     state: &AppState,
     model: &str,
@@ -677,6 +719,19 @@ fn upstream_urls(provider: &str) -> Result<(String, String), ApiError> {
         // Anthropic's OpenAI-compatible surface has no embeddings endpoint; the
         // embeddings route rejects this provider before reaching the URL.
         "anthropic" => Ok(openai_pair(anthropic_openai_base().trim_end_matches('/'))),
+        "platform" => {
+            let session = crate::accounts::read_cloud_session().ok_or_else(|| {
+                missing_key(
+                    "platform_unconfigured",
+                    "Sign in under Settings → Account to use Platform AI.",
+                )
+            })?;
+            let base = session.url.trim_end_matches('/');
+            Ok((
+                format!("{base}/v1/chat/completions"),
+                format!("{base}/v1/embeddings"),
+            ))
+        }
         _ => Err(ApiError::coded(
             StatusCode::INTERNAL_SERVER_ERROR,
             "invalid_provider",
@@ -689,7 +744,7 @@ fn missing_key(code: &'static str, message: &str) -> ApiError {
     ApiError::coded(StatusCode::SERVICE_UNAVAILABLE, code, message.to_string())
 }
 
-fn outbound_headers(provider: &str) -> Result<Vec<(String, String)>, ApiError> {
+fn outbound_headers(state: &AppState, provider: &str) -> Result<Vec<(String, String)>, ApiError> {
     let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     let bearer = |key: String| ("Authorization".to_string(), format!("Bearer {key}"));
 
@@ -733,6 +788,14 @@ fn outbound_headers(provider: &str) -> Result<Vec<(String, String)>, ApiError> {
                 headers.push(bearer(key));
             }
         }
+        "platform" => {
+            let token = crate::accounts::cached_platform_access(state)?;
+            headers.push(bearer(token));
+            headers.push((
+                "X-Agent-Platform-Client".to_string(),
+                crate::accounts::DESKTOP_APP_ID.to_string(),
+            ));
+        }
         _ => {}
     }
     Ok(headers)
@@ -762,9 +825,7 @@ async fn chat_target(state: &AppState, body: &mut Map<String, Value>) -> Result<
         resolve_model(Some(&requested_model).filter(|m| !m.is_empty()).map(String::as_str))?
     } else {
         if !is_supported_provider(&hint) {
-            return Err(ApiError::bad_request(
-                "provider must be local, ollama, lm_studio, gemini, aimlapi, or anthropic",
-            ));
+            return Err(ApiError::bad_request(CHAT_PROVIDER_HINT));
         }
         if !provider_configured(&hint) {
             return Err(not_configured(&hint));
@@ -802,8 +863,11 @@ async fn chat_target(state: &AppState, body: &mut Map<String, Value>) -> Result<
     body.insert("model".into(), json!(resolved));
     ensure_chat_request_supported(&state.http, &provider, &resolved, body).await?;
 
+    if provider == "platform" {
+        crate::accounts::ensure_platform_access(state).await?;
+    }
     let (chat_url, _) = upstream_urls(&provider)?;
-    Ok(Target { url: chat_url, headers: outbound_headers(&provider)? })
+    Ok(Target { url: chat_url, headers: outbound_headers(state, &provider)? })
 }
 
 /// One buffered chat completion for a handler in this process, skipping the
@@ -860,6 +924,8 @@ pub(crate) async fn chat_completions(
     raw: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     principal.0.require_scope("chat:write")?;
+    crate::accounts::require_ai_entitlement(&state, &principal.0, principal.0.client.as_deref()).await?;
+    crate::accounts::record_user_usage(&state, principal.0.user_id, 0, false).await;
     // Held for the handler. On the buffered branch that is the whole call; on
     // the streaming branch it covers opening the stream and not the body that
     // follows, because the permit cannot outlive the handler that borrowed it.
@@ -966,6 +1032,8 @@ async fn embeddings(
     raw: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     principal.0.require_scope("chat:write")?;
+    crate::accounts::require_ai_entitlement(&state, &principal.0, principal.0.client.as_deref()).await?;
+    crate::accounts::record_user_usage(&state, principal.0.user_id, 0, false).await;
     let mut body = parse_object(&raw)?;
     let requested_model = string_field(&body, "model")?;
     if requested_model.is_empty() {
@@ -1003,8 +1071,11 @@ async fn embeddings(
             let resolved = coerce_local_model_if_needed(&state.http, &provider, &resolved).await;
             body.insert("model".into(), json!(resolved));
 
+            if provider == "platform" {
+                crate::accounts::ensure_platform_access(&state).await?;
+            }
             let (_, embeddings_url) = upstream_urls(&provider)?;
-            Target { url: embeddings_url, headers: outbound_headers(&provider)? }
+            Target { url: embeddings_url, headers: outbound_headers(&state, &provider)? }
         }
     };
 
@@ -1079,6 +1150,8 @@ async fn images_generations(
     raw: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     principal.0.require_scope("chat:write")?;
+    crate::accounts::require_ai_entitlement(&state, &principal.0, principal.0.client.as_deref()).await?;
+    crate::accounts::record_user_usage(&state, principal.0.user_id, 0, false).await;
     let mut body = parse_object(&raw)?;
 
     let target = match byok::parse(&request_headers)? {
@@ -1146,6 +1219,8 @@ async fn audio_speech(
     raw: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     principal.0.require_scope("chat:write")?;
+    crate::accounts::require_ai_entitlement(&state, &principal.0, principal.0.client.as_deref()).await?;
+    crate::accounts::record_user_usage(&state, principal.0.user_id, 0, false).await;
     let mut body = parse_object(&raw)?;
 
     // A non-string `input` reports the same thing as a missing one: there is
@@ -1207,10 +1282,11 @@ async fn audio_speech(
 /// all — which is what a caller wants when a backend is known to be down and the
 /// screen still has to render.
 async fn catalog(
-    _principal: ProxyPrincipal,
+    principal: ProxyPrincipal,
     State(state): State<Arc<AppState>>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
+    crate::accounts::require_ai_entitlement(&state, &principal.0, principal.0.client.as_deref()).await?;
     let query = query.as_deref();
     let allowed = provider_catalog::parse_filter(query)?;
     let include_live = provider_catalog::query_flag(query, "live", true);
@@ -1253,7 +1329,11 @@ async fn readiness() -> Json<Value> {
 /// unsupported route through a failed request. `resolved` is the provider the
 /// proxy would pick for an unqualified request of that capability, or null when
 /// none is configured.
-async fn capabilities(_principal: ProxyPrincipal) -> Json<Value> {
+async fn capabilities(
+    principal: ProxyPrincipal,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, ApiError> {
+    crate::accounts::require_ai_entitlement(&state, &principal.0, principal.0.client.as_deref()).await?;
     let providers: Map<String, Value> = PROVIDERS
         .iter()
         .map(|spec| {
@@ -1271,13 +1351,13 @@ async fn capabilities(_principal: ProxyPrincipal) -> Json<Value> {
         })
         .collect();
 
-    Json(json!({
+    Ok(Json(json!({
         "object": "capabilities",
         "modalities": MODALITIES.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
         "providers": providers,
         "resolved": resolved,
         "byok": byok::discovery(),
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -1366,5 +1446,12 @@ mod tests {
         let (chat, _) = upstream_urls("local").unwrap();
         assert_eq!(chat, "http://box.lan:9000/v1/chat/completions");
         unsafe { std::env::remove_var("LOCAL_API_BASE") };
+    }
+
+    #[test]
+    fn platform_needs_a_session_file() {
+        unsafe { std::env::remove_var("AGENT_PLATFORM_CLOUD_SESSION") };
+        assert!(!crate::llm_config::provider_configured("platform"));
+        assert!(upstream_urls("platform").is_err());
     }
 }

@@ -398,8 +398,8 @@ async fn generate(
     let original_prompt = req.prompt.as_deref().unwrap_or("").trim();
     let id: i64 = sqlx::query_scalar(&db::sql(
         "INSERT INTO media_jobs (kind, prompt, enhanced_prompt, status, width, height, length, \
-         seed, comfy_prompt_id, created_at, updated_at) \
-         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)",
+         seed, comfy_prompt_id, created_at, updated_at, user_id) \
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)",
         state.backend,
     ))
     .bind(spec.kind)
@@ -415,6 +415,7 @@ async fn generate(
     .bind(&backend_job_id)
     .bind(&now)
     .bind(&now)
+    .bind(crate::identity::stamp_user_id(&state, &principal))
     .fetch_one(&state.any)
     .await?;
 
@@ -1086,12 +1087,15 @@ struct MediaJobOut {
     created_at: String,
     #[serde(serialize_with = "sql_time")]
     updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<i64>,
 }
 
 const JOB_COLUMNS: &str = "CAST(id AS BIGINT) AS id, kind, prompt, enhanced_prompt, status, \
      error, CAST(width AS BIGINT) AS width, CAST(height AS BIGINT) AS height, \
      CAST(length AS BIGINT) AS length, CAST(seed AS BIGINT) AS seed, file_name, \
-     CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at";
+     CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at, \
+     CAST(user_id AS BIGINT) AS user_id";
 
 async fn load_job(state: &AppState, id: i64) -> Result<MediaJobOut, ApiError> {
     sqlx::query_as(&db::sql(
@@ -1111,13 +1115,24 @@ async fn list_jobs(
     principal: Principal,
 ) -> Result<Response, ApiError> {
     principal.require_master_key(NOT_MASTER)?;
-    let sql = db::sql(
-        &format!("SELECT {JOB_COLUMNS} FROM media_jobs ORDER BY id DESC LIMIT ?"),
-        state.backend,
-    )
-    .into_owned();
-    let rows: Vec<MediaJobOut> =
-        sqlx::query_as(&sql).bind(JOBS_LIMIT).fetch_all(&state.any).await?;
+    let rows: Vec<MediaJobOut> = if let Some(uid) = principal.scoped_user_id() {
+        sqlx::query_as(&db::sql(
+            &format!("SELECT {JOB_COLUMNS} FROM media_jobs WHERE user_id = ? ORDER BY id DESC LIMIT ?"),
+            state.backend,
+        ))
+        .bind(uid)
+        .bind(JOBS_LIMIT)
+        .fetch_all(&state.any)
+        .await?
+    } else {
+        sqlx::query_as(&db::sql(
+            &format!("SELECT {JOB_COLUMNS} FROM media_jobs ORDER BY id DESC LIMIT ?"),
+            state.backend,
+        ))
+        .bind(JOBS_LIMIT)
+        .fetch_all(&state.any)
+        .await?
+    };
     Ok(Json(json!({ "jobs": rows })).into_response())
 }
 
@@ -1127,7 +1142,9 @@ async fn get_job(
     PathId(job_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     principal.require_master_key(NOT_MASTER)?;
-    Ok(Json(load_job(&state, job_id).await?).into_response())
+    let job = load_job(&state, job_id).await?;
+    crate::identity::assert_user_row(&principal, job.user_id)?;
+    Ok(Json(job).into_response())
 }
 
 /// The finished bytes — the server's first raw-binary route (ADR 0009), which
@@ -1140,6 +1157,7 @@ async fn job_file(
 ) -> Result<Response, ApiError> {
     principal.require_master_key(NOT_MASTER)?;
     let job = load_job(&state, job_id).await?;
+    crate::identity::assert_user_row(&principal, job.user_id)?;
     let Some(file_name) = job.file_name.filter(|_| job.status == "completed") else {
         return Err(ApiError::not_found("This job has no finished file."));
     };

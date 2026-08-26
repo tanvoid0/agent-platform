@@ -364,25 +364,43 @@ fn row_to_out(row: TeamRow) -> Result<TeamOut, ApiError> {
 // ---------------------------------------------------------------------------
 
 /// Reads: a workspace token sees global templates and its own.
-fn assert_visible(principal: &Principal, row: &TeamRow) -> Result<(), ApiError> {
-    match principal.workspace_id {
-        None => Ok(()),
-        Some(ws) => match row.workspace_id {
+async fn assert_visible(state: &AppState, principal: &Principal, row: &TeamRow) -> Result<(), ApiError> {
+    if let Some(ws) = principal.workspace_id {
+        return match row.workspace_id {
             None => Ok(()),
             Some(owner) if owner == ws => Ok(()),
             Some(_) => Err(ApiError::not_found("Team template not found")),
-        },
+        };
     }
+    if let Some(uid) = principal.scoped_user_id() {
+        return match row.workspace_id {
+            None => Ok(()),
+            Some(ws) => crate::identity::assert_workspace_visible(state, principal, ws).await.or_else(|_| {
+                let _ = uid;
+                Err(ApiError::not_found("Team template not found"))
+            }),
+        };
+    }
+    Ok(())
 }
 
 /// Writes: a workspace token may only touch its own — never a global template,
 /// which every other tenant is reading.
-fn assert_owned(principal: &Principal, row: &TeamRow) -> Result<(), ApiError> {
-    match principal.workspace_id {
-        None => Ok(()),
-        Some(ws) if row.workspace_id == Some(ws) => Ok(()),
-        Some(_) => Err(ApiError::not_found("Team template not found")),
+async fn assert_owned(state: &AppState, principal: &Principal, row: &TeamRow) -> Result<(), ApiError> {
+    if let Some(ws) = principal.workspace_id {
+        return if row.workspace_id == Some(ws) {
+            Ok(())
+        } else {
+            Err(ApiError::not_found("Team template not found"))
+        };
     }
+    if let Some(_uid) = principal.scoped_user_id() {
+        let Some(ws) = row.workspace_id else {
+            return Err(ApiError::not_found("Team template not found"));
+        };
+        return crate::identity::assert_workspace_visible(state, principal, ws).await;
+    }
+    Ok(())
 }
 
 async fn load_row(state: &AppState, team_id: i64) -> Result<TeamRow, ApiError> {
@@ -416,15 +434,23 @@ async fn list_teams(
     State(state): State<Arc<AppState>>,
     principal: Principal,
 ) -> Result<Response, ApiError> {
-    let rows: Vec<TeamRow> = match principal.workspace_id {
-        Some(ws) => sqlx::query_as(&crate::db::sql(&format!(
+    let rows: Vec<TeamRow> = match (principal.workspace_id, principal.scoped_user_id()) {
+        (Some(ws), _) => sqlx::query_as(&crate::db::sql(&format!(
             "SELECT {TEAM_COLUMNS} FROM teamtemplate \
              WHERE workspace_id IS NULL OR workspace_id = ? ORDER BY id ASC"
         ), state.backend))
         .bind(ws)
         .fetch_all(&state.any)
         .await?,
-        None => sqlx::query_as(&crate::db::sql(&format!(
+        (None, Some(uid)) => sqlx::query_as(&crate::db::sql(&format!(
+            "SELECT {TEAM_COLUMNS} FROM teamtemplate \
+             WHERE workspace_id IS NULL OR workspace_id IN \
+             (SELECT id FROM workspace WHERE user_id = ?) ORDER BY id ASC"
+        ), state.backend))
+        .bind(uid)
+        .fetch_all(&state.any)
+        .await?,
+        (None, None) => sqlx::query_as(&crate::db::sql(&format!(
             "SELECT {TEAM_COLUMNS} FROM teamtemplate ORDER BY id ASC"
         ), state.backend))
         .fetch_all(&state.any)
@@ -495,20 +521,17 @@ async fn create_team(
         Some(ws) => Some(ws),
         None => {
             if let Some(ws) = req.workspace_id {
-                // Text, not `NaiveDateTime`: the `Any` driver decodes no
-                // timestamp column on either backend. Only its presence is read.
-                let archived: Option<Option<String>> = sqlx::query_scalar(&crate::db::sql(
-                    "SELECT CAST(archived_at AS TEXT) FROM workspace WHERE id = ?",
-                    state.backend,
-                ))
-                        .bind(ws)
-                        .fetch_optional(&state.any)
-                        .await?;
-                if !matches!(archived, Some(None)) {
-                    return Err(ApiError::not_found("Workspace not found"));
+                crate::identity::assert_workspace_visible(&state, &principal, ws).await?;
+                Some(ws)
+            } else if principal.mode == crate::auth::AuthMode::UserSession {
+                if let Some(uid) = principal.user_id {
+                    Some(crate::identity::ensure_user_workspace(&state, uid, "user", "cloud").await?)
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-            req.workspace_id
         }
     };
 
@@ -550,7 +573,7 @@ async fn get_team(
     PathId(team_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     let row = load_row(&state, team_id).await?;
-    assert_visible(&principal, &row)?;
+    assert_visible(&state, &principal, &row).await?;
     Ok(Json(row_to_out(row)?).into_response())
 }
 
@@ -565,7 +588,7 @@ async fn update_team(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let row = load_row(&state, team_id).await?;
-    assert_owned(&principal, &row)?;
+    assert_owned(&state, &principal, &row).await?;
 
     let patch: Map<String, Value> = match serde_json::from_slice::<Value>(&body) {
         Ok(Value::Object(map)) => map,
@@ -659,7 +682,7 @@ async fn delete_team(
     PathId(team_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
     let row = load_row(&state, team_id).await?;
-    assert_owned(&principal, &row)?;
+    assert_owned(&state, &principal, &row).await?;
 
     let mut tx = state.any.begin().await?;
     // The snapshot on each process keeps the roster readable after the template

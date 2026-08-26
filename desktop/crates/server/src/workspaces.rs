@@ -58,10 +58,12 @@ struct WorkspaceRow {
     archived_at: Option<String>,
     created_at: String,
     updated_at: String,
+    user_id: Option<i64>,
 }
 
 pub const COLUMNS: &str = "CAST(id AS BIGINT) AS id, name, slug, description, CAST(archived_at AS TEXT) AS archived_at, \
-     CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at";
+     CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at, \
+     CAST(user_id AS BIGINT) AS user_id";
 
 impl WorkspaceRow {
     fn to_out(&self) -> Value {
@@ -71,6 +73,7 @@ impl WorkspaceRow {
             "slug": self.slug,
             "description": self.description,
             "archived_at": self.archived_at.as_deref().map(iso_from_sql),
+            "user_id": self.user_id,
             "created_at": iso_from_sql(&self.created_at),
             "updated_at": iso_from_sql(&self.updated_at),
         })
@@ -121,14 +124,29 @@ async fn list_workspaces(
     principal: Principal,
     RawQuery(query): RawQuery,
 ) -> Result<Response, ApiError> {
-    principal.require_master_key(NOT_A_TENANT)?;
     let include_archived = bool_query(query.as_deref(), "include_archived", false)?;
-    let sql = if include_archived {
-        format!("SELECT {COLUMNS} FROM workspace ORDER BY id ASC")
+    let (sql, bind_user): (String, Option<i64>) = if let Some(uid) = principal.scoped_user_id() {
+        let sql = if include_archived {
+            format!("SELECT {COLUMNS} FROM workspace WHERE user_id = ? ORDER BY id ASC")
+        } else {
+            format!("SELECT {COLUMNS} FROM workspace WHERE user_id = ? AND archived_at IS NULL ORDER BY id ASC")
+        };
+        (sql, Some(uid))
     } else {
-        format!("SELECT {COLUMNS} FROM workspace WHERE archived_at IS NULL ORDER BY id ASC")
+        principal.require_master_key(NOT_A_TENANT)?;
+        let sql = if include_archived {
+            format!("SELECT {COLUMNS} FROM workspace ORDER BY id ASC")
+        } else {
+            format!("SELECT {COLUMNS} FROM workspace WHERE archived_at IS NULL ORDER BY id ASC")
+        };
+        (sql, None)
     };
-    let rows: Vec<WorkspaceRow> = sqlx::query_as(&crate::db::sql(&sql, state.backend)).fetch_all(&state.any).await?;
+    let sql = crate::db::sql(&sql, state.backend).into_owned();
+    let mut q = sqlx::query_as::<_, WorkspaceRow>(&sql);
+    if let Some(uid) = bind_user {
+        q = q.bind(uid);
+    }
+    let rows: Vec<WorkspaceRow> = q.fetch_all(&state.any).await?;
     let out: Vec<Value> = rows.iter().map(WorkspaceRow::to_out).collect();
     Ok(Json(json!({ "workspaces": out })).into_response())
 }
@@ -156,7 +174,12 @@ async fn create_workspace(
     principal: Principal,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
-    principal.require_master_key(NOT_A_TENANT)?;
+    if principal.workspace_id.is_some() {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, NOT_A_TENANT));
+    }
+    if !principal.is_operator() && principal.user_id.is_none() {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, NOT_A_TENANT));
+    }
     let body = parse_body(&raw)?;
 
     let mut errors = Vec::new();
@@ -192,15 +215,17 @@ async fn create_workspace(
     }
 
     let now = sql_now();
+    let owner = crate::identity::stamp_user_id(&state, &principal);
     let id: i64 = sqlx::query_scalar(&crate::db::sql(
-        "INSERT INTO workspace (name, slug, description, archived_at, created_at, updated_at) \
-         VALUES (?, ?, ?, NULL, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
+        "INSERT INTO workspace (name, slug, description, archived_at, user_id, created_at, updated_at) \
+         VALUES (?, ?, ?, NULL, ?, ?, ?) RETURNING CAST(id AS BIGINT)", state.backend)
     )
     .bind(name.trim())
     .bind(&slug)
     // `req.description.strip() if req.description else None` — a blank string
     // is stored as NULL, not as "".
     .bind(description.filter(|d| !d.is_empty()).map(|d| d.trim().to_string()))
+    .bind(owner)
     .bind(&now)
     .bind(&now)
     .fetch_one(&state.any)
@@ -215,7 +240,7 @@ async fn get_workspace(
     principal: Principal,
     PathId(workspace_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
-    principal.require_master_key(NOT_A_TENANT)?;
+    crate::identity::assert_workspace_visible(&state, &principal, workspace_id).await?;
     let row = require_active(&state, workspace_id).await?;
     Ok(Json(row.to_out()).into_response())
 }
@@ -226,7 +251,10 @@ async fn update_workspace(
     PathId(workspace_id): PathId<i64>,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
-    principal.require_master_key(NOT_A_TENANT)?;
+    if principal.workspace_id.is_some() {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, NOT_A_TENANT));
+    }
+    crate::identity::assert_workspace_visible(&state, &principal, workspace_id).await?;
     let body = parse_body(&raw)?;
 
     let mut errors = Vec::new();
@@ -326,7 +354,10 @@ async fn delete_workspace(
     principal: Principal,
     PathId(workspace_id): PathId<i64>,
 ) -> Result<Response, ApiError> {
-    principal.require_master_key(NOT_A_TENANT)?;
+    if principal.workspace_id.is_some() {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, NOT_A_TENANT));
+    }
+    crate::identity::assert_workspace_visible(&state, &principal, workspace_id).await?;
     let row = require_active(&state, workspace_id).await?;
     // The `already archived` 409 in Python is unreachable — `require_active`
     // has already 404'd — and it is unreachable here for the same reason.
@@ -357,11 +388,27 @@ async fn get_my_workspace(
     State(state): State<Arc<AppState>>,
     principal: Principal,
 ) -> Result<Response, ApiError> {
-    let Some(workspace_id) = principal.workspace_id else {
+    if let Some(workspace_id) = principal.workspace_id {
+        crate::identity::assert_workspace_visible(&state, &principal, workspace_id).await?;
+        let row = require_active(&state, workspace_id).await?;
+        return Ok(Json(row.to_out()).into_response());
+    }
+    let Some(uid) = principal.user_id else {
         return Err(ApiError::bad_request(
-            "Master key is not bound to a workspace; use GET /workspaces to list them.",
+            "This credential is not bound to a user or workspace; use GET /workspaces to list them.",
         ));
     };
+    let username = principal
+        .email
+        .as_deref()
+        .and_then(|e| e.split('@').next())
+        .unwrap_or("user");
+    let kind = if principal.mode == crate::auth::AuthMode::OpenLocal {
+        "local"
+    } else {
+        "cloud"
+    };
+    let workspace_id = crate::identity::ensure_user_workspace(&state, uid, username, kind).await?;
     let row = require_active(&state, workspace_id).await?;
     Ok(Json(row.to_out()).into_response())
 }
@@ -384,7 +431,7 @@ mod tests {
     fn only_the_master_key_manages_tenants() {
         assert!(Principal::unrestricted().require_master_key(NOT_A_TENANT).is_ok());
         let tenant =
-            Principal { workspace_id: Some(3), token_id: Some(1), scopes: vec!["*".into()] };
+            Principal { workspace_id: Some(3), token_id: Some(1), scopes: vec!["*".into()], ..Principal::unrestricted() };
         assert_eq!(tenant.require_master_key(NOT_A_TENANT).unwrap_err().status, StatusCode::FORBIDDEN);
     }
 

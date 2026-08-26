@@ -160,6 +160,18 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         sort_order: 5,
     },
     ProviderSpec {
+        // Hosted Agent Platform (ADR 0013). Credential is the desktop's
+        // `cloud.session.json`, not an env key — Settings → Account writes it.
+        id: "platform",
+        api_key_env: None,
+        base_url_env: None,
+        label: "Platform AI",
+        registry: Registry::Chat,
+        default_model: "",
+        modalities: &[Chat, VisionInput],
+        sort_order: 6,
+    },
+    ProviderSpec {
         id: "image_local",
         api_key_env: None,
         base_url_env: Some("IMAGE_API_BASE"),
@@ -389,6 +401,7 @@ fn spec_configured(spec: &ProviderSpec) -> bool {
         "aimlapi" => !aimlapi_api_key().is_empty(),
         "anthropic" => !anthropic_api_key().is_empty(),
         "gemini" => !gemini_api_key().is_empty(),
+        "platform" => crate::accounts::platform_configured(),
         "image_local" => !image_api_base().is_empty(),
         "speech_local" => !speech_api_base().is_empty(),
         _ => true,

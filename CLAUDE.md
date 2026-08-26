@@ -60,11 +60,13 @@ claiming a change works; CI is the backstop, not the loop.
   `--target-dir` pointing outside the repo instead of killing the app
   (`.gitignore` pins `desktop/target/` exactly, so a sibling dir inside the repo
   shows up untracked).
-- **`agent-platformd` runs on SQLite or Postgres**, decided by `DATABASE_URL` —
-  the `sqlx::Any` pool migration finished, so `Config::from_env` no longer
-  refuses a DSN and there are two migration sets under `migrations/`. An *empty*
-  `DATABASE_URL` is not a DSN and must be unset rather than passed on
-  (`docker/entrypoint.sh` does this); the desktop is SQLite either way.
+- **SQLite is the default; Postgres is opt-in through `DATABASE_URL`.** One
+  `sqlx::AnyPool` (`AppState::any`) serves both, so every query site goes through
+  `db::sql` for placeholder rewriting and every migration is written twice —
+  `migrations/sqlite/` and `migrations/postgres/`, same number, same order.
+  A desktop install stays SQLite; the cloud deployment is what needs the DSN. An
+  *empty* `DATABASE_URL` is not a DSN and must be unset rather than passed on —
+  `docker/entrypoint.sh` does this.
 - **The Cloud Run deploy is free-tier only, and that is a hard rule.** No Cloud
   SQL, no Serverless VPC connector, no load balancer or IAP, no Cloud Build —
   each of those bills monthly whether or not anything connects, and every one of

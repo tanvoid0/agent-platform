@@ -452,21 +452,28 @@ async fn list_boards(
     Query(q): Query<ProjectQuery>,
 ) -> Result<Response, ApiError> {
     require_scope(&principal, "todos:read")?;
-    if principal.workspace_id.is_some() {
-        let project_id = q.project_id.ok_or_else(|| {
-            ApiError::bad_request("project_id is required for a workspace-scoped token.")
-        })?;
+    if let Some(project_id) = q.project_id {
         crate::projects::assert_access(&state, &principal, project_id).await?;
+    } else if principal.workspace_id.is_some() {
+        return Err(ApiError::bad_request("project_id is required for a workspace-scoped token."));
     }
 
-    let boards: Vec<BoardOut> = match q.project_id {
-        Some(project_id) => sqlx::query_as(&crate::db::sql(&format!(
+    let boards: Vec<BoardOut> = match (q.project_id, principal.scoped_user_id()) {
+        (Some(project_id), _) => sqlx::query_as(&crate::db::sql(&format!(
             "SELECT {BOARD_COLUMNS} FROM todo_boards b WHERE project_id = ? ORDER BY id ASC"
         ), state.backend))
         .bind(project_id)
         .fetch_all(&state.any)
         .await?,
-        None => {
+        (None, Some(uid)) => sqlx::query_as(&crate::db::sql(&format!(
+            "SELECT {BOARD_COLUMNS} FROM todo_boards b WHERE project_id IN \
+             (SELECT id FROM project WHERE workspace_id IN \
+              (SELECT id FROM workspace WHERE user_id = ?)) ORDER BY id ASC"
+        ), state.backend))
+        .bind(uid)
+        .fetch_all(&state.any)
+        .await?,
+        (None, None) => {
             sqlx::query_as(&crate::db::sql(&format!("SELECT {BOARD_COLUMNS} FROM todo_boards b ORDER BY id ASC"), state.backend))
                 .fetch_all(&state.any)
                 .await?

@@ -525,9 +525,10 @@ fn settings_view(app: &App) -> Element<'_, Message> {
             SettingsTab::Performance => performance_view(app),
             SettingsTab::Status => status_view(app),
             SettingsTab::Api => {
-                crate::apidocs_view::view(&app.apidocs, &app.shell.origin(), &app.shell.key)
+                crate::apidocs_view::view(&app.apidocs, &app.shell.origin(), app.client.key())
                     .map(Message::ApiDocs)
             }
+            SettingsTab::Account => crate::account_view::view(&app.account).map(Message::Account),
         }
     };
 
@@ -1679,18 +1680,16 @@ fn local_model_download(app: &App) -> Element<'_, Message> {
 }
 
 fn api_card(app: &App) -> Element<'_, Message> {
-    let key_display = if app.shell.key.is_empty() {
-        "(no key)".to_string()
-    } else if app.key_revealed {
-        app.shell.key.clone()
-    } else {
-        format!("{}{}", &app.shell.key[..6.min(app.shell.key.len())], "•".repeat(12))
-    };
+    let open = app.client.key().is_empty();
     let origin = app.shell.origin();
-    let curl = format!(
-        "curl -H \"Authorization: Bearer {}\" {origin}/api/v1/system/status",
-        app.shell.key
-    );
+    let curl = if open {
+        format!("curl {origin}/api/v1/system/status")
+    } else {
+        format!(
+            "curl -H \"Authorization: Bearer {}\" {origin}/api/v1/system/status",
+            app.client.key()
+        )
+    };
 
     let copied = |what: &'static str, label: &'static str| -> &'static str {
         if app.copied == Some(what) {
@@ -1700,39 +1699,67 @@ fn api_card(app: &App) -> Element<'_, Message> {
         }
     };
 
+    let mut actions = vec![
+        ui::button_secondary(
+            Icon::Copy,
+            copied("origin", "Copy URL"),
+            Message::Copy("origin", origin.clone()),
+        ),
+        ui::button_secondary(Icon::Copy, copied("curl", "Copy curl"), Message::Copy("curl", curl.clone())),
+    ];
+    if !open {
+        let key = app.client.key().to_string();
+        actions.insert(
+            0,
+            ui::button_ghost(
+                if app.key_revealed { Icon::EyeOff } else { Icon::Eye },
+                if app.key_revealed { "Hide key" } else { "Show key" },
+                Message::ToggleKeyRevealed,
+            ),
+        );
+        actions.insert(
+            1,
+            ui::button_secondary(
+                Icon::Copy,
+                copied("key", "Copy key"),
+                Message::Copy("key", key),
+            ),
+        );
+    }
+
+    let mut rows = vec![ui::field("Base URL", ui::mono(origin.clone()))];
+    if open {
+        rows.push(ui::field(
+            "Auth",
+            ui::badge_icon(Icon::CheckCircle, "none — open on loopback", Tone::Success),
+        ));
+    } else {
+        let shown = if app.key_revealed {
+            app.client.key().to_string()
+        } else {
+            format!(
+                "{}{}",
+                &app.client.key()[..6.min(app.client.key().len())],
+                "•".repeat(12)
+            )
+        };
+        rows.push(ui::field("API key", ui::mono(shown)));
+    }
+    rows.push(ui::cluster(actions).into());
+    rows.push(ui::code(ui::mono(if open {
+        format!("curl {origin}/api/v1/system/status")
+    } else {
+        format!("curl -H \"Authorization: Bearer <key>\" {origin}/api/v1/system/status")
+    })));
+
     ui::card_with_header(
         "API server",
         Some(ui::muted(
-            "Other local apps can use this server while the window is closed.",
+            "Other local apps can use this server with no token, like Ollama. \
+             A key is only needed if you expose the process beyond this machine.",
         )),
         None,
-        ui::stack(vec![
-            ui::field("Base URL", ui::mono(origin.clone())),
-            ui::field("API key", ui::mono(key_display)),
-            ui::cluster(vec![
-                ui::button_ghost(
-                    if app.key_revealed { Icon::EyeOff } else { Icon::Eye },
-                    if app.key_revealed { "Hide key" } else { "Show key" },
-                    Message::ToggleKeyRevealed,
-                ),
-                ui::button_secondary(
-                    Icon::Copy,
-                    copied("key", "Copy key"),
-                    Message::Copy("key", app.shell.key.clone()),
-                ),
-                ui::button_secondary(
-                    Icon::Copy,
-                    copied("origin", "Copy URL"),
-                    Message::Copy("origin", origin.clone()),
-                ),
-                ui::button_secondary(Icon::Copy, copied("curl", "Copy curl"), Message::Copy("curl", curl)),
-            ])
-            .into(),
-            // The sample never renders the key; the Copy button carries it.
-            ui::code(ui::mono(format!(
-                "curl -H \"Authorization: Bearer <key>\" {origin}/api/v1/system/status"
-            ))),
-        ]),
+        ui::stack(rows),
     )
 }
 

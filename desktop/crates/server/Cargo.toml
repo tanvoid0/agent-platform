@@ -29,17 +29,19 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # replaced Alembic. It embeds `migrations/` into the binary, so the deployed
 # artifact is still one file.
 #
-# **`tls-rustls-ring` is what lets `DATABASE_URL` reach a managed Postgres.**
-# Without a TLS feature, sqlx negotiates plaintext and answers a server that
-# demands otherwise with "TLS upgrade required by server but SQLx was built
-# without TLS support enabled" — every hosted provider (Neon, Supabase, Cloud
-# SQL) demands it. The local Postgres the tests run against does not, which is
-# why the suite was green over a connection the cloud would refuse.
+# **`tls-rustls-ring-native-roots` is what lets `DATABASE_URL` reach a managed
+# Postgres.** Without a TLS feature, sqlx negotiates plaintext and answers a
+# server that demands otherwise with "TLS upgrade required by server but SQLx
+# was built without TLS support enabled" — every hosted provider (Neon,
+# Supabase, Cloud SQL) demands it, and `sslmode=require` cannot handshake
+# without it. The local Postgres the tests run against does not, which is why
+# the suite was green over a connection the cloud would refuse.
 #
 # `-ring`, not plain `tls-rustls`, so the provider matches the one `reqwest`
 # already pulls: rustls installs a process-wide default `CryptoProvider`, and
 # two of them in one binary is a runtime panic rather than a build error.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "any", "chrono", "macros", "migrate", "tls-rustls-ring"] }
+# `-native-roots` reads the OS trust store rather than a bundled root set.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "sqlite", "postgres", "any", "chrono", "macros", "migrate"] }
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` so a JSON object round-trips in the order it was written
 # rather than sorted — `serde_json::Map` is a `BTreeMap` without it. Kept now
@@ -54,6 +56,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 sha2 = "0.10"
+hmac = "0.12"
+jsonwebtoken = "9"
 # Already in the tree via reqwest. Declared because the BYOK base-URL allowlist
 # is an SSRF guard, and that is not a job for string splitting.
 url = "2"
@@ -87,7 +91,7 @@ async-stream = "0.3.6"
 # the one hang the per-call reqwest timeouts elsewhere cannot cover. Hand-rolling
 # preflight is where people quietly get `Vary` wrong and poison a shared cache;
 # this is the crate axum's own examples use.
-tower-http = { version = "0.6", default-features = false, features = ["cors", "timeout"] }
+tower-http = { version = "0.6", default-features = false, features = ["cors", "timeout", "fs"] }
 # Host CPU/memory/disk for `GET /system/resources` (the Performance page's
 # meters). Sampled on demand on a request the desktop was already making, never
 # on a timer of its own. `system` + `disk` only: components (temperatures),

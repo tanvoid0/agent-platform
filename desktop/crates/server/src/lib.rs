@@ -8,8 +8,8 @@
 //!
 //! The domains, and the modules that hold them:
 //!
-//! - **auth + tokens** — `auth.rs` (three tiers, `last_used_at`),
-//!   `api_tokens.rs` (the workspace token CRUD)
+//! - **auth + tokens** — `auth.rs` (master, `agp_`, user JWT),
+//!   `api_tokens.rs` (workspace token CRUD), `accounts.rs` (magic-link, entitlements)
 //! - **processes** — `processes.rs` + `executor.rs` + `dag_schema.rs`: the
 //!   eleven routes, the DAG executor, sub-DAG expansion, startup recovery
 //! - **LLM proxy** — the whole `/v1` surface in `llm.rs` and its
@@ -62,6 +62,10 @@ macro_rules! logd {
     };
 }
 
+pub mod accounts;
+pub mod accounts_stripe;
+pub mod billing;
+pub mod cli;
 pub mod action_orchestrator;
 pub mod api_tokens;
 pub mod assistant;
@@ -70,6 +74,7 @@ pub mod coder_loop;
 pub mod coder_tools;
 pub mod assistant_turn;
 pub mod auth;
+pub mod identity;
 pub mod byok;
 pub mod chat;
 pub mod chat_thread_title;
@@ -203,6 +208,10 @@ impl Config {
 /// addresses at all (`localhost`, and the empty host some launchers pass) have
 /// to pass too. Anything unrecognised is treated as exposed: guessing wrong in
 /// that direction refuses a startup, guessing wrong the other way opens a server.
+pub fn is_loopback_host(host: &str) -> bool {
+    is_loopback(host)
+}
+
 fn is_loopback(host: &str) -> bool {
     let h = host.trim().trim_start_matches('[').trim_end_matches(']');
     if h.is_empty() || h.eq_ignore_ascii_case("localhost") {
@@ -231,6 +240,10 @@ pub struct AppState {
     /// ponytail: in-process like the Python one; both count every request so the
     /// effective limit is unchanged. Needs a shared store if this ever runs N-up.
     pub windows: Mutex<HashMap<i64, (u64, u32)>>,
+    /// Per-user `/v1` rate windows (user JWT callers).
+    pub user_windows: Mutex<HashMap<i64, (u64, u32)>>,
+    /// Per-IP windows for magic-link and unauthenticated `/v1`.
+    pub ip_windows: Mutex<HashMap<String, (u64, u32)>>,
     /// Coder turns parked on a delegated tool call, keyed by
     /// `(thread_id, call_id)` — `coder/desktop_executor.py`'s module-level
     /// `_pending` dict. **This is process memory**: `/chat/tool-result` must be
@@ -249,6 +262,11 @@ pub struct AppState {
     /// How much of this machine the server may use, and who gets it first
     /// (ADR 0010). Set by `PUT /system/resources`; read at every model call.
     pub limits: resources::Limits,
+    /// Cached access JWT for provider `platform` (ADR 0013). Refresh lives in
+    /// the session file the desktop writes; this is only the short-lived half.
+    pub platform_access: Mutex<Option<(String, i64)>>,
+    /// Desktop SQLite: the OS-username user seeded at startup (ADR 0014).
+    pub machine_user: Mutex<Option<identity::MachineUser>>,
 }
 
 impl AppState {
@@ -278,10 +296,14 @@ impl AppState {
             master_key,
             http: reqwest::Client::new(),
             windows: Mutex::new(HashMap::new()),
+            user_windows: Mutex::new(HashMap::new()),
+            ip_windows: Mutex::new(HashMap::new()),
             coder_pending: Mutex::new(HashMap::new()),
             model_jobs: Mutex::new(HashMap::new()),
             catalog: Arc::new(model_catalog::CatalogCache::default()),
             limits: resources::Limits::default(),
+            platform_access: Mutex::new(None),
+            machine_user: Mutex::new(None),
         }
     }
 }
@@ -308,7 +330,12 @@ impl AppState {
 /// against the same file.
 async fn health(State(state): State<Arc<AppState>>) -> Response {
     match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.any).await {
-        Ok(_) => Json(json!({"status": "ok", "service": "agent-platform"})).into_response(),
+        Ok(_) => Json(json!({
+            "status": "ok",
+            "service": "agent-platform",
+            "auth": identity::public_auth_info(&state),
+        }))
+        .into_response(),
         Err(e) => {
             logd!("health check could not reach the database: {e}");
             // 503, so a container orchestrator and the desktop's
@@ -550,10 +577,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(workflows::routes())
         .merge(workspace_files::routes())
         .merge(workspaces::routes())
+        .merge(identity::routes())
+        .merge(accounts::api_routes())
+        .merge(accounts::static_router())
         .fallback(not_found)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_token,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            accounts::unauth_v1_ip_limit,
         ))
         // The general cap. A route that needs more sets its own *closer to the
         // handler*, which is what makes it win: both layers write the same
@@ -596,6 +630,8 @@ pub async fn serve(cfg: Config) -> Result<(), BoxError> {
         std::fs::create_dir_all(parent)?;
     }
     db::ensure_schema(&state.any).await?;
+    identity::bootstrap(&state).await?;
+    accounts::seed_admin_emails(&state).await;
     state.catalog.clone().spawn_refresh(state.http.clone());
     workflow_engine::spawn_scheduler(state.clone());
     // Executors are in-process tasks and do not survive a restart, so whatever

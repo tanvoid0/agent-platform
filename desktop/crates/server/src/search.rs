@@ -497,6 +497,7 @@ async fn load_history(state: &AppState, id: i64) -> Result<SearchHistoryOut, Api
 #[derive(FromRow)]
 struct HistoryOwner {
     workspace_id: Option<i64>,
+    user_id: Option<i64>,
 }
 
 async fn assert_history_access(
@@ -505,7 +506,8 @@ async fn assert_history_access(
     history_id: i64,
 ) -> Result<(), ApiError> {
     let row: Option<HistoryOwner> = sqlx::query_as(&db::sql(
-        "SELECT CAST(workspace_id AS BIGINT) AS workspace_id FROM search_history WHERE id = ?",
+        "SELECT CAST(workspace_id AS BIGINT) AS workspace_id, CAST(user_id AS BIGINT) AS user_id \
+         FROM search_history WHERE id = ?",
         state.backend,
     ))
     .bind(history_id)
@@ -515,14 +517,13 @@ async fn assert_history_access(
     let Some(row) = row else {
         return Err(ApiError::not_found("Not found"));
     };
-    // The master key is unrestricted, same as everywhere else it appears —
-    // it sees and manages every workspace's history, which is why the single-
-    // row delete and the clear-all route below both go unfiltered for it.
-    match principal.workspace_id {
-        None => Ok(()),
-        Some(ws) if Some(ws) == row.workspace_id => Ok(()),
-        Some(_) => Err(ApiError::not_found("Not found")),
+    if let Some(ws) = principal.workspace_id {
+        if Some(ws) != row.workspace_id {
+            return Err(ApiError::not_found("Not found"));
+        }
+        return Ok(());
     }
+    crate::identity::assert_user_row(principal, row.user_id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -542,6 +543,8 @@ async fn list_history(
     let mut wheres: Vec<&str> = Vec::new();
     if principal.workspace_id.is_some() {
         wheres.push("workspace_id = ?");
+    } else if principal.scoped_user_id().is_some() {
+        wheres.push("user_id = ?");
     }
     if q.opened_only {
         wheres.push("opened != 0");
@@ -560,6 +563,8 @@ async fn list_history(
     let mut query = sqlx::query_as::<_, SearchHistoryOut>(&sql);
     if let Some(ws) = principal.workspace_id {
         query = query.bind(ws);
+    } else if let Some(uid) = principal.scoped_user_id() {
+        query = query.bind(uid);
     }
     let rows = query.bind(q.limit.clamp(1, HISTORY_LIMIT_CAP)).fetch_all(&state.any).await?;
 
@@ -618,8 +623,8 @@ async fn create_history(
         // Scoped to the caller's own workspace (or, for the master key, to
         // the rows it owns itself — `workspace_id IS NULL`) so promotion can
         // never flip a flag on a row that belongs to somebody else.
-        let existing: Option<i64> = match principal.workspace_id {
-            Some(ws) => sqlx::query_scalar(&db::sql(
+        let existing: Option<i64> = match (principal.workspace_id, principal.scoped_user_id()) {
+            (Some(ws), _) => sqlx::query_scalar(&db::sql(
                 "SELECT CAST(id AS BIGINT) FROM search_history \
                  WHERE workspace_id = ? AND query = ? AND opened = 0 \
                  ORDER BY id DESC LIMIT 1",
@@ -629,7 +634,17 @@ async fn create_history(
             .bind(&query)
             .fetch_optional(&state.any)
             .await?,
-            None => sqlx::query_scalar(&db::sql(
+            (None, Some(uid)) => sqlx::query_scalar(&db::sql(
+                "SELECT CAST(id AS BIGINT) FROM search_history \
+                 WHERE user_id = ? AND query = ? AND opened = 0 \
+                 ORDER BY id DESC LIMIT 1",
+                state.backend,
+            ))
+            .bind(uid)
+            .bind(&query)
+            .fetch_optional(&state.any)
+            .await?,
+            (None, None) => sqlx::query_scalar(&db::sql(
                 "SELECT CAST(id AS BIGINT) FROM search_history \
                  WHERE workspace_id IS NULL AND query = ? AND opened = 0 \
                  ORDER BY id DESC LIMIT 1",
@@ -654,8 +669,8 @@ async fn create_history(
     }
 
     let id: i64 = sqlx::query_scalar(&db::sql(
-        "INSERT INTO search_history (workspace_id, query, engine, source, opened, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)",
+        "INSERT INTO search_history (workspace_id, query, engine, source, opened, created_at, user_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING CAST(id AS BIGINT)",
         state.backend,
     ))
     .bind(principal.workspace_id)
@@ -664,6 +679,7 @@ async fn create_history(
     .bind(&source)
     .bind(i64::from(req.opened))
     .bind(&now)
+    .bind(crate::identity::stamp_user_id(&state, &principal))
     .fetch_one(&state.any)
     .await?;
 
@@ -690,14 +706,20 @@ async fn clear_history(
     State(state): State<Arc<AppState>>,
     principal: Principal,
 ) -> Result<Response, ApiError> {
-    match principal.workspace_id {
-        Some(ws) => {
+    match (principal.workspace_id, principal.scoped_user_id()) {
+        (Some(ws), _) => {
             sqlx::query(&db::sql("DELETE FROM search_history WHERE workspace_id = ?", state.backend))
                 .bind(ws)
                 .execute(&state.any)
                 .await?;
         }
-        None => {
+        (None, Some(uid)) => {
+            sqlx::query(&db::sql("DELETE FROM search_history WHERE user_id = ?", state.backend))
+                .bind(uid)
+                .execute(&state.any)
+                .await?;
+        }
+        (None, None) => {
             sqlx::query("DELETE FROM search_history").execute(&state.any).await?;
         }
     }

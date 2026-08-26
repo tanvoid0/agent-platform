@@ -1,20 +1,25 @@
-//! Bearer auth, ported from `app/api_tokens/auth.py`.
+//! Bearer auth, ported from `app/api_tokens/auth.py`, then tied to a user
+//! ([ADR 0014](../../../../docs/adr/0014-user-owned-data-local-and-cloud.md)).
 //!
-//! Three tiers, same as the Python server (see the tenancy contract in
-//! `app/tests/test_workspace_tenancy.py`):
+//! Tiers:
 //!
-//! - **master key** — operator, `workspace_id == None`, unrestricted
-//! - **`agp_…` workspace token** — one tenant; cross-tenant reads must 404, not 401
-//! - **`X-Agent-Platform-Client`** — a caller-supplied namespace, *not* a security
-//!   boundary, so it is not checked here (route handlers read it when they care)
+//! - **master key** — operator. May carry the desktop machine `user_id` so
+//!   writes are stamped, but `scoped_user_id` is `None` (sees every tenant).
+//! - **`agp_…` workspace token** — one workspace; `user_id` is that
+//!   workspace's owner. Cross-tenant reads 404, not 401.
+//! - **user session JWT** — one Portal / cloud user. Not the master key.
+//! - **open local** — no master key on loopback. Other apps send no
+//!   `Authorization` header; the caller is the OS-username user, not
+//!   `user_id = None`.
 //!
-//! With no master key configured, auth is fully open. That is the Python server's
-//! documented dev convenience, and diverging from it here would break local runs.
+//! Failures name the actual reason (`AUTH_REQUIRED`, `TOKEN_EXPIRED`, …) so
+//! another app hitting a hosted URL can tell "this server wants a token" from
+//! "this token is dead". `/health` repeats the short form without a credential.
 
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::{header::AUTHORIZATION, StatusCode};
+use axum::http::{header::AUTHORIZATION, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::{NaiveDateTime, Utc};
@@ -30,13 +35,40 @@ const TOKEN_PREFIX_MARKER: &str = "agp_";
 /// envelope, so it has to be this string and not something more accurate.
 const ERROR_TYPE: &str = "llm_proxy_error";
 
-/// Resolved caller. `workspace_id == None` is the unrestricted (master key or
-/// auth-disabled) caller.
+/// How this caller authenticated. Tenant isolation keys off this, not off
+/// `user_id == None` — a local machine user *has* a `user_id` and is still
+/// the operator of this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    OpenLocal,
+    MasterKey,
+    WorkspaceToken,
+    UserSession,
+}
+
+impl AuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMode::OpenLocal => "open_local",
+            AuthMode::MasterKey => "master_key",
+            AuthMode::WorkspaceToken => "workspace_token",
+            AuthMode::UserSession => "user_session",
+        }
+    }
+}
+
+/// Resolved caller.
 #[derive(Debug, Clone)]
 pub struct Principal {
     pub workspace_id: Option<i64>,
     pub token_id: Option<i64>,
     pub scopes: Vec<String>,
+    pub user_id: Option<i64>,
+    pub email: Option<String>,
+    pub entitlement: Option<String>,
+    pub is_admin: bool,
+    pub client: Option<String>,
+    pub mode: AuthMode,
 }
 
 /// Handlers take `Principal` directly; the middleware below has already put one
@@ -74,13 +106,34 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for ProxyPrincipal {
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         let header = parts.headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
-        resolve(state, header).await.map(ProxyPrincipal)
+        let mut principal = resolve(state, header).await?;
+        if principal.user_id.is_none() && header.is_none() {
+            if let Some(email) = parts
+                .headers
+                .get("x-agent-platform-user")
+                .and_then(|v| v.to_str().ok())
+            {
+                principal = crate::accounts::principal_from_dev_header(state, email).await?;
+            }
+        }
+        principal.client = crate::accounts::client_from_headers(&parts.headers);
+        Ok(ProxyPrincipal(principal))
     }
 }
 
 impl Principal {
     pub fn unrestricted() -> Self {
-        Self { workspace_id: None, token_id: None, scopes: vec!["*".into()] }
+        Self {
+            workspace_id: None,
+            token_id: None,
+            scopes: vec!["*".into()],
+            user_id: None,
+            email: None,
+            entitlement: None,
+            is_admin: false,
+            client: None,
+            mode: AuthMode::MasterKey,
+        }
     }
 
     pub fn has_scope(&self, scope: &str) -> bool {
@@ -100,6 +153,23 @@ impl Principal {
         ))
     }
 
+    /// Operator of this process: master key, or the local machine user on an
+    /// open loopback daemon. Workspace tokens and cloud JWTs are tenants.
+    pub fn is_operator(&self) -> bool {
+        self.workspace_id.is_none()
+            && matches!(self.mode, AuthMode::OpenLocal | AuthMode::MasterKey)
+    }
+
+    /// Tenant isolation. `None` is the cloud/master operator (sees every row).
+    /// Local and JWT callers get their `user_id` so one account cannot read
+    /// another. Workspace tokens also carry the workspace owner's id.
+    pub fn scoped_user_id(&self) -> Option<i64> {
+        if self.mode == AuthMode::MasterKey {
+            return None;
+        }
+        self.user_id
+    }
+
     /// An operator action, not a tenant one. A workspace token is a valid Bearer
     /// credential and gets past auth, so every route that manages the platform
     /// rather than the tenant's own data has to say so itself.
@@ -108,11 +178,14 @@ impl Principal {
     /// rule from different ends — "this endpoint wants the master key" for the
     /// `.env` surface, "workspaces are not yours to manage" for tenancy — and
     /// the wording is the only part of this that was ever different.
+    ///
+    /// A local machine user is an operator with a `user_id`; a cloud JWT is
+    /// not. The check is the mode, not `user_id.is_some()`.
     pub fn require_master_key(&self, denial: &'static str) -> Result<(), crate::error::ApiError> {
-        if self.workspace_id.is_some() {
-            return Err(crate::error::ApiError::new(StatusCode::FORBIDDEN, denial));
+        if self.is_operator() {
+            return Ok(());
         }
-        Ok(())
+        Err(crate::error::ApiError::new(StatusCode::FORBIDDEN, denial))
     }
 }
 
@@ -127,7 +200,7 @@ pub struct AuthError {
 }
 
 impl AuthError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self { status, code, message: message.into(), token_prefix: None }
     }
 
@@ -139,22 +212,53 @@ impl AuthError {
     fn invalid(message: &str) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "TOKEN_INVALID", message)
     }
+
+    pub fn invalid_pub(message: &str) -> Self {
+        Self::invalid(message)
+    }
 }
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
+        let mut extra = json!({
+            "auth": {
+                "required": true,
+                "header": "Authorization: Bearer <session JWT | agp_ workspace token | master key>",
+                "health": "/health",
+                "status": "/api/v1/system/status",
+                "me": "/api/v1/me",
+                "accounts": "/accounts",
+                "refresh": "/accounts/api/v1/auth/refresh",
+            }
+        });
+        if let Some(prefix) = self.token_prefix {
+            extra["token_prefix"] = json!(prefix);
+        }
         let mut err = json!({
             "message": self.message,
             "type": ERROR_TYPE,
             "code": self.code,
+            "extra": extra,
         });
         if let Some(request_id) = crate::request_id::current() {
             err["request_id"] = json!(request_id);
         }
-        if let Some(prefix) = self.token_prefix {
-            err["extra"] = json!({ "token_prefix": prefix });
+        let www = match self.code {
+            "AUTH_REQUIRED" => {
+                "Bearer realm=\"agent-platform\", error=\"invalid_request\", error_description=\"missing access token\""
+            }
+            "TOKEN_EXPIRED" => {
+                "Bearer realm=\"agent-platform\", error=\"invalid_token\", error_description=\"token expired\""
+            }
+            _ => {
+                "Bearer realm=\"agent-platform\", error=\"invalid_token\", error_description=\"invalid access token\""
+            }
+        };
+        let mut response = (self.status, axum::Json(json!({ "error": err }))).into_response();
+        if let Ok(value) = HeaderValue::from_str(www) {
+            response.headers_mut().insert("www-authenticate", value);
         }
-        (self.status, axum::Json(json!({ "error": err }))).into_response()
+        response
     }
 }
 
@@ -193,12 +297,39 @@ pub async fn require_token(
         .map(str::to_owned);
 
     let principal = resolve(&state, header.as_deref()).await?;
+    let mut principal = principal;
+    principal.client = crate::accounts::client_from_headers(req.headers());
     req.extensions_mut().insert(principal);
     Ok(next.run(req).await)
 }
 
+fn with_machine_stamp(mut principal: Principal, state: &AppState) -> Principal {
+    if principal.user_id.is_none() {
+        if let Some(user) = crate::identity::machine_user(state) {
+            principal.user_id = Some(user.id);
+            principal.email = Some(user.email);
+        }
+    }
+    principal
+}
+
+const AUTH_REQUIRED_MSG: &str = "\
+This Agent Platform API requires authentication. Send Authorization: Bearer \
+<session JWT | agp_ workspace token | master key>. GET /health (no token) \
+reports auth.required. 401 AUTH_REQUIRED means the header was missing; \
+TOKEN_EXPIRED means POST /accounts/api/v1/auth/refresh; TOKEN_INVALID means \
+the secret is not from this server.";
+
+const TOKEN_INVALID_MSG: &str = "\
+The Bearer token was not recognized. Use a current session JWT, an agp_ \
+workspace token issued by this server, or the master key. A leftover token \
+from another Agent Platform install fails this way.";
+
 pub async fn resolve(state: &AppState, authorization: Option<&str>) -> Result<Principal, AuthError> {
     let Some(expected) = state.master_key.as_deref() else {
+        if let Some(user) = crate::identity::machine_user(state) {
+            return Ok(crate::identity::principal_from_machine(&user));
+        }
         return Ok(Principal::unrestricted());
     };
 
@@ -206,17 +337,22 @@ pub async fn resolve(state: &AppState, authorization: Option<&str>) -> Result<Pr
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
         .ok_or_else(|| {
-            AuthError::invalid("Missing or invalid Authorization (expected Bearer token)")
+            AuthError::new(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED", AUTH_REQUIRED_MSG)
         })?;
 
     if raw.starts_with(TOKEN_PREFIX_MARKER) {
         return resolve_workspace_token(state, raw).await;
     }
 
-    if !ct_eq(raw, expected) {
-        return Err(AuthError::invalid("Invalid API key"));
+    if ct_eq(raw, expected) {
+        return Ok(with_machine_stamp(Principal::unrestricted(), state));
     }
-    Ok(Principal::unrestricted())
+
+    if raw.matches('.').count() == 2 {
+        return crate::accounts::principal_from_jwt(state, raw).await;
+    }
+
+    Err(AuthError::invalid(TOKEN_INVALID_MSG))
 }
 
 async fn resolve_workspace_token(state: &AppState, raw: &str) -> Result<Principal, AuthError> {
@@ -234,7 +370,7 @@ async fn resolve_workspace_token(state: &AppState, raw: &str) -> Result<Principa
     .await
     .map_err(db_error)?;
 
-    let row = row.ok_or_else(|| AuthError::invalid("Invalid API token"))?;
+    let row = row.ok_or_else(|| AuthError::invalid(TOKEN_INVALID_MSG))?;
     let prefix = Some(row.prefix.clone());
 
     match row.status.as_str() {
@@ -286,10 +422,29 @@ async fn resolve_workspace_token(state: &AppState, raw: &str) -> Result<Principa
     touch_last_used(state, row.id, row.last_used_at.as_deref().and_then(crate::wire::parse_naive))
         .await;
 
+    // Separate from the token query so a test database that predates
+    // `workspace.user_id` still authenticates; a missing column is "no owner",
+    // not "this token is bad".
+    let owner_user_id: Option<i64> = sqlx::query_scalar(&crate::db::sql(
+        "SELECT CAST(user_id AS BIGINT) FROM workspace WHERE id = ?",
+        state.backend,
+    ))
+    .bind(row.workspace_id)
+    .fetch_optional(&state.any)
+    .await
+    .ok()
+    .flatten();
+
     Ok(Principal {
         workspace_id: Some(row.workspace_id),
         token_id: Some(row.id),
         scopes: serde_json::from_str(&row.scopes_json).unwrap_or_default(),
+        user_id: owner_user_id,
+        email: None,
+        entitlement: None,
+        is_admin: false,
+        client: None,
+        mode: AuthMode::WorkspaceToken,
     })
 }
 

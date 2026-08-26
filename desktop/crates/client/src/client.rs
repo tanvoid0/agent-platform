@@ -127,7 +127,11 @@ impl Client {
     }
 
     pub(crate) fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        rb.bearer_auth(&self.key)
+        if self.key.is_empty() {
+            rb
+        } else {
+            rb.bearer_auth(&self.key)
+        }
     }
 
     async fn handle<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
