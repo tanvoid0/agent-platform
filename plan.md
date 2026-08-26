@@ -49,6 +49,8 @@ than died, is the section below.
 | Logs, status | `observability.rs` (the ring `logd!` writes to), `system.rs` (`/system/status`, `/system/logs`) |
 | Resource modes, AI-call priority, machine meters | `resources.rs` (`Limits`, the two lanes, the host/GPU sampler, `/system/resources`); gated at `llm::complete_internal` and `llm::chat_completions`; desktop Settings → Performance (`machine_view` in `screen.rs`) and the sidebar monitor ([ADR 0010](docs/adr/0010-resource-modes-and-ai-call-priority.md)) |
 | Env seeding, correlation ids | `dotenv.rs`, `request_id.rs` |
+| Web admin console | `desktop/crates/server/src/admin.html` — one static page, `include_str!`d and served at `/admin` by `lib.rs`; no build step, no assets |
+| Cloud deploy | `.github/workflows/deploy-cloud-run.yml` (a `dist` custom job listed in `dist-workspace.toml`'s `post-announce-jobs`), over the root `Dockerfile` + `docker/entrypoint.sh` |
 | Shared shapes | `wire.rs`, `error.rs` |
 | Desktop HTTP/SSE client | `desktop/crates/client/` (`enums.rs` is hand-maintained now — the generator went with `app/shared_enums.py`) |
 | Desktop screens | `desktop/crates/app/src/` — state/update in `x.rs`, rendering in `x_view.rs` |
@@ -94,6 +96,118 @@ SQLite-only and refuses to start with `DATABASE_URL` set — note the repo's own
 
 ## Backlog
 
+- **Cloud Run deploy — written, verified, and parked 2026-08-23.** Nothing is
+  deployed and nothing calls the workflow: the `post-announce-jobs` line is
+  commented out in `dist-workspace.toml`, `release.yml` is regenerated without a
+  deploy job, and no `gcloud` command has ever run against this project. Reviving
+  it is that one line plus `dist generate` and six repo variables. **The fixes it
+  turned up are not parked** — they were bugs in their own right and are listed
+  below.
+  `agent-platformd` would deploy as a **service, not a "Cloud Run function"**:
+  functions have no Rust runtime, the root `Dockerfile` already builds a
+  server-only image, and Cloud Run bills a container exactly like a function —
+  per request, scaling to zero.
+  - **`.github/workflows/deploy-cloud-run.yml` is a `dist` custom job.** Wired,
+    it runs *after* the GitHub Release exists so a build that failed on any of
+    the four platforms never reaches production; `dist generate` gives it
+    `needs: [plan, announce]` and passes a `plan` input, which is why the job
+    declares one it never reads — a called workflow errors on an input it has
+    not declared. Auth is Workload Identity Federation; no service-account JSON
+    key exists. Config is repo `vars` + Secret Manager, nothing in the file.
+    `--revision-suffix` carries the run number because `gcloud run deploy`
+    refuses a revision name that already exists, which is what redeploying a tag
+    (the rollback path) asks for.
+  - **The image was built and measured**, not assumed: 179 MB, `agent-platformd`
+    and nothing else, from the existing `Dockerfile` unchanged.
+  - **`--max-instances=1` is correctness, not thrift.** `AppState` holds three
+    process-memory maps: `coder_pending` (a `/chat/tool-result` must be served
+    by the process that served `/chat/stream`), `model_jobs`, and the
+    fixed-window rate limiter. Two instances behind one URL break the first,
+    orphan the second and double every token's effective limit.
+  - **Private by default, and that is the DDoS gate.** `--no-allow-unauthenticated`
+    unless `vars.GCP_ALLOW_PUBLIC` says otherwise: Google rejects an anonymous
+    request at its own front door, so a flood never starts a billable container.
+    Every alternative — Cloud Armor, a load balancer, IAP — costs more per month
+    than the service does. The admin page is reached with
+    `gcloud run services proxy`, which authenticates locally and serves it on
+    127.0.0.1, so the browser still needs no token. `--max-instances=1` is the
+    backstop if it is ever opened: one instance cannot bill more than one vCPU
+    however much arrives.
+  - **Postgres, not SQLite, and never Cloud SQL.** The container filesystem is
+    ephemeral, so scaling to zero would drop the database. `DATABASE_URL` comes
+    from Secret Manager and the `any` pool runs `migrations/postgres/` — pointed
+    at a serverless Postgres *outside* GCP. **The standing rule is free tier
+    only**: Cloud SQL's smallest instance is ~$9/month and bills whether or not
+    anything connects, and the same rule rules out a Serverless VPC connector,
+    Cloud Build (the image is built on the GitHub runner) and any load balancer.
+    What is left has to stay inside Cloud Run's 180k vCPU-s / 360k GiB-s / 2M
+    requests, Artifact Registry's 0.5 GB (a cleanup policy, or the bill starts
+    around release five), Secret Manager's 6 versions, and Logging's 50 GiB.
+  - **`PORT` is Cloud Run's contract.** `docker/entrypoint.sh` now reads it
+    between `AGENT_PLATFORM_PORT` and the 18410 default; `Config::from_env`
+    already refuses a non-loopback bind without a master key, which is the check
+    that makes a public URL safe to hand out.
+  - **Six env vars that the desktop defaults get wrong in a container**, found by
+    auditing what `serve` starts before it binds: `RESUME_ON_STARTUP=0` (a cold
+    start would replay the same interrupted work every time),
+    `WORKFLOW_SCHEDULER=0` (`workflow_engine` polls for due workflows and runs
+    them, and a workflow can call an LLM), `BACKUP=0` (`db::backup` runs
+    `VACUUM INTO` at every start — Postgres rejects the statement outright, and
+    the file would land on an ephemeral disk), `LOCAL_LLM_DOCKER_FIX=0`, and
+    `ORCHESTRATOR_INTERNAL_URL`/`PROXY_PUBLIC_URL` — both default to
+    `127.0.0.1:18410` while the process is on 8080 there, so `llm_admin`'s
+    self-calls would hit a closed port. Verified by running the daemon under
+    exactly that environment: recovery logged as disabled, no scheduler line, no
+    `.bak` written.
+  - **sqlx had no TLS, so `DATABASE_URL` could not have reached Neon at all.**
+    The features list was `runtime-tokio, sqlite, postgres, any, chrono, macros,
+    migrate` — no TLS backend, which makes sqlx answer a server that demands one
+    with *"TLS upgrade required by server but SQLx was built without TLS support
+    enabled"*. Every hosted Postgres demands one. The suite never caught it
+    because `tests/postgres.rs` runs against a local server that does not.
+    `tls-rustls-ring` now, matching the provider `reqwest` already pulls —
+    rustls installs a process-wide default `CryptoProvider`, and two in one
+    binary is a runtime panic rather than a build error. Verified as compiled
+    in, not against a live Neon.
+  - **No provider key reaches the container.** `--set-env-vars` replaces the
+    whole set, `--set-secrets` carries only the master key and the DSN, and the
+    baked `config/agent_platform.yaml` holds no keys — every URL in it is
+    loopback. The deploy cannot spend at an LLM provider because it cannot
+    authenticate to one.
+  - **Not in that image**: `worker/` (torch, `Dockerfile.train`) and anything
+    `managed_server.rs` fetches — no GPU, ephemeral disk. Provider `local` must
+    stay unselected there.
+  - **`.dockerignore` was three dead `app/*.db` lines**, so it excluded nothing:
+    a local `docker build` shipped 18 GB of `desktop/target` as context, and
+    `.env` sat in the context of every image. It now excludes secrets, build
+    output and local state — but *not* `worker/`, which `Dockerfile.train` COPYs
+    from this same root context.
+- **`/admin` — one static page, no build step — landed 2026-08-23.**
+  The desktop app is still the UI ([ADR 0005](docs/adr/0005-native-iced-desktop-headless-server.md));
+  this is the window into a server nobody can attach it to. `src/admin.html`,
+  `include_str!`d and served whole: status, the `/system/logs` ring, the host
+  meters, workspace CRUD, that workspace's API tokens (mint / hold / unhold /
+  revoke) and projects. Vanilla `fetch` against the same REST surface the app
+  uses, from the same origin — nothing to bundle, nothing to version against
+  the server, and `AGENT_PLATFORM_CORS_ORIGINS` stays unset.
+  - **Served unauthenticated, like `/openapi.json`**: `auth::require_token`
+    guards `/api/v1/*` and the document holds no secret. The master key is typed
+    in, kept in `sessionStorage` (gone with the tab), and sent as a bearer token
+    on every call the page then makes.
+  - **Driven, not only compiled.** Against a sandboxed daemon on `:18499`: the
+    status and resource tables rendered from the real bodies (which is how the
+    first draft's guessed `machine`/`memory_used_bytes` keys were caught — they
+    are `host`/`mem_used_bytes`), the log ring rendered flat from its JSON
+    records, and a workspace, a project and two tokens were created through the
+    page, one of them held.
+- **A cross-module env race in the test suite — fixed 2026-08-23.**
+  `llm_llama_process`'s launch-flags test sets `LOCAL_MODEL_PATH` to a real
+  file; while it holds that, `llm_config`'s capability routing sees `local` as a
+  configured provider and resolves chat to it instead of `ollama`. Each module
+  had a private lock, which is no lock at all across them. There is one
+  `crate::ENV_LOCK` now, and the stale `SAFETY: single-threaded test process`
+  comment is gone. It surfaced as an unrelated edit turning the suite red — the
+  worst way for a test to fail.
 - **Settings → Performance shows the machine, not just the knob — landed 2026-08-22.**
   The page had one meter (background model calls against the lane's limit) and
   said nothing about the desktop it was bounding. It now opens with four dials —

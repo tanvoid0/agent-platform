@@ -1,0 +1,259 @@
+# Deploy the tagged `agent-platformd` to Cloud Run, as a `dist` custom job.
+#
+# **PARKED — nothing calls this.** The `post-announce-jobs` line that wired it
+# into the release is commented out in `dist-workspace.toml`, and the generated
+# `release.yml` carries no deploy job, so a tag push does nothing here. It also
+# self-skips on an empty `vars.GCP_PROJECT_ID`, which is the second reason a
+# stray run would be a no-op. Reviving it: restore that one line, run
+# `dist generate`, set the repo variables below. Everything else is done.
+#
+# When it is wired, `dist` runs it *after* the GitHub Release exists. That
+# ordering is the point: a release that failed to build never reaches
+# production, and the image carries the same version string the release was
+# announced under.
+#
+# **A service, not a Cloud Run function.** Functions have no Rust runtime; the
+# repo's own `Dockerfile` already builds a server-only image (the iced app is
+# excluded there for the same reason it is `dist = false`), and Cloud Run bills
+# a container exactly like a function — per request, scaling to zero.
+#
+# **State that makes `--max-instances=1` a correctness requirement, not thrift.**
+# `AppState` holds three maps in process memory: `coder_pending` (a
+# `/chat/tool-result` must be served by the same process that served
+# `/chat/stream`), `model_jobs`, and the fixed-window rate-limit counters. Two
+# instances behind one URL breaks the first, orphans the second, and doubles
+# every token's effective limit.
+#
+# Configuration lives in repo variables and GCP Secret Manager, never here:
+#
+#   vars.GCP_PROJECT_ID        e.g. agent-platform-prod
+#   vars.GCP_REGION            a **US** region, e.g. us-central1 — see the free-tier
+#                              note below; the egress allowance is North America only
+#   vars.GCP_ARTIFACT_REPO     Artifact Registry repo name, e.g. containers
+#   vars.GCP_RUN_SERVICE       Cloud Run service name, e.g. agent-platformd
+#   vars.GCP_WIF_PROVIDER      projects/N/locations/global/workloadIdentityPools/…/providers/…
+#   vars.GCP_DEPLOY_SA         deployer@<project>.iam.gserviceaccount.com
+#   vars.GCP_ALLOW_PUBLIC      unset (the default) keeps the service private, which
+#                              is what stops an anonymous flood from ever starting a
+#                              billable container. "true" opens it to the internet.
+#
+# Secret Manager holds the two values the container needs; Cloud Run injects
+# them and this workflow never reads them:
+#
+#   agp-master-key             AGENT_PLATFORM_MASTER_KEY — the second gate behind
+#                              Cloud Run IAM, and the *only* gate if the service is
+#                              ever made public. `Config::from_env` refuses to bind
+#                              beyond the loopback without it, so this is not
+#                              optional here.
+#   agp-database-url           DATABASE_URL — a Postgres DSN. The server speaks it
+#                              through the `any` pool and runs `migrations/postgres/`.
+#                              SQLite is not an option here: the container filesystem
+#                              is ephemeral, so scaling to zero drops the database.
+#
+# **Free tier is the budget, and every choice here is downstream of that.**
+# The DSN points at a Postgres *outside* GCP (a serverless free tier). Cloud SQL
+# is deliberately not used and must not be added: its smallest instance is ~$9 a
+# month and it bills whether or not anything connects, which is the opposite of
+# everything else in this file. The same rule rules out a Serverless VPC
+# connector (~$8/month, always on), Cloud Build (billed per build — the image is
+# built on the GitHub runner instead), and any load balancer or IAP in front.
+#
+# What is left, and the allowance it has to stay inside:
+#
+#   Cloud Run       2M requests, 180k vCPU-s, 360k GiB-s per month. `--cpu-throttling`
+#                   plus `--min-instances=0` means an idle service bills nothing at
+#                   all, and 512Mi halves the GiB-s an in-flight request costs.
+#   Artifact Reg.   0.5 GB free, and a release adds an image version forever. The
+#                   one-time cleanup policy in the repo's setup notes is what keeps
+#                   this under the line; without it the bill starts at release ~5.
+#   Secret Manager  6 active versions and 10k accesses free. Two secrets, read at
+#                   instance start rather than per request.
+#   Cloud Logging   50 GiB/month free. `logd!` writes to stderr, which lands here.
+#
+# Nothing above needs a credit card beyond the account itself. Set a $1 budget
+# alert anyway — it is free, and it is the only thing that catches a mistake.
+name: Deploy Cloud Run
+
+on:
+  workflow_call:
+    inputs:
+      # `dist` passes its manifest to post-announce jobs. Declared and unused: a
+      # called workflow errors on an input it has not declared, and the tag is
+      # the only thing this job needs.
+      plan:
+        required: false
+        type: string
+  # Redeploying without cutting a release — a rollback, or a first deploy of a
+  # tag that predates this file.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to deploy (defaults to the checked-out ref)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # Workload Identity Federation. No service-account JSON key exists.
+
+jobs:
+  deploy:
+    name: deploy (cloud run)
+    runs-on: ubuntu-22.04
+    # Skip cleanly on a fork or an unconfigured repo rather than failing the
+    # release: the tag is already published by the time this runs.
+    if: ${{ vars.GCP_PROJECT_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Resolve tag and image
+        id: meta
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "image=${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_ARTIFACT_REPO }}/agent-platformd" >> "$GITHUB_OUTPUT"
+          # A revision suffix is [a-z0-9-] only, so `v0.5.0` cannot be one as it
+          # stands and a bare `tr` leaves a trailing dash the API also rejects.
+          # The run number is not decoration: `gcloud run deploy` refuses a
+          # revision name that already exists, which is exactly what a redeploy
+          # of the same tag — the rollback path — would ask for.
+          SLUG="$(echo "${TAG}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')"
+          echo "suffix=${SLUG}-r${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      # Built here rather than by `gcloud run deploy --source`, which bills a
+      # Cloud Build run per release. The runner minutes are already paid for.
+      - name: Build image
+        run: |
+          docker build -f Dockerfile \
+            -t "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" \
+            -t "${{ steps.meta.outputs.image }}:latest" \
+            .
+
+      - name: Push image
+        run: |
+          docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+          docker push "${{ steps.meta.outputs.image }}:latest"
+
+      # Every flag here is load-bearing, and most of them are spend limits:
+      #
+      #   --no-allow-unauthenticated  THE DDoS gate, and the default. Google rejects
+      #                          an unauthenticated request at its own front door —
+      #                          the container never starts, so a flood bills
+      #                          nothing. Anything else (Cloud Armor, a load
+      #                          balancer, IAP) costs more per month than the
+      #                          service does. Reach the admin page with
+      #                          `gcloud run services proxy` (see the setup notes):
+      #                          it authenticates locally and serves the page on
+      #                          127.0.0.1, so the browser needs no token.
+      #   --max-instances=1      the hard ceiling on spend, and separately a
+      #                          correctness requirement — see the process-memory
+      #                          note at the top of this file. One instance cannot
+      #                          bill more than one vCPU no matter what arrives.
+      #   --min-instances=0      scale to zero; an idle console costs nothing
+      #   --cpu-throttling       CPU billed only while a request is in flight
+      #   --concurrency=40       one instance, so this is the queue depth before
+      #                          Cloud Run sheds load rather than a scaling knob
+      #   --timeout=3600         the server streams SSE (`/chat/stream`,
+      #                          `/processes/…/stream`). Bounded by max-instances:
+      #                          40 slow-loris connections exhaust the service, they
+      #                          do not multiply the bill.
+      #
+      # `vars.GCP_ALLOW_PUBLIC = "true"` opens it to the internet, and then the
+      # master key is the only gate. Set that only if something other than an
+      # operator's browser has to reach this URL, and read the security note in
+      # the setup instructions first.
+      - name: Resolve exposure
+        id: expose
+        run: |
+          if [ "${{ vars.GCP_ALLOW_PUBLIC }}" = "true" ]; then
+            echo "flag=--allow-unauthenticated" >> "$GITHUB_OUTPUT"
+            echo "public=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Deploying PUBLIC (GCP_ALLOW_PUBLIC=true) — anonymous requests reach the container and are billable."
+          else
+            echo "flag=--no-allow-unauthenticated" >> "$GITHUB_OUTPUT"
+            echo "public=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Four of these are spend gates and two are port corrections. Every one of
+      # them exists because the daemon's default is a desktop on the loopback,
+      # and this is neither.
+      #
+      #   RESUME_ON_STARTUP=0     do not replay whatever the last shutdown
+      #                           interrupted — on a scale-to-zero service every
+      #                           cold start would replay it again
+      #   WORKFLOW_SCHEDULER=0    `workflow_engine` polls for due workflows and
+      #                           runs them, and a workflow can call an LLM. The
+      #                           deploy carries no provider key, so it cannot
+      #                           spend at a provider — this is the second lock
+      #                           on that door, not the first
+      #   BACKUP=0                `db::backup` runs `VACUUM INTO` at every start.
+      #                           Postgres rejects that statement outright, and
+      #                           the file would land on an ephemeral disk anyway
+      #   LOCAL_LLM_DOCKER_FIX=0  the loopback → `host.docker.internal` rewrite is
+      #                           for Compose. It self-disables without
+      #                           `/.dockerenv`, which Cloud Run does not create,
+      #                           but relying on that is a guess and this is free
+      #   ORCHESTRATOR_INTERNAL_URL / PROXY_PUBLIC_URL
+      #                           both default to `127.0.0.1:18410`, and this
+      #                           process is on 8080 here — the self-calls in
+      #                           `llm_admin` would hit a closed port. 8080 also
+      #                           happens to be where `gcloud run services proxy`
+      #                           puts it, so the public base is honest too
+      - name: Deploy revision
+        env:
+          ENV_VARS: >-
+            AGENT_PLATFORM_ENV=production,AGENT_PLATFORM_RESUME_ON_STARTUP=0,AGENT_PLATFORM_WORKFLOW_SCHEDULER=0,AGENT_PLATFORM_BACKUP=0,AGENT_PLATFORM_LOCAL_LLM_DOCKER_FIX=0,ORCHESTRATOR_INTERNAL_URL=http://127.0.0.1:8080,PROXY_PUBLIC_URL=http://127.0.0.1:8080
+        run: |
+          gcloud run deploy "${{ vars.GCP_RUN_SERVICE }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --image="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" \
+            --platform=managed \
+            ${{ steps.expose.outputs.flag }} \
+            --min-instances=0 \
+            --max-instances=1 \
+            --cpu=1 \
+            --memory=512Mi \
+            --concurrency=40 \
+            --cpu-throttling \
+            --timeout=3600 \
+            --port=8080 \
+            --set-env-vars="${ENV_VARS}" \
+            --set-secrets=AGENT_PLATFORM_MASTER_KEY=agp-master-key:latest,DATABASE_URL=agp-database-url:latest \
+            --revision-suffix="${{ steps.meta.outputs.suffix }}" \
+            --quiet
+
+      # Cloud Run will not shift traffic onto a container that failed its port
+      # bind, so "the ready revision is the one we just pushed" is the real
+      # check, and it is the only one available on a private service — an
+      # anonymous `curl` there is a 403 from Google, which says nothing about
+      # the app. On a public service the `/health` body is worth having too.
+      - name: Smoke the revision
+        run: |
+          read -r URL READY < <(gcloud run services describe "${{ vars.GCP_RUN_SERVICE }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}" --region="${{ vars.GCP_REGION }}" \
+            --format='value[separator=" "](status.url, status.latestReadyRevisionName)')
+          WANT="${{ vars.GCP_RUN_SERVICE }}-${{ steps.meta.outputs.suffix }}"
+          echo "deployed: ${URL} (ready revision: ${READY})"
+          if [ "${READY}" != "${WANT}" ]; then
+            echo "::error::ready revision is ${READY}, expected ${WANT} — traffic did not move"
+            exit 1
+          fi
+          if [ "${{ steps.expose.outputs.public }}" = "true" ]; then
+            curl --fail --silent --show-error --max-time 30 "${URL}/health"
+          else
+            echo "private service — reach it with: gcloud run services proxy ${{ vars.GCP_RUN_SERVICE }} --region ${{ vars.GCP_REGION }}"
+          fi

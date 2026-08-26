@@ -1,5 +1,36 @@
-# Build context is the agentic-ai repo root (see docker-compose.yml).
-# Root .dockerignore applies; this file documents local exclusions.
-app/agent_runs.db
-app/agent_runs.db-shm
-app/agent_runs.db-wal
+# What must not enter the build context.
+#
+# The three `app/*.db` lines this replaced were the whole file, and `app/` was
+# deleted with the Python server — so in practice nothing was excluded. That is
+# fine on a CI runner, whose checkout is clean, and 18 GB of `desktop/target`
+# on a developer's machine.
+#
+# `Dockerfile` COPYs explicit paths, so nothing here is load-bearing *today*.
+# `.env` is listed anyway: the day someone writes `COPY . .`, this is the line
+# that stops the master key and every provider key shipping inside the image.
+
+# Secrets — never, under any Dockerfile.
+.env
+.env.*
+*.key
+
+# Build output. `desktop/target` alone is tens of GB.
+desktop/target/
+target/
+node_modules/
+dist/
+
+# Local state: databases, workspaces, model files.
+data/
+*.db
+*.db-shm
+*.db-wal
+*.bak
+
+# Nothing COPYs the history.
+#
+# `worker/` is deliberately NOT excluded: `Dockerfile.train` builds from this
+# same root context (`docker-compose.train.yml`) and does `COPY worker/`, so
+# excluding it here would break that image while leaving the server's untouched
+# — a failure a long way from its cause.
+.git/

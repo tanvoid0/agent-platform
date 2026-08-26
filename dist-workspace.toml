@@ -35,6 +35,17 @@ ci = ["github"]
 # lost a tag to exactly that.
 plan-jobs = ["./release-smoke"]
 local-artifacts-jobs = ["./release-desktop"]
+# **The Cloud Run deploy is written but deliberately not wired.** Restoring it is
+# this one line plus `dist generate`:
+#
+#     post-announce-jobs = ["./deploy-cloud-run"]
+#
+# `post-announce`, not `publish`, so it runs only once the GitHub Release exists:
+# a build that failed on any of the four platforms must never reach a running
+# service. It is also why the deploy takes no artifact from `dist` — it builds
+# the container from the checkout at the tag, and `dist` supplies the ordering.
+# Until that line is back, `.github/workflows/deploy-cloud-run.yml` is reachable
+# only by hand, from the Actions tab.
 packages = ["agent-platform-server"]
 # `packages` scopes what gets *released*, not what gets *built*. Without this,
 # `dist` builds with `--workspace` (its default, for feature unification) and

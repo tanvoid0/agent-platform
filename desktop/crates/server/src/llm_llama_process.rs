@@ -491,10 +491,16 @@ mod tests {
     /// as prose instead of a tool call.
     #[test]
     fn the_launch_flags_come_from_the_model_settings() {
+        // Held for the whole test: `LOCAL_MODEL_PATH` pointing at a real file is
+        // exactly what makes `local` a *configured* provider, and `llm_config`'s
+        // capability routing asserts it is not. See `crate::ENV_LOCK`.
+        let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let temp = std::env::temp_dir().join("agp-llama-args-test.gguf");
         std::fs::write(&temp, b"GGUF").unwrap();
-        // SAFETY: single-threaded test process; these are read through
-        // `from_env_or_dotenv`, which does not cache env reads.
+        // SAFETY: the lock above is what makes this the only thread writing the
+        // environment; these are read through `from_env_or_dotenv`, which does
+        // not cache env reads.
         unsafe {
             std::env::set_var("LOCAL_MODEL_PATH", &temp);
             std::env::set_var("LOCAL_N_CTX", "4096");

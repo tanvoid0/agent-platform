@@ -60,9 +60,18 @@ claiming a change works; CI is the backstop, not the loop.
   `--target-dir` pointing outside the repo instead of killing the app
   (`.gitignore` pins `desktop/target/` exactly, so a sibling dir inside the repo
   shows up untracked).
-- **`agent-platformd` is SQLite-only** and refuses to start with `DATABASE_URL`
-  set. The `sqlx::Any` pool that lifts that restriction is half-converted; see
-  `AppState`.
+- **`agent-platformd` runs on SQLite or Postgres**, decided by `DATABASE_URL` —
+  the `sqlx::Any` pool migration finished, so `Config::from_env` no longer
+  refuses a DSN and there are two migration sets under `migrations/`. An *empty*
+  `DATABASE_URL` is not a DSN and must be unset rather than passed on
+  (`docker/entrypoint.sh` does this); the desktop is SQLite either way.
+- **The Cloud Run deploy is free-tier only, and that is a hard rule.** No Cloud
+  SQL, no Serverless VPC connector, no load balancer or IAP, no Cloud Build —
+  each of those bills monthly whether or not anything connects, and every one of
+  them costs more than the service. `DATABASE_URL` points at a Postgres outside
+  GCP; the service deploys `--no-allow-unauthenticated` so an anonymous flood
+  never starts a billable container, with `--max-instances=1` as the ceiling if
+  it is ever opened. See `.github/workflows/deploy-cloud-run.yml`.
 - **Diagnostics go through `logd!`, not `eprintln!`.** It writes the same line to
   stderr *and* into the ring `GET /system/logs` serves. There is exactly one
   `eprintln!` left in the crate, inside `observability::diagnostic`.

@@ -1,0 +1,433 @@
+<!--
+  The operator console, served at `/admin` by `lib.rs`.
+
+  One file, no build step, no dependency: it talks to the same REST surface the
+  desktop app does, from the same origin, so there is nothing to bundle, nothing
+  to version against the server, and `AGENT_PLATFORM_CORS_ORIGINS` stays unset.
+  The desktop app is still the UI (ADR 0005) — this is the window into a cloud
+  deployment nobody can attach the app to.
+
+  It is served unauthenticated, like `/`, `/openapi.json` and `/health`: the
+  auth layer guards `/api/v1/*` and this document carries no secret. The key is
+  typed in, held in `sessionStorage` (gone when the tab closes), and sent as a
+  bearer token on every call the page makes.
+
+  Scope is deliberate — status, the log ring, and the two things that cannot be
+  done from anywhere else once the server is remote: workspaces and their API
+  tokens, plus projects. Everything else is the app's job.
+-->
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>agent-platformd — admin</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd; --panel: #fff; --ink: #16181d; --muted: #6b7280;
+    --line: #e3e5ea; --accent: #2f6feb; --bad: #c0392b; --good: #1f7a4d;
+    --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --panel: #1c1f25; --ink: #e6e8ec; --muted: #9aa1ad;
+      --line: #2b2f37; --accent: #6ea0ff; --bad: #ff7b6b; --good: #57c98a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, sans-serif; }
+  header { display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+           padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  h1 { font-size: 15px; margin: 0 12px 0 0; font-weight: 600; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+  nav { display: flex; gap: 4px; padding: 10px 20px 0; }
+  nav button { background: none; border: 1px solid transparent; border-bottom: none;
+               padding: 6px 14px; border-radius: 6px 6px 0 0; color: var(--muted); cursor: pointer; }
+  nav button[aria-current="true"] { background: var(--panel); border-color: var(--line); color: var(--ink); }
+  main { padding: 0 20px 40px; }
+  section { display: none; border: 1px solid var(--line); background: var(--panel);
+            border-radius: 0 8px 8px 8px; padding: 16px; }
+  section[data-active] { display: block; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+  .kv { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px dotted var(--line); }
+  .kv span:first-child { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  input, select, button { font: inherit; }
+  input, select { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+                  border-radius: 6px; padding: 5px 8px; }
+  button { border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+           border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--bad); }
+  form.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+  pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word;
+        max-height: 60vh; overflow: auto; margin: 0; }
+  code, .mono { font-family: var(--mono); font-size: 12px; }
+  .pill { font-size: 11px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.active { color: var(--good); border-color: var(--good); }
+  .pill.revoked, .pill.held { color: var(--bad); border-color: var(--bad); }
+  #err { display: none; color: var(--bad); padding: 8px 20px; }
+  #err[data-shown] { display: block; }
+  .secret { background: var(--bg); border: 1px dashed var(--accent); border-radius: 6px;
+            padding: 8px; margin-top: 8px; font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  .muted { color: var(--muted); }
+</style>
+
+<header>
+  <h1>agent-platformd</h1>
+  <span id="ident" class="muted mono"></span>
+  <span style="flex:1"></span>
+  <input id="key" type="password" placeholder="master key" autocomplete="off" size="28">
+  <button id="connect" class="primary">Connect</button>
+  <button id="forget">Forget</button>
+</header>
+<div id="err"></div>
+
+<nav>
+  <button data-tab="status" aria-current="true">Status</button>
+  <button data-tab="logs">Logs</button>
+  <button data-tab="workspaces">Workspaces</button>
+  <button data-tab="projects">Projects</button>
+</nav>
+
+<main>
+  <section id="status" data-active>
+    <div class="card"><h2>Service</h2><div id="status-kv" class="grid"></div></div>
+    <div class="card"><h2>Resources</h2><div id="res-kv" class="grid"></div></div>
+    <button id="status-refresh">Refresh</button>
+  </section>
+
+  <section id="logs">
+    <h2>Ring buffer — <code>GET /api/v1/system/logs</code></h2>
+    <div class="row" style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <label><input type="checkbox" id="logs-auto"> follow</label>
+      <button id="logs-refresh">Refresh</button>
+      <button id="logs-clear">Clear view</button>
+      <span id="logs-note" class="muted"></span>
+    </div>
+    <pre id="logs-out"></pre>
+  </section>
+
+  <section id="workspaces">
+    <h2>Workspaces</h2>
+    <table><thead><tr><th>id</th><th>name</th><th>slug</th><th>created</th><th></th></tr></thead>
+      <tbody id="ws-rows"></tbody></table>
+    <form class="row" id="ws-new">
+      <input name="name" placeholder="name" required>
+      <input name="slug" placeholder="slug (optional)">
+      <input name="description" placeholder="description (optional)">
+      <button class="primary">Create workspace</button>
+    </form>
+    <div id="tokens" class="card" hidden>
+      <h2 id="tokens-title">Tokens</h2>
+      <table><thead><tr><th>id</th><th>name</th><th>prefix</th><th>status</th><th>reqs</th><th>cost</th><th></th></tr></thead>
+        <tbody id="tk-rows"></tbody></table>
+      <form class="row" id="tk-new">
+        <input name="name" placeholder="token name" required>
+        <input name="rate_limit_per_minute" type="number" min="1" placeholder="rate/min">
+        <input name="expires_at" type="date" title="expires at">
+        <button class="primary">Mint token</button>
+      </form>
+      <div id="tk-secret" class="secret" hidden></div>
+    </div>
+  </section>
+
+  <section id="projects">
+    <h2>Projects</h2>
+    <table><thead><tr><th>id</th><th>name</th><th>workspace</th><th>created</th><th></th></tr></thead>
+      <tbody id="pj-rows"></tbody></table>
+    <form class="row" id="pj-new">
+      <input name="name" placeholder="name" required>
+      <input name="workspace_id" type="number" placeholder="workspace id (optional)">
+      <input name="description" placeholder="description (optional)">
+      <button class="primary">Create project</button>
+    </form>
+  </section>
+</main>
+
+<script>
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+// sessionStorage, not localStorage: a master key should not outlive the tab.
+let KEY = sessionStorage.getItem("agp_key") || "";
+
+function fail(e) {
+  const box = $("#err");
+  box.textContent = String(e && e.message || e);
+  box.toggleAttribute("data-shown", true);
+  clearTimeout(fail.t);
+  fail.t = setTimeout(() => box.toggleAttribute("data-shown", false), 8000);
+}
+
+async function api(path, opts = {}) {
+  const headers = { "content-type": "application/json", ...(opts.headers || {}) };
+  if (KEY) headers.authorization = "Bearer " + KEY;
+  const res = await fetch(path, { ...opts, headers });
+  const text = await res.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  if (!res.ok) {
+    // The server answers `{detail}` for a plain error and `{detail:[…]}` for a
+    // validation failure — the FastAPI envelope the port kept.
+    const d = body && body.detail;
+    const msg = Array.isArray(d) ? d.map(e => `${(e.loc || []).join(".")}: ${e.msg}`).join("; ")
+              : typeof d === "string" ? d
+              : typeof body === "string" && body ? body
+              : `${res.status} ${res.statusText}`;
+    throw new Error(msg);
+  }
+  return body;
+}
+
+const fmt = {
+  when: v => v ? String(v).replace("T", " ").replace(/\.\d+/, "").replace("Z", "") : "—",
+  bytes: n => {
+    if (n == null) return "—";
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
+  },
+};
+
+function kv(target, pairs) {
+  target.innerHTML = "";
+  for (const [k, v] of pairs) {
+    const row = document.createElement("div");
+    row.className = "kv";
+    row.innerHTML = `<span></span><span class="mono"></span>`;
+    row.children[0].textContent = k;
+    row.children[1].textContent = v == null ? "—" : String(v);
+    target.append(row);
+  }
+}
+
+// --- status -----------------------------------------------------------------
+const failedChecks = group =>
+  (group?.checks || []).filter(c => !c.ok).map(c => `${c.name}: ${c.detail}`).join("; ");
+
+async function loadStatus() {
+  const s = await api("/api/v1/system/status");
+  $("#ident").textContent = `${s.server} · ${s.env} · ${s.platform}`;
+  kv($("#status-kv"), [
+    ["service", s.service], ["version", s.server], ["env", s.env],
+    ["uptime", `${Math.round(s.uptime_seconds)}s`],
+    ["auth required", s.auth_required],
+    ["listening", `${s.listening_on?.host}:${s.listening_on?.port}`],
+    ["database", s.paths?.database_backend],
+    ["readiness", s.readiness?.ok ? "ok" : failedChecks(s.readiness) || s.readiness?.status],
+    ["llm proxy", s.llm_proxy?.ok ? "ok" : failedChecks(s.llm_proxy) || s.llm_proxy?.status],
+    ["processes", `${s.processes?.active ?? 0} active / ${s.processes?.total ?? 0}`],
+  ]);
+  try {
+    const r = await api("/api/v1/system/resources");
+    const h = r.host || {};
+    kv($("#res-kv"), [
+      ["lane", `${r.resolved} (${r.mode})`],
+      ["background", `${r.background_in_flight}/${r.background_limit}`],
+      ["cpu", `${(h.cpu_percent ?? 0).toFixed(1)}% of ${r.cpus} cores`],
+      ["memory", `${fmt.bytes(h.mem_used_bytes)} / ${fmt.bytes(h.mem_total_bytes)}`],
+      ["disk", `${fmt.bytes(h.disk_used_bytes)} / ${fmt.bytes(h.disk_total_bytes)} on ${h.disk_mount ?? "—"}`],
+      ["this process", fmt.bytes(h.process_mem_bytes)],
+      ["gpus", (h.gpus || []).map(g => g.name).join(", ") || "none"],
+      ["os", h.os],
+    ]);
+  } catch { kv($("#res-kv"), [["resources", "unavailable"]]); }
+}
+
+// --- logs -------------------------------------------------------------------
+let logCursor = 0, logTimer = null;
+
+// The ring holds one JSON record per line — the shape `logd!` writes. Rendered
+// flat, because a wall of `{"timestamp":…}` is not a log anyone reads. A line
+// that will not parse is printed as it stands rather than dropped.
+function logLine(raw) {
+  try {
+    const r = JSON.parse(raw);
+    const t = (r.timestamp || "").slice(11, 19);
+    return `${t} ${String(r.level || "").padEnd(7)} ${r.message ?? raw}`;
+  } catch { return raw; }
+}
+
+async function loadLogs() {
+  const r = await api(`/api/v1/system/logs?after=${logCursor}`);
+  if (r.dropped) $("#logs-out").textContent += `… ${r.dropped} line(s) dropped from the ring …\n`;
+  if (r.lines.length) $("#logs-out").textContent += r.lines.map(logLine).join("\n") + "\n";
+  logCursor = r.next;
+  $("#logs-note").textContent = `cursor ${logCursor}`;
+  $("#logs-out").scrollTop = $("#logs-out").scrollHeight;
+}
+
+// --- workspaces & tokens ----------------------------------------------------
+let openWorkspace = null;
+
+async function loadWorkspaces() {
+  const { workspaces } = await api("/api/v1/workspaces");
+  const body = $("#ws-rows");
+  body.innerHTML = "";
+  for (const w of workspaces) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="mono"></td><td></td><td class="mono"></td><td class="muted"></td><td></td>`;
+    tr.children[0].textContent = w.id;
+    tr.children[1].textContent = w.name;
+    tr.children[2].textContent = w.slug;
+    tr.children[3].textContent = fmt.when(w.created_at);
+    const tokens = Object.assign(document.createElement("button"), { textContent: "Tokens" });
+    tokens.onclick = () => openTokens(w);
+    const rename = Object.assign(document.createElement("button"), { textContent: "Rename" });
+    rename.onclick = async () => {
+      const name = prompt("New name", w.name);
+      if (!name) return;
+      await api(`/api/v1/workspaces/${w.id}`, { method: "PATCH", body: JSON.stringify({ name }) })
+        .then(loadWorkspaces).catch(fail);
+    };
+    const archive = Object.assign(document.createElement("button"), { textContent: "Archive", className: "danger" });
+    archive.onclick = async () => {
+      if (!confirm(`Archive workspace "${w.name}"? Its tokens stop working.`)) return;
+      await api(`/api/v1/workspaces/${w.id}`, { method: "DELETE" }).then(loadWorkspaces).catch(fail);
+    };
+    tr.children[4].append(tokens, " ", rename, " ", archive);
+    body.append(tr);
+  }
+}
+
+async function openTokens(w) {
+  openWorkspace = w;
+  $("#tokens").hidden = false;
+  $("#tokens-title").textContent = `Tokens — ${w.name} (#${w.id})`;
+  $("#tk-secret").hidden = true;
+  await loadTokens();
+}
+
+async function loadTokens() {
+  if (!openWorkspace) return;
+  const { tokens } = await api(`/api/v1/workspaces/${openWorkspace.id}/api-tokens`);
+  const body = $("#tk-rows");
+  body.innerHTML = "";
+  for (const t of tokens) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="mono"></td><td></td><td class="mono"></td>
+                    <td><span class="pill"></span></td><td class="mono"></td><td class="mono"></td><td></td>`;
+    tr.children[0].textContent = t.id;
+    tr.children[1].textContent = t.name;
+    tr.children[2].textContent = t.prefix;
+    const pill = tr.children[3].firstChild;
+    pill.textContent = t.status;
+    pill.className = `pill ${t.status}`;
+    tr.children[4].textContent = t.total_requests;
+    tr.children[5].textContent = (t.total_cost ?? 0).toFixed(4);
+    const act = (label, path, danger) => {
+      const b = Object.assign(document.createElement("button"), { textContent: label });
+      if (danger) b.className = "danger";
+      b.onclick = async () => {
+        if (danger && !confirm(`${label} token "${t.name}"? This cannot be undone.`)) return;
+        const reason = danger ? (prompt("Reason (optional)") || null) : null;
+        await api(`/api/v1/workspaces/${openWorkspace.id}/api-tokens/${t.id}/${path}`,
+                  { method: "POST", body: JSON.stringify({ reason }) })
+          .then(loadTokens).catch(fail);
+      };
+      return b;
+    };
+    if (t.status !== "revoked") {
+      tr.children[6].append(t.status === "held" ? act("Unhold", "unhold") : act("Hold", "hold"), " ",
+                            act("Revoke", "revoke", true));
+    }
+    body.append(tr);
+  }
+}
+
+// --- projects ---------------------------------------------------------------
+async function loadProjects() {
+  const { projects } = await api("/api/v1/projects");
+  const body = $("#pj-rows");
+  body.innerHTML = "";
+  for (const p of projects) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="mono"></td><td></td><td class="mono"></td><td class="muted"></td><td></td>`;
+    tr.children[0].textContent = p.id;
+    tr.children[1].textContent = p.name;
+    tr.children[2].textContent = p.workspace_id ?? "—";
+    tr.children[3].textContent = fmt.when(p.created_at);
+    const del = Object.assign(document.createElement("button"), { textContent: "Delete", className: "danger" });
+    del.onclick = async () => {
+      if (!confirm(`Delete project "${p.name}"?`)) return;
+      await api(`/api/v1/projects/${p.id}`, { method: "DELETE" }).then(loadProjects).catch(fail);
+    };
+    tr.children[4].append(del);
+    body.append(tr);
+  }
+}
+
+// --- wiring -----------------------------------------------------------------
+const LOADERS = { status: loadStatus, logs: loadLogs, workspaces: loadWorkspaces, projects: loadProjects };
+
+function show(tab) {
+  $$("nav button").forEach(b => b.setAttribute("aria-current", String(b.dataset.tab === tab)));
+  $$("main section").forEach(s => s.toggleAttribute("data-active", s.id === tab));
+  LOADERS[tab]().catch(fail);
+}
+
+$$("nav button").forEach(b => b.onclick = () => show(b.dataset.tab));
+
+$("#connect").onclick = () => {
+  KEY = $("#key").value.trim();
+  sessionStorage.setItem("agp_key", KEY);
+  show($("nav button[aria-current='true']").dataset.tab);
+};
+$("#forget").onclick = () => { KEY = ""; sessionStorage.removeItem("agp_key"); $("#key").value = ""; };
+$("#key").addEventListener("keydown", e => { if (e.key === "Enter") $("#connect").click(); });
+
+$("#status-refresh").onclick = () => loadStatus().catch(fail);
+$("#logs-refresh").onclick = () => loadLogs().catch(fail);
+$("#logs-clear").onclick = () => { $("#logs-out").textContent = ""; };
+$("#logs-auto").onchange = e => {
+  clearInterval(logTimer);
+  logTimer = e.target.checked ? setInterval(() => loadLogs().catch(fail), 3000) : null;
+};
+
+// A form field left empty is *absent*, not an empty string: the validators
+// length-check any string that is actually there, so "" fails where null passes.
+function formBody(form, numbers = []) {
+  const out = {};
+  for (const [k, v] of new FormData(form)) {
+    const s = String(v).trim();
+    if (s) out[k] = numbers.includes(k) ? Number(s) : s;
+  }
+  return out;
+}
+
+$("#ws-new").onsubmit = async e => {
+  e.preventDefault();
+  try { await api("/api/v1/workspaces", { method: "POST", body: JSON.stringify(formBody(e.target)) });
+        e.target.reset(); await loadWorkspaces(); } catch (err) { fail(err); }
+};
+
+$("#tk-new").onsubmit = async e => {
+  e.preventDefault();
+  const body = formBody(e.target, ["rate_limit_per_minute"]);
+  // `<input type=date>` yields YYYY-MM-DD; the server wants a timestamp.
+  if (body.expires_at) body.expires_at = `${body.expires_at}T23:59:59Z`;
+  try {
+    const t = await api(`/api/v1/workspaces/${openWorkspace.id}/api-tokens`,
+                        { method: "POST", body: JSON.stringify(body) });
+    // The one and only time the raw token is ever returned — `create_token`
+    // appends it to the row and no read path can produce it again.
+    const box = $("#tk-secret");
+    box.hidden = false;
+    box.textContent = `${t.token}   — copy it now, it is not shown again`;
+    e.target.reset();
+    await loadTokens();
+  } catch (err) { fail(err); }
+};
+
+$("#pj-new").onsubmit = async e => {
+  e.preventDefault();
+  try { await api("/api/v1/projects", { method: "POST", body: JSON.stringify(formBody(e.target, ["workspace_id"])) });
+        e.target.reset(); await loadProjects(); } catch (err) { fail(err); }
+};
+
+$("#key").value = KEY;
+show("status");
+</script>

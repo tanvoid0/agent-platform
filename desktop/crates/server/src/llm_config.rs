@@ -752,7 +752,9 @@ mod tests {
     use std::sync::MutexGuard;
 
     /// Every test here moves `CONFIG_DIR`, and the file caches are process-wide.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// The lock lives at the crate root because it is not only this module that
+    /// has to hold it — see [`crate::ENV_LOCK`].
+    use crate::ENV_LOCK;
 
     struct Fixture {
         dir: PathBuf,

@@ -125,6 +125,23 @@ use serde_json::json;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// The one lock for tests that write process environment.
+///
+/// `cargo test` runs a thread per core in a single process, so a `set_var` in
+/// one test is visible to every other test running at that moment. Two modules
+/// had a private lock each, which is no lock at all across them:
+/// `llm_llama_process`'s launch-flags test sets `LOCAL_MODEL_PATH` to a real
+/// file, and while it holds that, `llm_config`'s capability routing sees
+/// `local` as a configured provider and resolves chat to it instead of
+/// `ollama`. It failed only under some interleavings, which is the worst way
+/// for it to fail — the suite was green until an unrelated edit shifted the
+/// scheduling.
+///
+/// `search.rs` keeps its own lock on purpose: it moves a disjoint set of
+/// variables, and sharing one would serialise two suites that never collide.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 /// Everything the server reads from the environment. The desktop shell sets
 /// these when it spawns the daemon; a headless run sets them itself.
 #[derive(Debug, Clone)]
@@ -345,8 +362,23 @@ async fn openapi() -> Response {
 async fn root() -> Response {
     // `docs` pointed at FastAPI's Swagger page, which no longer exists. The
     // machine-readable document does, and is what any client actually wants.
-    Json(json!({"service": "agent-platform", "api": "/api/v1", "openapi": "/openapi.json"}))
+    Json(json!({"service": "agent-platform", "api": "/api/v1", "openapi": "/openapi.json", "admin": "/admin"}))
         .into_response()
+}
+
+/// The operator console — one static document, no build step, no assets.
+///
+/// It exists for the deployment the desktop app cannot attach to: a cloud
+/// `agent-platformd` still needs someone to read its logs and mint a workspace
+/// token. The app remains the UI (ADR 0005); this covers what stops being
+/// reachable the moment the server is not on this machine.
+///
+/// Unauthenticated like `/openapi.json`, and for the same reason —
+/// `auth::require_token` guards `/api/v1/*`, this document holds no secret, and
+/// the key the page asks for is typed in by the operator and sent as a bearer
+/// token on every call the page then makes.
+async fn admin() -> Response {
+    axum::response::Html(include_str!("admin.html")).into_response()
 }
 
 /// `AGENT_PLATFORM_CORS_ORIGINS` — comma-separated origins allowed to call this
@@ -498,6 +530,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", axum::routing::get(health))
         .route("/", axum::routing::get(root))
         .route("/openapi.json", axum::routing::get(openapi))
+        .route("/admin", axum::routing::get(admin))
         .merge(action_orchestrator::routes())
         .merge(api_tokens::routes())
         .merge(assistant::routes())
