@@ -4,7 +4,7 @@ name = "agent-platform-server"
 # `dist` derives the tag from the version, so a skew would mean two tags for
 # one product. Bumped 0.1.0 → 0.2.0 to meet the app rather than moving the app
 # backwards.
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Rust API server for agent-platform: migrated domains plus a reverse proxy to the Python server (ADR 0007)"
 # `dist` requires this to generate GitHub CI; it is also what the generated
