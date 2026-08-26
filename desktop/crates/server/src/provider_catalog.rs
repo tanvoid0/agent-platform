@@ -62,8 +62,7 @@ fn discovery(provider: &str) -> Value {
 fn provider_capabilities(provider: &str) -> Value {
     json!({
         "streaming": true,
-        // Gemini's OpenAI-compatible surface takes no tool definitions.
-        "tools": provider != "gemini",
+        "tools": true,
         "json_mode": true,
         "modalities": Value::Object(modality_map(provider)),
         "model_discovery": discovery(provider),
@@ -782,8 +781,8 @@ mod tests {
     }
 
     #[test]
-    fn only_gemini_declares_no_tools() {
-        assert_eq!(provider_capabilities("gemini")["tools"], json!(false));
+    fn every_chat_provider_declares_tools() {
+        assert_eq!(provider_capabilities("gemini")["tools"], json!(true));
         assert_eq!(provider_capabilities("ollama")["tools"], json!(true));
         assert_eq!(provider_capabilities("ollama")["json_mode"], json!(true));
     }

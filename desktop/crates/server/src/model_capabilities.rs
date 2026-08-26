@@ -54,11 +54,7 @@ pub fn provider_default_capabilities(provider: &str) -> Map<String, Value> {
     let flag = |key: &str| modalities.get(key).and_then(Value::as_bool).unwrap_or(false);
     let mut caps = Map::new();
     caps.insert("chat".into(), json!(flag("chat")));
-    // Gemini's OpenAI-compatible surface does not take tool definitions.
-    caps.insert(
-        "tools".into(),
-        json!(provider_supports(provider, Modality::Chat) && provider != "gemini"),
-    );
+    caps.insert("tools".into(), json!(provider_supports(provider, Modality::Chat)));
     caps.insert("vision_input".into(), json!(flag("vision_input")));
     caps.insert("embeddings".into(), json!(flag("embeddings")));
     caps.insert("image_generation".into(), json!(flag("image_generation")));
@@ -507,8 +503,10 @@ mod tests {
     }
 
     #[test]
-    fn gemini_never_advertises_tools() {
-        assert!(!truthy(&provider_default_capabilities("gemini")["tools"]));
+    fn chat_providers_advertise_tools() {
+        // Gemini's OpenAI-compatible surface takes tool definitions, so the
+        // coder loop and the assistant may route to it.
+        assert!(truthy(&provider_default_capabilities("gemini")["tools"]));
         assert!(truthy(&provider_default_capabilities("ollama")["tools"]));
         assert!(truthy(&provider_default_capabilities("lm_studio")["embeddings"]));
         assert!(!truthy(&provider_default_capabilities("anthropic")["embeddings"]));
