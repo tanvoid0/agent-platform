@@ -536,6 +536,11 @@ pub struct ModelBuildJob {
     pub result: Value,
     #[serde(default)]
     pub error_message: Option<String>,
+    /// The newest `@@AGP:progress@@` payload the running stage printed, or an
+    /// empty object before the first one. Untyped on purpose: a stage that
+    /// learns to report a new field should not need a client release.
+    #[serde(default)]
+    pub progress: Value,
     #[serde(default)]
     pub log_tail: Option<String>,
     pub poll_url: String,

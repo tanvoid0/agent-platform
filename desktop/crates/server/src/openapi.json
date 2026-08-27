@@ -16864,6 +16864,42 @@
       ],
       "title": "Process Id",
       "description": "Link job to an orchestration process"
+     },
+     "resume": {
+      "type": "boolean",
+      "title": "Resume",
+      "description": "Pick up this adapter version's last checkpoint if one is on disk. Refused, with a reason in the job log, when the dataset or the hyperparameters have changed since it was written.",
+      "default": true
+     },
+     "adapter_version": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Adapter Version",
+      "description": "Adapter directory to train into. Defaults to v1.",
+      "examples": [
+       "v2"
+      ]
+     },
+     "init_from": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Init From",
+      "description": "Continue training from an existing adapter version's weights instead of starting a fresh one. This is what makes a second round of examples add to a model rather than replace it.",
+      "examples": [
+       "v1"
+      ]
      }
     },
     "type": "object",
@@ -16960,6 +16996,12 @@
        }
       ],
       "title": "Error Message"
+     },
+     "progress": {
+      "type": "object",
+      "additionalProperties": true,
+      "title": "Progress",
+      "description": "Newest progress report from the running stage: phase, step, total_steps, epoch, loss, elapsed_s, eta_s, gpu, and the stage it came from. Empty until the stage prints its first one."
      },
      "log_tail": {
       "anyOf": [
@@ -17224,6 +17266,12 @@
        }
       ],
       "title": "Eval Score"
+     },
+     "metadata": {
+      "type": "object",
+      "additionalProperties": true,
+      "title": "Metadata",
+      "description": "What the training stage recorded about this build: train_examples, dataset_sha256, init_from, steps, train_loss."
      },
      "is_active": {
       "type": "boolean",

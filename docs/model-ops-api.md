@@ -89,9 +89,94 @@ Knowledge files should be **chat JSONL** (`{"messages":[{"role":"user","content"
   "stages": ["prepare", "train", "export", "eval"],
   "register_alias": "my-coach-alias",
   "offline_eval": false,
-  "process_id": null
+  "process_id": null,
+  "resume": true,
+  "adapter_version": "v1",
+  "init_from": null
 }
 ```
+
+| Field | Meaning |
+|-------|---------|
+| `resume` | Default **true**. Pick up this adapter version's last checkpoint if one is on disk. The worker refuses it, and says why in the job log, when the dataset or the hyperparameters have changed since that checkpoint was written. `false` forces a clean run. |
+| `adapter_version` | Which `adapters/<version>/` directory to train into. Default `v1`. |
+| `init_from` | Continue from another version's trained weights instead of a fresh zero-initialised adapter. |
+
+---
+
+## Progress, resume, and continuation
+
+A fine-tune is the one stage measured in hours, so it reports as it goes.
+
+### Watching a run
+
+`GET /model-ops/jobs/{id}` carries a `progress` object, and every SSE `log`
+frame carries the same one beside the new log lines. It holds whatever the
+running stage reported:
+
+```json
+{
+  "stage": "train", "phase": "train",
+  "step": 420, "total_steps": 900, "epoch": 1.4,
+  "loss": 0.8312, "learning_rate": 0.00018,
+  "elapsed_s": 512.4, "eta_s": 585.1,
+  "resumed_from": 200,
+  "gpu": {"allocated_mb": 5120, "used_mb": 6480, "total_mb": 12288}
+}
+```
+
+`phase` is `load`, `train`, `save` or `done`. During `load` there is no step
+count — a quantized base model takes minutes to arrive — so `phase` plus
+`message` is all there is, and a client should show an indeterminate bar rather
+than 0%. Progress is a gauge, not a series: only the newest report is kept, and
+the history stays in the job log, which is where a loss curve should be read
+from. The operator console at `/admin` has a **Training** tab that renders all
+of this, and reattaches to a running job across a page reload.
+
+### Picking a run back up
+
+The `train` stage checkpoints about ten times per run (keeping the last two) and
+writes a `fingerprint.json` beside the adapter: the dataset's SHA-256 plus the
+hyperparameters that produced it. `resume: true` uses the newest checkpoint only
+when that fingerprint still matches. This is not caution for its own sake —
+`resume_from_checkpoint` restores an optimizer and a step counter without
+checking what they were computed for, so resuming onto a grown dataset produces
+a plausible adapter that quietly trained on less than it claims.
+
+### Adding to a model
+
+A second round of examples needs `init_from`, or it replaces what the first
+round taught rather than adding to it:
+
+```bash
+curl -X POST .../model-ops/jobs -H "..." -d '{
+  "project": "my-coach", "stages": ["train", "export", "eval"],
+  "adapter_version": "v2", "init_from": "v1"
+}'
+```
+
+`worker/model_ops/pipeline/incremental_train.py` is the same thing with a replay
+mix built in: it blends the approved feedback examples with a sample of the
+original training set, because a few hundred corrections on their own will
+overwrite everything else.
+
+---
+
+## The `prepare` stage refuses personal data
+
+`build_dataset` scans every example before it writes anything and fails the job
+if it finds an email address, a phone number, a UK postcode, a National
+Insurance number, or an account-length digit run. See
+[ADR 0015](adr/0015-job-pipeline-task-model.md) §2.4: a dataset becomes weights
+that cannot be edited afterwards, so the gate is a hard failure rather than a
+silent drop, and its message names the row and the kind without quoting what it
+matched.
+
+It scans **shapes, never literals** — the platform is deliberately not given the
+values it is protecting. Money is not a shape it looks for: `£55,000 - £65,000`
+is the training signal in a job advert, not a leak, and a gate that fires on
+every honest dataset gets switched off. Set `pii_scan: false` in `project.yaml`
+for a corpus that is public data with no subject in it.
 
 ---
 

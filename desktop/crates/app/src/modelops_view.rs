@@ -141,6 +141,64 @@ fn projects_card(state: &State) -> Element<'_, Message> {
     )
 }
 
+/// `93m`, `2h 14m`. Only used here, so it lives here rather than in `domain`.
+fn short_duration(seconds: f64) -> String {
+    let seconds = seconds.max(0.0) as u64;
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m {:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60),
+    }
+}
+
+/// The bar and the numbers under it, when the running stage is reporting any.
+///
+/// Everything is optional because it comes from a stage's own marker line:
+/// `prepare` prints a phase and a sentence, `train` prints a step count, a loss
+/// and an ETA. Rendering only what arrived keeps a short stage from showing a
+/// row of dashes, and lets a stage start reporting more without a change here.
+fn progress_rows<'a>(
+    job: &'a agent_platform_client::types::ModelBuildJob,
+    tone: Tone,
+) -> Vec<Element<'a, Message>> {
+    let progress = &job.progress;
+    let Some(fields) = progress.as_object().filter(|f| !f.is_empty()) else {
+        return Vec::new();
+    };
+    let number = |key: &str| fields.get(key).and_then(serde_json::Value::as_f64);
+    let step = number("step").unwrap_or(0.0) as usize;
+    let total = number("total_steps").unwrap_or(0.0) as usize;
+
+    let mut rows: Vec<Element<'a, Message>> = Vec::new();
+    if total > 0 {
+        rows.push(ui::meter(step, total, tone));
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if total > 0 {
+        parts.push(format!("step {step}/{total} ({:.0}%)", (step as f64 / total as f64) * 100.0));
+    }
+    if let Some(loss) = number("loss") {
+        parts.push(format!("loss {loss:.4}"));
+    }
+    if let Some(epoch) = number("epoch") {
+        parts.push(format!("epoch {epoch:.2}"));
+    }
+    if let Some(eta) = number("eta_s") {
+        parts.push(format!("eta {}", short_duration(eta)));
+    }
+    if let Some(from) = number("resumed_from") {
+        parts.push(format!("resumed at {}", from as usize));
+    }
+    if !parts.is_empty() {
+        rows.push(ui::caption(parts.join(" · ")));
+    }
+    if let Some(message) = fields.get("message").and_then(serde_json::Value::as_str) {
+        rows.push(ui::caption(message.to_string()));
+    }
+    rows
+}
+
 fn job_card<'a>(
     _state: &'a State,
     job: &'a agent_platform_client::types::ModelBuildJob,
@@ -164,6 +222,7 @@ fn job_card<'a>(
     if let Some(stage) = &job.current_stage {
         body.push(ui::field("Current stage", ui::body(stage.clone())));
     }
+    body.extend(progress_rows(job, tone));
     if let Some(error) = &job.error_message {
         body.push(ui::alert(Tone::Danger, "Job failed", Some(ui::mono(error.clone()))));
     }

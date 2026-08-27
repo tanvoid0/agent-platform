@@ -233,6 +233,11 @@ struct RegistryRow {
     ollama_tag: String,
     base_model: Option<String>,
     eval_score: Option<f64>,
+    /// Whatever `register_model_entry` printed, verbatim. Carries the lineage
+    /// ADR 0015 §2.4 L6 asks for — `dataset_sha256`, `init_from`, `steps` —
+    /// which is only useful if a reader can get at it, so it is exposed rather
+    /// than left as a column nothing selects.
+    metadata_json: Option<String>,
     /// 0/1, not `bool` — the `Any` driver will not decode a SQLite boolean.
     /// Always selected through [`REGISTRY_COLUMNS`]; see [`crate::db`].
     is_active: i64,
@@ -242,7 +247,7 @@ struct RegistryRow {
 /// backends decode. Shared by the three readers so a fourth cannot be written
 /// with a plain `is_active` that builds and then 500s on first request.
 const REGISTRY_COLUMNS: &str = concat!(
-    "SELECT id, project_id, version, ollama_tag, base_model, eval_score, ",
+    "SELECT id, project_id, version, ollama_tag, base_model, eval_score, metadata_json, ",
     crate::BOOL!("is_active"),
     " FROM model_registry_entries "
 );
@@ -259,15 +264,21 @@ struct JobRow {
     result_json: Option<String>,
     register_alias: Option<String>,
     error_message: Option<String>,
+    progress_json: Option<String>,
     created_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
 }
 
+/// `current_stage` is a `VARCHAR(32)` holding `"train"`, and it used to be
+/// selected as `CAST(current_stage AS BIGINT)` — a cast copied from the two
+/// identifier columns either side of it. SQLite gives `"train"` INTEGER
+/// affinity and reads it as `0`, so every client showed the same stage for the
+/// whole of a four-stage build, and the progress stepper had nothing to step.
 pub const JOB_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \
      CAST(project_id AS BIGINT) AS project_id, job_type, stages_json, status, \
-     CAST(current_stage AS BIGINT) AS current_stage, \
-     log_path, result_json, register_alias, error_message, \
+     current_stage, \
+     log_path, result_json, register_alias, error_message, progress_json, \
      CAST(created_at AS TEXT) AS created_at, CAST(started_at AS TEXT) AS started_at, \
      CAST(finished_at AS TEXT) AS finished_at";
 
@@ -290,6 +301,7 @@ impl RegistryRow {
             "ollama_tag": self.ollama_tag,
             "base_model": self.base_model,
             "eval_score": self.eval_score,
+            "metadata": object_or_empty(self.metadata_json.as_deref()),
             "is_active": self.is_active != 0,
         })
     }
@@ -438,6 +450,11 @@ impl JobRow {
             "register_alias": self.register_alias,
             "result": object_or_empty(self.result_json.as_deref()),
             "error_message": self.error_message,
+            // The newest `@@AGP:progress@@` payload, or `{}` before the first
+            // one arrives. A client renders whatever keys are there rather
+            // than switching on the stage, so a future stage that learns to
+            // report progress needs no client change.
+            "progress": object_or_empty(self.progress_json.as_deref()),
             "log_tail": read_job_log_tail(self.log_path.as_deref(), 80),
             "poll_url": format!("/api/v1/model-ops/jobs/{}", self.id),
             "stream_url": format!("/api/v1/model-ops/jobs/{}/stream", self.id),
@@ -1428,8 +1445,25 @@ struct BuildRequest {
     project: String,
     stages: Vec<String>,
     register_alias: Option<String>,
-    offline_eval: bool,
     process_id: Option<i64>,
+    options: StageOptions,
+}
+
+/// What a stage script needs beyond the project name.
+///
+/// `resume` and `init_from` are the two halves of "do not throw away work".
+/// `resume` picks up a run this machine started and lost — a crash, an OOM, a
+/// cancelled job — and the worker refuses it unless the dataset and the
+/// hyperparameters still match what the checkpoint was made under. `init_from`
+/// is the deliberate one: train a *new* adapter version starting from an
+/// existing one's weights, which is what makes a second round of examples add
+/// to a model rather than replace it.
+#[derive(Clone, Default)]
+struct StageOptions {
+    offline_eval: bool,
+    resume: bool,
+    adapter_version: Option<String>,
+    init_from: Option<String>,
 }
 
 impl BuildRequest {
@@ -1472,6 +1506,16 @@ impl BuildRequest {
         let register_alias = optional_str(&mut errors, body, "register_alias");
         let offline_eval = lax_bool(&mut errors, body, "offline_eval");
         let process_id = crate::wire::lax_int(&mut errors, body, "process_id");
+        let adapter_version = optional_str(&mut errors, body, "adapter_version");
+        let init_from = optional_str(&mut errors, body, "init_from");
+        // Absent means resume, because the caller who did not think about it
+        // wants the two hours back. `"resume": false` is how you force a clean
+        // run; `lax_bool` reads a missing key as false, so the flag is read
+        // only when it is actually present.
+        let resume = match body.get("resume") {
+            None | Some(Value::Null) => true,
+            Some(_) => lax_bool(&mut errors, body, "resume"),
+        };
 
         if !errors.is_empty() {
             return Err(ApiError::validation(errors));
@@ -1480,8 +1524,13 @@ impl BuildRequest {
             project,
             stages,
             register_alias: register_alias.filter(|a| !a.is_empty()),
-            offline_eval,
             process_id,
+            options: StageOptions {
+                offline_eval,
+                resume,
+                adapter_version: adapter_version.filter(|v| !v.is_empty()),
+                init_from: init_from.filter(|v| !v.is_empty()),
+            },
         })
     }
 }
@@ -1533,7 +1582,7 @@ async fn start_pipeline_job(state: Arc<AppState>, request: &BuildRequest) -> Res
     }
 
     let out = job_out(&state, job_id).await?;
-    spawn_pipeline_job(state, job_id, request.project.clone(), request.offline_eval);
+    spawn_pipeline_job(state, job_id, request.project.clone(), request.options.clone());
     Ok(out)
 }
 
@@ -1605,7 +1654,15 @@ async fn jobs_stream(
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .unwrap_or(0);
-    let mut first = read_job_log_tail(log_path.as_deref(), 200);
+    // `read_job_log_tail` drops the trailing newline, so without this the
+    // priming frame and the first appended chunk run into each other and the
+    // seam lands in the middle of a line.
+    let mut first = match read_job_log_tail(log_path.as_deref(), 200) {
+        tail if tail.is_empty() => tail,
+        tail => format!("{tail}
+"),
+    };
+    let mut last_progress = Value::Null;
 
     let stream = async_stream::stream! {
         loop {
@@ -1627,11 +1684,19 @@ async fn jobs_stream(
                 std::mem::take(&mut first)
             };
 
-            if !chunk.is_empty() {
+            // Progress rides the same frame as the log rather than getting a
+            // stream of its own: it changes on the same tick, and one channel
+            // means a client cannot render a bar that disagrees with the lines
+            // above it.
+            let progress = object_or_empty(row.progress_json.as_deref());
+            let progress_changed = progress != last_progress;
+            if !chunk.is_empty() || progress_changed {
+                last_progress = progress.clone();
                 let payload = json!({
                     "log": chunk,
                     "status": row.status,
                     "stage": row.current_stage,
+                    "progress": progress,
                 });
                 yield Ok::<_, std::convert::Infallible>(format!("event: log\ndata: {payload}\n\n"));
             }
@@ -1694,14 +1759,14 @@ impl JobHandle {
 pub type JobMap = std::collections::HashMap<i64, Arc<JobHandle>>;
 
 /// `run_job` for `job_type == "pipeline"`.
-fn spawn_pipeline_job(state: Arc<AppState>, job_id: i64, project: String, offline_eval: bool) {
+fn spawn_pipeline_job(state: Arc<AppState>, job_id: i64, project: String, options: StageOptions) {
     let (tx, rx) = tokio::sync::watch::channel(false);
     if let Ok(mut map) = state.model_jobs.lock() {
         map.insert(job_id, Arc::new(JobHandle { cancel: tx }));
     }
 
     tokio::spawn(async move {
-        let outcome = run_pipeline_job(&state, job_id, &project, offline_eval, rx).await;
+        let outcome = run_pipeline_job(&state, job_id, &project, options, rx).await;
         // Whether it finished or died, it is no longer cancellable.
         if let Ok(mut map) = state.model_jobs.lock() {
             map.remove(&job_id);
@@ -1759,7 +1824,7 @@ async fn run_pipeline_job(
     state: &AppState,
     job_id: i64,
     project: &str,
-    offline_eval: bool,
+    options: StageOptions,
     cancelled: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let job: JobRow = sqlx::query_as(&crate::db::sql(&format!(
@@ -1793,9 +1858,24 @@ async fn run_pipeline_job(
             .await;
         append_job_log(log_path.as_deref(), &format!("=== stage: {stage} ===\n"));
 
-        let markers =
-            run_stage(state, stage, project, offline_eval, log_path.as_deref(), cancelled.clone())
-                .await?;
+        // Each stage starts the gauge over. Without this a `train` stage that
+        // finished at 100% leaves the bar full while `export` runs, which
+        // reads as a job that has stalled at the end.
+        let _ = sqlx::query(&crate::db::sql("UPDATE model_build_jobs SET progress_json = NULL WHERE id = ?", state.backend))
+            .bind(job_id)
+            .execute(&state.any)
+            .await;
+
+        let markers = run_stage(
+            state,
+            job_id,
+            stage,
+            project,
+            &options,
+            log_path.as_deref(),
+            cancelled.clone(),
+        )
+        .await?;
 
         // `eval` is the only stage that contributes to `result`, and it used to
         // do so by returning a dict. Now it prints one.
@@ -1862,15 +1942,16 @@ const MARKER_PREFIX: &str = "@@AGP:";
 /// to the job log and picking the marker lines out as they go past.
 async fn run_stage(
     state: &AppState,
+    job_id: i64,
     stage: &str,
     project: &str,
-    offline_eval: bool,
+    options: &StageOptions,
     log_path: Option<&str>,
     mut cancelled: tokio::sync::watch::Receiver<bool>,
 ) -> Result<StageMarkers, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let script = stage_script(stage, project, offline_eval)?;
+    let script = stage_script(stage, project, options)?;
     let mut command = tokio::process::Command::new(train_python());
     command
         .arg("-c")
@@ -1928,7 +2009,7 @@ async fn run_stage(
                 match line {
                     Ok(Some(line)) => {
                         append_job_log(log_path, &format!("{line}\n"));
-                        handle_marker(state, &line, &mut markers).await;
+                        handle_marker(state, job_id, stage, &line, &mut markers).await;
                     }
                     _ => break,
                 }
@@ -1952,7 +2033,13 @@ async fn run_stage(
 /// `@@AGP:eval@@ {json}` and `@@AGP:registry@@ {json}`. Anything else on a
 /// marker line is ignored rather than fatal — a worker from a newer build must
 /// not fail a job on a parent that does not know its marker yet.
-async fn handle_marker(state: &AppState, line: &str, markers: &mut StageMarkers) {
+async fn handle_marker(
+    state: &AppState,
+    job_id: i64,
+    stage: &str,
+    line: &str,
+    markers: &mut StageMarkers,
+) {
     let Some(rest) = line.trim().strip_prefix(MARKER_PREFIX) else { return };
     let Some((kind, payload)) = rest.split_once("@@") else { return };
     let Ok(payload) = serde_json::from_str::<Value>(payload.trim()) else {
@@ -1961,6 +2048,26 @@ async fn handle_marker(state: &AppState, line: &str, markers: &mut StageMarkers)
     };
     match kind {
         "eval" => markers.eval = Some(payload),
+        "progress" => {
+            // Stamped with the stage here rather than in the worker: the stage
+            // is the parent's fact, the worker only knows the function it is
+            // in, and a client should not have to correlate two fields to
+            // label a bar.
+            let mut payload = payload;
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("stage".into(), Value::from(stage));
+            }
+            // Best effort, and deliberately not retried. Progress that fails
+            // to store is a bar that stays where it was for ten more steps;
+            // failing the job over it would be the tail wagging the dog.
+            let _ = sqlx::query(&crate::db::sql(
+                "UPDATE model_build_jobs SET progress_json = ? WHERE id = ?", state.backend)
+            )
+            .bind(payload.to_string())
+            .bind(job_id)
+            .execute(&state.any)
+            .await;
+        }
         "registry" => {
             // `set_active` rides in the envelope; `register_model_entry`'s
             // second argument defaulted to True.
@@ -2154,8 +2261,14 @@ fn worker_pythonpath() -> String {
 /// The project name is interpolated through a JSON string literal, which is a
 /// valid Python string literal for every character that can appear here and
 /// closes the injection the `{project!r}` in Python left open in principle.
-fn stage_script(stage: &str, project: &str, offline_eval: bool) -> Result<String, String> {
+fn stage_script(stage: &str, project: &str, options: &StageOptions) -> Result<String, String> {
+    // JSON string syntax is a subset of Python's, so this is also how a
+    // hostile project name stays inside its literal — see the test below.
     let name = Value::from(project).to_string();
+    let py_str = |value: &Option<String>| match value {
+        Some(v) => Value::from(v.as_str()).to_string(),
+        None => "None".to_string(),
+    };
     let body = match stage {
         "prepare" => format!(
             "from model_ops.pipeline.merge_knowledge import merge_packs\n\
@@ -2163,7 +2276,18 @@ fn stage_script(stage: &str, project: &str, offline_eval: bool) -> Result<String
              merge_packs({name})\n\
              build_dataset({name})\n"
         ),
-        "train" => format!("from model_ops.pipeline.train_lora import train\ntrain({name})\n"),
+        "train" => format!(
+            "from model_ops.pipeline.train_lora import train\n\
+             train({name}, adapter_version={version}, init_from={init_from}, resume={resume})\n",
+            version = match &options.adapter_version {
+                Some(v) => Value::from(v.as_str()).to_string(),
+                // The worker's own default, spelled out rather than omitted so
+                // the log line says which adapter a run wrote.
+                None => "\"v1\"".to_string(),
+            },
+            init_from = py_str(&options.init_from),
+            resume = if options.resume { "True" } else { "False" },
+        ),
         "export" => format!(
             "from model_ops.pipeline.export_ollama import merge_and_export_gguf\n\
              merge_and_export_gguf({name})\n"
@@ -2175,7 +2299,7 @@ fn stage_script(stage: &str, project: &str, offline_eval: bool) -> Result<String
              from model_ops.pipeline.eval import run_eval\n\
              _r = run_eval({name}, offline={})\n\
              print('{MARKER_PREFIX}eval@@ ' + json.dumps(_r if _r is not None else {{}}))\n",
-            if offline_eval { "True" } else { "False" }
+            if options.offline_eval { "True" } else { "False" }
         ),
         other => return Err(format!("Unknown stage: {other}")),
     };
@@ -2189,30 +2313,78 @@ mod tests {
     /// The stage scripts are strings compiled by another interpreter, so a typo
     /// here is a runtime failure minutes into a build. These assert the import
     /// lines and the marker the parent then parses.
+    /// `StageOptions::default()` is not the API default — `resume` arrives as
+    /// true from `BuildRequest::parse`. Spelled out so a test reads like the
+    /// request it stands for.
+    fn opts() -> StageOptions {
+        StageOptions { resume: true, ..StageOptions::default() }
+    }
+
     #[test]
     fn stage_scripts_name_the_pipeline_entry_points() {
-        let prepare = stage_script("prepare", "my-app", false).unwrap();
+        let prepare = stage_script("prepare", "my-app", &opts()).unwrap();
         assert!(prepare.contains("merge_packs(\"my-app\")"), "{prepare}");
         assert!(prepare.contains("build_dataset(\"my-app\")"), "{prepare}");
 
-        assert!(stage_script("train", "x", false).unwrap().contains("train(\"x\")"));
-        assert!(stage_script("export", "x", false)
+        assert!(stage_script("train", "x", &opts()).unwrap().contains("train(\"x\""));
+        assert!(stage_script("export", "x", &opts())
             .unwrap()
             .contains("merge_and_export_gguf(\"x\")"));
 
-        let eval = stage_script("eval", "x", true).unwrap();
+        let eval = stage_script("eval", "x", &StageOptions { offline_eval: true, ..opts() }).unwrap();
         assert!(eval.contains("run_eval(\"x\", offline=True)"), "{eval}");
         assert!(eval.contains("@@AGP:eval@@"), "{eval}");
-        assert!(stage_script("eval", "x", false).unwrap().contains("offline=False"));
+        assert!(stage_script("eval", "x", &opts()).unwrap().contains("offline=False"));
 
-        assert_eq!(stage_script("nope", "x", false), Err("Unknown stage: nope".into()));
+        assert_eq!(stage_script("nope", "x", &opts()), Err("Unknown stage: nope".into()));
+    }
+
+    /// Python has no `true`/`null`, and a stage script is compiled by an
+    /// interpreter minutes after this string is built — a JSON-shaped literal
+    /// in here is a `NameError` an hour into a build.
+    #[test]
+    fn the_train_script_is_python_not_json() {
+        let plain = stage_script("train", "x", &opts()).unwrap();
+        assert!(plain.contains("resume=True"), "{plain}");
+        assert!(plain.contains("init_from=None"), "{plain}");
+        assert!(plain.contains("adapter_version=\"v1\""), "{plain}");
+        assert!(!plain.contains("true") && !plain.contains("null"), "{plain}");
+
+        let continued = stage_script(
+            "train",
+            "x",
+            &StageOptions {
+                resume: false,
+                adapter_version: Some("v2".into()),
+                init_from: Some("v1".into()),
+                ..StageOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(continued.contains("adapter_version=\"v2\""), "{continued}");
+        assert!(continued.contains("init_from=\"v1\""), "{continued}");
+        assert!(continued.contains("resume=False"), "{continued}");
+    }
+
+    /// The same escaping rule as the project name, on the arguments that were
+    /// added beside it.
+    #[test]
+    fn adapter_names_stay_inside_their_literals() {
+        let script = stage_script(
+            "train",
+            "x",
+            &StageOptions { init_from: Some("v1\"); import os; os.system(\"id".into()), ..opts() },
+        )
+        .unwrap();
+        assert_eq!(script.matches("train(").count(), 1, "{script}");
+        assert!(script.contains(r#"init_from="v1\"); import os; os.system(\"id""#), "{script}");
     }
 
     /// A project name with a quote in it must not break out of the literal.
     #[test]
     fn a_hostile_project_name_stays_inside_its_string() {
-        let script = stage_script("train", "x\"); import os; os.system(\"rm -rf /", false).unwrap();
-        assert!(script.contains(r#"train("x\"); import os; os.system(\"rm -rf /")"#), "{script}");
+        let script = stage_script("train", "x\"); import os; os.system(\"rm -rf /", &opts()).unwrap();
+        assert!(script.contains(r#"train("x\"); import os; os.system(\"rm -rf /", adapter_version="#), "{script}");
         // One `train(` call, so nothing was appended as a second statement.
         assert_eq!(script.matches("train(").count(), 1);
     }
