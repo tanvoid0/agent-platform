@@ -38,6 +38,9 @@ FINGERPRINT_KEYS = (
     "lora_alpha",
     "epochs",
     "max_seq_len",
+    # Resuming a run that trained on the whole sequence into one that masks the
+    # prompt would carry the old gradient forward under a matching fingerprint.
+    "completion_only_loss",
     "learning_rate",
     "batch_size",
     "gradient_accumulation_steps",

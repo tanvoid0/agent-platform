@@ -29,6 +29,28 @@ from model_ops.pipeline.train_utils import bitsandbytes_config, cuda_device_map,
 from model_ops.registry_hook import register_model_entry
 
 
+def split_chat(example: dict) -> dict | None:
+    """Separate the prompt turns from the answer turn.
+
+    Flattening a chat example into one string, which `format_chat` does, leaves
+    the trainer no way to tell the question from the answer, so the loss covers
+    both and the model is graded on reproducing the prompt. That is fine when
+    the prompt is short and ruinous when it is not: on the screening corpus,
+    whose adverts are as long as real ones, the answer is nineteen tokens of a
+    2372 token row, so 99.2% of the gradient was teaching a screening model to
+    write job adverts.
+
+    TRL masks the prompt automatically when a dataset arrives as prompt and
+    completion columns, so the fix is to hand it those instead of a string.
+    Returns None when the example is not a chat row ending in an answer, and
+    the caller falls back to the flat form for it.
+    """
+    messages = example.get("messages") or []
+    if len(messages) < 2 or messages[-1].get("role") != "assistant":
+        return None
+    return {"prompt": messages[:-1], "completion": messages[-1:]}
+
+
 def format_chat(example: dict, tokenizer=None) -> str:
     messages = example.get("messages", [])
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
@@ -161,7 +183,17 @@ def train(
         "lora_rank": train_cfg.get("lora_rank", 16),
         "lora_alpha": train_cfg.get("lora_alpha", 32),
         "epochs": resolved_epochs,
-        "max_seq_len": train_cfg.get("max_seq_len", 2048),
+        # 4096, not 2048. SFT truncates a too-long row from the END, and the end
+        # of a chat example is the assistant turn, so a row over the limit trains
+        # on the prompt with its answer cut off. That is silent: no warning, no
+        # failed row, just a gradient with nothing to learn from. The screening
+        # corpus made this visible when its adverts grew to the length real job
+        # adverts actually are, at which point 94.3% of rows crossed 2048 and
+        # none crossed 4096. A project needing more sets max_seq_len itself.
+        "max_seq_len": train_cfg.get("max_seq_len", 4096),
+        # Off only to train on a trl too old to mask, knowing the gradient is
+        # then mostly the prompt.
+        "completion_only_loss": train_cfg.get("completion_only_loss", True),
         "learning_rate": train_cfg.get("learning_rate", 2e-4),
         "batch_size": batch_size,
         "gradient_accumulation_steps": grad_accum,
@@ -190,6 +222,7 @@ def train(
     from datasets import Dataset
     from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    import trl
     from trl import SFTConfig, SFTTrainer
 
     require_cuda()
@@ -258,13 +291,46 @@ def train(
         model = attach_adapter(model, base_model)
 
     progress.note(progress.PHASE_LOAD, f"tokenizing {len(examples)} examples")
-    texts = [format_chat(ex, tokenizer) for ex in examples]
-    dataset_obj = Dataset.from_dict({"text": texts})
+    # Prompt and completion columns where every row is a chat example, so the
+    # loss lands on the answer. Mixed or non-chat data keeps the old flat form:
+    # a partial split would mask some rows and not others, which is worse than
+    # masking none of them because the difference would not show up anywhere.
+    splits = [split_chat(ex) for ex in examples]
+    completion_only = (
+        config["completion_only_loss"] and bool(splits) and all(split is not None for split in splits)
+    )
+    if completion_only:
+        dataset_obj = Dataset.from_dict(
+            {
+                "prompt": [split["prompt"] for split in splits],
+                "completion": [split["completion"] for split in splits],
+            }
+        )
+    else:
+        dataset_obj = Dataset.from_dict({"text": [format_chat(ex, tokenizer) for ex in examples]})
+    progress.note(
+        progress.PHASE_LOAD,
+        "loss on the answer only" if completion_only else "loss on the whole sequence",
+    )
 
     # About ten checkpoints per run, whatever its length, and only the last two
     # kept: enough granularity that a crash costs minutes rather than hours,
     # without a disk full of 4-bit optimizer states.
     save_steps = max(10, min(200, total_hint // 10 or 10))
+
+    # trl>=0.11 is all requirements.txt asks for, and prompt/completion masking
+    # arrived later. Refuse rather than train: a silently unmasked run looks
+    # exactly like a masked one until the adapter is worse for reasons nobody
+    # can see, which is the failure this change exists to remove.
+    if completion_only and "completion_only_loss" not in getattr(
+        SFTConfig, "__dataclass_fields__", {}
+    ):
+        raise RuntimeError(
+            "This trl is too old to mask the prompt out of the loss "
+            f"(found {getattr(trl, '__version__', 'unknown')}). Upgrade trl, or set "
+            "train.completion_only_loss to false in project.yaml to accept a run "
+            "whose gradient is mostly the prompt."
+        )
 
     sft_config = SFTConfig(
         output_dir=str(output_dir),
@@ -278,7 +344,7 @@ def train(
         save_steps=save_steps,
         save_total_limit=2,
         report_to="none",
-        dataset_text_field="text",
+        **({} if completion_only else {"dataset_text_field": "text"}),
         **resolve_precision(),
     )
 
