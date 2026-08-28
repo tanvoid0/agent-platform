@@ -74,6 +74,38 @@
   .secret { background: var(--bg); border: 1px dashed var(--accent); border-radius: 6px;
             padding: 8px; margin-top: 8px; font-family: var(--mono); font-size: 12px; word-break: break-all; }
   .muted { color: var(--muted); }
+
+  /* --- training monitor --------------------------------------------------
+     A fine-tune runs for hours. These four pieces answer, in order, the four
+     questions someone watching one actually has: which stage, how far, how is
+     it going, and is it still alive. */
+  .steps { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .step { flex: 1 1 90px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px;
+          font-size: 12px; color: var(--muted); background: var(--bg); }
+  .step b { display: block; font-weight: 600; }
+  .step[data-state="running"] { border-color: var(--accent); color: var(--ink); }
+  .step[data-state="done"] { border-color: var(--good); color: var(--good); }
+  .step[data-state="failed"] { border-color: var(--bad); color: var(--bad); }
+  .bar { height: 10px; border-radius: 99px; background: var(--line); overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; border-radius: 99px; background: var(--accent);
+             transition: width .4s ease; }
+  /* Before step 1 there is no percentage to show — a model is loading. A
+     striped crawl says "working" without inventing a number. */
+  .bar[data-indeterminate] > i { width: 35%; background:
+      repeating-linear-gradient(115deg, var(--accent) 0 10px, transparent 10px 20px);
+      animation: crawl 1.4s linear infinite; }
+  @keyframes crawl { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+  @media (prefers-reduced-motion: reduce) { .bar[data-indeterminate] > i { animation: none; width: 100%; } }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px; margin-top: 12px; }
+  .metric { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  .metric span { display: block; font-size: 11px; color: var(--muted); }
+  .metric b { font-family: var(--mono); font-size: 14px; font-weight: 600; }
+  .spark { width: 100%; height: 56px; display: block; margin-top: 10px; }
+  .spark path { fill: none; stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+  .spark rect { fill: var(--bg); stroke: var(--line); }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; }
+  legend { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 0 4px; }
+  label.check { display: inline-flex; gap: 5px; align-items: center; color: var(--ink); }
 </style>
 
 <header>
@@ -91,6 +123,7 @@
   <button data-tab="logs">Logs</button>
   <button data-tab="workspaces">Workspaces</button>
   <button data-tab="projects">Projects</button>
+  <button data-tab="training">Training</button>
 </nav>
 
 <main>
@@ -145,6 +178,66 @@
       <input name="description" placeholder="description (optional)">
       <button class="primary">Create project</button>
     </form>
+  </section>
+
+  <section id="training">
+    <div class="card">
+      <h2>Build a model</h2>
+      <form id="tr-build">
+        <fieldset>
+          <legend>What</legend>
+          <div class="row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <select name="project" id="tr-project" required></select>
+            <label class="check"><input type="checkbox" name="prepare" checked> prepare</label>
+            <label class="check"><input type="checkbox" name="train" checked> train</label>
+            <label class="check"><input type="checkbox" name="export" checked> export</label>
+            <label class="check"><input type="checkbox" name="eval" checked> eval</label>
+            <label class="check"><input type="checkbox" name="offline_eval"> offline eval</label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Continue or resume</legend>
+          <div class="row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <input name="adapter_version" placeholder="adapter version (v1)" size="18">
+            <select name="init_from" id="tr-initfrom">
+              <option value="">start from the base model</option>
+            </select>
+            <label class="check"><input type="checkbox" name="resume" checked> resume a half-finished run</label>
+          </div>
+          <div class="muted" style="margin-top:6px;font-size:12px">
+            Resume picks up this version's own last checkpoint, and is refused if the dataset or the
+            hyperparameters have changed since it was written. Continuing from an adapter trains a new
+            version on top of an existing one's weights.
+          </div>
+        </fieldset>
+        <div class="row" style="display:flex;gap:8px;align-items:center">
+          <button class="primary">Start build</button>
+          <input id="tr-attach" type="number" placeholder="attach to job id" size="10" style="width:150px">
+          <button type="button" id="tr-attach-go">Attach</button>
+          <span id="tr-note" class="muted"></span>
+        </div>
+      </form>
+    </div>
+
+    <div class="card" id="tr-monitor" hidden>
+      <h2>Job <span id="tr-job" class="mono"></span> — <span id="tr-status"></span></h2>
+      <div class="steps" id="tr-steps"></div>
+      <div class="bar" id="tr-bar"><i></i></div>
+      <div class="metrics" id="tr-metrics"></div>
+      <svg class="spark" id="tr-spark" viewBox="0 0 300 56" preserveAspectRatio="none" aria-label="training loss"></svg>
+      <div class="row" style="display:flex;gap:8px;align-items:center;margin-top:10px">
+        <button type="button" id="tr-cancel" class="danger">Cancel job</button>
+        <button type="button" id="tr-detach">Detach</button>
+        <span id="tr-message" class="muted"></span>
+      </div>
+      <pre id="tr-log" style="margin-top:10px"></pre>
+    </div>
+
+    <div class="card">
+      <h2>Registry</h2>
+      <table><thead><tr><th>project</th><th>version</th><th>tag</th><th>examples</th><th>eval</th><th></th></tr></thead>
+        <tbody id="tr-registry"></tbody></table>
+    </div>
   </section>
 </main>
 
@@ -360,8 +453,249 @@ async function loadProjects() {
   }
 }
 
+// --- training ---------------------------------------------------------------
+// A fine-tune runs for hours, so the tab has to survive a reload: the job id is
+// kept in sessionStorage and reattached on load. Detaching stops watching; it
+// does not stop the job, which belongs to the server.
+const MODEL_OPS = "/api/v1/model-ops";
+const STAGES = ["prepare", "train", "export", "eval"];
+let watching = null;   // { id, abort }
+let lossSeries = [];
+
+fmt.dur = s => {
+  if (s == null) return "—";
+  s = Math.round(s);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor(s % 3600 / 60)).padStart(2, "0")}m`;
+};
+
+async function loadTraining() {
+  const [{ projects }, { entries }] = await Promise.all([
+    api(`${MODEL_OPS}/projects`),
+    api(`${MODEL_OPS}/registry`),
+  ]);
+
+  const select = $("#tr-project");
+  const chosen = select.value;
+  select.innerHTML = "";
+  for (const p of projects) {
+    const opt = document.createElement("option");
+    opt.value = p.name;
+    opt.textContent = `${p.name} — ${p.manifest?.base_model || "no base model"}`;
+    select.append(opt);
+  }
+  if (chosen) select.value = chosen;
+
+  const initFrom = $("#tr-initfrom");
+  const priorChoice = initFrom.value;
+  initFrom.innerHTML = `<option value="">start from the base model</option>`;
+  for (const e of entries) {
+    const opt = document.createElement("option");
+    opt.value = e.version;
+    opt.textContent = `continue ${e.project_name}/${e.version}`;
+    initFrom.append(opt);
+  }
+  if (priorChoice) initFrom.value = priorChoice;
+
+  const body = $("#tr-registry");
+  body.innerHTML = "";
+  for (const e of entries) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td></td><td class="mono"></td><td class="mono"></td>
+                    <td class="mono"></td><td class="mono"></td><td></td>`;
+    tr.children[0].textContent = e.project_name ?? "—";
+    tr.children[1].textContent = e.version;
+    tr.children[2].textContent = e.ollama_tag;
+    tr.children[3].textContent = e.metadata?.train_examples ?? "—";
+    tr.children[4].textContent = e.eval_score == null ? "—" : e.eval_score;
+    if (e.is_active) {
+      tr.children[5].innerHTML = `<span class="pill active">active</span>`;
+    } else {
+      const go = Object.assign(document.createElement("button"), { textContent: "Activate" });
+      go.onclick = () => api(`${MODEL_OPS}/registry/${e.id}/activate`, { method: "POST" })
+        .then(loadTraining).catch(fail);
+      tr.children[5].append(go);
+    }
+    body.append(tr);
+  }
+
+  const stored = sessionStorage.getItem("agp_job");
+  if (stored && !watching) attachJob(Number(stored)).catch(() => sessionStorage.removeItem("agp_job"));
+}
+
+/// SSE by hand rather than `EventSource`, which cannot carry an Authorization
+/// header and would need the token in the query string — where it would land in
+/// every access log between here and the server.
+async function streamFrames(id, onFrame, signal) {
+  const res = await fetch(`${MODEL_OPS}/jobs/${id}/stream`, {
+    headers: { authorization: "Bearer " + KEY }, signal,
+  });
+  if (!res.ok || !res.body) throw new Error(`stream failed: ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let cut;
+    // Frames are separated by a blank line and can be split across reads, so
+    // the tail of the buffer stays until its terminator arrives.
+    while ((cut = buffer.indexOf("\n\n")) >= 0) {
+      const raw = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      let event = "message", data = "";
+      for (const line of raw.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (data) { try { onFrame(event, JSON.parse(data)); } catch { /* keep reading */ } }
+    }
+  }
+}
+
+function renderSteps(stages, current, status) {
+  const box = $("#tr-steps");
+  box.innerHTML = "";
+  const at = stages.indexOf(current);
+  stages.forEach((name, i) => {
+    const el = document.createElement("div");
+    el.className = "step";
+    el.innerHTML = `<b></b><span></span>`;
+    el.children[0].textContent = name;
+    let state = "";
+    if (status === "failed" && i === at) state = "failed";
+    else if (status === "succeeded" || (at >= 0 && i < at)) state = "done";
+    else if (i === at && status === "running") state = "running";
+    if (state) el.dataset.state = state;
+    el.children[1].textContent = state || "waiting";
+    box.append(el);
+  });
+}
+
+function renderProgress(p, status) {
+  const running = status === "running" || status === "pending";
+  const step = Number(p.step || 0), total = Number(p.total_steps || 0);
+  const pct = status === "succeeded" ? 100
+            : total > 0 && step > 0 ? Math.min(100, (step / total) * 100)
+            : 0;
+
+  const bar = $("#tr-bar");
+  // No step count yet and still alive means a base model is loading, which can
+  // take minutes. A 0% bar there reads as stuck.
+  bar.toggleAttribute("data-indeterminate", running && pct === 0);
+  bar.firstElementChild.style.width = pct ? `${pct.toFixed(1)}%` : "";
+
+  $("#tr-message").textContent = p.message || "";
+  const gpu = p.gpu;
+  // Only what this stage actually reported: `prepare` has no loss and no ETA,
+  // and a grid of nine dashes says less than no grid at all.
+  kvMetrics([
+    ["progress", total ? `${step}/${total}` : "—"],
+    ["percent", pct ? `${pct.toFixed(1)}%` : "—"],
+    ["epoch", p.epoch != null ? Number(p.epoch).toFixed(2) : "—"],
+    ["loss", p.loss != null ? Number(p.loss).toFixed(4) : "—"],
+    ["lr", p.learning_rate != null ? Number(p.learning_rate).toExponential(1) : "—"],
+    ["elapsed", fmt.dur(p.elapsed_s)],
+    ["eta", fmt.dur(p.eta_s)],
+    ["vram", gpu ? `${gpu.used_mb}/${gpu.total_mb} MB` : "—"],
+    ["resumed at", p.resumed_from ?? "—"],
+  ].filter(([, value]) => value !== "—"));
+
+  if (p.loss != null) {
+    const last = lossSeries[lossSeries.length - 1];
+    if (!last || last[0] !== step) lossSeries.push([step, Number(p.loss)]);
+    drawSpark();
+  }
+}
+
+function kvMetrics(pairs) {
+  const box = $("#tr-metrics");
+  box.innerHTML = "";
+  box.hidden = !pairs.length;
+  for (const [label, value] of pairs) {
+    const el = document.createElement("div");
+    el.className = "metric";
+    el.innerHTML = `<span></span><b></b>`;
+    el.children[0].textContent = label;
+    el.children[1].textContent = value;
+    box.append(el);
+  }
+}
+
+// Loss against step, scaled to whatever range the run is actually in. An axis
+// fixed at zero flattens the only part anyone reads — whether it is still
+// falling.
+function drawSpark() {
+  const svg = $("#tr-spark");
+  svg.innerHTML = "";
+  if (lossSeries.length < 2) return;
+  const xs = lossSeries.map(p => p[0]), ys = lossSeries.map(p => p[1]);
+  const [x0, x1] = [Math.min(...xs), Math.max(...xs)];
+  const [y0, y1] = [Math.min(...ys), Math.max(...ys)];
+  const sx = x => 2 + ((x - x0) / (x1 - x0 || 1)) * 296;
+  const sy = y => 52 - ((y - y0) / (y1 - y0 || 1)) * 48;
+  const d = lossSeries.map((p, i) => `${i ? "L" : "M"}${sx(p[0]).toFixed(1)},${sy(p[1]).toFixed(1)}`).join(" ");
+  svg.innerHTML =
+    `<rect x="0.5" y="0.5" width="299" height="55" rx="4"></rect><path d="${d}"></path>`;
+  svg.setAttribute("aria-label", `loss ${y1.toFixed(3)} down to ${ys[ys.length - 1].toFixed(3)}`);
+}
+
+function renderJob(job) {
+  $("#tr-monitor").hidden = false;
+  $("#tr-job").textContent = `#${job.id}`;
+  $("#tr-status").textContent = job.status + (job.error_message ? ` — ${job.error_message}` : "");
+  renderSteps(job.stages || STAGES, job.current_stage, job.status);
+  renderProgress(job.progress || {}, job.status);
+}
+
+async function attachJob(id) {
+  detachJob();
+  lossSeries = [];
+  sessionStorage.setItem("agp_job", String(id));
+  // The row first, so a page opened mid-run paints before the stream's first
+  // frame — which only arrives when something is appended to the log.
+  const job = await api(`${MODEL_OPS}/jobs/${id}`);
+  // The stream's first frame carries the last 200 lines as context, so the log
+  // starts empty here rather than being seeded from `log_tail` and then having
+  // the same lines appended again.
+  $("#tr-log").textContent = "";
+  renderJob(job);
+  const stages = job.stages || STAGES;
+
+  const abort = new AbortController();
+  watching = { id, abort };
+  streamFrames(id, (event, frame) => {
+    if (event === "log") {
+      if (frame.log) {
+        const out = $("#tr-log");
+        out.textContent = (out.textContent + frame.log).slice(-20000);
+        out.scrollTop = out.scrollHeight;
+      }
+      renderSteps(stages, frame.stage, frame.status);
+      $("#tr-status").textContent = frame.status;
+      if (frame.progress) renderProgress(frame.progress, frame.status);
+    } else if (event === "done") {
+      $("#tr-status").textContent = frame.status;
+      renderSteps(stages, null, frame.status);
+      $("#tr-bar").removeAttribute("data-indeterminate");
+      sessionStorage.removeItem("agp_job");
+      loadTraining().catch(fail);
+    }
+  }, abort.signal).catch(e => { if (e.name !== "AbortError") fail(e); });
+}
+
+function detachJob() {
+  if (watching) watching.abort.abort();
+  watching = null;
+}
+
 // --- wiring -----------------------------------------------------------------
-const LOADERS = { status: loadStatus, logs: loadLogs, workspaces: loadWorkspaces, projects: loadProjects };
+const LOADERS = {
+  status: loadStatus, logs: loadLogs, workspaces: loadWorkspaces,
+  projects: loadProjects, training: loadTraining,
+};
 
 function show(tab) {
   $$("nav button").forEach(b => b.setAttribute("aria-current", String(b.dataset.tab === tab)));
@@ -426,6 +760,40 @@ $("#pj-new").onsubmit = async e => {
   e.preventDefault();
   try { await api("/api/v1/projects", { method: "POST", body: JSON.stringify(formBody(e.target, ["workspace_id"])) });
         e.target.reset(); await loadProjects(); } catch (err) { fail(err); }
+};
+
+$("#tr-build").onsubmit = async e => {
+  e.preventDefault();
+  const form = new FormData(e.target);
+  const stages = STAGES.filter(s => form.get(s));
+  if (!stages.length) return fail(new Error("Pick at least one stage"));
+  const body = {
+    project: form.get("project"),
+    stages,
+    offline_eval: !!form.get("offline_eval"),
+    // Unchecked means an explicit false — absent would mean "resume", which is
+    // the server's default and the opposite of what the box now says.
+    resume: !!form.get("resume"),
+  };
+  const version = String(form.get("adapter_version") || "").trim();
+  const initFrom = String(form.get("init_from") || "").trim();
+  if (version) body.adapter_version = version;
+  if (initFrom) body.init_from = initFrom;
+  try {
+    const job = await api(`${MODEL_OPS}/jobs`, { method: "POST", body: JSON.stringify(body) });
+    $("#tr-note").textContent = `started job #${job.id}`;
+    await attachJob(job.id);
+  } catch (err) { fail(err); }
+};
+
+$("#tr-attach-go").onclick = () => {
+  const id = Number($("#tr-attach").value);
+  if (id) attachJob(id).catch(fail);
+};
+$("#tr-detach").onclick = () => { detachJob(); sessionStorage.removeItem("agp_job"); $("#tr-monitor").hidden = true; };
+$("#tr-cancel").onclick = async () => {
+  if (!watching || !confirm(`Cancel job #${watching.id}?`)) return;
+  try { await api(`${MODEL_OPS}/jobs/${watching.id}/cancel`, { method: "POST" }); } catch (err) { fail(err); }
 };
 
 $("#key").value = KEY;

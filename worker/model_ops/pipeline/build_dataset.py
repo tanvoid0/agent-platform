@@ -8,6 +8,8 @@ from pathlib import Path
 
 import jsonschema
 
+from model_ops import progress
+from model_ops.pipeline import pii_scan
 from model_ops.pipeline.jsonl_utils import load_jsonl, write_jsonl
 from model_ops.pipeline.project_loader import data_root, get_project_dir, load_input_schema, load_project
 
@@ -87,6 +89,13 @@ def build_dataset(project: str, eval_ratio: float = 0.1, seed: int = 42) -> tupl
             "Add chat JSONL files under knowledge/ with messages[{role, content}]."
         )
 
+    # ADR 0015 §2.4 L4. Runs before the split, so a leak cannot hide in the
+    # half that only the eval stage reads, and before anything is written, so a
+    # failed scan leaves no file for a later stage to pick up and train on.
+    if manifest.get("pii_scan", True):
+        progress.note(progress.PHASE_LOAD, f"scanning {len(examples)} examples for personal data")
+        pii_scan.require_clean(examples, f"project {project}")
+
     random.seed(seed)
     random.shuffle(examples)
     split = max(1, int(len(examples) * eval_ratio))
@@ -97,4 +106,10 @@ def build_dataset(project: str, eval_ratio: float = 0.1, seed: int = 42) -> tupl
     eval_path = datasets_dir / "eval.jsonl"
     write_jsonl(train_path, train_set)
     write_jsonl(eval_path, eval_set)
+    progress.note(
+        progress.PHASE_DONE,
+        f"{len(train_set)} train, {len(eval_set)} eval",
+        train_examples=len(train_set),
+        eval_examples=len(eval_set),
+    )
     return train_path, eval_path

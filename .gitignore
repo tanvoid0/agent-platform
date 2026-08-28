@@ -20,6 +20,20 @@ env/
 
 # Runtime / build
 data/
+# ... except the model-ops seed. `ensure_data_scaffold` (both the Rust one and
+# `worker/model_ops/paths.py`) copies `defaults.yaml` and the `_template`
+# project out of here on first run, so a clone without them cannot create a
+# model-ops project at all: `load_defaults` raises and `POST /projects`
+# answers 500. `data/` matches a directory of that name at any depth, which is
+# how it caught a directory that is source, not runtime.
+!worker/model_ops/data/
+# Seed only. The live copy of a project owns these three, `install_project.py`
+# creates `knowledge/` in it, and this is a public repo — so re-ignore them
+# under the negation rather than trusting that nobody ever writes a corpus into
+# the scaffold they copied it from.
+worker/model_ops/data/projects/*/knowledge/
+worker/model_ops/data/projects/*/datasets/
+worker/model_ops/data/projects/*/adapters/
 dist/
 node_modules/
 .svelte-kit/
