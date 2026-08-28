@@ -127,9 +127,13 @@ Rules that make it a controlled environment rather than a log:
   human or frontier pass confirmed them; a model must not feed on itself.
 
 Export is one admin route, `GET /api/admin/training/export?task=...&split=...`,
-emitting chat JSONL in exactly the shape model-ops ingests (system prompt from
-the task's prompt template, user message from the input snapshot, assistant
-message from the output). Guarded by a new agent-token scope `training:read`.
+emitting chat JSONL in exactly the shape model-ops ingests: **two messages, user
+first** — the input snapshot as the user turn, the output as the assistant turn.
+The task's system prompt is *not* a third message; it lives in the project's
+`export/system.txt` and `export_ollama` bakes it into the Modelfile. A row that
+carries its own system turn is dropped silently by `build_dataset`, which reads
+`messages[0]` as the input JSON, and `eval.py` likewise reads `[0]` and `[1]` as
+prompt and expected answer. Guarded by a new agent-token scope `training:read`.
 
 ### 2.4 Sensitive data never reaches the weights
 
@@ -324,8 +328,11 @@ Not built yet:
   screening and field mapping have their `DecisionTask` and system prompt and no
   call site.
 - **L5** — the extraction battery and memorisation canaries in the `eval` stage.
-- The four task projects themselves, the distillation sweep that fills them, and
-  the shadow-mode routing of §2.5.
+- The four task projects: `jobhunt-screener` is scaffolded and empty (manifest,
+  input schema, system prompt, installed by `worker/install_project.py`); the
+  other three are not created. The distillation sweep that fills them and the
+  shadow-mode routing of §2.5 are not built either — the corpus is the blocker,
+  not the pipeline.
 
 ## 6. Non-goals
 

@@ -1,0 +1,3 @@
+You are a helpful domain assistant.
+Input is compact JSON. Output 2-4 sentences of actionable advice.
+Stay concise and specific to the input state.

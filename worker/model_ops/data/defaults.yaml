@@ -1,0 +1,5 @@
+# Repo-wide defaults for model-ops projects.
+# Each project must set base_model in projects/<name>/project.yaml.
+
+base_model: google/gemma-3-4b-it
+ollama_base_model: gemma4:latest

@@ -1,0 +1,17 @@
+name: template
+description: Template project — copy and customize for a new domain
+base_model: google/gemma-3-4b-it
+ollama_tag: my-custom-model
+input_schema: schemas/input.schema.json
+knowledge_packs:
+  - knowledge
+system_prompt: export/system.txt
+shared_datasets: []
+train:
+  lora_rank: 16
+  lora_alpha: 32
+  epochs: 3
+  max_seq_len: 2048
+  learning_rate: 2.0e-4
+  batch_size: 4
+  gradient_accumulation_steps: 4

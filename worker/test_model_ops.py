@@ -1,7 +1,9 @@
 """Self-check for the parts of the pipeline that decide something.
 
-No framework and no fixtures: `python test_model_ops.py` from `worker/`, and it
-needs none of the GPU stack. What it covers is the logic a wrong answer from is
+No framework required: `python test_model_ops.py` from `worker/`, and it needs
+none of the GPU stack. The directory argument is named `tmp_path` so that a
+`pytest` run over this directory supplies it as its own fixture rather than
+erroring on collection; `main` passes it positionally. What it covers is the logic a wrong answer from is
 expensive and silent — a resume onto the wrong dataset, a PII gate that does not
 fire, a step total that makes the progress bar lie.
 
@@ -15,7 +17,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+import jsonschema
+
 from model_ops.pipeline import checkpoints, pii_scan
+from model_ops.pipeline.build_dataset import _validate_example
 from model_ops.pipeline.train_lora import planned_steps
 
 
@@ -28,8 +33,8 @@ def test_planned_steps() -> None:
     assert planned_steps(0, 4, 4, 3) == 3
 
 
-def test_checkpoint_discovery(tmp: Path) -> None:
-    output = tmp / "checkpoint"
+def test_checkpoint_discovery(tmp_path: Path) -> None:
+    output = tmp_path / "checkpoint"
     assert checkpoints.last_checkpoint(output) is None
 
     for step in (50, 400, 100):
@@ -42,8 +47,8 @@ def test_checkpoint_discovery(tmp: Path) -> None:
     assert checkpoints.checkpoint_step(found) == 400
 
 
-def test_resume_requires_a_matching_fingerprint(tmp: Path) -> None:
-    adapter = tmp / "adapters" / "v1"
+def test_resume_requires_a_matching_fingerprint(tmp_path: Path) -> None:
+    adapter = tmp_path / "adapters" / "v1"
     output = adapter / "checkpoint"
     (output / "checkpoint-200").mkdir(parents=True)
 
@@ -76,8 +81,8 @@ def test_resume_requires_a_matching_fingerprint(tmp: Path) -> None:
     assert resume is None and "disabled" in reason, reason
 
 
-def test_dataset_digest_tracks_content(tmp: Path) -> None:
-    path = tmp / "train.jsonl"
+def test_dataset_digest_tracks_content(tmp_path: Path) -> None:
+    path = tmp_path / "train.jsonl"
     path.write_text('{"messages":[]}\n', encoding="utf-8")
     first = checkpoints.dataset_digest(path)
     path.write_text('{"messages":[]}\n{"messages":[]}\n', encoding="utf-8")
@@ -133,17 +138,55 @@ def test_require_clean_fails_loudly_and_says_nothing() -> None:
         raise AssertionError("require_clean accepted a row with an email in it")
 
 
+def test_screener_schema_accepts_the_rows_the_exporter_will_send() -> None:
+    schema = json.loads(
+        (Path(__file__).parent / "model_ops/data/projects/jobhunt-screener/schemas/input.schema.json")
+        .read_text(encoding="utf-8")
+    )
+    valid = jsonschema.Draft202012Validator(schema).is_valid
+    advert = "Senior Rust engineer, London hybrid, GBP 75,000 - GBP 90,000."
+
+    # `build_dataset._validate_example` drops a row that fails this schema
+    # without a word. An over-tight schema therefore does not fail loudly: it
+    # empties the dataset, and the job dies a stage later on "No training
+    # examples" pointing at the knowledge dir, which is the wrong place to look.
+    assert valid({
+        "advert": advert,
+        "constraint": "right to work without sponsorship",
+        "predicates": {"rtw": "eligible_no_sponsorship"},
+    })
+    # Predicates are per-constraint; a constraint answered from the advert alone
+    # sends none, and that row must still train.
+    assert valid({"advert": advert, "constraint": "salary floor"})
+
+    # The two halves of the question are what makes a verdict replayable.
+    assert not valid({"constraint": "salary floor"})
+    assert not valid({"advert": advert})
+
+    # And the row itself leads with the user turn. `_validate_example` reads
+    # `messages[0]`, and `eval.py` reads `messages[0]` and `[1]` as prompt and
+    # expected answer, so a row carrying its own system message is dropped —
+    # silently, as a row that failed the schema. The system prompt belongs in
+    # `export/system.txt`, which `export_ollama` bakes into the Modelfile.
+    user = {"role": "user", "content": json.dumps({"advert": advert, "constraint": "salary floor"})}
+    answer = {"role": "assistant", "content": json.dumps({"a": "yes", "r": "range starts above it"})}
+    assert _validate_example({"messages": [user, answer]}, schema) is not None
+    system = {"role": "system", "content": "You screen a job advert."}
+    assert _validate_example({"messages": [system, user, answer]}, schema) is None
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as raw:
-        tmp = Path(raw)
+        tmp_path = Path(raw)
         checks = [
             (test_planned_steps, ()),
-            (test_checkpoint_discovery, (tmp / "a",)),
-            (test_resume_requires_a_matching_fingerprint, (tmp / "b",)),
-            (test_dataset_digest_tracks_content, (tmp / "c",)),
+            (test_checkpoint_discovery, (tmp_path / "a",)),
+            (test_resume_requires_a_matching_fingerprint, (tmp_path / "b",)),
+            (test_dataset_digest_tracks_content, (tmp_path / "c",)),
             (test_pii_scan_catches_what_it_must, ()),
             (test_pii_scan_leaves_the_training_signal_alone, ()),
             (test_require_clean_fails_loudly_and_says_nothing, ()),
+            (test_screener_schema_accepts_the_rows_the_exporter_will_send, ()),
         ]
         failures = 0
         for check, args in checks:

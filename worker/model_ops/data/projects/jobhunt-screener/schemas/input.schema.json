@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "One advert, one constraint, one verdict to make",
+  "type": "object",
+  "properties": {
+    "advert": { "type": "string" },
+    "constraint": { "type": "string" },
+    "predicates": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  },
+  "required": ["advert", "constraint"]
+}
