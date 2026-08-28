@@ -16881,7 +16881,8 @@
        }
       ],
       "title": "Adapter Version",
-      "description": "Adapter directory to train into. Defaults to v1.",
+      "pattern": "^[a-zA-Z0-9_-]+$",
+      "description": "Adapter directory to train into. Defaults to v1. Becomes a directory name, so it is restricted to ^[a-zA-Z0-9_-]+$.",
       "examples": [
        "v2"
       ]
@@ -16896,7 +16897,8 @@
        }
       ],
       "title": "Init From",
-      "description": "Continue training from an existing adapter version's weights instead of starting a fresh one. This is what makes a second round of examples add to a model rather than replace it.",
+      "pattern": "^[a-zA-Z0-9_-]+$",
+      "description": "Continue training from an existing adapter version's weights instead of starting a fresh one. This is what makes a second round of examples add to a model rather than replace it. Becomes a directory name, so it is restricted to ^[a-zA-Z0-9_-]+$.",
       "examples": [
        "v1"
       ]

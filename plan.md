@@ -98,6 +98,61 @@ pointed elsewhere.
 
 ## Backlog
 
+- **Job-pipeline task models — first project scaffolded 2026-08-28.**
+  [ADR 0015](docs/adr/0015-job-pipeline-task-model.md). `jobhunt-screener` is a
+  bundled scaffold under `worker/model_ops/data/projects/` — manifest, input
+  schema, system prompt — installed into the live data dir by
+  `worker/install_project.py`. `ensure_data_scaffold` copies `_template` and
+  nothing else on purpose, so a shipped install never grows somebody else's
+  projects; that script is the manual half. **Nothing is trained.** The corpus
+  is the blocker, not the pipeline: the portfolio captures `scoring` only, and
+  the distillation sweep of §2.2 is what fills the rest.
+  - **A knowledge row is exactly two messages, user first.**
+    `build_dataset._validate_example` parses `messages[0]` as the input JSON and
+    `eval.py` reads `[0]` and `[1]` as prompt and expected answer, so a row
+    carrying its own system message is dropped *silently* — as a schema failure
+    — and the job dies a stage later on "No training examples", pointing at the
+    knowledge dir. The system prompt belongs in `export/system.txt`, which
+    `export_ollama` bakes into the Modelfile `SYSTEM` block.
+    `worker/test_model_ops.py` asserts both halves.
+  - **A `train` stage reports progress and can be picked up again — landed
+    2026-08-28.** The stage prints `@@AGP:progress@@ {json}` on the same stdout
+    channel as `registry_hook`; `model_ops.rs::handle_marker` keeps the newest
+    payload on `model_build_jobs.progress_json` (migration `0007`) and puts it
+    on both the job row and the SSE frame, so a client attaching halfway through
+    a two-hour run gets step, loss, ETA and VRAM instead of a blank bar. The
+    admin page's Training tab and the desktop Model ops card both render it.
+    `resume` (default **true**) picks up the last checkpoint, but only when
+    `checkpoints.resolve` finds the run's fingerprint — hyperparameters plus the
+    dataset's SHA-256 — unchanged; `init_from` starts a new adapter version from
+    an existing one's weights, which is what `incremental_train` was already
+    asking for and silently not getting.
+    - **`current_stage` was being read as `0` for every stage.** It is a
+      `VARCHAR(32)` that `JOB_COLUMNS` cast to `BIGINT`; SQLite gives `"train"`
+      integer affinity and returns `0`, so every client showed stage one for the
+      whole build. The cast is gone.
+    - **`adapter_version` and `init_from` are `^[a-zA-Z0-9_-]+$`**, the same as
+      a project name. Both become a directory the worker creates or reads, and
+      escaping them into the stage script's Python literal stops a quote but not
+      a `..`.
+  - **The dataset gate refuses personal data — landed 2026-08-28.** ADR 0015
+    §2.4 L4. `pii_scan.require_clean` runs in `build_dataset` before the split
+    and before anything is written, matches on shape rather than on literals,
+    and never quotes what it found — the job log is the file it exists to keep
+    clean. Salary is deliberately not a pattern: it is the training signal here,
+    and is checked upstream where the exporter can compare literals. Off per
+    project with `pii_scan: false` in `project.yaml`.
+  - **Loss lands on the answer, not the advert.** SFT was flattening a chat row
+    to one string, so the gradient covered the prompt too — on a corpus whose
+    adverts are as long as real ones that was 99.2% of it. Rows now arrive as
+    prompt/completion columns, which TRL masks; `max_seq_len` default is 4096
+    because SFT truncates from the *end*, which is where the answer is, and
+    94.3% of rows crossed 2048. A trl too old to mask is refused, not run.
+  - **A trained model reaches the picker only after `export`.**
+    `model_catalog.rs` lists live Ollama tags, not registry rows, and the
+    `config.yaml` alias is written only when the build request carries
+    `register_alias` — blank by default in the desktop Model ops form. A
+    train-only build leaves a registry entry and no visible model.
 - **User-owned data, local and cloud — landed 2026-08-23.**
   [ADR 0014](docs/adr/0014-user-owned-data-local-and-cloud.md). Identity is
   always a `users` row: local startup registers the OS user (`kind = local`)

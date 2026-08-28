@@ -1037,6 +1037,25 @@ async fn projects_list(
 ) -> Result<Response, ApiError> {
     principal.require_scope("model:read")?;
     ensure_data_scaffold();
+
+    // A project directory with no row is one that arrived by hand — copied in,
+    // or installed by `worker/install_project.py` — and `sync_project_row` is
+    // already the thing that adopts one. Without this pass the list is DB-only:
+    // the directory is there and `jobs_create` would build it happily, but the
+    // app shows nothing, which reads as a failed install. Underscore names are
+    // scaffolding (`_template`), not projects.
+    if let Ok(entries) = std::fs::read_dir(projects_dir()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('_') || !entry.path().join("project.yaml").is_file() {
+                continue;
+            }
+            if let Err(e) = sync_project_row(&state, &name).await {
+                logd!("model-ops: {name} is on disk but did not adopt: {e:?}");
+            }
+        }
+    }
+
     let rows: Vec<ProjectRow> = sqlx::query_as(&crate::db::sql(
         "SELECT id, name, description, manifest_json FROM model_projects ORDER BY name", state.backend)
     )
@@ -1466,6 +1485,25 @@ struct StageOptions {
     init_from: Option<String>,
 }
 
+/// An optional string that becomes a directory name on the worker side.
+///
+/// Same `^[a-zA-Z0-9_-]+$` as a project name, and rejected rather than
+/// sanitised: a caller who asked for `../v1` wants something this endpoint does
+/// not do, and silently rewriting it would train an adapter under a name they
+/// did not ask for.
+fn path_segment(errors: &mut Vec<Value>, body: &Value, field: &str) -> Option<String> {
+    let value = optional_str(errors, body, field)?;
+    if !value.is_empty() && !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        errors.push(ApiError::field_error(
+            field,
+            "string_pattern_mismatch",
+            "String should match pattern '^[a-zA-Z0-9_-]+$'",
+        ));
+    }
+    Some(value)
+}
+
 impl BuildRequest {
     /// `ModelBuildJobCreateRequest`. `stages` defaults to all four, and an
     /// unknown stage is a 422 rather than a runtime `ValueError` — the enum is
@@ -1506,8 +1544,13 @@ impl BuildRequest {
         let register_alias = optional_str(&mut errors, body, "register_alias");
         let offline_eval = lax_bool(&mut errors, body, "offline_eval");
         let process_id = crate::wire::lax_int(&mut errors, body, "process_id");
-        let adapter_version = optional_str(&mut errors, body, "adapter_version");
-        let init_from = optional_str(&mut errors, body, "init_from");
+        // Both are joined onto a path by the worker — `adapters/<version>` is
+        // created and written to, `adapters/<init_from>` is read — so they get
+        // the same charset a project name gets in `projects_create`. Escaping
+        // them into the Python literal stops code injection but not a `..`,
+        // and the value is still a path segment on the other side of it.
+        let adapter_version = path_segment(&mut errors, body, "adapter_version");
+        let init_from = path_segment(&mut errors, body, "init_from");
         // Absent means resume, because the caller who did not think about it
         // wants the two hours back. `"resume": false` is how you force a clean
         // run; `lax_bool` reads a missing key as false, so the flag is read
@@ -2378,6 +2421,36 @@ mod tests {
         .unwrap();
         assert_eq!(script.matches("train(").count(), 1, "{script}");
         assert!(script.contains(r#"init_from="v1\"); import os; os.system(\"id""#), "{script}");
+    }
+
+    /// The escaping in `stage_script` keeps a hostile value inside its Python
+    /// literal, and that is not enough on its own: `../../x` needs no quote to
+    /// escape and is a valid path segment once the worker joins it. The
+    /// endpoint refuses it.
+    #[test]
+    fn a_traversing_adapter_name_is_a_400() {
+        let ok = json!({"project": "p", "stages": ["train"], "adapter_version": "v2", "init_from": "v1"});
+        let parsed = BuildRequest::parse(&ok).expect("plain names are accepted");
+        assert_eq!(parsed.options.adapter_version.as_deref(), Some("v2"));
+        assert_eq!(parsed.options.init_from.as_deref(), Some("v1"));
+
+        for (field, value) in [
+            ("adapter_version", "../../../etc"),
+            ("adapter_version", "v1/../../x"),
+            ("init_from", "../v1"),
+            ("init_from", "a b"),
+        ] {
+            let mut body = json!({"project": "p", "stages": ["train"]});
+            body[field] = Value::from(value);
+            let err = BuildRequest::parse(&body)
+                .err()
+                .unwrap_or_else(|| panic!("{field}={value:?} was accepted"));
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY, "{field}={value:?}");
+        }
+
+        // Empty is "not supplied", the same as absent — not a pattern failure.
+        let empty = json!({"project": "p", "stages": ["train"], "adapter_version": ""});
+        assert_eq!(BuildRequest::parse(&empty).unwrap().options.adapter_version, None);
     }
 
     /// A project name with a quote in it must not break out of the literal.
