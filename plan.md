@@ -98,6 +98,66 @@ pointed elsewhere.
 
 ## Backlog
 
+- **A JSON client can resolve a pending call, and a drifted Postgres takes a
+  write again — landed 2026-08-30.** Both halves came from the same place: a
+  JetBrains plugin driving the Coder agent over plain JSON, which could start a
+  turn and then not finish one.
+  - **`POST /api/v1/coder/chat/approve/send`** is the non-streaming twin of
+    `/approve`, the way `send` is to `stream`. `/send` already hands back a
+    `pending_call` that only an SSE client could answer, so a JSON-only client
+    had two options — approve everything up front with
+    `auto_approve_commands`, or park the thread forever. Neither is a
+    permission model.
+  - The two now share `run_approval`, which takes the [`Emitter`] and returns
+    the outcome instead of finishing either way itself; `Emitter::Discard` is
+    what makes the JSON twin free rather than a third copy of the resume
+    logic. `chat_approve` lost ~90 lines to it and kept its behaviour — the
+    error frames, the mid-call disconnect that still commits its tool result,
+    and `finish_stream`'s own `ClientGone` handling, which the old copy
+    duplicated. `openapi.json` gained the route, so the drift test covers it,
+    and `coder_tools_cap` lists it because the caps live on a call both routes
+    make.
+  - **`0008_timestamp_columns_to_text`** repairs a database Alembic built.
+    `wire::sql_now()` binds a string and a `TIMESTAMP` column refuses it
+    ("column is of type timestamp without time zone but expression is of type
+    text"), which 500ed every write to a drifted column —
+    `POST /api/v1/teams` is where it was found, not what was special about it.
+    `0001_initial.sql` could never fix it: `CREATE TABLE IF NOT EXISTS` skips a
+    table that already exists. The migration converts only the 33 tables this
+    schema declares, by name, and only columns that are still a timestamp — a
+    no-op on a database built from `0001_initial.sql`, and idempotent on the
+    second start. `to_char(…, 'YYYY-MM-DD HH24:MI:SS.US')` preserves existing
+    values in `sql_now()`'s own fixed-width format, and a
+    `DEFAULT CURRENT_TIMESTAMP` comes off before the type change and goes back
+    after, because a default is what blocks the `ALTER` outright.
+  - `postgres_schema::a_legacy_timestamp_column_is_converted_and_then_takes_a_string`
+    builds the Alembic shape in a scratch schema and asserts both halves of
+    repaired: the column is `text`, and the row that was already there kept its
+    value. **Adding a migration file may not rebuild on its own** — `sqlx`'s
+    rerun-if-changed missed the new file until `db.rs` was touched, and the
+    test failed against the *previous* embedded set while the file sat right
+    there. Touch `db.rs` if a new migration appears not to run.
+
+- **Taking the port back from a stale server — landed 2026-08-28.** The
+  port-conflict banner grows a **Stop that server** button:
+  `shell::take_port` reads the listening pid out of `netstat -ano -p TCP`,
+  and kills it **only** when its image is `agent-platformd` — the app never
+  binds the port itself, so accepting our own executable's name would widen
+  what this may kill without ever matching a real holder. Anything else — a
+  Docker port-forward, an unrelated service — is named in the log and left
+  alone, because `PortOwner::Foreign` covers those as readily as a daemon of
+  ours. On a button, never on startup, for the same reason.
+  - `is_our_process` became one line over a new `process_name(pid)`, so the
+    refusal can say *what* it found rather than just that it did not match.
+  - The parse reads the **local** address field and an empty foreign address,
+    never the state word: `LISTENING` is localized, and a client of ours
+    connected out to the same port number carries it in the third column. Both
+    traps are in the unit test, and both appear in real output on this machine.
+  - Three checks: the parse, the refusal (an ephemeral port held by the test
+    binary, which is the case a wider guard would kill), and — `#[ignore]`d
+    beside the GGUF check, because it needs a built daemon and a real port —
+    spawning `agent-platformd` and actually taking the port off it.
+
 - **Job-pipeline task models — first project scaffolded 2026-08-28.**
   [ADR 0015](docs/adr/0015-job-pipeline-task-model.md). `jobhunt-screener` is a
   bundled scaffold under `worker/model_ops/data/projects/` — manifest, input
