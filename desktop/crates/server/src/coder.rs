@@ -64,6 +64,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/v1/coder/chat/stream", post(chat_stream))
         .route("/api/v1/coder/chat/retry", post(chat_retry))
         .route("/api/v1/coder/chat/approve", post(chat_approve))
+        // The JSON twin, so a client that cannot read SSE can still resolve a
+        // pending call - `send` is to `stream` what this is to `approve`.
+        .route("/api/v1/coder/chat/approve/send", post(chat_approve_send))
         .route("/api/v1/coder/chat/tool-result", post(chat_tool_result))
 }
 
@@ -1310,19 +1313,174 @@ async fn chat_retry(
 }
 
 // ---------------------------------------------------------------------------
-// POST /coder/chat/approve
+// POST /coder/chat/approve, and its non-streaming twin
 // ---------------------------------------------------------------------------
 
-async fn chat_approve(
-    State(state): State<Arc<AppState>>,
-    principal: Principal,
-    headers: HeaderMap,
-    // Raw bytes, not `Option<Json<ApprovalRequest>>` — see `require_body`'s
-    // comment.
-    body: axum::body::Bytes,
-) -> Result<Response, ApiError> {
-    require_chat_write(&state, &principal).await?;
-    let body: ApprovalRequest = require_body(&body)?;
+/// Everything resolving a pending call produces that a caller has to persist
+/// or report — and nothing about *how* it was delivered.
+struct ApprovalOutcome {
+    persisted: Persisted,
+    context_usage: ContextUsageOut,
+    usage_steps: Vec<LlmStepUsageOut>,
+    stop: Option<TurnStop>,
+}
+
+/// Run or refuse the call the thread is parked on, thread the result back into
+/// the history, and carry the turn on from there.
+///
+/// The two approve routes differ in exactly two things: where frames go while
+/// this runs, and how the end is reported. Both are the caller's — this takes
+/// an [`Emitter`] and hands back an [`ApprovalOutcome`], so the non-streaming
+/// twin is `Emitter::Discard` rather than a second copy of the logic.
+///
+/// Errors come back as `ApiError` and are the caller's to shape too: the SSE
+/// route renders them as an `error` frame on a 200 stream, the JSON one as the
+/// status they carry.
+async fn run_approval(
+    state: &Arc<AppState>,
+    thread: &ThreadRow,
+    body: &ApprovalRequest,
+    call_id: &str,
+    approve: bool,
+    client_id: Option<&str>,
+    emitter: &Emitter<'_>,
+) -> Result<ApprovalOutcome, ApiError> {
+    let req = &body.common;
+    let pending = thread
+        .pending_call()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "No pending call on this thread."))?;
+    let pending_call_id =
+        pending.get("call_id").and_then(Value::as_str).unwrap_or_default().to_string();
+    if pending_call_id != call_id {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "call_id mismatch: pending is {}",
+                crate::todos::py_repr(pending.get("call_id").unwrap_or(&Value::Null))
+            ),
+        ));
+    }
+
+    // `resolve_pending_call` passes `None` for the requested root — the
+    // thread's own workspace is the only one a resume may run in.
+    let root = resolve_workspace(thread, None)?;
+    let executor = build_executor(
+        &root,
+        thread.id,
+        client_id,
+        // `allow_commands` defaults to **True** on this route: the user has
+        // just approved the command, so the session-level switch is not
+        // consulted again.
+        true,
+        req.delegate_tools,
+    )?;
+
+    let mut history = thread.messages();
+    let mut llm_messages =
+        llm_messages_from_history_with_mode(&history, req.mode_instruction.as_deref());
+    let context_usage = coder_context_usage(&llm_messages);
+    let mut outcome = TurnOutcome::default();
+
+    let name = pending.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+    let mut args = pending.get("arguments").cloned().filter(Value::is_object).unwrap_or(json!({}));
+    if name == "run_command" {
+        if let Some(edited) = &body.edited_command {
+            let original =
+                args.get("command").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+            let edited = edited.trim();
+            if !edited.is_empty() && edited != original && is_command_override(&original, edited) {
+                args["command"] = json!(edited);
+            }
+        }
+    }
+
+    /// The turn is over before it started: the client hung up. Persist what
+    /// the thread already had rather than losing the pending call with it.
+    fn client_gone(thread: &ThreadRow, history: Vec<Value>, pending: Option<Value>) -> Persisted {
+        Persisted {
+            thread_id: thread.id,
+            title: thread.title.clone(),
+            workspace_root: thread.workspace_root.clone(),
+            model: thread.model.clone(),
+            messages: history,
+            pending,
+        }
+    }
+
+    let result = if approve {
+        if !emitter.emit(
+            "tool_call",
+            json!({ "call_id": pending_call_id, "name": name, "arguments": args }),
+        ) {
+            return Ok(ApprovalOutcome {
+                persisted: client_gone(thread, history, thread.pending_call()),
+                context_usage,
+                usage_steps: Vec::new(),
+                stop: Some(TurnStop::ClientGone),
+            });
+        }
+        executor.execute(state, &name, &args, &pending_call_id).await
+    } else {
+        "Error: command rejected by the user.".to_string()
+    };
+    let result = truncate_text_to_tokens(&result, tool_result_soft_cap_tokens());
+    let tool_msg = json!({
+        "role": "tool",
+        "tool_call_id": pending_call_id,
+        "name": name,
+        "content": result,
+    });
+    llm_messages.push(tool_msg.clone());
+    outcome.new_history.push(tool_msg);
+    if !emitter.emit("tool_result", json!({ "name": name, "content": result })) {
+        // A disconnect here still commits the tool result, the way the
+        // generator's `finally` does.
+        history.extend(std::mem::take(&mut outcome.new_history));
+        return Ok(ApprovalOutcome {
+            persisted: client_gone(thread, history, None),
+            context_usage,
+            usage_steps: Vec::new(),
+            stop: Some(TurnStop::ClientGone),
+        });
+    }
+
+    let remaining = match pending.get("remaining") {
+        Some(Value::Array(calls)) => parse_tool_calls_raw(calls),
+        _ => Vec::<ToolCall>::new(),
+    };
+    // `model or thread.model` — this route falls back to whatever the thread
+    // was last driven with, which the others do not.
+    let mut options = req.turn_options();
+    options.model = req.model.clone().filter(|m| !m.is_empty()).or(thread.model.clone());
+    // `resolve_pending_call` never passes `plan`: the plan, if there was one,
+    // is already in the history this resume picks up from.
+    options.plan = false;
+
+    let stop =
+        run_agent_turn(state, &mut llm_messages, &executor, &options, Some(remaining), emitter, &mut outcome)
+            .await;
+
+    history.extend(std::mem::take(&mut outcome.new_history));
+    Ok(ApprovalOutcome {
+        persisted: Persisted {
+            thread_id: thread.id,
+            title: thread.title.clone(),
+            // `_persist` here does **not** write `workspace_root` or `model`,
+            // unlike the other two — the resume keeps whatever the row had.
+            workspace_root: thread.workspace_root.clone(),
+            model: thread.model.clone(),
+            messages: history,
+            pending: outcome.pending,
+        },
+        context_usage,
+        usage_steps: outcome.usage_steps,
+        stop: stop.err(),
+    })
+}
+
+/// Validation both approve routes do before either touches the thread.
+fn approval_request(body: &axum::body::Bytes) -> Result<ApprovalRequest, ApiError> {
+    let body: ApprovalRequest = require_body(body)?;
     let mut errors = Vec::new();
     if body.thread_id.is_none() {
         errors.push(ApiError::field_error("thread_id", "missing", "Field required"));
@@ -1338,9 +1496,78 @@ async fn chat_approve(
     // Same as `chat_retry`: the caps live on `validate_tools`, and this route
     // does not go through `SendRequest::validate`.
     body.common.validate_tools(&mut errors);
-    if !errors.is_empty() {
-        return Err(ApiError::validation(errors));
+    if errors.is_empty() {
+        Ok(body)
+    } else {
+        Err(ApiError::validation(errors))
     }
+}
+
+/// `POST /coder/chat/approve/send` — the non-streaming twin, the same shape as
+/// `send` is to `stream`.
+///
+/// A client that speaks plain JSON can now resolve a pending call as well as
+/// start one. Without this, `send` could hand back a `pending_call` that only
+/// an SSE client could ever answer, so a JSON-only client had two options:
+/// approve everything up front, or park the thread forever.
+async fn chat_approve_send(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    // Raw bytes, not `Option<Json<ApprovalRequest>>` — see `require_body`'s
+    // comment.
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    require_chat_write(&state, &principal).await?;
+    let body = approval_request(&body)?;
+    require_master_key_configured(&state)?;
+
+    let thread_id = body.thread_id.unwrap_or_default();
+    let call_id = body.call_id.clone().unwrap_or_default();
+    let approve = body.approve.unwrap_or_default();
+    let thread = get_thread_by_id(&state, &principal, thread_id).await?;
+
+    let outcome = run_approval(
+        &state,
+        &thread,
+        &body,
+        &call_id,
+        approve,
+        client_header(&headers).as_deref(),
+        &Emitter::Discard,
+    )
+    .await?;
+
+    // Same rule as `chat_send`: a failed turn persists nothing and answers with
+    // the error. `ClientGone` cannot happen here - nothing is streaming.
+    if let Some(TurnStop::Failed(err)) = outcome.stop {
+        return Err(err);
+    }
+    outcome.persisted.write(&state).await?;
+
+    let usage = serde_json::to_value(merge_llm_usages(outcome.usage_steps)).unwrap_or(Value::Null);
+    crate::executor::record_api_token_usage(
+        &state,
+        principal.token_id,
+        usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
+        usage.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
+        false,
+    )
+    .await;
+
+    Ok(Json(done_payload(&outcome.persisted, &outcome.context_usage, &usage)).into_response())
+}
+
+async fn chat_approve(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    // Raw bytes, not `Option<Json<ApprovalRequest>>` — see `require_body`'s
+    // comment.
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    require_chat_write(&state, &principal).await?;
+    let body = approval_request(&body)?;
     require_master_key_configured(&state)?;
 
     let thread_id = body.thread_id.unwrap_or_default();
@@ -1353,152 +1580,37 @@ async fn chat_approve(
     let token_id = principal.token_id;
 
     tokio::spawn(async move {
-        let req = &body.common;
-        // Both of these are `error` frames with no `done`, and neither is an
-        // HTTP status: a client that asks about a call the server has forgotten
-        // gets a 200 stream saying so.
-        let Some(pending) = thread.pending_call() else {
-            let _ = tx.send(sse("error", &json!({ "detail": "No pending call on this thread." })));
-            return;
-        };
-        let pending_call_id =
-            pending.get("call_id").and_then(Value::as_str).unwrap_or_default().to_string();
-        if pending_call_id != call_id {
-            let detail = format!(
-                "call_id mismatch: pending is {}",
-                crate::todos::py_repr(pending.get("call_id").unwrap_or(&Value::Null))
-            );
-            let _ = tx.send(sse("error", &json!({ "detail": detail })));
-            return;
-        }
-
-        // `resolve_pending_call` passes `None` for the requested root — the
-        // thread's own workspace is the only one a resume may run in.
-        let setup = resolve_workspace(&thread, None).and_then(|root| {
-            build_executor(
-                &root,
-                thread.id,
-                client_id.as_deref(),
-                // `allow_commands` defaults to **True** on this route: the user
-                // has just approved the command, so the session-level switch is
-                // not consulted again.
-                true,
-                req.delegate_tools,
-            )
-        });
-        let executor = match setup {
-            Ok(executor) => executor,
+        let outcome = run_approval(
+            &state,
+            &thread,
+            &body,
+            &call_id,
+            approve,
+            client_id.as_deref(),
+            &Emitter::Sse(&tx),
+        )
+        .await;
+        // Every setup failure is an `error` frame with no `done`, and none is
+        // an HTTP status: a client that asks about a call the server has
+        // forgotten gets a 200 stream saying so.
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
             Err(err) => {
                 let _ = tx.send(sse("error", &json!({ "detail": err.message })));
                 return;
             }
         };
-
-        let mut history = thread.messages();
-        let mut llm_messages =
-            llm_messages_from_history_with_mode(&history, req.mode_instruction.as_deref());
-        let context_usage = coder_context_usage(&llm_messages);
-        let mut outcome = TurnOutcome::default();
-
-        let name = pending.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
-        let mut args = pending.get("arguments").cloned().filter(Value::is_object).unwrap_or(json!({}));
-        if name == "run_command" {
-            if let Some(edited) = &body.edited_command {
-                let original = args
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                let edited = edited.trim();
-                if !edited.is_empty() && edited != original && is_command_override(&original, edited)
-                {
-                    args["command"] = json!(edited);
-                }
-            }
-        }
-
-        let result = if approve {
-            if !tx
-                .send(sse(
-                    "tool_call",
-                    &json!({ "call_id": pending_call_id, "name": name, "arguments": args }),
-                ))
-                .is_ok()
-            {
-                return;
-            }
-            executor.execute(&state, &name, &args, &pending_call_id).await
-        } else {
-            "Error: command rejected by the user.".to_string()
-        };
-        let result = truncate_text_to_tokens(&result, tool_result_soft_cap_tokens());
-        let tool_msg = json!({
-            "role": "tool",
-            "tool_call_id": pending_call_id,
-            "name": name,
-            "content": result,
-        });
-        llm_messages.push(tool_msg.clone());
-        outcome.new_history.push(tool_msg);
-        if tx.send(sse("tool_result", &json!({ "name": name, "content": result }))).is_err() {
-            // A disconnect here still commits the tool result, the way the
-            // generator's `finally` does.
-            history.extend(std::mem::take(&mut outcome.new_history));
-            let persisted = Persisted {
-                thread_id: thread.id,
-                title: thread.title.clone(),
-                workspace_root: thread.workspace_root.clone(),
-                model: thread.model.clone(),
-                messages: history,
-                pending: None,
-            };
-            let _ = persisted.write(&state).await;
-            return;
-        }
-
-        let remaining = match pending.get("remaining") {
-            Some(Value::Array(calls)) => parse_tool_calls_raw(calls),
-            _ => Vec::<ToolCall>::new(),
-        };
-        // `model or thread.model` — this route falls back to whatever the
-        // thread was last driven with, which the others do not.
-        let mut options = req.turn_options();
-        options.model = req.model.clone().filter(|m| !m.is_empty()).or(thread.model.clone());
-        // `resolve_pending_call` never passes `plan`: the plan, if there was
-        // one, is already in the history this resume picks up from.
-        options.plan = false;
-
-        let stop = run_agent_turn(
-            &state,
-            &mut llm_messages,
-            &executor,
-            &options,
-            Some(remaining),
-            &Emitter::Sse(&tx),
-            &mut outcome,
-        )
-        .await;
-
-        history.extend(std::mem::take(&mut outcome.new_history));
-        let persisted = Persisted {
-            thread_id: thread.id,
-            title: thread.title.clone(),
-            // `_persist` here does **not** write `workspace_root` or `model`,
-            // unlike the other two — the resume keeps whatever the row had.
-            workspace_root: thread.workspace_root.clone(),
-            model: thread.model.clone(),
-            messages: history,
-            pending: outcome.pending,
-        };
+        // `ClientGone` needs no special case here: `finish_stream` persists
+        // first and only then decides whether anyone is left to send `done`
+        // to, which is what commits a tool result the caller hung up on.
         finish_stream(
             &state,
             &tx,
             token_id,
-            &persisted,
-            &context_usage,
+            &outcome.persisted,
+            &outcome.context_usage,
             outcome.usage_steps,
-            stop.err(),
+            outcome.stop,
         )
         .await;
     });

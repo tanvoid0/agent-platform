@@ -9597,6 +9597,80 @@
     }
    }
   },
+  "/api/v1/coder/chat/approve/send": {
+   "post": {
+    "tags": [
+     "coder"
+    ],
+    "summary": "Coder Chat Approve Send",
+    "description": "Resolve a run_command call that paused for approval and resume the agent turn, answering with one JSON body instead of an SSE stream.",
+    "operationId": "coder_chat_approve_send_api_v1_coder_chat_approve_send_post",
+    "parameters": [
+     {
+      "name": "authorization",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "Authorization"
+      }
+     },
+     {
+      "name": "X-Agent-Platform-Client",
+      "in": "header",
+      "required": false,
+      "schema": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "title": "X-Agent-Platform-Client"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/CoderApprovalRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      }
+     },
+     "422": {
+      "description": "Validation Error",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
   "/api/v1/coder/chat/tool-result": {
    "post": {
     "tags": [

@@ -55,13 +55,21 @@ fn first_error_loc(body: &str) -> String {
 
 /// Bodies that satisfy each route's *other* required fields, so the only thing
 /// left to reject is `tools`.
-fn routes() -> [(&'static str, Value); 4] {
+fn routes() -> [(&'static str, Value); 5] {
     [
         ("/api/v1/coder/chat/send", json!({"message": "hi", "thread_id": 1})),
         ("/api/v1/coder/chat/stream", json!({"message": "hi", "thread_id": 1})),
         ("/api/v1/coder/chat/retry", json!({"thread_id": 1})),
         (
             "/api/v1/coder/chat/approve",
+            json!({"thread_id": 1, "call_id": "c1", "approve": true}),
+        ),
+        // The JSON twin shares `approval_request` with the streaming one, which
+        // is exactly why it is listed: the caps live on a call both make, and a
+        // route that stopped making it would look fine until a caller sent 65
+        // tool specs to it.
+        (
+            "/api/v1/coder/chat/approve/send",
             json!({"thread_id": 1, "call_id": "c1", "approve": true}),
         ),
     ]
