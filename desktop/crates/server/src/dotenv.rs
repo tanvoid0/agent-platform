@@ -122,17 +122,61 @@ fn apply_missing(values: &HashMap<String, String>, skip: &[&str]) -> usize {
 /// expansion, no multi-line values. Matches every `.env` this repo ships; widen
 /// it the day one of those appears rather than porting a whole dotenv dialect.
 fn parse_file(path: &Path) -> HashMap<String, String> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Ok(bytes) = std::fs::read(path) else {
         return HashMap::new();
     };
-    if raw.contains('\0') {
-        logd!(
-            "{} contains NUL bytes — it was written as UTF-16 (PowerShell `>>` does this). \
-             Parsing anyway with the NULs stripped; rewrite it as UTF-8.",
-            path.display()
-        );
+    // Lossy, not `read_to_string`: a UTF-16 file with any non-ASCII character
+    // in it is not valid UTF-8, and returning an empty map there would lose the
+    // operator's whole configuration silently. Read-only on purpose - the
+    // repair is `repair_env_encoding`, which only `main` calls.
+    parse_env_text(&String::from_utf8_lossy(&bytes))
+}
+
+/// Rewrite a mis-encoded `.env` as UTF-8, once, before anything reads it.
+///
+/// PowerShell's `>>` appends UTF-16LE, so a `.env` extended that way is UTF-8
+/// down to the last redirect and NUL-interleaved after it. Warning about that
+/// on every boot fixed nothing - the file stayed broken and the message became
+/// scenery - so the daemon now repairs the file. The original is kept beside it
+/// the first time, because this is the operator's credentials and a bad guess
+/// must not be the only copy.
+///
+/// **Called from `main` only, never from a read path.** It writes to the
+/// operator's `.env`, and `tests/postgres_schema.rs` calls `load_env_files` to
+/// find `DATABASE_URL` - a test run must not edit that file.
+pub fn repair_env_encoding() {
+    let Some(root) = server_root() else { return };
+    repair_file(&root.join(".env"));
+}
+
+/// ponytail: repair is "drop the NULs and BOMs", not a real UTF-16 decode. It
+/// is exactly right for the ASCII these files hold and for the mixed-encoding
+/// shape `>>` produces, which a whole-file UTF-16 decode would mangle. A `.env`
+/// with non-ASCII in it needs `encoding_rs`; nothing here has one.
+fn repair_file(path: &Path) {
+    let Ok(bytes) = std::fs::read(path) else { return };
+    let raw = String::from_utf8_lossy(&bytes);
+    if !raw.contains('\0') && !raw.contains('\u{feff}') {
+        return;
     }
-    parse_env_text(&raw)
+    let backup = path.with_extension("utf16.bak");
+    if !backup.exists() {
+        if let Err(e) = std::fs::write(&backup, &bytes) {
+            // No backup, no rewrite. The NULs are stripped at parse time
+            // anyway, which is the old behaviour and is not worth risking a
+            // lost `.env` to improve on.
+            logd!("{} is mis-encoded but could not be backed up ({e}); leaving it alone", path.display());
+            return;
+        }
+    }
+    match std::fs::write(path, raw.replace(['\0', '\u{feff}'], "").as_bytes()) {
+        Ok(()) => logd!(
+            "{} was UTF-16 (PowerShell `>>` does this); rewrote it as UTF-8, original at {}",
+            path.display(),
+            backup.display()
+        ),
+        Err(e) => logd!("{} is mis-encoded and could not be rewritten ({e})", path.display()),
+    }
 }
 
 /// The `env:` block of `config/agent_platform.yaml`, stringified the way
@@ -222,6 +266,25 @@ mod tests {
         let map = parse_file(&path);
         assert_eq!(map["AGP_TEST_PLAIN"], "utf8");
         assert_eq!(map["AGP_TEST_NUL"], "utf16");
+
+        // Repair is a separate, explicit step: reading must never write.
+        assert!(std::fs::read(&path).unwrap().contains(&0), "parse_file rewrote the file");
+
+        repair_file(&path);
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(!on_disk.contains(&0), "the file itself was not fixed");
+        assert_eq!(parse_file(&path), map, "the repaired file parses the same");
+        assert!(
+            std::fs::read(path.with_extension("utf16.bak")).unwrap().contains(&0),
+            "the mis-encoded original was not kept"
+        );
+        // Second boot: nothing left to do, and the backup is not overwritten
+        // with the already-repaired copy.
+        repair_file(&path);
+        assert!(
+            std::fs::read(path.with_extension("utf16.bak")).unwrap().contains(&0),
+            "the backup was clobbered on the second pass"
+        );
 
         let mut raw = HashMap::new();
         raw.insert("AGP_TEST_RAW\0NUL".to_string(), "x".to_string());

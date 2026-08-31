@@ -484,7 +484,21 @@ impl Shell {
         match self.server.as_mut() {
             None => false,
             Some(child) => match child.try_wait() {
-                Ok(Some(_)) => {
+                // The status used to be dropped here, so a server that refused
+                // to start — a bad `DATABASE_URL`, an edited migration, a taken
+                // port — left the app showing "not running" and nothing else.
+                // The daemon's own reason is already in this ring, drained off
+                // its stderr; this line is what says the exit was real and
+                // final rather than a slow boot.
+                Ok(Some(status)) => {
+                    self.log_line(format!("[shell] the server exited ({}), see the lines above for why", describe(status)));
+                    self.server = None;
+                    false
+                }
+                Err(e) => {
+                    // Cannot reap it: treat as gone rather than claiming a
+                    // health we cannot observe.
+                    self.log_line(format!("[shell] lost track of the server process ({e})"));
                     self.server = None;
                     false
                 }
@@ -647,6 +661,24 @@ mod job {
 
 /// Drains a child pipe into the ring on its own thread. Not optional: a child
 /// whose output nobody reads blocks once the OS pipe buffer fills.
+
+/// `exit code 2` / `signal 9`, or a bare status when the platform has neither.
+/// `ExitStatus`'s own Display is "exit code: 2" on Windows and "signal: 9
+/// (SIGKILL)" on unix; this keeps one shape for the log.
+fn describe(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit code {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("signal {sig}");
+        }
+    }
+    status.to_string()
+}
+
 fn drain_into_log<R: Read + Send + 'static>(log: Arc<Mutex<LogRing>>, stream: R) {
     std::thread::spawn(move || {
         for line in BufReader::new(stream).lines() {

@@ -202,10 +202,39 @@ pub fn connect_lazy(url: &str, backend: Backend) -> AnyPool {
 /// next migration — worth adding reversibility the first time a release
 /// actually has to be undone, not before.
 pub async fn ensure_schema(pool: &AnyPool) -> Result<(), sqlx::Error> {
-    migrator(backend_of(pool))
-        .run(pool)
-        .await
-        .map_err(sqlx::Error::from)
+    let backend = backend_of(pool);
+    migrator(backend).run(pool).await.map_err(|e| explain_migrate_failure(backend, e))
+}
+
+/// sqlx's own migration errors name a version and nothing else - "migration 9
+/// was previously applied but has been modified" is true, and leaves the reader
+/// to work out which file, why it is fatal, and what to do. This is the last
+/// thing the daemon says before it exits, so it says all three.
+fn explain_migrate_failure(backend: Backend, e: sqlx::migrate::MigrateError) -> sqlx::Error {
+    let dir = match backend {
+        Backend::Sqlite => "sqlite",
+        Backend::Postgres => "postgres",
+    };
+    let hint = match &e {
+        sqlx::migrate::MigrateError::VersionMismatch(v) => Some(format!(
+            "migrations/{dir}/{v:04}_*.sql was edited after it was applied to this database. \
+             An applied migration is checksummed and must not change (see CLAUDE.md). Either \
+             restore that file to the version that was applied, or - if the schema it produces \
+             is unchanged - re-stamp the row in `_sqlx_migrations` for version {v}."
+        )),
+        sqlx::migrate::MigrateError::VersionMissing(v) => Some(format!(
+            "this database has migration {v} applied but migrations/{dir}/ no longer contains it, \
+             so it was built by a newer or different build than this one."
+        )),
+        _ => None,
+    };
+    let message = match hint {
+        Some(hint) => format!("the database schema could not be brought up to date: {e}. {hint}"),
+        None => format!("the database schema could not be brought up to date: {e}"),
+    };
+    // Boxed as a protocol error: the caller logs the message and exits, and
+    // nothing branches on the variant.
+    sqlx::Error::Protocol(message)
 }
 
 static SQLITE_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");

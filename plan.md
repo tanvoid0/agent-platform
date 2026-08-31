@@ -100,6 +100,31 @@ pointed elsewhere.
 
 ## Backlog
 
+- **The API document is readable from another repo, and a failed start says why
+  — landed 2026-08-31.** All four found by pointing a second project
+  (`portal_equalizer`) at this server and watching what it could not work out.
+  - **`GET /openapi.json` is 400 KB**, which is more than an agent in another
+    repo can afford to read to find one route, so it stayed unread and that repo
+    guessed. `?index` is now the table of contents — one line per operation,
+    grouped by tag, 14 KB — and `?tag=todos,projects` a valid document holding
+    only those paths with `components.schemas` pruned to their transitive `$ref`
+    closure. No params still serves the same bytes. Two tests: no operation is
+    dropped from the index, no tag view carries a dangling `$ref`.
+  - **A mis-encoded `.env` was warned about on every boot and fixed by nobody.**
+    PowerShell's `>>` appends UTF-16LE, so the file is UTF-8 down to the last
+    redirect and NUL-interleaved after it. `dotenv::repair_env_encoding` rewrites
+    it as UTF-8 with the original kept at `.env.utf16.bak`. **Called from `main`
+    only** — the first version repaired inside `parse_file`, and
+    `tests/postgres_schema.rs` calls `load_env_files` to find `DATABASE_URL`, so
+    a test run edited the operator's credentials file.
+  - **The app threw away the daemon's exit status.** `shell::server_running`
+    matched `Ok(Some(_))`, so a server that refused to start left the UI showing
+    "not running" and no reason. It logs the status now, and a failed `try_wait`
+    no longer reports a process it cannot see as healthy.
+  - **`ensure_schema` passed sqlx's error through verbatim.** "migration 9 was
+    previously applied but has been modified" names a version and leaves the
+    reader to find the file, the rule, and the way out; it now names all three.
+
 - **The Processes screen reads as a log you can act on — landed 2026-08-30.**
   Found by looking at the Events tab on a real run: raw markdown in one mono
   wall, the type badge and timestamp squeezed against it.
