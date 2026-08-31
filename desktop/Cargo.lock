@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "agent-platform-desktop"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "agent-platform-client",
  "agent-platform-local-llm",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "agent-platform-server"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "async-stream",
  "axum",
