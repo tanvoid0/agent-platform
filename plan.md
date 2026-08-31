@@ -46,6 +46,8 @@ than died, is the section below.
 | Workspaces, files, documents | `workspaces.rs`, `workspace_files.rs`, `documents.rs` (upload ingest + PDF extraction) |
 | Model ops (Ollama, registry, build jobs) | `model_ops.rs` — all seventeen routes and the stage runner; the pipeline itself is `worker/model_ops/pipeline/` |
 | Image/video generation | `media.rs` (the seam + the ComfyUI adapter) + `media_templates/*.json`, `media_sdcpp.rs` (the sd-server adapter) + `media_sdcpp_process.rs` (its lifecycle, over `managed_server.rs`); desktop `studio.rs`/`studio_view.rs` ([ADR 0009](docs/adr/0009-local-media-generation.md), [ADR 0011](docs/adr/0011-stable-diffusion-cpp-media-backend.md)) |
+| Social ads (Studio → Social ads tab) | `ads.rs` — the platform sizes, the marketing roster, the copy pass, `ad_campaigns` and `project.brand_json`; draws through `media::start_job`. Desktop `studio_ads.rs`/`studio_ads_view.rs`, nested in `studio.rs`'s state ([ADR 0017](docs/adr/0017-social-advertisements.md)) |
+| Downloads (every model file the app fetches) | `desktop/crates/app/src/downloads.rs` (queue, 3 at a time, promote/retry/cancel) + `downloads_view.rs` (the screen, and the rows Studio and Settings embed); `model_download.rs` is the single-URL engine underneath |
 | Logs, status | `observability.rs` (the ring `logd!` writes to), `system.rs` (`/system/status`, `/system/logs`) |
 | Resource modes, AI-call priority, machine meters | `resources.rs` (`Limits`, the two lanes, the host/GPU sampler, `/system/resources`); gated at `llm::complete_internal` and `llm::chat_completions`; desktop Settings → Performance (`machine_view` in `screen.rs`) and the sidebar monitor ([ADR 0010](docs/adr/0010-resource-modes-and-ai-call-priority.md)) |
 | Env seeding, correlation ids | `dotenv.rs`, `request_id.rs` |
@@ -97,6 +99,240 @@ pointed elsewhere.
   `GET /processes/{id}`. Desktop gates its detail polling on the stream.
 
 ## Backlog
+
+- **The Processes screen reads as a log you can act on — landed 2026-08-30.**
+  Found by looking at the Events tab on a real run: raw markdown in one mono
+  wall, the type badge and timestamp squeezed against it.
+  - **The events feed asked the wrong question every poll.**
+    `GET /processes/{id}/events` is a *forward* cursor (`id > after_id`, ASC,
+    server-capped at 2000). The app passed `after_id = 0` on every 800ms tick,
+    so a run past 2000 events showed its **oldest** 2000 for ever and never its
+    latest. It now appends from `State::event_cursor`, drains a full page
+    immediately instead of one page per tick (gated on the cursor moving, so a
+    page of ids already held cannot loop), keeps the newest 5000, and says on
+    screen how many older ones were dropped. Export still walks the whole log.
+  - **Events render as markdown, and only one at a time.** Rows are a pill line
+    (type, `task N`, line count, relative time) over a one-line summary; the
+    body opens in a sidebar with Copy and "Open subagent". Only the open event
+    is parsed — parsing all 2000 per poll was the first version of this.
+  - **Approvals stopped needing the modal.** Approve on the board card and in
+    the inspector keeps the agent's own output (an omitted `output` means
+    "keep"); "Approve all (N)" reads the task list rather than the board rows,
+    so a board search cannot narrow the batch. Reject routes through one
+    confirm dialog that states the cost — the server fails the whole run on it —
+    and Esc cancels that dialog before anything else.
+  - **The other tabs caught up.** Board columns fold; the timeline carries
+    per-task durations and a wave wall clock (its slowest task, since a wave is
+    parallel); the summary has elapsed and a done/total meter; the run list
+    filters by text or `#id` with All/Live/Finished scope; task output renders
+    markdown, is capped at 260px, and copies; toolbar actions lose their handler
+    while `busy` rather than only showing a badge.
+  - **Left undone:** the Reject control on a board card is icon-only, no tab
+    explains "wave" or "review gate" to a first-time user, and nothing tests the
+    view layer.
+
+- **A stalled run says what actually stalled it, and auto-approve is a
+  property of the run — landed 2026-08-30.** Both found by reading a real
+  process (agent_2 failed, 11 tasks downstream of it) that reported a graph
+  problem it did not have.
+  - **`DAG deadlock: cyclic dependencies among task(s) …` for a graph with no
+    cycle in it.** `executor::deadlock_reason` bucketed every unmet dependency
+    that was not `failed` as a cycle, so anything two hops downstream of a
+    failed task was named a cycle member. It now propagates blocked-ness from
+    the failed and missing dependencies first, and only what is left — pending,
+    unblocked and still unrunnable — is reported as cyclic. The DAG is
+    Kahn-validated at every write, so in practice this branch names a failed
+    upstream and the fix is to retry it.
+  - **`auto_approve` is a column on `process`** (`0011_process_auto_approve`),
+    not just an argument to `spawn_plan`. It was readable exactly once, at the
+    plan gate, and `sync`/`retry`/startup recovery all re-spawned planning with
+    a hardcoded `false`. It now also gates task review — a `requires_review`
+    task on an auto-approving run completes instead of parking in
+    `awaiting_review` — and `PATCH /api/v1/processes/{id}` flips it mid-run,
+    from the toggle beside Sync on the run's toolbar. Turning it on does not
+    release the gate the run is sitting at now; the executor reads it at the
+    next one.
+
+- **A run you start is visible while it runs, and the clock is right — landed
+  2026-08-30.** Found by driving a real run end to end (plan → approve →
+  execute) against Ollama rather than by reading the code.
+  - **Every timestamp on screen was off by the machine's UTC offset.**
+    `domain::seconds_since` compared `wire::sql_now()` — which is
+    `Utc::now().naive_utc()` — against `chrono::Local::now()`. At UTC+1 a run
+    started two seconds ago read `1h ago`, which also made the buckets look far
+    coarser than they are. Now compared against `Utc::now()`; every caller
+    passes a server-written `created_at`/`updated_at`, so there is no naive
+    local stamp on the other side of it.
+  - **Pressing Start run on Home looked like it did nothing.** Two causes, both
+    fixed: `screen::notice` had no arm for `Screen::Dashboard`, so the
+    `Started run #N.` toast the module raises was silently dropped on the one
+    screen that also hosts the composer; and the "Needs you" card listed only
+    `needs_user` runs, so a run spent its whole planning minute — and its whole
+    execution — showing "No runs waiting on you." It is **Active runs** now:
+    everything `processes::is_live`, blocked ones sorted first and drawn with
+    the kit's `selected` emphasis. Starting from anywhere other than Processes
+    also opens the run it just created, which Back returns from.
+  - **Board cards carried a truncated uuid and nothing else.** Three
+    "Documentation Writer" nodes were three identical cards over
+    `unboring...` — a slug the *planner model* invented, nothing in this repo
+    produces it. The card shows the node's instruction, plus tokens, revisions,
+    a review-gate badge and any per-node model. `ui::wrap_row` is the new kit
+    helper behind it and behind the sidebar footer.
+  - **The run composer said nothing when there were no teams.** A fresh install
+    has none, the picker was empty, and Start run answered "Pick a team first."
+    about an empty list. It now says so and opens Teams.
+  - **`db::backup` and `db::checkpoint` ran SQLite-only statements on every
+    Postgres start and shutdown** — `VACUUM INTO` and
+    `PRAGMA wal_checkpoint(TRUNCATE)`. The first log line of a cloud start was
+    `backup failed: syntax error at or near "INTO"`, which reads like a broken
+    backup rather than like there being no local file to back up. Both bail on
+    `db::backend_of(pool) != Sqlite`.
+  - **A wide DAG wave killed twelve tasks against a Ollama that was running.**
+    `should_retry_transport` refused to retry *any* loopback connection
+    refusal — sound for "the local app is not installed", wrong for a live
+    listener whose accept backlog is full under a 32-node fan-out. One retry
+    now (`LOOPBACK_REFUSAL_ATTEMPTS`), which still costs a dead port only a
+    single backoff. Both halves are asserted against a real refused connect.
+
+- **One download queue for the whole app — landed 2026-08-30.** The GGUF paste
+  box and Studio's Wan installer each owned a handle, a `.part` and a byte count,
+  and the Wan one drained strictly one file at a time behind a single "file 1 of
+  2 · 10% overall" bar. Both now enqueue into `downloads::Downloads`: three
+  transfers at once, a named bar per file, and cancel / retry / promote per row.
+  The rows render the same in Studio's missing-models card, on the Settings
+  local-model card, and on the Downloads screen (sidebar → LIBRARY). A finished
+  job is routed by its `Tag` — a GGUF becomes `local_model_path`, the last Wan
+  file makes Studio re-ask ComfyUI. Providers → the media card's "Model files"
+  button lands here too. Two fetches stay off the queue on purpose: the whisper
+  model (`stt.rs`, 60 MB on the blocking dictation path — putting it on the
+  queue means the first mic press fails and sends the user to another screen)
+  and the updater (`update_check.rs`, whose bytes are one step of a
+  checksum-then-swap; a cancellable transfer there is a broken install). Still
+  deliberately absent: resume (wants a `Range` request and a `.part` size
+  check), speed/ETA, and hash verification — worth doing the first time a 10 GB
+  transfer actually dies.
+
+- **Studio makes social advertisements — landed 2026-08-30.** A second tab on
+  Studio turns a project's brand brief plus a one-line ask into N ads: caption,
+  hashtags, call to action, and a picture sized for where it is going, with the
+  post text one button away. [ADR 0017](docs/adr/0017-social-advertisements.md)
+  is the reasoning; the three decisions worth knowing without reading it:
+  - **The team is a roster rendered into a prompt**, which is what a team
+    already is here (`executor::render_team_context_for_planner`). `ads.rs`
+    carries a four-role social marketing roster — strategist, copywriter, art
+    director, social lead — and a campaign may name any `teamtemplate` row
+    instead. The DAG path was declined for now, not forever: the executor's
+    tool path is deliberately dead and tasknode output has no structured
+    channel, so taking it would have meant reopening a settled decision to
+    ship the first version.
+  - **The server owns the sizes** (`GET /api/v1/ads/platforms`), and every one
+    is a multiple of 16 — `media::snap` would rewrite Instagram's nominal
+    1080×1080 to 1072×1072 in silence. A unit test asserts every preset
+    survives `snap` unchanged, so a 1080 added later fails when it is written.
+  - **Copy is all-or-nothing; pictures are best-effort.** Prose instead of JSON
+    fails the request and starts zero jobs (one blunt retry first). But once
+    the copy exists it is stored even if every picture was refused — the words
+    cost a model round-trip and stand on their own.
+  - Schema: `0009_ad_campaigns` adds `project.brand_json` (a third blob column
+    beside the two the project row already has) and `ad_campaigns`, whose
+    `copy_json` references `media_jobs` ids softly — a pruned picture leaves a
+    variant that renders its words, not a campaign that vanishes.
+  - `media::start_job` was extracted out of the `generate` route handler; it
+    was the only part of a generation another domain could not reach. Same
+    seam, one more caller.
+  - **The installed checkpoint is the real quality ceiling.**
+    `media::choose_checkpoint` falls back to whatever is there, and a bare
+    ComfyUI install has SD 1.5 — a 512² model being asked for 1088 and up,
+    which repeats the subject instead of filling the frame. The Ads tab warns
+    by name (`studio_ads::undersized_model`) rather than blocking: the run does
+    work, it just looks wrong. An unrecognised checkpoint warns about nothing.
+  ### … next steps
+  - **Video ads landed, at a measured size.** `ig_reel` is 720×1280 × 49
+    frames. The numbers behind that, on an RTX 5080 (16 GB) through the
+    server's own `text_to_video.json`: 480×832 in 45s, 720×1280 in 7.2 min,
+    and **1088×1920 — the nominal story size — sampled for 3m24s and then
+    killed the ComfyUI process outright in VAE decode**, which no client can
+    report as a failure. A test caps any video preset at 720×1280 so that
+    cannot come back. Still open: `fps` is fixed at 24 and `length` is capped
+    at 241 frames, so ~10s is the ceiling whatever the size.
+  - **Meta publishing has one hard problem, already visible.** Instagram's
+    container API needs a *publicly reachable* `image_url`; a desktop-local
+    file has none. That needs the Cloud Run deployment (free-tier only) or a
+    temporary upload host, and it has to be designed before the route is real.
+  - **Higgsfield is a third `MediaBackend` arm** per ADR 0011 — probe, submit,
+    poll returning bytes. New needs: an API key inside the adapter, and
+    remote-base semantics (precedented by `media_sdcpp_process`).
+  - The entry below plans to **collapse `ads.rs` onto a modality-dispatching
+    executor** once roles stop being text-only. That is the right end state;
+    the copy pass and the platform table survive it either way.
+
+- **The media backend is a capability provider now — landed 2026-08-30, half of
+  a four-step plan.** ComfyUI/sd.cpp existed only as `media.rs`, invisible to
+  `llm_config`'s capability router, so nothing but `ads.rs` could ask for a
+  picture. Done: a `Modality::VideoGeneration`, a `media_local` `ProviderSpec`
+  (`MEDIA_API_BASE`, `[ImageGeneration, VideoGeneration]`, `sort_order: 0`) so
+  `resolve_provider_for_capability` answers without anyone naming a provider;
+  `/v1/images/generations` pins `image_local` explicitly, because the media
+  backend does not speak that route's OpenAI shape and its door is
+  `POST /media/jobs`; `MEDIA_IMAGE_MODEL` as the image half of the
+  per-modality defaults, and a Media card on Settings → Providers carrying it,
+  the base URL and the reachability badge.
+  ### … next steps
+  - **A task node renders now — landed 2026-08-30, [ADR 0018](docs/adr/0018-modality-routed-task-nodes.md).**
+    `SubagentSpec.modality` / `tasknode.modality` (`text` | `image` | `video`,
+    migration `0010`), dispatched in `executor::execute_task`: text to the chat
+    proxy as before, the other two to `media::generate_and_wait`, which starts
+    the usual job and polls the row. Output stays text (`Generated image (media
+    job 12): /api/v1/media/jobs/12/file`) with `tasknode.media_job_id` as the
+    machine-readable half; failure is `LlmFailure::Llm`, so the node retries.
+    `teams.rs` accepts image and video roles; audio is still shut. The planner
+    prompt documents when to emit one.
+    - Still open: **`ads.rs` has not been collapsed onto this path** — it starts
+      its own `media::start_job` per variant, which is now the second way to
+      make a picture from a team. Worth folding once a campaign wants
+      dependencies between its variants.
+  - **Settings is grouped by modality now — landed 2026-08-30.** The Providers
+    tab is labelled **Models** and reads Text / Images & video / Speech / Other,
+    over a "What runs what" card that names the provider each modality would
+    actually reach — the thing that was previously only visible by making a
+    request. Speech (`SPEECH_API_BASE` / `SPEECH_API_KEY`) got a card at last;
+    it had been in the capability router since the port with nowhere to be set.
+    The `SettingsTab::Providers` variant kept its name — renaming it would touch
+    every nav call site for a label.
+    - Still open: **checkpoint downloads stay on the Downloads screen**, linked
+      from the media card rather than moved. Model ops stays separate on
+      purpose — it makes models rather than routing to them.
+
+- **The app got a Back button, and Settings got a sidebar — landed 2026-08-30.**
+  Three navigation faults, found by clicking through the built app rather than
+  reading it.
+  - **Back.** `App.back` is a `Vec<(Screen, SettingsTab)>` pushed by `Nav`,
+    `NavSettings` and `OpenRun` before they move, popped by `Message::Back`
+    (the sidebar arrow, or Alt+Left). `push_history` skips a hop onto the page
+    you are already on — otherwise pressing one nav entry twice buries the real
+    previous page — and caps at `BACK_MAX`. Back dismisses what is layered over
+    the page first (close prompt, help, notifications, the task review, the
+    provider modal), the way Esc does, but never stops a turn in flight: Back
+    is not a stop button.
+  - **Settings is a sidebar, not a tab strip.** Seven equal segments in the
+    top-left corner said nothing about which of them was a preference
+    (Appearance) and which was a workspace of its own (Model ops), and on a
+    3440px window the strip and the page it controlled were at opposite ends
+    of the eye. `SettingsTab::group()` files each under APP / MODELS / SYSTEM
+    and `screen::settings_shell` draws them as a second nav column, with Logs
+    listed beside them — it is a Settings tab in everything but name, and stays
+    a `Screen` only because the traced-error banners jump to it.
+  - **A screen that names a setting now opens it.** Search said "add a Search
+    API key in Providers" and did nothing about it; the Studio banner said to
+    edit `MEDIA_API_BASE` in a `.env`; a failed run said "LLM proxy returned
+    HTTP 403" and stopped there. Each of those screens gained an
+    `OpenSettings` message, intercepted in `main::update` exactly as
+    `TraceLogs` is, because only `App` owns which screen is open.
+  - Two smaller faults from the same pass: the sidebar footer's six icon
+    buttons overflowed 208px and clipped **Restart app** off the end (it wraps
+    now), and the API tab pointed at a `/tokens` page that has not existed
+    since the Python server (`POST /api/v1/workspaces/{workspace_id}/api-tokens`
+    is what mints one).
 
 - **A JSON client can resolve a pending call, and a drifted Postgres takes a
   write again — landed 2026-08-30.** Both halves came from the same place: a
@@ -241,16 +477,31 @@ pointed elsewhere.
     desktop follows any 3xx to its loopback callback, and the IPv6 loopback
     literal `http://[::1]:…` is accepted (bracket-stripped before `IpAddr`).
 
+- **Desktop: keyed local API — landed 2026-08-31.**
+  [ADR 0019](docs/adr/0019-key-the-local-api.md), superseding the open-loopback
+  half of ADR 0013. The spawn passes `master.key` as
+  `AGENT_PLATFORM_MASTER_KEY`: this server runs commands and holds BYOK
+  provider keys, so an unauthenticated loopback is not the Ollama trade it was
+  filed as. No user-facing setup — the key was already generated on first run.
+  - **Removed five vestigial `master_key.is_none()` 503 guards**
+    (`chat`, `coder`, `coder_loop`, `assistant`, `todos`). They preserved a
+    status Python's HTTP self-call produced; the Rust loop calls
+    `llm::chat_completions` in-process. Under ADR 0013's empty key they made
+    chat, coder and the assistant 503 on every desktop install.
+  - Settings → API / Status and the Account card point at the key instead of
+    saying no token is required.
+
 - **Desktop: open loopback + optional cloud account — landed 2026-08-23.**
-  [ADR 0013](docs/adr/0013-desktop-local-open-cloud-account.md). The iced app
-  no longer injects a master key when it spawns `agent-platformd` — local API
-  is open on loopback like Ollama. Settings → Account magic-links against a
-  hosted origin; the session file is provider `platform` on the local daemon.
-  SQLite and local routes never require a Portal login.
-  - **Spawn sets `AGENT_PLATFORM_MASTER_KEY` empty** so a developer `.env`
-    cannot re-arm it. `host_guard` and off-loopback-requires-key stay.
-  - **Attach-if-running** tries unauthenticated status first, then the leftover
-    install key, so an older keyed daemon is still adopted.
+  [ADR 0013](docs/adr/0013-desktop-local-open-cloud-account.md). Settings →
+  Account magic-links against a hosted origin; the session file is provider
+  `platform` on the local daemon. SQLite and local routes never require a
+  Portal login.
+  - **Spawn set `AGENT_PLATFORM_MASTER_KEY` empty** so a developer `.env` could
+    not re-arm it — superseded by ADR 0019, which passes the install key for the
+    same "`.env` does not decide this" reason. `host_guard` and
+    off-loopback-requires-key stay.
+  - **Attach-if-running** tries unauthenticated status first, then the install
+    key, so a pre-0019 open daemon is still adopted.
   - **Magic-link `redirect_uri`** must be loopback; verify GET 303s tokens to
     the desktop callback. Paste-the-link is the fallback.
   - **Allowlist** includes `agent-platform-desktop`. Cloud `/v1` still gates on

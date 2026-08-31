@@ -63,6 +63,14 @@ impl Backend {
     }
 }
 
+/// Which engine a live pool is talking to. `VACUUM INTO` and
+/// `PRAGMA wal_checkpoint` are SQLite statements; run against Postgres each is
+/// a syntax error, logged on every start and every shutdown, which reads like
+/// the backup broke rather than like there was never a file to back up.
+pub fn backend_of(pool: &AnyPool) -> Backend {
+    Backend::from_url(pool.connect_options().database_url.as_str())
+}
+
 /// Select a boolean column in a form the `Any` driver will decode, aliased back
 /// to its own name. Read it into an `i64` and compare against 0.
 ///
@@ -194,7 +202,7 @@ pub fn connect_lazy(url: &str, backend: Backend) -> AnyPool {
 /// next migration — worth adding reversibility the first time a release
 /// actually has to be undone, not before.
 pub async fn ensure_schema(pool: &AnyPool) -> Result<(), sqlx::Error> {
-    migrator(Backend::from_url(pool.connect_options().database_url.as_str()))
+    migrator(backend_of(pool))
         .run(pool)
         .await
         .map_err(sqlx::Error::from)
@@ -237,6 +245,12 @@ const BACKUP_GENERATIONS: usize = 3;
 /// this process's.
 pub async fn backup(pool: &AnyPool, db_path: &std::path::Path) {
     if crate::env_opt("AGENT_PLATFORM_BACKUP").as_deref() == Some("0") {
+        return;
+    }
+    // Postgres has no local file here to snapshot, and its backups are the
+    // deployment's own. Without this the first log line of every cloud start
+    // was `backup failed: syntax error at or near "INTO"`.
+    if backend_of(pool) != Backend::Sqlite {
         return;
     }
     let Some(dir) = db_path.parent() else { return };
@@ -305,6 +319,10 @@ fn prune_backups(dir: &std::path::Path, stem: &str) {
 /// the difference between copying one small file and one large one, and it is a
 /// single statement at the only moment nothing is writing.
 pub async fn checkpoint(pool: &AnyPool) {
+    // There is no WAL sidecar to fold in on Postgres; see [`backup`].
+    if backend_of(pool) != Backend::Sqlite {
+        return;
+    }
     if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(pool).await {
         logd!("wal checkpoint failed: {e}");
     }

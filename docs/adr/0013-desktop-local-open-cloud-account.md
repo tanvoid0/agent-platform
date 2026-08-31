@@ -4,7 +4,10 @@ Date: 2026-08-23
 
 ## Status
 
-Accepted.
+Accepted; the open-loopback half superseded by
+[ADR 0019](0019-key-the-local-api.md) on 2026-08-31. The desktop spawn now
+passes the install key. Everything below about the cloud account, the session
+file, and provider `platform` still holds.
 
 ## Context
 

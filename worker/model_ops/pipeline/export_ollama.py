@@ -156,7 +156,7 @@ def merge_and_export_gguf(
 
     modelfile_content = f"""{from_line}
 
-PARAMETER temperature 0.4
+PARAMETER temperature 0
 PARAMETER top_p 0.9
 PARAMETER num_ctx 4096
 

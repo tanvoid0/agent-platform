@@ -500,10 +500,15 @@ impl Shell {
         // No args: everything the daemon needs comes through the environment.
         cmd.env("AGENT_PLATFORM_HOST", "127.0.0.1")
             .env("AGENT_PLATFORM_PORT", port.to_string())
-            // Empty, not omitted: load_dotenv does not override a present value,
-            // and a developer `.env` master key would otherwise lock the local
-            // API. Loopback is open like Ollama (ADR 0013).
-            .env("AGENT_PLATFORM_MASTER_KEY", "")
+            // The per-install key, always set so `load_dotenv` (which only fills
+            // gaps) cannot let a developer `.env` decide what the local API
+            // trusts. ADR 0013 spawned this open, like Ollama; ADR 0019 keys it,
+            // because this server is not an inference endpoint — it runs
+            // commands, reads and writes the workspace, and holds the user's
+            // BYOK provider keys and cloud session. Empty only when the key file
+            // could not be read, which degrades to the old open server rather
+            // than to an app that cannot reach its own data.
+            .env("AGENT_PLATFORM_MASTER_KEY", &self.key)
             .env("AGENT_PLATFORM_ENV", "development")
             .env("AGENT_PLATFORM_DB_PATH", self.data_dir.join("agent_platform.db"))
             .env("AGENT_PLATFORM_WORKSPACE_ROOT", self.data_dir.join("workspaces"))
@@ -690,11 +695,11 @@ pub fn health_ok(port: u16) -> bool {
 
 /// Decide whether the server already on the port is one we may adopt.
 ///
-/// An open loopback server (no master key, ADR 0013) answers status without a
-/// bearer and is treated as ours — one listener, like Ollama. A leftover keyed
-/// daemon from an older install still accepts this install's key. Anything else
-/// that is healthy but rejects both is foreign (a Docker forward, another
-/// product).
+/// A daemon of ours answers status with this install's key (ADR 0019). An open
+/// one — a pre-0019 spawn, or a bare `cargo run -p agent-platform-server` — has
+/// no master key and answers without a bearer; still treated as ours, so an
+/// upgrade does not have to kill the process it finds. Anything else that is
+/// healthy but rejects both is foreign (a Docker forward, another product).
 pub fn port_owner(port: u16, key: &str) -> PortOwner {
     if !health_ok(port) {
         return PortOwner::Free;
@@ -708,12 +713,16 @@ pub fn port_owner(port: u16, key: &str) -> PortOwner {
     }
 }
 
-/// Bearer the iced client should send. Empty when the server is open.
+/// Bearer the iced client should send. Empty only when the server on the port
+/// answers unauthenticated — an open daemon from a pre-[ADR 0019] install, still
+/// adopted rather than killed.
+///
+/// `Free` means we are about to spawn one ourselves, and [`Shell::spawn`] gives
+/// it this key.
 pub fn client_key(port: u16, install_key: &str, owner: PortOwner) -> String {
     match owner {
-        PortOwner::Free => String::new(),
         PortOwner::Ours if probe(port, "/api/v1/system/status", None) == Some(200) => String::new(),
-        PortOwner::Ours | PortOwner::Foreign => install_key.to_string(),
+        PortOwner::Free | PortOwner::Ours | PortOwner::Foreign => install_key.to_string(),
     }
 }
 
@@ -766,38 +775,37 @@ fn exe_name() -> String {
         .unwrap_or_else(|| "agent-platform".to_string())
 }
 
-/// Whether `pid` is a live process running this same executable. The name check
-/// matters: pids are recycled, and the file may be days stale.
+/// The image name of a live process, or `None` when the pid is dead. Asking for
+/// the name rather than matching one, because the port takeover needs to *say*
+/// what it found before it refuses to kill it.
 #[cfg(windows)]
-fn is_our_process(pid: u32) -> bool {
+fn process_name(pid: u32) -> Option<String> {
     use std::os::windows::process::CommandExt;
     let mut cmd = Command::new("tasklist");
-    cmd.args([
-        "/FI",
-        &format!("PID eq {pid}"),
-        "/FI",
-        &format!("IMAGENAME eq {}", exe_name()),
-        "/NH",
-        "/FO",
-        "CSV",
-    ])
-    .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    match cmd.output() {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\"")),
-        Err(_) => false,
-    }
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let out = cmd.output().ok()?;
+    // `"agent-platformd.exe","1234","Console",…` on a hit; on a miss tasklist
+    // prints an INFO sentence instead, which has no leading quote to strip.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let name = text.lines().next()?.strip_prefix('"')?.split('"').next()?.to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 #[cfg(not(windows))]
+fn process_name(pid: u32) -> Option<String> {
+    let out = Command::new("ps").args(["-p", &pid.to_string(), "-o", "comm="]).output().ok()?;
+    let comm = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Path::new(&comm)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+}
+
+/// Whether `pid` is a live process running this same executable. The name check
+/// matters: pids are recycled, and the file may be days stale.
 fn is_our_process(pid: u32) -> bool {
-    match Command::new("ps").args(["-p", &pid.to_string(), "-o", "comm="]).output() {
-        Ok(out) => {
-            let comm = String::from_utf8_lossy(&out.stdout);
-            let comm = comm.trim();
-            !comm.is_empty() && Path::new(comm).file_name().map(|n| n == exe_name().as_str()) == Some(true)
-        }
-        Err(_) => false,
-    }
+    process_name(pid).as_deref() == Some(exe_name().as_str())
 }
 
 #[cfg(windows)]
@@ -812,6 +820,86 @@ fn kill_process(pid: u32) {
 #[cfg(not(windows))]
 fn kill_process(pid: u32) {
     let _ = Command::new("kill").arg(pid.to_string()).output();
+}
+
+/// The pid listening on `port`, from the OS's own socket table.
+///
+/// Shelling out for the same reason [`process_name`] and `autostart` do: no
+/// unsafe, no extra `windows-sys` feature, and it runs when a human presses a
+/// button.
+#[cfg(windows)]
+fn port_pid(port: u16) -> Option<u32> {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = Command::new("netstat");
+    cmd.args(["-ano", "-p", "TCP"]).creation_flags(0x0800_0000);
+    let out = cmd.output().ok()?;
+    parse_netstat_pid(&String::from_utf8_lossy(&out.stdout), port)
+}
+
+/// The listening row for `port` in `netstat -ano -p TCP` output, as a pid.
+///
+/// Two things this must not do. It must read the *local* address, the second
+/// field: a client of ours connected out to the same port number carries that
+/// number in the third, and killing that would kill the wrong process. And it
+/// must not read the state word, which is localized — `LISTENING` is absent on
+/// a German or Japanese Windows. A listening socket is identified instead by
+/// its empty foreign address, which is the same in every locale.
+#[cfg(windows)]
+fn parse_netstat_pid(output: &str, port: u16) -> Option<u32> {
+    let suffix = format!(":{port}");
+    output.lines().find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 5 || !f[0].eq_ignore_ascii_case("TCP") || !f[1].ends_with(&suffix) {
+            return None;
+        }
+        (f[2] == "0.0.0.0:0" || f[2] == "[::]:0" || f[2] == "*:*").then(|| f[4].parse().ok())?
+    })
+}
+
+#[cfg(not(windows))]
+fn port_pid(port: u16) -> Option<u32> {
+    let out = Command::new("lsof")
+        .args(["-t", "-sTCP:LISTEN", &format!("-itcp:{port}")])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse().ok()
+}
+
+/// Stop the server holding `port` — but only when it is one of ours. Returns
+/// the pid it stopped, or the reason it stopped nothing.
+///
+/// The refusal is the feature. [`PortOwner::Foreign`] covers a Docker
+/// port-forward and an unrelated service as readily as a stale daemon of ours,
+/// and a button that killed whatever answered would be a foot-gun with a
+/// helpful label on it. So the image name decides, and anything else is left
+/// alone and named in the log.
+///
+/// `agent-platformd` is the *only* name allowed, deliberately. The app never
+/// binds the port itself — the daemon does, always (ADR 0007) — so accepting
+/// our own executable's name would widen what this may kill without ever
+/// matching a real port holder.
+pub fn take_port(port: u16) -> Result<u32, String> {
+    let pid = port_pid(port)
+        .ok_or_else(|| format!("nothing is listening on port {port} any more"))?;
+    let name = process_name(pid)
+        .ok_or_else(|| format!("pid {pid} held port {port} and is already gone"))?;
+    if name != DAEMON_EXE {
+        return Err(format!(
+            "port {port} is held by {name} (pid {pid}), which is not an agent-platform server — leaving it alone"
+        ));
+    }
+
+    kill_process(pid);
+    // The same wait `claim_single_instance` does: the socket outlives the
+    // process by a moment, and spawning into that window bind-fails.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && (process_name(pid).is_some() || health_ok(port)) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if health_ok(port) {
+        return Err(format!("stopped pid {pid}, but something is still answering on port {port}"));
+    }
+    Ok(pid)
 }
 
 /// Start the app at login, from the per-user `Run` key.
@@ -935,6 +1023,109 @@ pub fn spawn_detached(program: &str, args: &[&str]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bearer for a server we are about to spawn ourselves. This returned
+    /// empty under ADR 0013, when the spawn left the API open; a spawn that
+    /// carries the key and a client that sends none is every route 401ing.
+    ///
+    /// Neither arm here probes the port — only `Ours` does — so this stays
+    /// offline and the port number is inert.
+    #[test]
+    fn a_server_we_are_about_to_spawn_is_reached_with_the_install_key() {
+        assert_eq!(client_key(1, "k", PortOwner::Free), "k");
+        assert_eq!(client_key(1, "k", PortOwner::Foreign), "k");
+    }
+
+    /// The half that protects the user: anything that is not our daemon is
+    /// named and left alone. Binds an ephemeral port so it collides with
+    /// nothing, and the holder is this test binary — which is exactly the case
+    /// that would be fatal if the guard also accepted our own executable name.
+    #[test]
+    fn take_port_refuses_a_process_that_is_not_our_daemon() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let why = take_port(port).expect_err("took a process that was not our daemon");
+        assert!(why.contains(&port.to_string()), "{why}");
+        // It says what it found rather than just refusing.
+        assert!(why.contains("not an agent-platform server"), "{why}");
+
+        // Still ours, still listening: the refusal did not fire taskkill first
+        // and explain afterwards.
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
+
+    /// The kill path itself, which no amount of parsing proves: a real daemon
+    /// of ours on a real port, stopped through `take_port`.
+    ///
+    /// Ignored by default for the reason the GGUF check is — it needs a built
+    /// `agent-platformd` beside the test binary and it binds a port:
+    ///
+    ///     cargo test -p agent-platform-desktop -- --ignored take_port
+    #[test]
+    #[ignore]
+    fn take_port_stops_a_daemon_of_ours_and_frees_the_port() {
+        const PORT: u16 = 18499;
+        let exe = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join(DAEMON_EXE);
+        assert!(exe.is_file(), "build agent-platformd first: {}", exe.display());
+
+        let dir = std::env::temp_dir().join(format!("agp-takeport-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Every var the daemon would otherwise take from a developer `.env`,
+        // which only fills gaps: an unset DATABASE_URL there would put this on
+        // a real Postgres instead of a throwaway file.
+        let mut child = Command::new(&exe)
+            .env("AGENT_PLATFORM_PORT", PORT.to_string())
+            .env("AGENT_PLATFORM_MASTER_KEY", "")
+            .env("DATABASE_URL", "")
+            .env("AGENT_PLATFORM_DB_PATH", dir.join("takeport.db"))
+            .env("CONFIG_DIR", &dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !health_ok(PORT) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(health_ok(PORT), "the daemon never came up on {PORT}");
+
+        let pid = take_port(PORT).expect("take_port refused a daemon of ours");
+        assert_eq!(pid, child.id(), "took the wrong process");
+        assert!(!health_ok(PORT), "port {PORT} still answering after the takeover");
+        assert!(process_name(pid).is_none(), "pid {pid} outlived the takeover");
+
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The takeover kills by pid, so reading the wrong row kills the wrong
+    /// process. Both traps are in this fixture: a client of ours *connected to*
+    /// 18410 carries that port in its foreign address, and the state word is
+    /// not English on a localized Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_listening_row_is_the_one_the_takeover_reads() {
+        let out = "\
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    127.0.0.1:18410        0.0.0.0:0              LISTENING       4242
+  TCP    127.0.0.1:53311        127.0.0.1:18410        ESTABLISHED     9999
+  TCP    0.0.0.0:445            0.0.0.0:0              ABH\u{d6}REN        4
+";
+        assert_eq!(parse_netstat_pid(out, 18410), Some(4242));
+        // Still a listener, still found, without the word being read.
+        assert_eq!(parse_netstat_pid(out, 445), Some(4));
+        assert_eq!(parse_netstat_pid(out, 18411), None);
+        // 53311 is a connection, not a listener: nothing there to take.
+        assert_eq!(parse_netstat_pid(out, 53311), None);
+    }
 
     /// The point of [`write_atomic`] is that the *old* contents survive a failed
     /// write, where `std::fs::write` would have truncated them first.

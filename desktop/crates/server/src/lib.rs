@@ -67,6 +67,7 @@ pub mod accounts_stripe;
 pub mod billing;
 pub mod cli;
 pub mod action_orchestrator;
+pub mod ads;
 pub mod api_tokens;
 pub mod assistant;
 pub mod coder;
@@ -559,6 +560,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/openapi.json", axum::routing::get(openapi))
         .route("/admin", axum::routing::get(admin))
         .merge(action_orchestrator::routes())
+        .merge(ads::routes())
         .merge(api_tokens::routes())
         .merge(assistant::routes())
         .merge(coder::routes())

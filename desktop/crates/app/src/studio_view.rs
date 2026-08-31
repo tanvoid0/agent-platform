@@ -7,22 +7,41 @@
 //! looked at and where to get the thing — never a red banner, and never in
 //! place of the composer (ADR 0009).
 
-use crate::studio::{Kind, Message, State, IMAGE_SIZES, PRESETS, VIDEO_LENGTHS, VIDEO_SIZES};
+use crate::studio::{Kind, Message, State, Tab, IMAGE_SIZES, PRESETS, VIDEO_LENGTHS, VIDEO_SIZES};
+use crate::downloads::Downloads;
 use crate::ui::{self, space, Icon, Tone};
 use agent_platform_client::types::MediaJob;
 use iced::widget::{container, image, Row};
 use iced::{Element, Length};
 
-pub fn view(state: &State) -> Element<'_, Message> {
-    let mut blocks: Vec<Element<'_, Message>> = Vec::new();
+pub fn view<'a>(state: &'a State, downloads: &'a Downloads) -> Element<'a, Message> {
+    let mut blocks: Vec<Element<'_, Message>> = vec![ui::segmented([
+        (Tab::Create.label(), state.tab == Tab::Create, Message::TabChanged(Tab::Create)),
+        (Tab::Ads.label(), state.tab == Tab::Ads, Message::TabChanged(Tab::Ads)),
+    ])];
 
     if let Some(error) = &state.error {
         blocks.push(ui::error_bar(error, Message::TraceLogs, Message::Dismiss, Vec::new()));
     }
+    // The backend cards belong to both tabs: an ad's picture is a media job,
+    // so a stopped ComfyUI is the same problem with the same fix on either.
     if let Some(card) = backend_card(state) {
         blocks.push(card);
     }
-    if let Some(card) = video_models_card(state) {
+    if state.tab == Tab::Ads {
+        blocks.push(crate::studio_ads_view::view(state).map(Message::Ads));
+        return ui::page(
+            "Studio",
+            Some(ui::muted(
+                "Social advertisements written from a project's brand brief, with the picture \
+                 sized for where it is going and the text ready to copy.",
+            )),
+            Some(header_actions()),
+            ui::stack_lg(blocks),
+        );
+    }
+
+    if let Some(card) = video_models_card(state, downloads) {
         blocks.push(card);
     }
     if let Some(card) = unsupported_kind_card(state) {
@@ -37,9 +56,22 @@ pub fn view(state: &State) -> Element<'_, Message> {
             "Images and video generated on this machine, from a sentence. Nothing leaves the \
              computer.",
         )),
-        Some(ui::button_secondary(Icon::Refresh, "Refresh", Message::Refresh)),
+        Some(header_actions()),
         ui::stack_lg(blocks),
     )
+}
+
+/// The same pair on both tabs: an ad's picture is a media job like any other,
+/// so the settings that send it somewhere and the refresh that re-asks are the
+/// same buttons wherever you are standing.
+fn header_actions<'a>() -> Element<'a, Message> {
+    ui::cluster(vec![
+        // Where Studio sends its jobs is a Providers setting; this screen
+        // is where you find out it is wrong.
+        ui::button_ghost(Icon::Settings, "Media settings", Message::OpenSettings),
+        ui::button_secondary(Icon::Refresh, "Refresh", Message::Refresh),
+    ])
+    .into()
 }
 
 /// Shown only when the backend needs something. A working install gets its
@@ -218,13 +250,13 @@ fn unsupported_kind_card(state: &State) -> Option<Element<'_, Message>> {
 /// the size, the destination and a confirm, because ten gigabytes written
 /// into another application's install directory is not a thing to start on a
 /// stray click.
-fn video_models_card(state: &State) -> Option<Element<'_, Message>> {
+fn video_models_card<'a>(state: &'a State, downloads: &'a Downloads) -> Option<Element<'a, Message>> {
     if state.kind != Kind::Video {
         return None;
     }
     let reqs = state.requirements.as_ref()?;
-    let install = &state.install;
-    if reqs.missing().next().is_none() && !install.running() {
+    let running = crate::downloads_view::media_running(downloads);
+    if reqs.missing().next().is_none() && !running {
         return None;
     }
 
@@ -249,24 +281,21 @@ fn video_models_card(state: &State) -> Option<Element<'_, Message>> {
         )));
     }
 
-    if install.running() {
-        let current = install.current.as_ref();
-        let name = current.map(|c| c.file_name.as_str()).unwrap_or("");
-        let got = crate::model_download::human(current.map(|c| c.received).unwrap_or(0));
-        rows.push(ui::body(match current.and_then(|c| c.bytes) {
-            // A length the server knew or the transfer reported; without one a
-            // bare byte count still shows movement.
-            Some(total) => format!(
-                "{name} — {got} of {} · file {} of {} · {}% overall",
-                crate::model_download::human(total),
-                install.done + 1,
-                install.total,
-                (install.fraction() * 100.0).round() as i64
-            ),
-            None => format!("{name} — {got} so far · file {} of {}", install.done + 1, install.total),
-        }));
+    if running {
+        // One named bar per file, from the shared queue — the same rows the
+        // Downloads screen draws, so cancelling here and cancelling there are
+        // the same button.
+        rows.push(crate::downloads_view::panel(
+            downloads.by_tag(crate::downloads::Tag::MediaModel),
+            Message::Downloads,
+        ));
         rows.push(
-            ui::cluster(vec![ui::button_ghost(Icon::X, "Cancel", Message::InstallCancel)]).into(),
+            ui::cluster(vec![ui::button_ghost(
+                Icon::Download,
+                "All downloads",
+                Message::OpenDownloads,
+            )])
+            .into(),
         );
     } else if !reqs.can_install() {
         // Something is missing but there is nowhere safe to put it: say so
@@ -275,7 +304,7 @@ fn video_models_card(state: &State) -> Option<Element<'_, Message>> {
             "ComfyUI's models folder could not be located from here, so these cannot be \
              installed automatically — drop them into the folders above by hand.",
         ));
-    } else if install.armed {
+    } else if state.install.armed {
         rows.push(ui::body(format!(
             "Download {} into {}?",
             crate::studio::format_bytes(reqs.missing_bytes()),

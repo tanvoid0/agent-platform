@@ -235,11 +235,40 @@ fn is_loopback_refusal(e: &reqwest::Error) -> bool {
         .is_some_and(|h| matches!(h.as_str(), "127.0.0.1" | "::1" | "localhost"))
 }
 
+/// How many attempts a *loopback* refusal gets. One retry, not none: a refused
+/// connect to 127.0.0.1 usually means nothing is listening, but it is also what
+/// a live listener with a full accept backlog returns — Ollama refusing the
+/// twelfth simultaneous connect of a wide DAG wave while happily serving the
+/// first eleven. Seen: a 32-node run where twelve tasks died on
+/// "connection failed. Is Ollama running?" with Ollama running the whole time.
+/// One extra attempt costs a single backoff against a dead port, which is the
+/// case [`is_loopback_refusal`] exists to keep cheap.
+const LOOPBACK_REFUSAL_ATTEMPTS: u32 = 2;
+
 fn should_retry_transport(e: &reqwest::Error, attempt: u32, max_attempts: u32) -> bool {
-    if attempt + 1 >= max_attempts || is_loopback_refusal(e) {
+    retry_transport(
+        is_loopback_refusal(e),
+        e.is_connect() || e.is_timeout() || e.is_body(),
+        attempt,
+        max_attempts,
+    )
+}
+
+/// The decision itself, over facts rather than a `reqwest::Error` — that type
+/// cannot be constructed in a test, and this is the branch worth pinning.
+fn retry_transport(
+    loopback_refusal: bool,
+    transport_failure: bool,
+    attempt: u32,
+    max_attempts: u32,
+) -> bool {
+    if attempt + 1 >= max_attempts {
         return false;
     }
-    e.is_connect() || e.is_timeout() || e.is_body()
+    if loopback_refusal && attempt + 1 >= LOOPBACK_REFUSAL_ATTEMPTS {
+        return false;
+    }
+    transport_failure
 }
 
 /// Vendors reject bursts from many concurrent agents with these statuses, or with
@@ -358,6 +387,32 @@ pub fn sse_error_chunk(code: &str, message: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// A refused loopback connect gets exactly one retry and then stops.
+    ///
+    /// Both halves matter. Zero retries is what failed twelve tasks of a
+    /// thirty-two node run against a *running* Ollama that had simply refused
+    /// the burst; a full budget is what would make every probe of a local app
+    /// that is not installed wait seconds before saying so.
+    #[tokio::test]
+    async fn a_refused_loopback_connect_is_retried_once_and_no_more() {
+        // A port nothing is listening on: bind one, read its number, drop it.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let err = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("nothing is listening");
+        assert!(is_loopback_refusal(&err), "expected a loopback refusal: {err}");
+
+        // `max_attempts` is deliberately generous here — the loopback rule, not
+        // the global budget, is what has to stop the second attempt.
+        assert!(should_retry_transport(&err, 0, 8), "the first refusal retries");
+        assert!(!should_retry_transport(&err, 1, 8), "the second does not");
+    }
+
     #[test]
     fn secrets_are_stripped_from_logged_urls() {
         // Python writes `%2A%2A%2A` here: its `quote_plus` escapes `*`, the URL
@@ -391,5 +446,19 @@ mod tests {
             assert!(d >= base && d <= base * 1.25 + 1e-9, "attempt {attempt}: {d}");
         }
         assert!(backoff(30, 400).as_secs_f64() <= 30.0);
+    }
+
+    /// A refused loopback connect gets exactly one retry: enough to ride out a
+    /// full accept backlog during a wide DAG wave, not enough to spend the whole
+    /// budget waiting for a local app that is not running.
+    #[test]
+    fn a_loopback_refusal_is_retried_once_and_no_further() {
+        assert!(retry_transport(true, true, 0, 3), "first refusal is retried");
+        assert!(!retry_transport(true, true, 1, 3), "the second is not");
+        // A remote host keeps the full budget.
+        assert!(retry_transport(false, true, 1, 3));
+        assert!(!retry_transport(false, true, 2, 3), "budget still ends at max_attempts");
+        // Nothing retries an error that is not a transport failure.
+        assert!(!retry_transport(false, false, 0, 3));
     }
 }

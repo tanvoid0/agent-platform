@@ -1103,7 +1103,7 @@ async fn embeddings(
 /// rather than among the chat providers.
 fn backend_url(provider: &str, capability: Modality) -> Result<String, ApiError> {
     let (id, base, code, key, path) = match capability {
-        Modality::ImageGeneration => (
+        Modality::ImageGeneration | Modality::VideoGeneration => (
             "image_local",
             image_api_base(),
             "image_base_missing",
@@ -1174,9 +1174,14 @@ async fn images_generations(
         }
         None => {
             let hint = string_field(&body, "provider")?.to_ascii_lowercase();
+            // Unhinted requests pin `image_local` rather than asking the router:
+            // `media_local` also declares `image_generation` and outranks it,
+            // but it speaks ComfyUI's graph API, not this route's OpenAI shape.
+            // Its door is `POST /api/v1/media/jobs`, and routing an OpenAI body
+            // there would fail inside the upstream instead of here.
             let provider = require_provider_for_capability(
                 Modality::ImageGeneration,
-                Some(&hint).filter(|h| !h.is_empty()).map(String::as_str),
+                Some(if hint.is_empty() { "image_local" } else { hint.as_str() }),
             )?;
             body.remove("provider");
             let model = string_field(&body, "model")?;

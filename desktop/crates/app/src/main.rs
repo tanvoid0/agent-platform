@@ -48,6 +48,8 @@ mod library_view;
 mod logs;
 mod memory;
 mod memory_view;
+mod downloads;
+mod downloads_view;
 mod model_download;
 mod modelops;
 mod modelops_view;
@@ -61,6 +63,8 @@ mod search;
 mod search_view;
 mod shell;
 mod studio;
+mod studio_ads;
+mod studio_ads_view;
 mod studio_view;
 mod stt;
 mod ui;
@@ -92,6 +96,7 @@ pub enum Screen {
     Coder,
     Search,
     Studio,
+    Downloads,
     Assistant,
     Memory,
     Logs,
@@ -106,7 +111,12 @@ impl Screen {
     pub fn needs_server(self) -> bool {
         // Dashboard is the landing page and reports server health itself, so it
         // must render against a dead API rather than hide behind the guard.
-        !matches!(self, Screen::Settings | Screen::Memory | Screen::Logs | Screen::Dashboard)
+        // Downloads pulls from Hugging Face straight to disk — the server is
+        // not in that path, so a dead one must not hide the progress bars.
+        !matches!(
+            self,
+            Screen::Settings | Screen::Memory | Screen::Logs | Screen::Dashboard | Screen::Downloads
+        )
     }
 
     /// The assistant and its memory share one sidebar entry and one tab strip:
@@ -141,7 +151,10 @@ impl SettingsTab {
 
     pub fn label(self) -> &'static str {
         match self {
-            SettingsTab::Providers => "Providers",
+            // The tab is still `Providers` in code — renaming the variant would
+            // touch every nav call site for a label. What it shows is grouped by
+            // modality now, and "Models" is what that page answers.
+            SettingsTab::Providers => "Models",
             SettingsTab::ModelOps => "Model ops",
             SettingsTab::Appearance => "Appearance",
             SettingsTab::Performance => "Performance",
@@ -156,6 +169,38 @@ impl SettingsTab {
     /// connection details and quickstart to show without one.
     pub fn needs_server(self) -> bool {
         matches!(self, SettingsTab::Providers | SettingsTab::ModelOps)
+    }
+
+    /// Which heading the settings sidebar files this tab under. Seven equal
+    /// tabs in a strip said nothing about what any of them was; three groups
+    /// say what kind of thing you are about to change.
+    pub fn group(self) -> &'static str {
+        match self {
+            SettingsTab::Appearance | SettingsTab::Performance | SettingsTab::Account => "APP",
+            SettingsTab::Providers | SettingsTab::ModelOps => "MODELS",
+            SettingsTab::Status | SettingsTab::Api => "SYSTEM",
+        }
+    }
+
+    /// The groups in the order the sidebar draws them, each with its tabs. A
+    /// function rather than a const so [`SettingsTab::ALL`] stays the one list
+    /// a new tab has to be added to.
+    pub fn groups() -> [(&'static str, Vec<SettingsTab>); 3] {
+        ["APP", "MODELS", "SYSTEM"].map(|g| {
+            (g, SettingsTab::ALL.into_iter().filter(|t| t.group() == g).collect())
+        })
+    }
+
+    pub fn icon(self) -> ui::Icon {
+        match self {
+            SettingsTab::Providers => ui::Icon::Server,
+            SettingsTab::ModelOps => ui::Icon::Cpu,
+            SettingsTab::Appearance => ui::Icon::Image,
+            SettingsTab::Performance => ui::Icon::Activity,
+            SettingsTab::Status => ui::Icon::Info,
+            SettingsTab::Api => ui::Icon::Zap,
+            SettingsTab::Account => ui::Icon::Users,
+        }
     }
 }
 
@@ -225,6 +270,11 @@ pub struct App {
     pub screen: Screen,
     /// Which tab the Settings page shows; remembered across visits.
     pub settings_tab: SettingsTab,
+    /// Where Back goes: every place the user has been, newest last. A desktop
+    /// app with drill-downs and no history leaves "start over from the sidebar"
+    /// as the only way out of one. Capped at [`BACK_MAX`] because nobody walks
+    /// back further than that and an unbounded one is a leak.
+    pub back: Vec<(Screen, SettingsTab)>,
     /// Last answer from `/system/resources` — what the sidebar monitor draws and
     /// what the Performance tab shows `Auto` currently resolving to. `None` until
     /// the first read, and cleared when the server goes away, so the monitor is
@@ -240,8 +290,11 @@ pub struct App {
     /// The same, for the port the local model is served on. Empty means off.
     pub local_server_port_input: String,
     /// The Hugging Face download row on the same card: what is typed in it, and
-    /// how far the transfer has got.
+    /// what the last press made of it. The transfer itself belongs to
+    /// [`downloads`], along with every other file the app fetches.
     pub model_dl: model_download::State,
+    /// Every transfer in flight or waiting, from any screen.
+    pub downloads: downloads::Downloads,
     /// Which of the two chat tabs the sidebar entry returns to.
     pub chat_tab: Screen,
     pub status: Option<SystemStatus>,
@@ -275,7 +328,33 @@ pub struct App {
     pub update_check: update_check::State,
 }
 
+/// One hop onto the back stack. Free rather than a method so it can be tested
+/// without an `App`, which owns a tray icon and an HTTP client.
+fn push_history(stack: &mut Vec<(Screen, SettingsTab)>, here: (Screen, SettingsTab)) {
+    // Re-entering the screen you are already on is not a hop. Without this,
+    // pressing the same nav entry twice buries the real previous page.
+    if stack.last() == Some(&here) {
+        return;
+    }
+    stack.push(here);
+    if stack.len() > BACK_MAX {
+        stack.remove(0);
+    }
+}
+
+/// How far Back reaches. Deep enough that no real trail is cut short, shallow
+/// enough that a session left open for a week is not carrying every hop it ever
+/// made.
+const BACK_MAX: usize = 32;
+
 impl App {
+    /// File where we are now, so Back can return to it. Called by the nav
+    /// messages *before* they move — never by [`Message::Back`] itself, which
+    /// would otherwise trap the user between two screens.
+    fn remember(&mut self) {
+        push_history(&mut self.back, (self.screen, self.settings_tab));
+    }
+
     /// Single source of truth for "can the UI talk to the API yet". Every gate —
     /// nav locks, screen guards, poll intervals — reads this and nothing else.
     pub fn server_state(&self) -> ServerState {
@@ -348,6 +427,9 @@ pub enum Message {
     /// Home inbox: open this run on the Processes screen.
     OpenRun(i64),
     NavSettings(SettingsTab),
+    /// The back arrow (and Alt+Left): return to the last place, dismissing
+    /// whatever is open over this one first — the same order Esc uses.
+    Back,
     StatusTick,
     /// The Performance tab's picker. Saves, then pushes.
     SetResourceMode(shell::ResourceMode),
@@ -405,11 +487,14 @@ pub enum Message {
     /// The Hugging Face reference in the download row.
     SetModelUrl(String),
     DownloadModel,
-    CancelModelDownload,
-    /// One step of that download; the terminal arms clear the row.
-    ModelDownloaded(model_download::Progress),
+    /// One step of one transfer, keyed by the job it belongs to.
+    Download(u64, model_download::Progress),
+    /// A press on a download row, from this screen or an embedded panel.
+    Downloads(downloads::Action),
     Copy(&'static str, String),
     RestartServer,
+    /// Stop the foreign server holding our port, then start ours.
+    TakePort,
     RestartApp,
     RevealPath(String),
     /// "Check for updates" in Settings → Status, and its answer.
@@ -730,6 +815,7 @@ fn boot() -> (App, Task<Message>) {
         tray_light_plate: shell::system_is_dark(),
         screen: Screen::Dashboard,
         settings_tab: SettingsTab::Providers,
+        back: Vec::new(),
         resources: None,
         resource_ticks: 0,
         local_ctx_input: local_n_ctx.to_string(),
@@ -738,6 +824,7 @@ fn boot() -> (App, Task<Message>) {
             p => p.to_string(),
         },
         model_dl: model_download::State::default(),
+        downloads: downloads::Downloads::default(),
         chat_tab: Screen::Assistant,
         status: None,
         status_error: None,
@@ -838,6 +925,46 @@ fn quit(app: &mut App) -> ! {
 /// under the same id on both servers ([`request_id`] on the Rust side,
 /// `app/observability.py` on the Python side), so the filter finds the line
 /// regardless of which server answered.
+/// Queue every Wan file ComfyUI is missing. Sizes come from the server, so the
+/// bars read properly from the first tick rather than after the first response
+/// header.
+fn start_media_download(app: &mut App) -> Task<Message> {
+    app.studio.install.armed = false;
+    let Some(reqs) = &app.studio.requirements else {
+        return Task::none();
+    };
+    let Some(root) = reqs.models_root.clone() else {
+        app.studio.error = Some(
+            "ComfyUI's models folder could not be located, so there is nowhere to put these              files. Install them by hand, or set MEDIA_API_BASE to the instance you mean."
+                .into(),
+        );
+        return Task::none();
+    };
+
+    let wanted: Vec<_> = reqs
+        .missing()
+        .map(|item| {
+            (
+                std::path::PathBuf::from(&root).join(&item.folder),
+                item.file_name.clone(),
+                item.url.clone(),
+                u64::try_from(item.size_bytes).ok(),
+            )
+        })
+        .collect();
+
+    for (dir, file, url, bytes) in wanted {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            app.studio.error = Some(format!("Could not create {}: {e}", dir.display()));
+            return Task::none();
+        }
+        if let Some(id) = app.downloads.enqueue(downloads::Tag::MediaModel, url, dir, file) {
+            app.downloads.expect_bytes(id, bytes);
+        }
+    }
+    app.downloads.pump()
+}
+
 fn trace_logs_task(app: &mut App, trace_id: String) -> Task<Message> {
     app.logs.filter = trace_id;
     app.logs.paused = false;
@@ -884,6 +1011,8 @@ fn enter_screen_inner(app: &mut App) -> Task<Message> {
         // History is server-owned now (`/api/v1/search/history`) — another
         // window, or E.V., can have added to it since the last visit.
         Screen::Search => Task::done(Message::Search(search::Message::LoadHistory)),
+        // Nothing to fetch: the queue is in memory and already drawing itself.
+        Screen::Downloads => Task::none(),
         // Both halves every visit: another window (or E.V., through the media
         // routes) can have started a job, and ComfyUI can have been launched
         // or stopped since the last look.
@@ -1170,6 +1299,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                 // it is covering the screen, and it stops nothing to close it.
                 app.notifications_open = false;
                 Task::none()
+            } else if app.processes.confirm_reject.is_some() {
+                // Above the review modal: the confirm is layered over it, and a
+                // dialog that ends the run must be the first thing Esc cancels.
+                update(app, Message::Processes(processes::Message::CancelReject))
             } else if app.processes.review.is_some() {
                 update(app, Message::Processes(processes::Message::CloseReview))
             } else if app.screen == Screen::Coder && app.coder.stoppable() {
@@ -1215,6 +1348,9 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Nav(screen) => {
+            if screen != app.screen {
+                app.remember();
+            }
             app.screen = screen;
             app.help_open = false;
             if screen.is_chat() {
@@ -1224,6 +1360,9 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             enter_screen(app)
         }
         Message::OpenRun(id) => {
+            if app.screen != Screen::Processes {
+                app.remember();
+            }
             app.screen = Screen::Processes;
             app.help_open = false;
             app.copied = None;
@@ -1233,8 +1372,36 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             ])
         }
         Message::NavSettings(tab) => {
+            if (app.screen, app.settings_tab) != (Screen::Settings, tab) {
+                app.remember();
+            }
             app.screen = Screen::Settings;
             app.settings_tab = tab;
+            app.copied = None;
+            enter_screen(app)
+        }
+        Message::Back => {
+            // What is layered *over* the page is what Back means while it is
+            // covering it, exactly as for Esc. Only the covering ones: Back is
+            // not a stop button, so a turn in flight is left running.
+            if app.close_prompt.is_some() || app.help_open || app.notifications_open {
+                return update(app, Message::EscapePressed);
+            }
+            if app.processes.confirm_reject.is_some() {
+                return update(app, Message::Processes(processes::Message::CancelReject));
+            }
+            if app.processes.review.is_some() {
+                return update(app, Message::Processes(processes::Message::CloseReview));
+            }
+            if app.providers.open.is_some() {
+                return update(app, Message::Providers(providers::Message::Close));
+            }
+            let Some((screen, tab)) = app.back.pop() else { return Task::none() };
+            app.screen = screen;
+            app.settings_tab = tab;
+            if screen.is_chat() {
+                app.chat_tab = screen;
+            }
             app.copied = None;
             enter_screen(app)
         }
@@ -1502,60 +1669,51 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.model_dl.error = None;
             Task::none()
         }
-        Message::DownloadModel if app.model_dl.active => Task::none(),
         Message::DownloadModel => match model_download::resolve(&app.model_dl.input) {
             Err(e) => {
                 app.model_dl.error = Some(e);
                 Task::none()
             }
             Ok((url, name)) => {
-                app.model_dl.active = true;
-                app.model_dl.received = 0;
-                app.model_dl.total = None;
                 app.model_dl.error = None;
                 let dir = app.shell.data_dir.join("models");
-                app.model_dl.part = Some(model_download::part_path(&dir, &name));
-                let (task, handle) = Task::stream(model_download::download(url, dir, name))
-                    .map(Message::ModelDownloaded)
-                    .abortable();
-                app.model_dl.handle = Some(handle);
-                task
+                match app.downloads.enqueue(downloads::Tag::LocalModel, url, dir, name) {
+                    // Already queued: the box still clears, because the press
+                    // did what the user meant even though it started nothing.
+                    None => Task::none(),
+                    Some(_) => {
+                        app.model_dl.input.clear();
+                        app.downloads.pump()
+                    }
+                }
             }
         },
-        Message::CancelModelDownload => {
-            if let Some(handle) = app.model_dl.handle.take() {
-                handle.abort();
-            }
-            // Aborting drops the stream mid-write, so nothing inside the
-            // transfer gets to clean up after itself.
-            if let Some(part) = app.model_dl.part.take() {
-                let _ = std::fs::remove_file(part);
-            }
-            app.model_dl.active = false;
-            Task::none()
+        Message::Download(id, progress) => {
+            let finished = app.downloads.progressed(id, progress);
+            let follow_up = match finished {
+                // Point at it, since a download nobody selects is a wasted
+                // 20 GB. Same restart rule as the picker: the weights load on
+                // the next run.
+                Some(downloads::Finished { tag: downloads::Tag::LocalModel, path }) => {
+                    app.settings.local_model_path = path;
+                    save_settings(app);
+                    Task::none()
+                }
+                // Re-ask rather than assume: ComfyUI has to see the file for
+                // the missing-models card to go away, and only the last one
+                // landing can do that.
+                Some(downloads::Finished { tag: downloads::Tag::MediaModel, .. })
+                    if !downloads_view::media_running(&app.downloads) =>
+                {
+                    Task::done(Message::Studio(studio::Message::Refresh))
+                }
+                _ => Task::none(),
+            };
+            Task::batch([app.downloads.pump(), follow_up])
         }
-        Message::ModelDownloaded(model_download::Progress::Downloading { received, total }) => {
-            app.model_dl.received = received;
-            app.model_dl.total = total;
-            Task::none()
-        }
-        Message::ModelDownloaded(model_download::Progress::Done(path)) => {
-            app.model_dl.active = false;
-            app.model_dl.handle = None;
-            app.model_dl.part = None;
-            app.model_dl.input.clear();
-            // Point at it, since a download nobody selects is a wasted 20 GB.
-            // Same restart rule as the picker: the weights load on the next run.
-            app.settings.local_model_path = path;
-            save_settings(app);
-            Task::none()
-        }
-        Message::ModelDownloaded(model_download::Progress::Failed(e)) => {
-            app.model_dl.active = false;
-            app.model_dl.handle = None;
-            app.model_dl.part = None;
-            app.model_dl.error = Some(e);
-            Task::none()
+        Message::Downloads(action) => {
+            app.downloads.act(action);
+            app.downloads.pump()
         }
         Message::UnloadLocalModel => {
             #[cfg(feature = "local-llm")]
@@ -1581,7 +1739,9 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             } else if !app.shell.attached {
                 app.shell.log_line("[shell] restarting the server");
                 app.shell.start_server();
-                app.client = Client::new(app.shell.origin(), String::new());
+                // The server we just spawned carries the install key, so the
+                // client has to send it — an empty bearer here 401s every route.
+                app.client = Client::new(app.shell.origin(), app.shell.key.clone());
             } else {
                 app.client = Client::new(
                     app.shell.origin(),
@@ -1589,6 +1749,21 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                 );
             }
             app.child_alive = app.shell.server_running();
+            Task::none()
+        }
+        Message::TakePort => {
+            match shell::take_port(app.shell.port) {
+                Ok(pid) => {
+                    app.shell.log_line(format!(
+                        "[shell] stopped the server holding port {} (pid {pid})",
+                        app.shell.port
+                    ));
+                    // Re-probing and starting ours is exactly what the re-check
+                    // button already does, down to clearing `port_conflict`.
+                    return update(app, Message::RestartServer);
+                }
+                Err(why) => app.shell.log_line(format!("[shell] {why}")),
+            }
             Task::none()
         }
         Message::RestartApp => {
@@ -1682,6 +1857,30 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::Processes(processes::Message::Chat(chat::Message::TraceLogs(id))) => {
             trace_logs_task(app, id)
         }
+        // This screen names a setting it cannot change; send the user to the
+        // one page that can. Above the catch-all, as `TraceLogs` is.
+        Message::Processes(processes::Message::OpenSettings) => {
+            update(app, Message::NavSettings(SettingsTab::Providers))
+        }
+        Message::Processes(processes::Message::OpenTeams) => {
+            update(app, Message::Nav(Screen::Teams))
+        }
+        // A run started from Home used to leave the user on Home, where nothing
+        // reports a run that is still planning: the composer resets, the toast
+        // is the only feedback, and planning takes a minute. Go to the run it
+        // just created. Only from elsewhere - on Processes the module's own
+        // `Select` already puts it on screen - and Back returns to Home.
+        Message::Processes(processes::Message::Created(Ok(id)))
+            if app.screen != Screen::Processes =>
+        {
+            let started = processes::update(
+                &mut app.processes,
+                &app.client,
+                processes::Message::Created(Ok(id)),
+            )
+            .map(Message::Processes);
+            Task::batch([started, Task::done(Message::OpenRun(id))])
+        }
         Message::Processes(msg) => {
             // Embedded chats have no picker of their own, so they run on the
             // app-wide pair — read here rather than copied at boot, so a change
@@ -1702,6 +1901,11 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         // message (so an edit in the dashboard lands on the next turn, not the
         // next restart) and one harvest when a reply completes.
         Message::Assistant(assistant::Message::TraceLogs(id)) => trace_logs_task(app, id),
+        // This screen names a setting it cannot change; send the user to the
+        // one page that can. Above the catch-all, as `TraceLogs` is.
+        Message::Assistant(assistant::Message::OpenSettings) => {
+            update(app, Message::NavSettings(SettingsTab::Appearance))
+        }
         Message::Assistant(msg) => {
             let closed = matches!(msg, assistant::Message::Chunk(ChatChunk::Done));
             // Autosave at the moments the thread actually changed shape: the
@@ -1804,6 +2008,12 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Providers(providers::Message::TraceLogs(id)) => trace_logs_task(app, id),
+        // Settings names a screen it is not: the checkpoints the media card
+        // reports on are fetched on Downloads. Above the catch-all, as
+        // `TraceLogs` is.
+        Message::Providers(providers::Message::OpenDownloads) => {
+            update(app, Message::Nav(Screen::Downloads))
+        }
         Message::Providers(msg) => {
             providers::update(&mut app.providers, &app.client, msg).map(Message::Providers)
         }
@@ -1835,6 +2045,11 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             task
         }
         Message::Coder(coder::Message::TraceLogs(id)) => trace_logs_task(app, id),
+        // This screen names a setting it cannot change; send the user to the
+        // one page that can. Above the catch-all, as `TraceLogs` is.
+        Message::Coder(coder::Message::OpenSettings) => {
+            update(app, Message::NavSettings(SettingsTab::Providers))
+        }
         Message::Coder(msg) => {
             // The folder and the model outlive the session, so they are settings
             // rather than screen state; everything else the Coder screen holds
@@ -1904,8 +2119,23 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             workflows::update(&mut app.workflows, &app.client, msg).map(Message::Workflows)
         }
         Message::Search(search::Message::TraceLogs(id)) => trace_logs_task(app, id),
+        // This screen names a setting it cannot change; send the user to the
+        // one page that can. Above the catch-all, as `TraceLogs` is.
+        Message::Search(search::Message::OpenSettings) => {
+            update(app, Message::NavSettings(SettingsTab::Providers))
+        }
         Message::Search(msg) => search::update(&mut app.search, &app.client, msg).map(Message::Search),
         Message::Studio(studio::Message::TraceLogs(id)) => trace_logs_task(app, id),
+        // This screen names a setting it cannot change; send the user to the
+        // one page that can. Above the catch-all, as `TraceLogs` is.
+        Message::Studio(studio::Message::OpenSettings) => {
+            update(app, Message::NavSettings(SettingsTab::Providers))
+        }
+        // The confirm is intercepted rather than handled in `studio::update`:
+        // the queue lives in `app.downloads`, which that function cannot see.
+        Message::Studio(studio::Message::InstallConfirm) => start_media_download(app),
+        Message::Studio(studio::Message::OpenDownloads) => update(app, Message::Nav(Screen::Downloads)),
+        Message::Studio(studio::Message::Downloads(action)) => Task::done(Message::Downloads(action)),
         Message::Studio(msg) => studio::update(&mut app.studio, &app.client, msg).map(Message::Studio),
     }
 }
@@ -2194,6 +2424,19 @@ fn subscription(app: &App) -> Subscription<Message> {
         )
         .then_some(Message::ToggleHelp)
     }));
+    // Alt+Left is Back everywhere a Windows app has one, and it is the half of
+    // the arrow that works without reaching for the mouse.
+    subs.push(iced::keyboard::listen().filter_map(|event| {
+        matches!(
+            event,
+            iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft),
+                modifiers,
+                ..
+            } if modifiers.alt()
+        )
+        .then_some(Message::Back)
+    }));
     if app.close_prompt.is_some()
         || app.library.confirm.is_some()
         || app.assistant_open
@@ -2235,6 +2478,36 @@ fn main() -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Back is only as good as what it remembers: a repeat of the current page
+    /// must not bury the previous one, and a long session must not grow the
+    /// stack without bound.
+    #[test]
+    fn the_back_stack_skips_repeats_and_stays_bounded() {
+        let mut stack = Vec::new();
+        let home = (Screen::Dashboard, SettingsTab::Providers);
+        let logs = (Screen::Logs, SettingsTab::Providers);
+        push_history(&mut stack, home);
+        push_history(&mut stack, home);
+        assert_eq!(stack, vec![home], "the same page twice is one hop");
+        push_history(&mut stack, logs);
+        assert_eq!(stack, vec![home, logs]);
+
+        // Two Settings tabs are two places, even though the screen is one.
+        let mut tabs = Vec::new();
+        push_history(&mut tabs, (Screen::Settings, SettingsTab::Status));
+        push_history(&mut tabs, (Screen::Settings, SettingsTab::Account));
+        assert_eq!(tabs.len(), 2);
+
+        let mut long = Vec::new();
+        for _ in 0..BACK_MAX + 10 {
+            // Alternate, or the repeat guard swallows every hop after the first.
+            push_history(&mut long, home);
+            push_history(&mut long, logs);
+        }
+        assert_eq!(long.len(), BACK_MAX, "oldest hops fall off the bottom");
+        assert_eq!(long.last(), Some(&logs), "the newest hop is kept");
+    }
 
     /// The context box writes straight into a `u32` setting, so what it refuses
     /// is the whole validation there is.

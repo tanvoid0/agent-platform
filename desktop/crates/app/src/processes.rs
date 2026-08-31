@@ -9,7 +9,7 @@ use crate::domain::{err_string, non_empty};
 use crate::domain::{self, BoardColumn, BoardRow};
 use agent_platform_client::types::*;
 use agent_platform_client::Client;
-use iced::widget::text_editor;
+use iced::widget::{markdown, text_editor};
 use iced::Task;
 use std::time::Duration;
 
@@ -32,6 +32,36 @@ impl ViewMode {
             ViewMode::Board => "Board",
             ViewMode::Timeline => "Timeline",
             ViewMode::Events => "Events",
+        }
+    }
+}
+
+/// Run-list scope. A long-lived install accumulates runs, and the list was
+/// every one of them with no way to reach the live ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunScope {
+    All,
+    Live,
+    Finished,
+}
+
+impl RunScope {
+    pub const ALL: [RunScope; 3] = [RunScope::All, RunScope::Live, RunScope::Finished];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RunScope::All => "All",
+            RunScope::Live => "Live",
+            RunScope::Finished => "Finished",
+        }
+    }
+
+    fn matches(self, status: &str) -> bool {
+        let terminal = matches!(status, "completed" | "failed" | "cancelled");
+        match self {
+            RunScope::All => true,
+            RunScope::Live => !terminal,
+            RunScope::Finished => terminal,
         }
     }
 }
@@ -60,6 +90,10 @@ pub struct State {
     pub selected: Option<i64>,
     pub detail: Option<ProcessDetailResponse>,
     pub events: Vec<EventLogRecord>,
+    /// Rendered markdown for the *open* event only, keyed by its id. Every
+    /// event was parsed on every load before this, and a live run reloads all
+    /// 2000 of them every 800ms — only the one on screen is ever rendered.
+    pub event_md: Option<(i64, Vec<markdown::Item>)>,
     pub teams: Vec<TeamTemplateSummary>,
     pub projects: Vec<ProjectSummary>,
     /// False until each list has come back once; an empty list is a valid answer,
@@ -71,6 +105,22 @@ pub struct State {
     pub needs_attention_only: bool,
     pub event_filter: String,
     pub inspecting: Option<String>,
+    /// Event id whose full body is open in the events sidebar.
+    pub event_open: Option<i64>,
+    /// Events dropped off the front of the buffer, so the tab can say so.
+    pub events_trimmed: usize,
+    /// Filter over the run list — matches the goal text or `#id`.
+    pub run_search: String,
+    /// Which runs the list shows: all, live, or finished.
+    pub run_scope: RunScope,
+    /// Board columns folded away, so a run with fifty done tasks still fits.
+    pub collapsed: std::collections::HashSet<BoardColumn>,
+    /// A reject waiting on the confirm dialog — it fails the whole run.
+    pub confirm_reject: Option<i64>,
+    /// Rendered markdown for the inspected task's output, keyed by task id and
+    /// output length. Only the open task is parsed, and only when it changes —
+    /// a detail poll lands every 800ms and outputs run to thousands of lines.
+    pub output_md: Option<(i64, usize, Vec<markdown::Item>)>,
     pub review: Option<ReviewDraft>,
     /// Multi-line editor for [`ReviewDraft::output`]. Not on the draft: iced's
     /// `Content` is not `Clone`, and review messages still need to be.
@@ -97,6 +147,7 @@ impl Default for State {
             selected: None,
             detail: None,
             events: Vec::new(),
+            event_md: None,
             teams: Vec::new(),
             projects: Vec::new(),
             lists_loaded: (false, false),
@@ -106,6 +157,13 @@ impl Default for State {
             needs_attention_only: false,
             event_filter: String::new(),
             inspecting: None,
+            event_open: None,
+            events_trimmed: 0,
+            run_search: String::new(),
+            run_scope: RunScope::All,
+            collapsed: Default::default(),
+            confirm_reject: None,
+            output_md: None,
             review: None,
             review_output: text_editor::Content::new(),
             lineage: crate::graph::Lineage::All,
@@ -150,6 +208,79 @@ impl State {
             rows.retain(|r| domain::row_needs_attention(r, &status));
         }
         rows
+    }
+
+    /// The runs the list shows under the current search and scope.
+    pub fn visible_processes(&self) -> Vec<&ProcessRecord> {
+        let needle = self.run_search.trim().to_lowercase();
+        self.processes
+            .iter()
+            .filter(|p| self.run_scope.matches(p.status.as_str()))
+            .filter(|p| {
+                needle.is_empty()
+                    || p.goal.to_lowercase().contains(&needle)
+                    || p.id.to_string() == needle.trim_start_matches('#')
+            })
+            .collect()
+    }
+
+    /// The highest event id held, which is what the next page asks after.
+    pub fn event_cursor(&self) -> i64 {
+        self.events.last().map(|e| e.id).unwrap_or(0)
+    }
+
+    /// Parse the open event's body, once. Cheap when nothing moved: an event is
+    /// immutable, so its id alone is the key.
+    pub fn refresh_event_md(&mut self) {
+        let Some(id) = self.event_open else {
+            self.event_md = None;
+            return;
+        };
+        if self.event_md.as_ref().map(|(cached, _)| *cached) == Some(id) {
+            return;
+        }
+        self.event_md = self
+            .events
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| (id, markdown::parse(&e.content).collect()));
+    }
+
+    /// Reparse the inspected task's output if it is new to us. Cheap when
+    /// nothing moved: the (id, len) key short-circuits.
+    pub fn refresh_output_md(&mut self) {
+        let Some(uuid) = self.inspecting.clone() else {
+            self.output_md = None;
+            return;
+        };
+        let Some(task) = self.task_by_uuid(&uuid) else {
+            self.output_md = None;
+            return;
+        };
+        let Some(output) = task.output.as_deref().or(task.draft_output.as_deref()) else {
+            self.output_md = None;
+            return;
+        };
+        let key = (task.id, output.len());
+        if self.output_md.as_ref().map(|(id, len, _)| (*id, *len)) == Some(key) {
+            return;
+        }
+        self.output_md = Some((key.0, key.1, markdown::parse(output).collect()));
+    }
+
+    /// Task ids sitting at the review gate. Read off the task list, not the
+    /// board rows — a board search must not narrow what "Approve all" approves.
+    pub fn awaiting_review_task_ids(&self) -> Vec<i64> {
+        self.detail
+            .as_ref()
+            .map(|d| {
+                d.tasks
+                    .iter()
+                    .filter(|t| t.status == "awaiting_review")
+                    .map(|t| t.id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn rows_in_column(&self, column: BoardColumn) -> Vec<BoardRow> {
@@ -271,6 +402,25 @@ pub enum Message {
     /// "View logs" on a traced error banner — intercepted in `main::update`
     /// before it reaches here, so this arm exists only to satisfy exhaustiveness.
     TraceLogs(String),
+    /// A link in an event's rendered markdown.
+    LinkClicked(String),
+    /// Open (or close, with `None`) an event's full body in the sidebar.
+    OpenEvent(Option<i64>),
+    /// Put one event's full body on the clipboard.
+    CopyEvent(i64),
+    /// Put a task's output on the clipboard.
+    CopyOutput(i64),
+    /// Jump from an event to the subagent whose task raised it.
+    InspectTask(i64),
+    /// Recentre the graph canvas after a pan or zoom loses the nodes.
+    ResetViewport,
+    /// The settings link in this screen's header — the key a failed run needs lives in Settings.
+    /// Intercepted in `main::update` the same way, so this arm exists
+    /// only to satisfy exhaustiveness.
+    OpenSettings,
+    /// The composer's way out when no team exists yet. Intercepted in
+    /// `main::update` like the rest; a run cannot start without one.
+    OpenTeams,
     // data in
     ListTick,
     Listed(Result<Vec<ProcessRecord>, String>),
@@ -286,6 +436,9 @@ pub enum Message {
     TeamPicked(i64),
     ProjectPicked(Option<i64>),
     ToggleAutoApprove(bool),
+    /// Flip auto-approve on the *selected, already-created* process, unlike
+    /// [`Message::ToggleAutoApprove`], which sets it on the composer.
+    SetAutoApprove(bool),
     Submit,
     Created(Result<i64, String>),
     // detail controls
@@ -304,12 +457,29 @@ pub enum Message {
     Export,
     RetryTask(i64),
     OpenReview(i64),
+    /// Approve a task straight from the board, keeping the agent's own output.
+    ApproveTask(i64),
+    /// Approve every task waiting at the review gate, in one pass.
+    ApproveAllReviews,
+    /// Ask before rejecting — a reject fails the run, so it is not one click.
+    RejectTask(i64),
+    /// Yes, reject it.
+    RejectTaskConfirmed(i64),
+    /// Dismiss the reject confirmation.
+    CancelReject,
+    /// Fold a board column away, or unfold it.
+    ToggleColumn(BoardColumn),
+    RunSearchChanged(String),
+    SetRunScope(RunScope),
     CloseReview,
     ReviewOutputEdited(text_editor::Action),
     ReviewFeedbackChanged(String),
     ReviewInstructionsChanged(String),
     SubmitReview(ReviewDecision),
     ActionDone(Result<String, String>),
+    /// Sync's own completion: it answers 200 even on the branches where it
+    /// declines to act, so the outcome is in the body, not the status code.
+    SyncDone(Result<SyncProcessResponse, String>),
     DismissNotice,
     // scoped chat
     ToggleChat,
@@ -348,24 +518,40 @@ fn fetch_list(client: &Client, project_id: Option<i64>) -> Task<Message> {
     )
 }
 
-fn fetch_detail(client: &Client, id: i64) -> Task<Message> {
+/// One page of events. The route is a *forward* cursor (`id > after_id`, ASC,
+/// server-capped at 2000), so asking from 0 every poll returned the run's
+/// oldest 2000 for ever — a long run never showed its latest event at all.
+const EVENT_PAGE: u32 = 2000;
+
+/// How many events are kept in memory. A run that outruns this loses its
+/// oldest, which the events tab says out loud; Export still walks them all.
+const EVENT_BUFFER: usize = 5000;
+
+fn fetch_events(client: &Client, id: i64, after_id: i64) -> Task<Message> {
+    let client = client.clone();
+    Task::perform(
+        async move {
+            err_string(client.process_events(id, None, EVENT_PAGE, after_id).await)
+                .map(|r| r.events)
+        },
+        Message::EventsLoaded,
+    )
+}
+
+fn fetch_detail(client: &Client, id: i64, after_id: i64) -> Task<Message> {
     let c1 = client.clone();
-    let c2 = client.clone();
     Task::batch([
         Task::perform(
             async move { err_string(c1.process_detail(id).await).map(Box::new) },
             Message::Detailed,
         ),
-        Task::perform(
-            async move { err_string(c2.process_events(id, None, 2000, 0).await).map(|r| r.events) },
-            Message::EventsLoaded,
-        ),
+        fetch_events(client, id, after_id),
     ])
 }
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
-        Message::TraceLogs(_) => Task::none(),
+        Message::TraceLogs(_) | Message::OpenSettings | Message::OpenTeams => Task::none(),
         Message::ListTick => {
             // Teams/projects are fetched at boot, before the app's own server has
             // finished starting — that first request fails. Retry on the list
@@ -395,13 +581,18 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.selected = Some(id);
             state.detail = None;
             state.events.clear();
+            state.events_trimmed = 0;
+            state.event_md = None;
+            // A filter and an open event belong to the run they were opened on.
+            state.event_filter.clear();
             state.inspecting = None;
+            state.event_open = None;
             close_review(state);
             state.viewport = crate::graph::Viewport::default();
-            fetch_detail(client, id)
+            fetch_detail(client, id, 0)
         }
         Message::DetailTick | Message::StreamFrame => match state.selected {
-            Some(id) => fetch_detail(client, id),
+            Some(id) => fetch_detail(client, id, state.event_cursor()),
             None => Task::none(),
         },
         Message::Detailed(Ok(detail)) => {
@@ -417,6 +608,7 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             }
             state.detail = Some(*detail);
             state.error = None;
+            state.refresh_output_md();
             // The scope only becomes addressable once the detail lands, so an
             // open panel gets its thread here rather than at Select.
             if state.chat_open {
@@ -429,10 +621,77 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             Task::none()
         }
         Message::EventsLoaded(Ok(events)) => {
-            state.events = events;
-            Task::none()
+            let full_page = events.len() >= EVENT_PAGE as usize;
+            let cursor = state.event_cursor();
+            state.events.extend(events.into_iter().filter(|e| e.id > cursor));
+            let overflow = state.events.len().saturating_sub(EVENT_BUFFER);
+            if overflow > 0 {
+                state.events.drain(..overflow);
+                state.events_trimmed += overflow;
+            }
+            state.refresh_event_md();
+            // A full page means the cursor has not caught up yet — keep draining
+            // rather than waiting a poll per page on a run with a long backlog.
+            // Gated on the cursor actually moving: a full page of ids we already
+            // hold would otherwise refetch itself for ever.
+            match (full_page && state.event_cursor() > cursor, state.selected) {
+                (true, Some(id)) => fetch_events(client, id, state.event_cursor()),
+                _ => Task::none(),
+            }
         }
         Message::EventsLoaded(Err(_)) => Task::none(),
+        Message::CopyEvent(id) => {
+            let Some(event) = state.events.iter().find(|e| e.id == id) else {
+                return Task::none();
+            };
+            state.notice.set("Event copied.");
+            iced::clipboard::write(event.content.clone())
+        }
+        Message::CopyOutput(task_id) => {
+            let text = state
+                .detail
+                .as_ref()
+                .and_then(|d| d.tasks.iter().find(|t| t.id == task_id))
+                .and_then(|t| t.output.clone().or_else(|| t.draft_output.clone()));
+            match text {
+                Some(text) => {
+                    state.notice.set("Output copied.");
+                    iced::clipboard::write(text)
+                }
+                None => Task::none(),
+            }
+        }
+        Message::InspectTask(task_id) => {
+            // The event only carries a task id; the board and inspector are
+            // keyed by client_uuid, so a jump has to go through the task list.
+            let Some(task) = state.detail.as_ref().and_then(|d| d.tasks.iter().find(|t| t.id == task_id))
+            else {
+                state.notice.set("That task is not in this run's plan any more.");
+                return Task::none();
+            };
+            state.inspecting = Some(task.client_uuid.clone());
+            state.view = ViewMode::Board;
+            state.refresh_output_md();
+            if state.chat_open {
+                state.ensure_chat();
+            }
+            Task::none()
+        }
+        Message::ResetViewport => {
+            state.viewport = crate::graph::Viewport::default();
+            Task::none()
+        }
+        Message::OpenEvent(id) => {
+            state.event_open = id;
+            state.refresh_event_md();
+            Task::none()
+        }
+        Message::LinkClicked(url) => {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                crate::shell::reveal_path(&url);
+            }
+            Task::none()
+        }
         Message::TeamsLoaded(Ok(teams)) => {
             state.lists_loaded.0 = true;
             state.error = None;
@@ -521,10 +780,25 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         }
         Message::EventFilterChanged(f) => {
             state.event_filter = f;
+            // Keep the sidebar honest: an event the filter hides cannot stay open.
+            if let Some(open) = state.event_open {
+                let needle = state.event_filter.to_lowercase();
+                let still_shown = state.events.iter().any(|e| {
+                    e.id == open
+                        && (needle.is_empty()
+                            || e.event_type.to_lowercase().contains(&needle)
+                            || e.content.to_lowercase().contains(&needle))
+                });
+                if !still_shown {
+                    state.event_open = None;
+                    state.event_md = None;
+                }
+            }
             Task::none()
         }
         Message::Inspect(uuid) => {
             state.inspecting = uuid;
+            state.refresh_output_md();
             if state.chat_open {
                 state.ensure_chat();
             }
@@ -537,12 +811,20 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Canvas(event) => {
             use crate::graph::CanvasEvent;
             match event {
-                CanvasEvent::Selected(uuid) => state.inspecting = Some(uuid),
+                CanvasEvent::Selected(uuid) => {
+                    state.inspecting = Some(uuid);
+                    state.refresh_output_md();
+                }
                 CanvasEvent::Panned(delta) => state.viewport.pan(delta),
                 CanvasEvent::Zoomed(delta) => state.viewport.zoom(delta),
             }
             Task::none()
         }
+
+        Message::SetAutoApprove(on) => run_action(state, client, move |c, id| async move {
+            err_string(c.set_process_auto_approve(id, on).await)
+                .map(|_| if on { "Auto-approve on".to_string() } else { "Auto-approve off".to_string() })
+        }),
 
         Message::Approve => {
             let Some(id) = state.selected else { return Task::none() };
@@ -579,14 +861,75 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         Message::Retry => run_action(state, client, |c, id| async move {
             err_string(c.retry_process(id).await).map(|r| format!("retrying {}", r.retry.as_str()))
         }),
-        Message::Sync => run_action(state, client, |c, id| async move {
-            err_string(c.sync_process(id).await).map(|r| r.detail)
-        }),
+        Message::Sync => {
+            let Some(id) = state.selected else { return Task::none() };
+            state.busy = true;
+            let c = client.clone();
+            Task::perform(async move { err_string(c.sync_process(id).await) }, Message::SyncDone)
+        }
         Message::Export => run_action(state, client, export_process),
         Message::RetryTask(task_id) => run_action(state, client, move |c, id| async move {
             err_string(c.retry_task(id, task_id).await).map(|r| format!("task {} requeued", r.task_id))
         }),
 
+        Message::ApproveTask(task_id) => {
+            let Some(id) = state.selected else { return Task::none() };
+            state.busy = true;
+            approve_all(client.clone(), id, vec![task_id])
+        }
+        Message::ApproveAllReviews => {
+            let Some(id) = state.selected else { return Task::none() };
+            let ids = state.awaiting_review_task_ids();
+            if ids.is_empty() {
+                state.notice.set("Nothing is waiting for review.");
+                return Task::none();
+            }
+            state.busy = true;
+            approve_all(client.clone(), id, ids)
+        }
+        Message::RejectTask(task_id) => {
+            state.confirm_reject = Some(task_id);
+            Task::none()
+        }
+        Message::CancelReject => {
+            state.confirm_reject = None;
+            Task::none()
+        }
+        Message::RejectTaskConfirmed(task_id) => {
+            state.confirm_reject = None;
+            // The reject may have been raised from inside the review modal.
+            close_review(state);
+            let Some(id) = state.selected else { return Task::none() };
+            state.busy = true;
+            let client = client.clone();
+            let body = ReviewTaskBody {
+                decision: ReviewDecision::Reject,
+                output: None,
+                feedback: None,
+                instructions: None,
+            };
+            Task::perform(
+                async move {
+                    err_string(client.review_task(id, task_id, &body).await)
+                        .map(|r| r.message.unwrap_or(r.status))
+                },
+                Message::ActionDone,
+            )
+        }
+        Message::RunSearchChanged(v) => {
+            state.run_search = v;
+            Task::none()
+        }
+        Message::SetRunScope(scope) => {
+            state.run_scope = scope;
+            Task::none()
+        }
+        Message::ToggleColumn(column) => {
+            if !state.collapsed.remove(&column) {
+                state.collapsed.insert(column);
+            }
+            Task::none()
+        }
         Message::OpenReview(task_id) => {
             let task = state
                 .detail
@@ -652,15 +995,22 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             )
         }
         Message::ActionDone(result) => {
-            state.busy = false;
             match result {
                 Ok(msg) => state.notice.set(msg),
                 Err(e) => state.error = Some(e),
             }
-            match state.selected {
-                Some(id) => fetch_detail(client, id),
-                None => Task::none(),
+            after_action(state, client)
+        }
+        Message::SyncDone(result) => {
+            match result {
+                // `none` is a terminal run, `blocked` is an open gate. The server
+                // took the call and ran nothing, so a green tick is a lie — the
+                // detail says what to press instead, and it has to read that way.
+                Ok(r) if sync_acted(&r.action) => state.notice.set(r.detail),
+                Ok(r) => state.notice.set_info(r.detail),
+                Err(e) => state.error = Some(e),
             }
+            after_action(state, client)
         }
         Message::DismissNotice => {
             state.notice.clear();
@@ -695,6 +1045,13 @@ fn is_terminal_status(status: ProcessStatus) -> bool {
     matches!(status, ProcessStatus::Completed | ProcessStatus::Failed | ProcessStatus::Cancelled)
 }
 
+/// The run has not finished: it is planning, executing, or stopped for a human.
+/// Home lists these, because a run the user just started is one of them and
+/// showed up nowhere until it either failed or asked a question.
+pub(crate) fn is_live(status: ProcessStatus) -> bool {
+    !is_terminal_status(status) && status != ProcessStatus::Unknown
+}
+
 /// The run stopped moving on its own and is waiting for a human — the two
 /// states where the engine will not take another step until someone answers.
 pub(crate) fn needs_user(status: ProcessStatus) -> bool {
@@ -723,6 +1080,35 @@ fn settled(
 }
 
 /// Run a process-scoped action against the selected run.
+/// Approve tasks without opening the review modal — the agent's own output is
+/// kept (an omitted `output` means "keep what it produced"). Sequential, because
+/// each approval can expand into a sub-DAG the next wave is computed from.
+fn approve_all(client: Client, process_id: i64, task_ids: Vec<i64>) -> Task<Message> {
+    Task::perform(
+        async move {
+            let total = task_ids.len();
+            let mut failed: Vec<String> = Vec::new();
+            for task_id in task_ids {
+                let body = ReviewTaskBody {
+                    decision: ReviewDecision::Approve,
+                    output: None,
+                    feedback: None,
+                    instructions: None,
+                };
+                if let Err(e) = client.review_task(process_id, task_id, &body).await {
+                    failed.push(format!("task {task_id}: {e}"));
+                }
+            }
+            match failed.len() {
+                0 => Ok(format!("Approved {}.", crate::ui::count(total, "task", "tasks"))),
+                n if n == total => Err(failed.join("; ")),
+                n => Ok(format!("Approved {} of {total}; {n} failed: {}", total - n, failed.join("; "))),
+            }
+        },
+        Message::ActionDone,
+    )
+}
+
 /// Writes `{exported_at, process, tasks, events}` to a file the user picks —
 /// the whole run, not the page currently on screen, so events are walked to the
 /// end. Cancelling the picker is a no-op, not an error.
@@ -750,6 +1136,22 @@ async fn export_process(client: Client, id: i64) -> Result<String, String> {
     let name = handle.file_name();
     handle.write(&bytes).await.map_err(|e| e.to_string())?;
     Ok(format!("Exported {count} event(s) to {name}."))
+}
+
+/// Did sync actually do something? `none` is a terminal run and `blocked` is an
+/// open gate — both answer 200 having run nothing. `Unknown` is a server newer
+/// than this build; assume it acted, since the alternative mislabels real work.
+fn sync_acted(action: &ProcessSyncAction) -> bool {
+    !matches!(action, ProcessSyncAction::None | ProcessSyncAction::Blocked)
+}
+
+/// Every action's tail: the request is over, and the row it touched is stale.
+fn after_action(state: &mut State, client: &Client) -> Task<Message> {
+    state.busy = false;
+    match state.selected {
+        Some(id) => fetch_detail(client, id, state.event_cursor()),
+        None => Task::none(),
+    }
 }
 
 fn run_action<F, Fut>(state: &mut State, client: &Client, f: F) -> Task<Message>
@@ -819,6 +1221,163 @@ mod tests {
         assert!(s.board_rows().is_empty());
         s.detail = Some(detail("approval_required", true));
         assert_eq!(s.board_rows().len(), 1);
+    }
+
+    /// Approve-all reads the review gate, not the whole task list, and says so
+    /// rather than firing an empty batch.
+    #[test]
+    fn approve_all_only_takes_tasks_at_the_review_gate() {
+        let mut s = State::default();
+        s.selected = Some(1);
+        let mut d = detail("running", true);
+        d.tasks = serde_json::from_value(json!([
+            {"id": 7, "process_id": 1, "client_uuid": "a", "role": "R", "system_prompt": "s",
+             "instructions": "i", "llm_model": null, "dependencies_json": "[]",
+             "status": "awaiting_review", "output": null, "tokens_used": 0,
+             "started_at": null, "completed_at": null},
+            {"id": 8, "process_id": 1, "client_uuid": "b", "role": "R2", "system_prompt": "s",
+             "instructions": "i", "llm_model": null, "dependencies_json": "[]",
+             "status": "running", "output": null, "tokens_used": 0,
+             "started_at": null, "completed_at": null}
+        ]))
+        .unwrap();
+        s.detail = Some(d);
+        assert_eq!(s.awaiting_review_task_ids(), vec![7]);
+        // A board filter narrows the board, never the batch.
+        s.board_search = "zzz".into();
+        assert_eq!(s.awaiting_review_task_ids(), vec![7]);
+        s.board_search.clear();
+
+        s.detail = Some(detail("running", true));
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let _ = update(&mut s, &client, Message::ApproveAllReviews);
+        assert!(!s.busy);
+        assert!(s.notice.get().unwrap().0.contains("Nothing is waiting"));
+    }
+
+    /// Sync answers 200 on the branches where it declines to act. A green tick
+    /// there reads as "done" on a run where nothing ran.
+    #[test]
+    fn a_sync_that_ran_nothing_does_not_read_as_success() {
+        for declined in [ProcessSyncAction::None, ProcessSyncAction::Blocked] {
+            assert!(!sync_acted(&declined), "{declined:?} ran nothing");
+        }
+        for acted in [
+            ProcessSyncAction::AlignedStatus,
+            ProcessSyncAction::RequeuedPlan,
+            ProcessSyncAction::RequeuedExecution,
+            // A server newer than this build: assume it did the work.
+            ProcessSyncAction::Unknown,
+        ] {
+            assert!(sync_acted(&acted), "{acted:?} did something");
+        }
+
+        let mut t = crate::domain::Toast::default();
+        t.set_info("blocked");
+        assert_eq!(t.get().unwrap().2, crate::ui::Tone::Info);
+        t.set("requeued");
+        assert_eq!(t.get().unwrap().2, crate::ui::Tone::Success);
+    }
+
+    /// The list narrows by scope and text, and `#id` finds a run by number.
+    #[test]
+    fn the_run_list_filters_by_scope_and_text() {
+        let mut s = State::default();
+        s.processes = serde_json::from_value(json!([
+            {"id": 1, "goal": "ship the docs", "status": "running", "total_tokens": 0,
+             "total_cost": 0.0, "created_at": "2026-08-02T10:00:00", "updated_at": "2026-08-02T10:00:00"},
+            {"id": 2, "goal": "fix the parser", "status": "completed", "total_tokens": 0,
+             "total_cost": 0.0, "created_at": "2026-08-02T10:00:00", "updated_at": "2026-08-02T10:00:00"}
+        ]))
+        .unwrap();
+        assert_eq!(s.visible_processes().len(), 2);
+        s.run_scope = RunScope::Live;
+        assert_eq!(s.visible_processes().iter().map(|p| p.id).collect::<Vec<_>>(), vec![1]);
+        s.run_scope = RunScope::Finished;
+        assert_eq!(s.visible_processes().iter().map(|p| p.id).collect::<Vec<_>>(), vec![2]);
+        s.run_scope = RunScope::All;
+        s.run_search = "parser".into();
+        assert_eq!(s.visible_processes().len(), 1);
+        s.run_search = "#1".into();
+        assert_eq!(s.visible_processes().iter().map(|p| p.id).collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// The event feed is a forward cursor: pages append, the cursor advances,
+    /// and nothing already held is refetched.
+    #[test]
+    fn events_append_from_the_cursor_and_never_refetch() {
+        fn page(ids: &[i64]) -> Vec<EventLogRecord> {
+            serde_json::from_value(json!(ids
+                .iter()
+                .map(|id| json!({
+                    "id": id, "process_id": 1, "task_id": null, "event_type": "trace",
+                    "content": "x", "created_at": "2026-08-02T10:00:00"
+                }))
+                .collect::<Vec<_>>()))
+            .unwrap()
+        }
+        let mut s = State::default();
+        let client = Client::new("http://127.0.0.1:1", "k");
+        assert_eq!(s.event_cursor(), 0);
+        let _ = update(&mut s, &client, Message::EventsLoaded(Ok(page(&[1, 2, 3]))));
+        assert_eq!(s.event_cursor(), 3);
+        // The server answers `id > after_id`, but a replayed page must not
+        // duplicate rows if one ever arrives.
+        let _ = update(&mut s, &client, Message::EventsLoaded(Ok(page(&[2, 3, 4]))));
+        assert_eq!(s.events.iter().map(|e| e.id).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(s.event_cursor(), 4);
+        assert_eq!(s.events_trimmed, 0);
+    }
+
+    /// An event the filter hides must not stay open in the sidebar.
+    #[test]
+    fn filtering_closes_an_event_it_hides() {
+        let mut s = State::default();
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let events: Vec<EventLogRecord> = serde_json::from_value(json!([
+            {"id": 5, "process_id": 1, "task_id": null, "event_type": "trace",
+             "content": "planner said hello", "created_at": "2026-08-02T10:00:00"}
+        ]))
+        .unwrap();
+        let _ = update(&mut s, &client, Message::EventsLoaded(Ok(events)));
+        assert!(s.event_md.is_none(), "nothing is parsed until an event is opened");
+        let _ = update(&mut s, &client, Message::OpenEvent(Some(5)));
+        assert_eq!(s.event_md.as_ref().map(|(id, _)| *id), Some(5));
+        let _ = update(&mut s, &client, Message::EventFilterChanged("trace".into()));
+        assert_eq!(s.event_open, Some(5), "a filter it matches leaves it open");
+        let _ = update(&mut s, &client, Message::EventFilterChanged("error".into()));
+        assert!(s.event_open.is_none());
+    }
+
+    /// Reject ends the run, so it asks first and only fires on the confirm.
+    #[test]
+    fn reject_asks_before_it_ends_the_run() {
+        let mut s = State::default();
+        s.selected = Some(1);
+        s.detail = Some(detail("running", true));
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let _ = update(&mut s, &client, Message::RejectTask(7));
+        assert_eq!(s.confirm_reject, Some(7));
+        assert!(!s.busy, "nothing is sent until the dialog is answered");
+        let _ = update(&mut s, &client, Message::CancelReject);
+        assert!(s.confirm_reject.is_none());
+        let _ = update(&mut s, &client, Message::RejectTask(7));
+        let _ = update(&mut s, &client, Message::RejectTaskConfirmed(7));
+        assert!(s.confirm_reject.is_none());
+        assert!(s.busy);
+    }
+
+    /// A folded column is a view state, not a filter: the rows stay.
+    #[test]
+    fn a_board_column_folds_and_unfolds() {
+        let mut s = State::default();
+        s.detail = Some(detail("running", true));
+        let client = Client::new("http://127.0.0.1:1", "k");
+        let _ = update(&mut s, &client, Message::ToggleColumn(BoardColumn::Pending));
+        assert!(s.collapsed.contains(&BoardColumn::Pending));
+        assert_eq!(s.rows_in_column(BoardColumn::Pending).len(), 1);
+        let _ = update(&mut s, &client, Message::ToggleColumn(BoardColumn::Pending));
+        assert!(s.collapsed.is_empty());
     }
 
     #[test]

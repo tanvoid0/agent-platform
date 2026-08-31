@@ -34,8 +34,10 @@ OS username (`kind = local`, email `local:{username}@localhost`) and gives it
 a personal workspace. Cloud magic-link does the same for the email. Writes
 stamp `user_id`; reads by a non-operator 404 (not 401) on someone else's row.
 
-**Local loopback stays open** (ADR 0013). The change is that the unauthenticated
-caller is that machine user, not `user_id = None`. Operator routes
+**Local loopback stays open** (ADR 0013 — since keyed by
+[ADR 0019](0019-key-the-local-api.md); the master-key caller is stamped with the
+same machine user, so what follows is unchanged). The change is that the
+unauthenticated caller is that machine user, not `user_id = None`. Operator routes
 (create-any-workspace, media, llm admin) still work for that process — it is
 the person at the keyboard — but tenant lists are filtered to their row, which
 after backfill is the whole local database.

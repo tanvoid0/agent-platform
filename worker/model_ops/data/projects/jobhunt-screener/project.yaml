@@ -1,5 +1,5 @@
 name: jobhunt-screener
-description: One screening verdict per constraint (ADR 0015 task model)
+description: Four screening verdicts in one call, a/l/o/s (ADR 0015 task model)
 base_model: google/gemma-3-4b-it
 ollama_tag: jobhunt-screener
 input_schema: schemas/input.schema.json
@@ -11,7 +11,7 @@ train:
   lora_rank: 16
   lora_alpha: 32
   epochs: 3
-  max_seq_len: 2048
+  max_seq_len: 4096
   learning_rate: 2.0e-4
   batch_size: 4
   gradient_accumulation_steps: 4
