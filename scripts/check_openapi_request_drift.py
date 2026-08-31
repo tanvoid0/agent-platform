@@ -52,6 +52,10 @@ PAIRS = [
     ("coder.rs", "ToolResultRequest", "CoderToolResultRequest", set()),
     ("coder.rs", "ThreadCreateRequest", "CoderThreadCreateRequest", set()),
     ("media.rs", "GenerateRequest", "MediaGenerateRequest", set()),
+    ("ads.rs", "CampaignCreate", "AdCampaignCreate", set()),
+    # `Brand` is both the request body and the response of PUT /brand — the
+    # bare object either way, so one schema covers both directions.
+    ("ads.rs", "Brand", "AdBrand", set()),
 ]
 
 _SOURCES: dict[str, str] = {}

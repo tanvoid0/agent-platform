@@ -360,6 +360,13 @@ fn model_path() -> PathBuf {
 }
 
 /// First run downloads the model (~60 MB); after that it's a file read.
+///
+/// ponytail: deliberately not on the [`crate::downloads`] queue, unlike every
+/// other model file. This runs on the whisper worker thread, underneath a
+/// `spawn_blocking` in the middle of a dictation — routing it through the UI
+/// queue would mean the first press of the mic fails and asks the user to go
+/// watch a bar somewhere else. 60 MB once is short enough to just wait for.
+/// Move it if the model gets big enough that the wait needs a progress bar.
 fn ensure_model() -> Result<PathBuf, String> {
     let path = model_path();
     if path.is_file() {

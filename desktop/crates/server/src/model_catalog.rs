@@ -262,6 +262,20 @@ pub fn ollama_tag_matches(tags: &[String], model: &str) -> bool {
     !model.trim().is_empty() && tags.iter().any(|tag| tag == model || base(tag) == base(model))
 }
 
+/// The tag to use when `model` is not installed: one from the same family
+/// ("llama3" -> "llama3.1:8b") if there is one, else the first tag.
+///
+/// Ollama lists newest-pulled first, which can be an unrelated fine-tune, so
+/// "first" is a poor default on its own.
+fn ollama_fallback_tag(tags: &[String], model: &str) -> String {
+    let base = |s: &str| s.split(':').next().unwrap_or("").to_string();
+    let want = base(model);
+    tags.iter()
+        .find(|tag| !want.is_empty() && base(tag).starts_with(&want))
+        .unwrap_or(&tags[0])
+        .clone()
+}
+
 /// If the requested model is not in the local catalog, use the first one that is.
 ///
 /// A local backend that has never pulled the configured default would otherwise
@@ -285,11 +299,9 @@ pub async fn coerce_local_model_if_needed(
         if tags.is_empty() || ollama_tag_matches(&tags, model) {
             return model.to_string();
         }
-        logd!(
-            "Ollama model {model:?} not in local tags; falling back to {:?}",
-            tags[0]
-        );
-        return tags[0].clone();
+        let pick = ollama_fallback_tag(&tags, model);
+        logd!("Ollama model {model:?} not in local tags; falling back to {pick:?}");
+        return pick;
     }
 
     if provider == "lm_studio" {
@@ -346,6 +358,16 @@ fn string_field_list(body: Option<&Value>, list_key: &str, field: &str) -> Vec<S
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn fallback_prefers_the_same_model_family() {
+        let tags = vec![
+            "jobhunt-screener:latest".to_string(),
+            "llama3.1:8b".to_string(),
+        ];
+        assert_eq!(ollama_fallback_tag(&tags, "llama3"), "llama3.1:8b");
+        assert_eq!(ollama_fallback_tag(&tags, "mistral"), "jobhunt-screener:latest");
+    }
 
     #[test]
     fn both_upstream_shapes_parse_and_bad_ones_are_empty() {

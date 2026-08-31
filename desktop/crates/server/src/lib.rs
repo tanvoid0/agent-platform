@@ -67,6 +67,7 @@ pub mod accounts_stripe;
 pub mod billing;
 pub mod cli;
 pub mod action_orchestrator;
+pub mod ads;
 pub mod api_tokens;
 pub mod assistant;
 pub mod coder;
@@ -123,12 +124,15 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use serde_json::json;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The API reference, checked in rather than generated. See [`openapi`].
+const OPENAPI_JSON: &str = include_str!("openapi.json");
 
 /// The one lock for tests that write process environment.
 ///
@@ -378,18 +382,136 @@ async fn not_found(req: Request) -> Response {
 /// forget — the honest fix is `utoipa` annotations, worth doing the first time
 /// a stale entry actually misleads someone. Unauthenticated, as FastAPI served
 /// it: it describes the surface, it does not expose data.
-async fn openapi() -> Response {
-    (
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        include_str!("openapi.json"),
-    )
-        .into_response()
+///
+/// `?index` and `?tag=` serve trimmed views of the same file. The whole
+/// document is 400 KB, more than an agent in another repo can afford to read
+/// to find one route: `?index` is the table of contents, `?tag=todos` the
+/// chapter, schemas pruned to what it references.
+async fn openapi(Query(q): Query<HashMap<String, String>>) -> Response {
+    let ct = [(axum::http::header::CONTENT_TYPE, "application/json")];
+    if q.contains_key("index") {
+        return (ct, openapi_index()).into_response();
+    }
+    match q.get("tag") {
+        Some(tags) => (ct, openapi_by_tag(tags)).into_response(),
+        None => (ct, OPENAPI_JSON).into_response(),
+    }
+}
+
+/// The checked-in document, parsed. Panicking here is a malformed file that
+/// `openapi_index_lists_every_operation` would already have failed on.
+fn openapi_doc() -> serde_json::Value {
+    serde_json::from_str(OPENAPI_JSON).expect("openapi.json is valid JSON")
+}
+
+/// The methods a path item may hold. Anything else in there (`parameters`,
+/// `summary`) is not an operation and must not be counted as one.
+const HTTP_METHODS: [&str; 7] = ["get", "put", "post", "delete", "patch", "head", "options"];
+
+/// `?index` — the table of contents: one line per operation, grouped by tag.
+/// A few KB instead of 400, which is the whole point of it.
+fn openapi_index() -> String {
+    let doc = openapi_doc();
+    let mut ops = serde_json::Map::new();
+    for (path, item) in doc["paths"].as_object().into_iter().flatten() {
+        for method in HTTP_METHODS {
+            let Some(op) = item.get(method) else { continue };
+            let tag = op["tags"][0].as_str().unwrap_or("untagged");
+            let line = format!(
+                "{} {} — {}",
+                method.to_uppercase(),
+                path,
+                op["summary"].as_str().unwrap_or("")
+            );
+            ops.entry(tag.to_string())
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .expect("just inserted an array")
+                .push(json!(line));
+        }
+    }
+    json!({
+        "info": doc["info"],
+        "usage": "GET /openapi.json?tag=<tag>[,<tag>] for the full spec of those tags, schemas included. GET /openapi.json for everything.",
+        "operations": ops,
+    })
+    .to_string()
+}
+
+/// `?tag=todos,projects` — a valid OpenAPI document holding only those tags'
+/// paths, with `components.schemas` pruned to what they actually reference.
+fn openapi_by_tag(tags: &str) -> String {
+    let doc = openapi_doc();
+    let wanted: Vec<&str> = tags.split(',').map(str::trim).collect();
+    let mut paths = serde_json::Map::new();
+    for (path, item) in doc["paths"].as_object().into_iter().flatten() {
+        let kept: serde_json::Map<String, serde_json::Value> = HTTP_METHODS
+            .iter()
+            .filter_map(|m| item.get(*m).map(|op| ((*m).to_string(), op.clone())))
+            .filter(|(_, op)| {
+                op["tags"]
+                    .as_array()
+                    .is_some_and(|ts| ts.iter().any(|t| wanted.contains(&t.as_str().unwrap_or(""))))
+            })
+            .collect();
+        if !kept.is_empty() {
+            paths.insert(path.clone(), serde_json::Value::Object(kept));
+        }
+    }
+    let paths = serde_json::Value::Object(paths);
+    json!({
+        "openapi": doc["openapi"],
+        "info": doc["info"],
+        "paths": paths,
+        "components": {"schemas": openapi_prune_schemas(&doc, &paths)},
+    })
+    .to_string()
+}
+
+/// Every schema the kept paths reach, transitively — a `$ref` in a response
+/// pulls in the schema it names, and whatever *that* one refs in turn. Missing
+/// the closure would serve a document with dangling refs, which is worse than
+/// serving all 144.
+fn openapi_prune_schemas(
+    doc: &serde_json::Value,
+    paths: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let all = doc["components"]["schemas"].as_object().cloned().unwrap_or_default();
+    let mut queue = openapi_refs(paths);
+    let mut kept = serde_json::Map::new();
+    while let Some(name) = queue.pop() {
+        if kept.contains_key(&name) {
+            continue;
+        }
+        let Some(schema) = all.get(&name) else { continue };
+        queue.extend(openapi_refs(schema));
+        kept.insert(name, schema.clone());
+    }
+    kept.sort_keys();
+    kept
+}
+
+/// The schema names `$ref`d anywhere under `v`.
+fn openapi_refs(v: &serde_json::Value) -> Vec<String> {
+    match v {
+        serde_json::Value::Object(m) => m
+            .iter()
+            .flat_map(|(k, v)| match (k.as_str(), v.as_str()) {
+                ("$ref", Some(r)) => {
+                    r.strip_prefix("#/components/schemas/").map(String::from).into_iter().collect()
+                }
+                _ => openapi_refs(v),
+            })
+            .collect(),
+        serde_json::Value::Array(a) => a.iter().flat_map(openapi_refs).collect(),
+        _ => vec![],
+    }
 }
 
 async fn root() -> Response {
     // `docs` pointed at FastAPI's Swagger page, which no longer exists. The
     // machine-readable document does, and is what any client actually wants.
-    Json(json!({"service": "agent-platform", "api": "/api/v1", "openapi": "/openapi.json", "admin": "/admin"}))
+    Json(json!({"service": "agent-platform", "api": "/api/v1", "openapi": "/openapi.json", "openapi_index": "/openapi.json?index", "admin": "/admin"}))
         .into_response()
 }
 
@@ -559,6 +681,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/openapi.json", axum::routing::get(openapi))
         .route("/admin", axum::routing::get(admin))
         .merge(action_orchestrator::routes())
+        .merge(ads::routes())
         .merge(api_tokens::routes())
         .merge(assistant::routes())
         .merge(coder::routes())
@@ -747,6 +870,50 @@ mod tests {
             "192.168.1.10:18410",
         ] {
             assert!(!host_is_local(host), "{host:?} must be rejected");
+        }
+    }
+
+    /// The index is what another project reads first, so an operation missing
+    /// from it is a route that repo will never learn about.
+    #[test]
+    fn openapi_index_lists_every_operation() {
+        let doc = openapi_doc();
+        let total: usize = doc["paths"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|item| HTTP_METHODS.iter().filter(|m| item.get(**m).is_some()).count())
+            .sum();
+        let index: serde_json::Value = serde_json::from_str(&openapi_index()).unwrap();
+        let listed: usize = index["operations"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|v| v.as_array().unwrap().len())
+            .sum();
+        assert_eq!(listed, total, "index dropped operations");
+    }
+
+    /// A tag view with a dangling `$ref` is a document no generator can read.
+    #[test]
+    fn a_tag_view_carries_the_schemas_it_references() {
+        let view: serde_json::Value =
+            serde_json::from_str(&openapi_by_tag("todos,projects")).unwrap();
+        let schemas = view["components"]["schemas"].as_object().unwrap();
+        assert!(!view["paths"].as_object().unwrap().is_empty(), "no paths matched");
+        assert!(
+            schemas.len() < openapi_doc()["components"]["schemas"].as_object().unwrap().len(),
+            "pruning kept everything"
+        );
+        for name in openapi_refs(&view) {
+            assert!(schemas.contains_key(&name), "{name} is referenced but not carried");
+        }
+        for item in view["paths"].as_object().unwrap().values() {
+            for op in item.as_object().unwrap().values() {
+                let tags: Vec<&str> =
+                    op["tags"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+                assert!(tags.contains(&"todos") || tags.contains(&"projects"), "leaked {tags:?}");
+            }
         }
     }
 }

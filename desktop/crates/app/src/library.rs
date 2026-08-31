@@ -193,6 +193,55 @@ pub const TEAM_PRESETS: &[Preset] = &[
             },
         ],
     },
+    // The same four roles Studio's Ads tab uses when no team is named
+    // (`server/src/ads.rs::default_roster`). Kept here as well so the roster is
+    // something a user can fork and tune in the editor rather than a constant
+    // only the server can see — the two lists feed different consumers and
+    // neither breaks if the other changes.
+    Preset {
+        name: "Social media marketing",
+        description: "Writes ads: one angle, one voice, one picture brief, the platform's rules.",
+        color: PURPLE,
+        category: "Marketing",
+        roles: &[
+            PresetRole {
+                id: "strategist",
+                name: "Campaign strategist",
+                description:
+                    "Owns the angle: which single benefit this ad is about, and who it is aimed \
+                     at. Refuses to say three things at once.",
+                parent: "",
+                accent: PURPLE,
+            },
+            PresetRole {
+                id: "copywriter",
+                name: "Copywriter",
+                description:
+                    "Writes the caption and the call to action in the brand's voice. Leads with \
+                     the hook, never with the company name.",
+                parent: "strategist",
+                accent: BLUE,
+            },
+            PresetRole {
+                id: "art_director",
+                name: "Art director",
+                description:
+                    "Decides what the picture shows and describes it as a diffusion prompt. Keeps \
+                     the frame clear where text will sit.",
+                parent: "strategist",
+                accent: ORANGE,
+            },
+            PresetRole {
+                id: "social_lead",
+                name: "Social media lead",
+                description:
+                    "Knows each platform's conventions and limits. Picks hashtags people follow \
+                     rather than padding the count.",
+                parent: "strategist",
+                accent: GREEN,
+            },
+        ],
+    },
     Preset {
         name: "Autonomous product engineering",
         description: "Software-style tree: lead → senior + QA; backend chain to frontend.",

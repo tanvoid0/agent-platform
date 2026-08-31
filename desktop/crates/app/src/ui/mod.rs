@@ -507,6 +507,18 @@ pub fn stack_lg<'a, M: 'a>(children: Vec<Element<'a, M>>) -> Column<'a, M> {
 }
 
 /// Horizontal group (`flex items-center gap-2`).
+/// [`cluster`] that wraps instead of overflowing. A row of badges whose count
+/// depends on data (a board card's facts, the sidebar's utility strip) has no
+/// width it is guaranteed to fit in, and an overflowing `Row` clips its tail
+/// silently — the clipped control is simply unreachable.
+pub fn wrap_row<'a, M: 'a>(children: Vec<Element<'a, M>>) -> Element<'a, M> {
+    Row::with_children(children)
+        .spacing(space::XS)
+        .align_y(iced::Alignment::Center)
+        .wrap()
+        .into()
+}
+
 pub fn cluster<'a, M: 'a>(children: Vec<Element<'a, M>>) -> Row<'a, M> {
     Row::with_children(children)
         .spacing(space::SM)

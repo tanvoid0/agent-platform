@@ -52,7 +52,7 @@ use crate::AppState;
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/processes", get(list_processes).post(start_process))
-        .route("/api/v1/processes/{process_id}", get(get_process))
+        .route("/api/v1/processes/{process_id}", get(get_process).patch(patch_process))
         .route("/api/v1/processes/{process_id}/events", get(list_events))
         .route("/api/v1/processes/{process_id}/approve", post(approve_dag))
         .route("/api/v1/processes/{process_id}/cancel", post(cancel_process))
@@ -111,6 +111,9 @@ struct ProcessOut {
     client_id: Option<String>,
     token_id: Option<i64>,
     model_build_job_id: Option<i64>,
+    /// `INTEGER` 0/1 on both backends, for the same reason `requires_review` is.
+    #[serde(serialize_with = "sql_flag")]
+    auto_approve: i64,
     #[serde(serialize_with = "sql_time")]
     created_at: String,
     #[serde(serialize_with = "sql_time")]
@@ -123,7 +126,7 @@ pub const PROCESS_COLUMNS: &str = "CAST(id AS BIGINT) AS id, goal, status, dag_j
      CAST(team_template_id AS BIGINT) AS team_template_id, team_snapshot_json, \
      CAST(project_id AS BIGINT) AS project_id, client_id, \
      CAST(token_id AS BIGINT) AS token_id, \
-     CAST(model_build_job_id AS BIGINT) AS model_build_job_id, \
+     CAST(model_build_job_id AS BIGINT) AS model_build_job_id, auto_approve, \
      CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at";
 
 #[derive(Debug, FromRow, Serialize)]
@@ -136,6 +139,11 @@ struct TaskNodeOut {
     system_prompt: String,
     instructions: String,
     llm_model: Option<String>,
+    /// `text` | `image` | `video`, and the media job the last two started
+    /// (ADR 0018). `media_job_id` is here so a reader can fetch the picture
+    /// without parsing it back out of `output`.
+    modality: String,
+    media_job_id: Option<i64>,
     dependencies_json: String,
     status: String,
     /// `INTEGER` on both backends, so `i64` here — the `Any` driver will not
@@ -158,7 +166,8 @@ struct TaskNodeOut {
 
 pub const TASK_COLUMNS: &str = "CAST(id AS BIGINT) AS id, \
      CAST(process_id AS BIGINT) AS process_id, client_uuid, parent_client_uuid, role, \
-     system_prompt, instructions, llm_model, dependencies_json, status, requires_review, \
+     system_prompt, instructions, llm_model, modality, \
+     CAST(media_job_id AS BIGINT) AS media_job_id, dependencies_json, status, requires_review, \
      reviewer_client_uuid, review_feedback, \
      CAST(revision_count AS BIGINT) AS revision_count, draft_output, output, \
      failure_debug_json, CAST(tokens_used AS BIGINT) AS tokens_used, \
@@ -836,20 +845,62 @@ async fn start_process(
     .bind(req.project_id)
     .bind(client_id.as_deref())
     .bind(principal.token_id)
+    .bind(i64::from(req.auto_approve))
     .bind(&now)
     .bind(&now)
     .fetch_one(&state.any)
     .await?;
 
-    crate::executor::spawn_plan(
-        state.clone(),
-        process_id,
-        goal,
-        Some(team_context),
-        req.auto_approve,
-    );
+    crate::executor::spawn_plan(state.clone(), process_id, goal, Some(team_context));
 
     Ok(Json(json!({ "process_id": process_id, "status": "pending" })).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /processes/{id}
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct PatchProcessRequest {
+    #[serde(default)]
+    auto_approve: Option<bool>,
+}
+
+/// Flip `auto_approve` on a process already in flight.
+///
+/// Only that one field: everything else on the row is either the planner's
+/// output or a status the executor owns. Turning it on does **not** clear the
+/// gate the process is sitting at right now — the executor reads the flag when
+/// it next reaches one — so the caller still posts `/approve` or a task review
+/// to release the current stop.
+async fn patch_process(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    headers: HeaderMap,
+    PathId(process_id): PathId<i64>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    principal.require_scope("process:write")?;
+    accessible_process(&state, &principal, &headers, process_id).await?;
+    let req: PatchProcessRequest = parse_body_or_default(&body)?;
+
+    if let Some(auto_approve) = req.auto_approve {
+        sqlx::query(&crate::db::sql("UPDATE process SET auto_approve = ?, updated_at = ? WHERE id = ?", state.backend))
+            .bind(i64::from(auto_approve))
+            .bind(sql_now())
+            .bind(process_id)
+            .execute(&state.any)
+            .await?;
+        append_event(
+            &state,
+            process_id,
+            None,
+            if auto_approve { "Auto-approve turned on" } else { "Auto-approve turned off" },
+        )
+        .await?;
+    }
+
+    Ok(Json(load_process(&state, process_id).await?).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,7 +1305,6 @@ async fn sync_process(
                 process_id,
                 proc.goal.clone(),
                 team_context_from_snapshot(proc.team_snapshot_json.as_deref()),
-                false,
             );
             Ok(sync_response(
                 process_id,
@@ -1402,7 +1452,6 @@ async fn retry_process(
                 process_id,
                 proc.goal.clone(),
                 team_context_from_snapshot(proc.team_snapshot_json.as_deref()),
-                false,
             );
             Ok(Json(json!({
                 "process_id": process_id,

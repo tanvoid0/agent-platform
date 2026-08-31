@@ -90,6 +90,7 @@ icons! {
     ChevronRight => chevron_right,
     ListChecks => list_checks,
     ArrowLeft => arrow_left,
+    ArrowUp => arrow_up,
     ArrowRight => arrow_right,
     Globe => globe,
     LogOut => log_out,

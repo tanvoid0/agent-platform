@@ -108,6 +108,10 @@ pub struct State {
     /// card, shown where a model is actually chosen. Empty when Ollama is down;
     /// that is not an error banner, the catalog row already says it is stopped.
     pub local_models: Vec<OllamaModelSummary>,
+    /// The media backend probe (`GET /media/status`). `None` until the first
+    /// fetch settles; unreachable is ordinary state, not an error banner —
+    /// the Media card says so itself.
+    pub media: Option<MediaStatus>,
     pub busy: bool,
     pub error: Option<String>,
     pub notice: crate::domain::Toast,
@@ -153,7 +157,7 @@ impl State {
 
     /// Whether the *saved* `.env` (not an unsaved draft — same rule the
     /// catalog badges above already follow) has this env key set.
-    fn env_set(&self, key: &str) -> bool {
+    pub fn env_set(&self, key: &str) -> bool {
         self.env_key(key).is_some_and(|k| k.set)
     }
 
@@ -198,6 +202,10 @@ impl State {
                 "OLLAMA_API_BASE" => body.ollama_api_base = v,
                 "LM_STUDIO_API_BASE" => body.lm_studio_api_base = v,
                 "AIMLAPI_OPENAI_BASE" => body.aimlapi_openai_base = v,
+                "MEDIA_API_BASE" => body.media_api_base = v,
+                "MEDIA_IMAGE_MODEL" => body.media_image_model = v,
+                "SPEECH_API_BASE" => body.speech_api_base = v,
+                "SPEECH_API_KEY" => body.speech_api_key = v,
                 _ => {}
             }
         }
@@ -221,6 +229,7 @@ pub enum Message {
     EnvLoaded(Result<Box<LlmEnv>, String>),
     CatalogLoaded(Result<Vec<ProviderEntry>, String>),
     LocalModelsLoaded(Result<Vec<OllamaModelSummary>, String>),
+    MediaStatusLoaded(Result<Box<MediaStatus>, String>),
     FieldChanged(&'static str, String),
     DefaultProviderChanged(String),
     DefaultModelChanged(String),
@@ -234,6 +243,10 @@ pub enum Message {
     Launch(&'static str),
     /// Open a provider's key page in the browser.
     OpenUrl(&'static str),
+    /// "Model files" on the media card. Checkpoint downloads live on the
+    /// Downloads screen; intercepted in `main::update` like `TraceLogs`, since
+    /// this screen cannot navigate.
+    OpenDownloads,
     PullNameChanged(String),
     PullModel,
     Pulled(Result<i64, String>),
@@ -243,7 +256,7 @@ pub enum Message {
 }
 
 pub fn refresh(client: &Client) -> Task<Message> {
-    let (c1, c2, c3) = (client.clone(), client.clone(), client.clone());
+    let (c1, c2, c3, c4) = (client.clone(), client.clone(), client.clone(), client.clone());
     Task::batch([
         Task::perform(
             async move { err_string(c1.llm_env().await).map(Box::new) },
@@ -257,12 +270,16 @@ pub fn refresh(client: &Client) -> Task<Message> {
             async move { err_string(c3.ollama_models().await).map(|r| r.models) },
             Message::LocalModelsLoaded,
         ),
+        Task::perform(
+            async move { err_string(c4.media_status().await).map(Box::new) },
+            Message::MediaStatusLoaded,
+        ),
     ])
 }
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
-        Message::TraceLogs(_) => Task::none(),
+        Message::TraceLogs(_) | Message::OpenDownloads => Task::none(),
         Message::Refresh => refresh(client),
         Message::EnvLoaded(Ok(env)) => {
             state.error = None;
@@ -284,6 +301,12 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
         // banner: the catalog row already renders it as "stopped".
         Message::LocalModelsLoaded(result) => {
             state.local_models = result.unwrap_or_default();
+            Task::none()
+        }
+        // Same rule as Ollama above: a media backend that is down is what the
+        // card renders, not a failure of this screen.
+        Message::MediaStatusLoaded(result) => {
+            state.media = result.ok().map(|s| *s);
             Task::none()
         }
         Message::CatalogLoaded(Err(e)) => {
@@ -448,6 +471,27 @@ mod tests {
         let _ = update(&mut s, &client(), Message::EnvLoaded(Ok(Box::new(env))));
         let _ = update(&mut s, &client(), Message::CatalogLoaded(Ok(providers)));
         s
+    }
+
+    /// Neither the media pair nor the speech pair is in the provider table, so
+    /// nothing walks them — same pin as the search pair below.
+    #[test]
+    fn media_base_reaches_the_save_body() {
+        let mut s = loaded();
+        assert!(s.pending().media_api_base.is_none());
+        let _ = update(
+            &mut s,
+            &client(),
+            Message::FieldChanged("MEDIA_API_BASE", " http://127.0.0.1:9188 ".into()),
+        );
+        assert_eq!(s.pending().media_api_base.as_deref(), Some("http://127.0.0.1:9188"));
+
+        let _ = update(
+            &mut s,
+            &client(),
+            Message::FieldChanged("SPEECH_API_BASE", "http://127.0.0.1:8020".into()),
+        );
+        assert_eq!(s.pending().speech_api_base.as_deref(), Some("http://127.0.0.1:8020"));
     }
 
     #[test]

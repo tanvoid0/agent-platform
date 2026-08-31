@@ -212,7 +212,9 @@ pub fn tokens(theme: &Theme) -> Tokens {
 }
 
 /// Semantic color roles for domain state. Screens pick a `Tone`, never a color.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Hash`: the toast's dismissal timer is a subscription keyed on the whole
+// notice tuple, and the tone rides along in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tone {
     Neutral,
     Info,

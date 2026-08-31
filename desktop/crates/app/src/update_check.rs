@@ -134,6 +134,11 @@ const DOWNLOAD_BASE: &str = "https://github.com/tanvoid0/agent-platform/releases
 
 /// Download release `version`, verify it, and swap it over this install.
 ///
+/// Not on the [`crate::downloads`] queue either, and this one never should be:
+/// the bytes are one step of a checksum-then-swap chain that stops the server
+/// and replaces the running binaries. A transfer the user can cancel, retry or
+/// reorder halfway through that is a broken install, not a paused download.
+///
 /// The caller must have stopped the daemon first: its exe is replaced too, and
 /// a running child holds the handle. Returns once the new files are in place —
 /// **the process is still the old binary** and the caller relaunches

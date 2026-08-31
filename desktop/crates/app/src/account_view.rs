@@ -35,11 +35,12 @@ fn local_card<'a>() -> Element<'a, Message> {
         "This machine",
         Some(ui::muted(
             "Projects, chats, coder and local models stay in the SQLite file on this computer. \
-             No account. The local API is open on loopback, like Ollama.",
+             No account. The local API is bound to loopback and needs this install's key.",
         )),
         None,
         ui::stack(vec![ui::caption(
-            "Other apps on this machine call http://127.0.0.1:18410 with no token.",
+            "Other apps on this machine call http://127.0.0.1:18410 with the key from \
+             Settings → Status.",
         )]),
     )
 }

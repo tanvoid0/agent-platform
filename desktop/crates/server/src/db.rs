@@ -63,6 +63,14 @@ impl Backend {
     }
 }
 
+/// Which engine a live pool is talking to. `VACUUM INTO` and
+/// `PRAGMA wal_checkpoint` are SQLite statements; run against Postgres each is
+/// a syntax error, logged on every start and every shutdown, which reads like
+/// the backup broke rather than like there was never a file to back up.
+pub fn backend_of(pool: &AnyPool) -> Backend {
+    Backend::from_url(pool.connect_options().database_url.as_str())
+}
+
 /// Select a boolean column in a form the `Any` driver will decode, aliased back
 /// to its own name. Read it into an `i64` and compare against 0.
 ///
@@ -194,10 +202,39 @@ pub fn connect_lazy(url: &str, backend: Backend) -> AnyPool {
 /// next migration — worth adding reversibility the first time a release
 /// actually has to be undone, not before.
 pub async fn ensure_schema(pool: &AnyPool) -> Result<(), sqlx::Error> {
-    migrator(Backend::from_url(pool.connect_options().database_url.as_str()))
-        .run(pool)
-        .await
-        .map_err(sqlx::Error::from)
+    let backend = backend_of(pool);
+    migrator(backend).run(pool).await.map_err(|e| explain_migrate_failure(backend, e))
+}
+
+/// sqlx's own migration errors name a version and nothing else - "migration 9
+/// was previously applied but has been modified" is true, and leaves the reader
+/// to work out which file, why it is fatal, and what to do. This is the last
+/// thing the daemon says before it exits, so it says all three.
+fn explain_migrate_failure(backend: Backend, e: sqlx::migrate::MigrateError) -> sqlx::Error {
+    let dir = match backend {
+        Backend::Sqlite => "sqlite",
+        Backend::Postgres => "postgres",
+    };
+    let hint = match &e {
+        sqlx::migrate::MigrateError::VersionMismatch(v) => Some(format!(
+            "migrations/{dir}/{v:04}_*.sql was edited after it was applied to this database. \
+             An applied migration is checksummed and must not change (see CLAUDE.md). Either \
+             restore that file to the version that was applied, or - if the schema it produces \
+             is unchanged - re-stamp the row in `_sqlx_migrations` for version {v}."
+        )),
+        sqlx::migrate::MigrateError::VersionMissing(v) => Some(format!(
+            "this database has migration {v} applied but migrations/{dir}/ no longer contains it, \
+             so it was built by a newer or different build than this one."
+        )),
+        _ => None,
+    };
+    let message = match hint {
+        Some(hint) => format!("the database schema could not be brought up to date: {e}. {hint}"),
+        None => format!("the database schema could not be brought up to date: {e}"),
+    };
+    // Boxed as a protocol error: the caller logs the message and exits, and
+    // nothing branches on the variant.
+    sqlx::Error::Protocol(message)
 }
 
 static SQLITE_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
@@ -237,6 +274,12 @@ const BACKUP_GENERATIONS: usize = 3;
 /// this process's.
 pub async fn backup(pool: &AnyPool, db_path: &std::path::Path) {
     if crate::env_opt("AGENT_PLATFORM_BACKUP").as_deref() == Some("0") {
+        return;
+    }
+    // Postgres has no local file here to snapshot, and its backups are the
+    // deployment's own. Without this the first log line of every cloud start
+    // was `backup failed: syntax error at or near "INTO"`.
+    if backend_of(pool) != Backend::Sqlite {
         return;
     }
     let Some(dir) = db_path.parent() else { return };
@@ -305,6 +348,10 @@ fn prune_backups(dir: &std::path::Path, stem: &str) {
 /// the difference between copying one small file and one large one, and it is a
 /// single statement at the only moment nothing is writing.
 pub async fn checkpoint(pool: &AnyPool) {
+    // There is no WAL sidecar to fold in on Postgres; see [`backup`].
+    if backend_of(pool) != Backend::Sqlite {
+        return;
+    }
     if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(pool).await {
         logd!("wal checkpoint failed: {e}");
     }

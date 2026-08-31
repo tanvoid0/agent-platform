@@ -267,7 +267,11 @@ async fn llm_proxy_routes_authenticate_per_route() {
     assert_eq!(v["providers"]["ollama"]["configured"], true);
     assert_eq!(v["providers"]["image_local"]["configured"], false);
     assert_eq!(v["resolved"]["chat"], "ollama");
-    assert_eq!(v["resolved"]["image_generation"], Value::Null);
+    // The media backend has a loopback default too, so pictures route without
+    // configuration — ComfyUI (or sd.cpp) is the image and video provider by
+    // being wired, not by being chosen.
+    assert_eq!(v["resolved"]["image_generation"], "media_local");
+    assert_eq!(v["resolved"]["video_generation"], "media_local");
     assert_eq!(v["byok"]["providers"][0]["id"], "openai");
 
     let _ = std::fs::remove_file(&db);

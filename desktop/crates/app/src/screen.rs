@@ -31,6 +31,9 @@ const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
         &[
             (Screen::Projects, Icon::Folder, "Projects"),
             (Screen::Teams, Icon::Users, "Teams"),
+            // Model files land on this machine, so they belong with the other
+            // things it holds rather than with the tools that use them.
+            (Screen::Downloads, Icon::Download, "Downloads"),
         ],
     ),
     (
@@ -74,7 +77,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
             crate::coder_board::view(&app.coder, &app.settings.theme.resolve()).map(Message::Coder)
         }
         Screen::Search => crate::search_view::view(&app.search).map(Message::Search),
-        Screen::Studio => crate::studio_view::view(&app.studio).map(Message::Studio),
+        Screen::Studio => {
+            crate::studio_view::view(&app.studio, &app.downloads).map(Message::Studio)
+        }
+        Screen::Downloads => crate::downloads_view::view(&app.downloads),
         Screen::Assistant | Screen::Memory => chat_view(app),
     };
 
@@ -106,8 +112,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
 
     let shell: Element<'_, Message> = match notice(app) {
-        Some((text, _)) => {
-            ui::toast_layer(shell, ui::toast(text, Tone::Success, Message::NoticeExpired))
+        Some((text, _, tone)) => {
+            ui::toast_layer(shell, ui::toast(text, tone, Message::NoticeExpired))
         }
         None => shell.into(),
     };
@@ -184,10 +190,13 @@ fn assistant_panel(app: &App) -> Element<'_, Message> {
 /// The transient message of whatever screen is open, with the generation
 /// counter the toast timer keys on. Screens keep their own `notice`; this is
 /// the one place that turns them into a toast.
-pub fn notice(app: &App) -> Option<(String, u64)> {
+pub fn notice(app: &App) -> Option<(String, u64, Tone)> {
     match app.screen {
         Screen::Projects | Screen::Teams => app.library.notice.get(),
-        Screen::Processes => app.processes.notice.get(),
+        // Home hosts the same run composer, so it has to show the same toast.
+        // Missing here, "Started run #N." was raised and silently dropped, and
+        // pressing Start looked like it had done nothing at all.
+        Screen::Processes | Screen::Dashboard => app.processes.notice.get(),
         Screen::Workflows => app.workflows.notice.get(),
         Screen::Settings => match app.settings_tab {
             SettingsTab::Providers => app.providers.notice.get(),
@@ -245,6 +254,17 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     container(
         column![
             brand(app),
+            // Back sits above the destinations, not among them: it is how you
+            // leave where you are, and every other row here is somewhere to go.
+            // Always drawn — disabled rather than absent, so the nav list below
+            // does not jump a row the first time the user goes anywhere.
+            ui::button_sized(
+                Some(Icon::ArrowLeft),
+                "Back",
+                ui::ButtonVariant::Ghost,
+                ui::Size::Sm,
+                (!app.back.is_empty()).then_some(Message::Back),
+            ),
             // The list scrolls on its own so the brand block and the footer keep
             // their place in a short window.
             scrollable(Column::with_children(items).spacing(2.0)).height(Length::Fill),
@@ -262,7 +282,10 @@ fn sidebar(app: &App) -> Element<'_, Message> {
             // locks — Status and Logs live inside it. Icon-only like its two
             // neighbors, so the row reads as one utility strip; each gets a
             // tooltip since none of the three carry a visible label.
-            ui::cluster(footer_controls(app)).width(Length::Fill),
+            // `wrap_row`, not `cluster`: six 28px buttons plus their gaps overflow
+            // a 208px sidebar, and the one that fell off the end was Restart app
+            // — clipped, so unreachable.
+            ui::wrap_row(footer_controls(app)),
         ]
         .spacing(space::SM),
     )
@@ -420,23 +443,30 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
         blocks.push(
             crate::processes_view::new_run_composer(&app.processes).map(Message::Processes),
         );
-        let waiting: Vec<_> = app
+        // Everything in flight, not just what is blocked. A run spends its
+        // first minute planning, and this card said "No runs waiting on you"
+        // through all of it — pressing Start looked like it had done nothing.
+        // Blocked runs still come first and still read louder; they are the
+        // ones that stay stopped until someone answers.
+        let mut live: Vec<_> = app
             .processes
             .processes
             .iter()
-            .filter(|p| crate::processes::needs_user(p.status))
+            .filter(|p| crate::processes::is_live(p.status))
             .collect();
-        let inbox: Element<'_, Message> = if waiting.is_empty() {
+        live.sort_by_key(|p| !crate::processes::needs_user(p.status));
+
+        let inbox: Element<'_, Message> = if live.is_empty() {
             ui::empty_state_action(
                 Icon::Inbox,
-                "No runs waiting on you.",
+                "Nothing running. Start a run above.",
                 ui::button_outline(Icon::Activity, "All runs", Message::Nav(Screen::Processes)),
             )
         } else {
             ui::stack(
-                waiting
-                    .iter()
+                live.iter()
                     .map(|p| {
+                        let blocked = crate::processes::needs_user(p.status);
                         let mut lines = vec![
                             ui::cluster(vec![
                                 ui::badge(
@@ -446,27 +476,37 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
                                 ui::caption(format!("#{}", p.id)),
                                 ui::spacer(),
                                 ui::caption(
-                                    crate::domain::relative_time(&p.created_at)
+                                    crate::domain::relative_time(&p.updated_at)
                                         .unwrap_or_default(),
                                 ),
                             ])
                             .into(),
                             ui::body(crate::domain::truncate(&p.goal, 90)),
                         ];
-                        if let Some(hint) = crate::domain::process_waiting_hint(p.status.as_str()) {
-                            lines.push(ui::caption(hint));
+                        match crate::domain::process_waiting_hint(p.status.as_str()) {
+                            Some(hint) => lines.push(ui::caption(hint)),
+                            // A run that is still moving says so rather than
+                            // leaving the row looking like it has stalled.
+                            None => lines.push(ui::caption("Working — nothing to answer yet.")),
                         }
-                        ui::list_item(ui::stack(lines), false, Message::OpenRun(p.id))
+                        // `selected` is the kit's own emphasis; a blocked run is
+                        // the one row on this card that is asking for something.
+                        ui::list_item(ui::stack(lines), blocked, Message::OpenRun(p.id))
                     })
                     .collect(),
             )
             .into()
         };
+        let blocked = live.iter().filter(|p| crate::processes::needs_user(p.status)).count();
         blocks.push(ui::card_with_header(
-            "Needs you",
-            Some(ui::muted(
-                "Plan approval or task review — the run will not move until you answer.",
-            )),
+            "Active runs",
+            Some(ui::muted(match blocked {
+                0 => "Everything in flight. Nothing is waiting on you.".to_string(),
+                n => format!(
+                    "Everything in flight. {} — the run will not move until you answer.",
+                    ui::count(n, "run needs you", "runs need you"),
+                ),
+            })),
             None,
             inbox,
         ));
@@ -475,7 +515,7 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
     ui::page(
         "Home",
         Some(ui::muted(format!(
-            "Start a run, or pick up anything waiting on you. {} is standing by.",
+            "Start a run, or pick up one already going. {} is standing by.",
             crate::assistant::name()
         ))),
         Some(ui::button_ghost(Icon::Activity, "All runs", Message::Nav(Screen::Processes))),
@@ -507,9 +547,6 @@ fn uptime(seconds: f64) -> String {
 /// nothing else does and lands you on the tabs that still work.
 fn settings_view(app: &App) -> Element<'_, Message> {
     let ready = app.server_ready();
-    let tabs = ui::segmented(SettingsTab::ALL.map(|tab| {
-        (tab.label(), app.settings_tab == tab, Message::NavSettings(tab))
-    }));
 
     let body = if app.settings_tab.needs_server() && !ready {
         blocked_view(app, app.settings_tab.label())
@@ -532,7 +569,55 @@ fn settings_view(app: &App) -> Element<'_, Message> {
         }
     };
 
-    tabbed(tabs, body)
+    settings_shell(app, body)
+}
+
+/// Settings' own sidebar. It was a strip of seven equal segments in the top-left
+/// corner: nothing said which of them was a preference (Appearance) and which
+/// was a workspace of its own (Model ops), the labels were the smallest text on
+/// screen, and a page 3000px wide put the tabs and the thing they controlled at
+/// opposite ends of the eye. A second nav column says what kind of thing each
+/// one changes, has room for the labels, and puts the list beside its page.
+///
+/// A column of the row, not an overlay, for the same reason the E.V. panel is —
+/// the page next to it stays live and clickable.
+fn settings_shell<'a>(app: &'a App, body: Element<'a, Message>) -> Element<'a, Message> {
+    let ready = app.server_ready();
+    let mut items: Vec<Element<'a, Message>> = vec![ui::heading("Settings")];
+    for (group, tabs) in SettingsTab::groups() {
+        items.push(ui::nav_group(group));
+        for tab in tabs {
+            items.push(if tab.needs_server() && !ready {
+                ui::nav_item_locked(tab.icon(), tab.label())
+            } else {
+                ui::nav_item(
+                    tab.icon(),
+                    tab.label(),
+                    app.settings_tab == tab,
+                    Message::NavSettings(tab),
+                )
+            });
+        }
+    }
+    // Logs is a Settings tab in everything but name — the page you read when a
+    // change did not take, and the other half of Status. It is a `Screen`
+    // because the traced-error banners jump straight to it, so it is listed
+    // here rather than moved.
+    items.push(ui::nav_item(Icon::Scroll, "Logs", false, Message::Nav(Screen::Logs)));
+
+    row![
+        container(scrollable(Column::with_children(items).spacing(2.0)).height(Length::Fill))
+            .width(208)
+            .padding(space::MD)
+            .height(Length::Fill)
+            .style(ui::theme::sidebar),
+        ui::separator_vertical(),
+        container(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(ui::theme::app_background),
+    ]
+    .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +783,19 @@ fn brand(app: &App) -> Element<'_, Message> {
     // hole, so the plate follows the active theme.
     let dark = ui::theme::tokens(&app.settings.theme.resolve()).dark;
     let mark = iced::widget::image(crate::logo_handle(dark)).width(24).height(24);
+    // Offline or port-in-use is the one status the user has to act on, so the
+    // fix rides beside the badge instead of living only in Settings → Status.
+    let fix: Vec<Element<'_, Message>> = match app.server_state() {
+        _ if app.shell.attached => Vec::new(),
+        ServerState::Unreachable => {
+            vec![ui::icon_tip(Icon::Refresh, "Start the server", Message::RestartServer)]
+        }
+        ServerState::Conflict => vec![
+            ui::icon_tip(Icon::Refresh, "Re-check the port", Message::RestartServer),
+            ui::icon_tip(Icon::Stop, "Stop that server and start ours", Message::TakePort),
+        ],
+        _ => Vec::new(),
+    };
     ui::stack(vec![
         ui::cluster(vec![mark.into(), ui::body("Agent Platform")]).into(),
         // The bell shares the status line rather than the name's: at 208px the
@@ -705,11 +803,19 @@ fn brand(app: &App) -> Element<'_, Message> {
         // make it. What it counts is everything the sidebar badges count, from
         // every screen at once — including the Settings tabs that have no badge
         // of their own.
-        ui::cluster(vec![
-            ui::badge(label, tone),
-            ui::spacer(),
-            ui::bell(crate::notify::total(), crate::note_tone(""), Message::ToggleNotifications),
-        ])
+        ui::cluster(
+            std::iter::once(ui::badge(label, tone))
+                .chain(fix)
+                .chain([
+                    ui::spacer(),
+                    ui::bell(
+                        crate::notify::total(),
+                        crate::note_tone(""),
+                        Message::ToggleNotifications,
+                    ),
+                ])
+                .collect(),
+        )
         .into(),
     ])
     .into()
@@ -1414,6 +1520,7 @@ fn status_view(app: &App) -> Element<'_, Message> {
                     ),
                     ui::cluster(vec![
                         ui::button_secondary(Icon::Refresh, "Re-check port", Message::RestartServer),
+                        ui::button_destructive(Icon::Stop, "Stop that server", Message::TakePort),
                         ui::button_ghost(
                             Icon::FolderOpen,
                             "Open data folder",
@@ -1487,6 +1594,14 @@ fn server_card(app: &App) -> Element<'_, Message> {
         rows.push(ui::field("Environment", ui::body(status.env.clone())));
         rows.push(ui::field("Version", ui::body(status.server.clone())));
         rows.push(ui::field("Platform", ui::muted(status.platform.clone())));
+        // Attached to a server we did not spawn, so it picked its own database
+        // — a scratch one reads exactly like the real one until you look, and
+        // every row then 404s. Say which file this is, here, not just on Status.
+        if app.shell.attached {
+            if let Some(db) = status.paths.database.as_deref() {
+                rows.push(ui::field("Database", ui::mono(db.to_string())));
+            }
+        }
     }
     if let Some(err) = &app.status_error {
         rows.push(ui::caption(err.clone()));
@@ -1642,7 +1757,7 @@ fn local_llm_card(app: &App) -> Element<'_, Message> {
 /// No search and no browse — the model card in the browser is a better catalog
 /// than anything this could draw, and what it gives you is a link to paste.
 fn local_model_download(app: &App) -> Element<'_, Message> {
-    let mut bar = vec![
+    let mut rows = vec![ui::cluster(vec![
         container(ui::input_submit(
             "owner/repo/model-Q4_K_M.gguf, or a Hugging Face link",
             &app.model_dl.input,
@@ -1651,27 +1766,17 @@ fn local_model_download(app: &App) -> Element<'_, Message> {
         ))
         .width(Length::Fill)
         .into(),
-    ];
-    if app.model_dl.active {
-        bar.push(ui::badge("downloading…", Tone::Info));
-        // The one control that matters on a 20 GB transfer: the way out.
-        bar.push(ui::button_ghost(Icon::X, "Cancel", Message::CancelModelDownload));
-    } else {
-        bar.push(ui::button_secondary(Icon::Download, "Get", Message::DownloadModel));
-    }
-    let mut rows = vec![ui::cluster(bar).into()];
+        ui::button_secondary(Icon::Download, "Get", Message::DownloadModel),
+    ])
+    .into()];
 
-    if app.model_dl.active {
-        let got = crate::model_download::human(app.model_dl.received);
-        rows.push(ui::caption(match app.model_dl.total {
-            // The server may not send a length; a bare byte count still moves.
-            None => format!("{got} so far"),
-            Some(total) => format!(
-                "{got} of {} ({}%)",
-                crate::model_download::human(total),
-                app.model_dl.received * 100 / total.max(1)
-            ),
-        }));
+    // The transfer's own row, drawn by the Downloads screen's renderer — the
+    // paste box no longer counts bytes, it only starts them.
+    let mine: Vec<_> =
+        app.downloads.by_tag(crate::downloads::Tag::LocalModel).filter(|j| j.active()).collect();
+    if !mine.is_empty() {
+        rows.push(crate::downloads_view::panel(mine.into_iter(), Message::Downloads));
+        rows.push(ui::button_ghost(Icon::Download, "All downloads", Message::Nav(Screen::Downloads)));
     }
     if let Some(e) = &app.model_dl.error {
         rows.push(ui::alert_error(e.clone()));
@@ -1755,8 +1860,9 @@ fn api_card(app: &App) -> Element<'_, Message> {
     ui::card_with_header(
         "API server",
         Some(ui::muted(
-            "Other local apps can use this server with no token, like Ollama. \
-             A key is only needed if you expose the process beyond this machine.",
+            "Other local apps reach this server with the key below. It is generated \
+             per install and kept in master.key beside your settings — nothing to \
+             set up, and nothing else on this machine gets in without it.",
         )),
         None,
         ui::stack(rows),
