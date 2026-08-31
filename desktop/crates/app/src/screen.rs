@@ -1645,6 +1645,29 @@ fn startup_card(app: &App) -> Element<'_, Message> {
                  launch the app yourself. Either way the server runs and the tray icon opens \
                  the window.",
             ),
+            ui::caption("Database"),
+            ui::input(
+                "postgres://… (blank keeps everything on this machine)",
+                &app.settings.database_url,
+                Message::SetDatabaseUrl,
+            ),
+            ui::toggle(
+                if app.settings.use_cloud_db { Icon::Globe } else { Icon::HardDrive },
+                if !app.settings.cloud_available() {
+                    "Local SQLite — add a connection string above to use a cloud database"
+                } else if app.settings.use_cloud_db {
+                    "Cloud Postgres"
+                } else {
+                    "Local SQLite"
+                },
+                app.settings.use_cloud_db && app.settings.cloud_available(),
+                Message::SetUseCloudDb(!app.settings.use_cloud_db),
+            ),
+            ui::caption(
+                "The server picks this up when it restarts. If the cloud database cannot be \
+                 reached it falls back to the local file and says so in the log, so the app \
+                 still opens away from a connection.",
+            ),
         ]),
     )
 }

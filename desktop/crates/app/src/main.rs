@@ -492,6 +492,10 @@ pub enum Message {
     /// A press on a download row, from this screen or an embedded panel.
     Downloads(downloads::Action),
     Copy(&'static str, String),
+    /// The cloud DSN, edited in Settings. Applied to the daemon on its next
+    /// start, which is why the caption there says so.
+    SetDatabaseUrl(String),
+    SetUseCloudDb(bool),
     RestartServer,
     /// Stop the foreign server holding our port, then start ours.
     TakePort,
@@ -709,6 +713,7 @@ fn boot() -> (App, Task<Message>) {
     let attached = owner == shell::PortOwner::Ours;
 
     let mut sh = Shell {
+        cloud_dsn: settings.cloud_dsn(),
         server: None,
         log,
         daemon,
@@ -1581,6 +1586,18 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                 app.shell.log_line(format!("[shell] could not change the login entry: {e}"));
             }
             app.autostart = shell::autostart::enabled();
+            Task::none()
+        }
+        Message::SetDatabaseUrl(url) => {
+            app.settings.database_url = url;
+            save_settings(app);
+            app.shell.cloud_dsn = app.settings.cloud_dsn();
+            Task::none()
+        }
+        Message::SetUseCloudDb(on) => {
+            app.settings.use_cloud_db = on;
+            save_settings(app);
+            app.shell.cloud_dsn = app.settings.cloud_dsn();
             Task::none()
         }
         Message::SetStartMinimized(on) => {

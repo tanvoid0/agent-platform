@@ -737,21 +737,56 @@ pub fn router(state: Arc<AppState>) -> Router {
     }
 }
 
+/// The pool `serve` runs on: the configured DSN when it answers, the local
+/// SQLite file when it does not.
+///
+/// A desktop install must end up with a database either way — there is no
+/// useful "no database" state for it, and a laptop that opens the app on a
+/// train should still work. So an unreachable `DATABASE_URL` degrades to the
+/// local file rather than refusing to start.
+///
+/// The fallback is loud on purpose. "The row you saved is missing" and "we
+/// wrote it to the local file instead" look identical from the UI, and a
+/// silent switch between two databases is how you lose a day.
+///
+/// Only *reachability* falls back. A DSN that answers and then fails to
+/// migrate is a real problem with a real database and must not be papered
+/// over by quietly using a different one — `ensure_schema` still returns that
+/// error to the caller.
+async fn open_database(cfg: &Config) -> AppState {
+    let local = || AppState::new(&cfg.db_path, cfg.master_key.clone());
+    let Some(dsn) = cfg.database_url.as_deref() else {
+        return local();
+    };
+    let state = AppState::with_url(&cfg.db_path, Some(dsn), cfg.master_key.clone());
+    // The pool is lazy, so this is the first thing that actually dials it.
+    // Never log `e` with the DSN in it: a DSN carries a password.
+    match state.any.acquire().await {
+        Ok(_) => state,
+        Err(e) => {
+            logd!(
+                "the configured database did not answer ({e}); falling back to the local \
+                 SQLite database at {}",
+                cfg.db_path.display()
+            );
+            local()
+        }
+    }
+}
+
 pub async fn serve(cfg: Config) -> Result<(), BoxError> {
     // Before anything slow, so `uptime_seconds` measures the server and not the
     // time it spent waiting for a backend to answer.
     system::mark_started();
-    let state = Arc::new(AppState::with_url(
-        &cfg.db_path,
-        cfg.database_url.as_deref(),
-        cfg.master_key.clone(),
-    ));
-    // Before anything queries: Alembic used to do this from the Python child,
-    // and there is no child. See `db::ensure_schema` for what it can and cannot
-    // do (it creates; it does not migrate).
+    // The directory first: the SQLite fallback in `open_database` writes into
+    // it, and so does `ensure_schema` on a fresh install.
     if let Some(parent) = cfg.db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let state = Arc::new(open_database(&cfg).await);
+    // Before anything queries: Alembic used to do this from the Python child,
+    // and there is no child. See `db::ensure_schema` for what it can and cannot
+    // do (it creates; it does not migrate).
     db::ensure_schema(&state.any).await?;
     identity::bootstrap(&state).await?;
     accounts::seed_admin_emails(&state).await;

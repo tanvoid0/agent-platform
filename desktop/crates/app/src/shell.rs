@@ -168,6 +168,15 @@ impl ResourceMode {
 #[serde(default)]
 pub struct Settings {
     pub port: u16,
+    /// Cloud Postgres DSN. Empty means none is configured, which is the only
+    /// state in which the Local/Cloud choice is not offered.
+    #[serde(default)]
+    pub database_url: String,
+    /// Use `database_url` when it is set. Off keeps the local SQLite file even
+    /// with a DSN configured, which is what makes this a toggle rather than a
+    /// consequence of pasting a DSN.
+    #[serde(default)]
+    pub use_cloud_db: bool,
     pub start_minimized: bool,
     pub theme: ThemeMode,
     /// Which E.V. animation the canvas draws.
@@ -298,6 +307,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             port: DEFAULT_PORT,
+            database_url: String::new(),
+            use_cloud_db: false,
             start_minimized: false,
             theme: ThemeMode::default(),
             hud_style: HudStyle::default(),
@@ -418,6 +429,10 @@ impl LogRing {
 /// Owns the child process and its captured output. Port and key are fixed for
 /// the run so external API clients keep a stable address across restarts.
 pub struct Shell {
+    /// The cloud Postgres DSN to hand the daemon, or empty for the local file.
+    /// Held here rather than read from `Settings` at spawn time because the
+    /// spawn is the only thing that needs it and `Shell` is what does it.
+    pub cloud_dsn: String,
     pub server: Option<Child>,
     pub log: Arc<Mutex<LogRing>>,
     /// `agent-platformd`. It is the whole server — there is no second process
@@ -429,6 +444,26 @@ pub struct Shell {
     /// True when this app found a healthy server already on the port and became
     /// a pure client. An attached server is never killed or restarted by us.
     pub attached: bool,
+}
+
+impl Settings {
+    /// The DSN to spawn the daemon with: the configured one when Cloud is
+    /// chosen, otherwise empty, which the daemon reads as "use the local file".
+    ///
+    /// Cloud with no DSN is not an error state to report, it is just local —
+    /// there is nothing to connect to, and the app having a database is worth
+    /// more than being right about a toggle the user half-set.
+    pub fn cloud_dsn(&self) -> String {
+        let dsn = self.database_url.trim();
+        if self.use_cloud_db && !dsn.is_empty() { dsn.to_string() } else { String::new() }
+    }
+
+    /// Whether the Local/Cloud choice means anything yet. Local is always
+    /// available (the file is created on demand), so this is only ever about
+    /// whether a cloud database has been named.
+    pub fn cloud_available(&self) -> bool {
+        !self.database_url.trim().is_empty()
+    }
 }
 
 impl Shell {
@@ -539,8 +574,10 @@ impl Shell {
                 crate::account::session_path(&self.data_dir),
             )
             // A developer's .env must not point a desktop install at someone's
-            // Postgres. Present-but-empty wins, because load_dotenv does not override.
-            .env("DATABASE_URL", "");
+            // Postgres: present-but-empty wins, because load_dotenv only fills
+            // gaps. Non-empty only when the user chose Cloud and gave a DSN, so
+            // the default install is still SQLite and still ignores `.env`.
+            .env("DATABASE_URL", &self.cloud_dsn);
         // The GGUF the daemon's `local` provider runs, through the
         // `llama-server` it manages itself (ADR 0012). Empty path is omitted so
         // a headless LOCAL_MODEL_PATH in the parent environment still reaches
@@ -1247,9 +1284,29 @@ mod tests {
         assert_eq!(loaded.port, 12345);
         assert!(loaded.start_minimized);
         assert_eq!(loaded.theme, ThemeMode::Light);
+        assert_eq!(loaded.database_url, "", "a saved default carries no DSN");
         std::fs::remove_dir_all(&dir).ok();
 
         let missing = Settings::load(Path::new("Z:/definitely/not/here"));
         assert_eq!(missing.port, DEFAULT_PORT);
+    }
+
+    /// The rule the toggle encodes: Cloud only when a DSN is actually there,
+    /// because a half-set toggle must still leave the app with a database.
+    #[test]
+    fn cloud_is_only_chosen_when_there_is_something_to_connect_to() {
+        let mut s = Settings::default();
+        assert_eq!(s.cloud_dsn(), "", "a fresh install is local");
+        assert!(!s.cloud_available());
+
+        s.database_url = "  postgres://user:pw@host/db  ".into();
+        assert!(s.cloud_available());
+        assert_eq!(s.cloud_dsn(), "", "a DSN alone does not switch the database");
+
+        s.use_cloud_db = true;
+        assert_eq!(s.cloud_dsn(), "postgres://user:pw@host/db", "trimmed");
+
+        s.database_url = "   ".into();
+        assert_eq!(s.cloud_dsn(), "", "cloud with a blank DSN is local, not an error");
     }
 }
