@@ -301,13 +301,6 @@ async fn call_llm_step(
     opts: &TurnOptions,
     tools: bool,
 ) -> Result<(Value, Option<Value>), ApiError> {
-    if state.master_key.is_none() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "AGENT_PLATFORM_MASTER_KEY is not set.",
-        ));
-    }
-
     let (fitted, _) = fit_chat_messages_for_request(messages.to_vec());
     let mut payload = Map::new();
     payload.insert("messages".into(), Value::Array(fitted));

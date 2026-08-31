@@ -2614,10 +2614,6 @@ async fn chat_only(
     }
     messages.push(json!({ "role": "user", "content": message }));
 
-    if state.master_key.is_none() {
-        return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "AGENT_PLATFORM_MASTER_KEY is not set."));
-    }
-
     let (fitted, _) = crate::context_budget::fit_chat_messages_for_request(messages);
     let mut payload = Map::new();
     payload.insert("messages".into(), Value::Array(fitted));
