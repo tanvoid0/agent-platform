@@ -3284,7 +3284,7 @@ dependencies = [
 [[package]]
 name = "iced_term"
 version = "0.8.0"
-source = "git+https://github.com/tanvoid0/iced_term.git?branch=feat%2Fterminal-text#bfcdc1ac492a1d37e1d7ca539cd286ead42783dc"
+source = "git+https://github.com/tanvoid0/iced_term.git?rev=bfcdc1ac492a1d37e1d7ca539cd286ead42783dc#bfcdc1ac492a1d37e1d7ca539cd286ead42783dc"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
