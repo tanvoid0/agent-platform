@@ -11,13 +11,15 @@ use iced::{Element, Length, Padding};
 /// The sidebar: short groups of things you work in. Settings stays in the
 /// footer — it is where you change the app, not where you use it.
 const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
+    // The reframe puts the owner where the work is: Home is the front door,
+    // Workspace is the project you work inside (its Board and Code tabs are the
+    // old Processes and Coder screens). Everything below is still reachable but
+    // demoted — the flat 15-screen list the reframe was meant to tuck away.
     (
         "WORK",
         &[
             (Screen::Dashboard, Icon::House, "Home"),
             (Screen::Workspace, Icon::Folder, "Workspace"),
-            (Screen::Processes, Icon::Activity, "Processes"),
-            (Screen::Coder, Icon::Cpu, "Coder"),
         ],
     ),
     (
@@ -28,22 +30,19 @@ const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
         ],
     ),
     (
-        "LIBRARY",
+        "ADVANCED",
         &[
+            // The surfaces the Workspace tabs now front, plus the library and
+            // tools — one tap away, no longer the first thing the owner sees.
+            (Screen::Processes, Icon::Activity, "Processes"),
+            (Screen::Coder, Icon::Cpu, "Coder"),
             (Screen::Projects, Icon::Folder, "Projects"),
             (Screen::Teams, Icon::Users, "Teams"),
-            // Model files land on this machine, so they belong with the other
-            // things it holds rather than with the tools that use them.
-            (Screen::Downloads, Icon::Download, "Downloads"),
-        ],
-    ),
-    (
-        "TOOLS",
-        &[
             (Screen::Workflows, Icon::Zap, "Workflows"),
             (Screen::Plans, Icon::ListChecks, "Plans"),
             (Screen::Agenda, Icon::Clock, "Agenda"),
             (Screen::Search, Icon::Search, "Search"),
+            (Screen::Downloads, Icon::Download, "Downloads"),
         ],
     ),
 ];
