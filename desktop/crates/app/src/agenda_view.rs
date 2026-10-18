@@ -130,7 +130,7 @@ fn page<'a>(
             )
             .width(Length::Fill),
             ui::separator_vertical(),
-            agenda_chat_view::pane(&state.chat, theme).map(Message::Chat),
+            agenda_chat_view::pane(&state.chat, theme, agenda_chat_view::WIDTH.into()).map(Message::Chat),
         ]
         .spacing(space::MD),
     )

@@ -583,6 +583,41 @@ pub struct UploadFilesResponse {
     pub uploaded: u32,
 }
 
+/// One entry in a project workspace directory listing
+/// (`GET /projects/{id}/files/list`). `kind` is `"dir"` or `"file"`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceListResponse {
+    pub entries: Vec<WorkspaceEntry>,
+}
+
+/// `GET /projects/{id}/files/info` — ensures the directory exists and returns
+/// where it lives on disk. `absolute_path` is what the Code tab roots at.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceInfo {
+    pub absolute_path: String,
+    pub relative_prefix: String,
+}
+
+/// A single file read through `GET /projects/{id}/files/file?path=`.
+/// A `.pdf` comes back as its derived markdown (`content_kind` =
+/// `"pdf_derived_markdown"`, `derived_path` set); everything else is `"text"`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkspaceFile {
+    pub path: String,
+    pub content: String,
+    pub content_kind: String,
+    #[serde(default)]
+    pub derived_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OllamaModelsResponse {
     pub models: Vec<OllamaModelSummary>,

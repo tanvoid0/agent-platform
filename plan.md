@@ -100,6 +100,47 @@ pointed elsewhere.
 
 ## Backlog
 
+- **Reframe Stage B — the tabs do real work — landed 2026-10-18.** The three
+  surfaces that were stubs or global in Stage A are now project-scoped and real
+  (plan: `~/.claude/plans/delegated-stargazing-tower.md`). One branch/PR
+  (`feat/coder-approve-json-twin`), on top of the Stage A shell and the sidebar
+  demote (`3142b7c`).
+  - **Chat is the project's planning chat, not the global E.V.** The Workspace
+    Chat tab now renders `agenda_chat_view::pane` (the same pane the Agenda
+    screen uses, `?project_id=` endpoints) instead of `assistant_view::panel`.
+    It follows `current_project`: set on `Message::SetProject` and on entering
+    the Chat tab (both via `agenda_chat::set_project`, routed up through
+    `Message::Agenda(Chat(..))` so an approved proposal still reloads its board).
+    `agenda_chat_view::pane` grew a `width` param (Agenda keeps the 460px column,
+    Workspace fills). The HUD frame-beat no longer fires for the Chat tab — the
+    planning chat has no HUD canvas.
+  - **Docs is a real file browser.** New client methods `project_files_list` /
+    `project_file_read` over `/projects/{id}/files/{list,file}` (shapes in
+    `client::types`: `WorkspaceEntry`/`WorkspaceListResponse`/`WorkspaceFile`).
+    New app module `docs.rs`/`docs_view.rs`: a folder rail on the left (folders
+    first, drill in, Up), the selected file's text rendered as markdown on the
+    right — ingested PDFs show up as their derived markdown. Scoped to
+    `current_project` via `docs::set_project` in the Workspace/Docs enter arm.
+    One unit test on the list-response parse.
+  - **Code is rooted at the project sandbox.** `Message::SetProject(Some(id))`
+    now ensures `<app_dir>/workspaces/project-{id}/` via the new
+    `project_workspace_info` (the server `files/info` route creates it and
+    returns the absolute path) and re-roots the Coder with the existing
+    `coder::Message::RootPicked`. RootPicked starts a fresh session/thread, so
+    nothing collides on the server's `workspace_root` key. Unassigned (None)
+    leaves the Coder's current folder.
+  - Also fixed a pre-existing red test from `3142b7c`: `nav_groups_stay_short`
+    asserted ≤4 entries per NAV group, but the demote deliberately made
+    `ADVANCED` a 9-entry catch-all; the test now exempts that bucket.
+  - Touchpoints: `client/src/{client,types}.rs`, `main.rs` (mod, `App.docs`,
+    `boot`, `Message::Docs`, dispatch, `SetProject`, `enter_screen_inner` Chat +
+    Docs arms, `subscription` hud gate), `screen.rs` (Workspace Chat/Docs arms,
+    dropped `workspace_docs`), `docs.rs`/`docs_view.rs`, `agenda_chat_view.rs`,
+    `agenda_view.rs`.
+  - **Left for Stage C:** Slack-style threads/mentions across agents in Chat;
+    board drag/interaction; Bitbucket-style git graph + diffs in Code; Docs
+    write/edit (it is read-only).
+
 - **Reframe Stage A — the project workspace — landed 2026-10-18.** First
   structural stage of the "company" reframe (plan:
   `~/.claude/plans/delegated-stargazing-tower.md`). A new `Screen::Workspace`

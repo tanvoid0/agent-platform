@@ -35,6 +35,8 @@ mod coder_term;
 mod coder_notes;
 mod coder_tools;
 mod coder_view;
+mod docs;
+mod docs_view;
 mod domain;
 mod graph;
 mod history;
@@ -360,6 +362,7 @@ pub struct App {
     pub workflows: workflows::State,
     pub todos: todos::State,
     pub agenda: agenda::State,
+    pub docs: docs::State,
     pub coder: coder_board::Board,
     pub search: search::State,
     pub studio: studio::State,
@@ -568,6 +571,7 @@ pub enum Message {
     Workflows(workflows::Message),
     Todos(todos::Message),
     Agenda(agenda::Message),
+    Docs(docs::Message),
     Coder(coder::Message),
     Search(search::Message),
     Studio(studio::Message),
@@ -914,6 +918,7 @@ fn boot() -> (App, Task<Message>) {
         workflows: workflows::State::default(),
         todos: todos::State::default(),
         agenda: agenda::State::default(),
+        docs: docs::State::default(),
         coder,
         search: search::State::default(),
         studio: studio::State::default(),
@@ -1105,9 +1110,19 @@ fn enter_screen_inner(app: &mut App) -> Task<Message> {
         // (project-scoped) run list, Code the coder sessions. Docs is a
         // placeholder in this stage, so it fetches nothing.
         Screen::Workspace => match app.workspace_tab {
-            WorkspaceTab::Chat => assistant::load_catalog(&app.client).map(Message::Assistant),
+            // The project-scoped planning chat, pointed at the open project;
+            // set_project loads its threads (and is a no-op if already in sync).
+            WorkspaceTab::Chat => {
+                agenda_chat::set_project(&mut app.agenda.chat, &app.client, app.current_project)
+                    .map(|m| Message::Agenda(agenda::Message::Chat(m)))
+            }
             WorkspaceTab::Board => Task::done(Message::Processes(processes::Message::ListTick)),
-            WorkspaceTab::Docs => Task::none(),
+            // The project-files browser, scoped to the open project; set_project
+            // lists its root (no-op if already pointed there).
+            WorkspaceTab::Docs => {
+                docs::set_project(&mut app.docs, &app.client, app.current_project)
+                    .map(Message::Docs)
+            }
             WorkspaceTab::Code => {
                 let mut tasks = vec![
                     coder::load_threads(&mut app.coder, &app.client).map(Message::Coder),
@@ -1468,11 +1483,29 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.current_project = id;
             // The Board is the process list scoped to a project; the processes
             // module already owns that filter, so reuse it rather than duplicate
-            // the scoping here. Then reload whichever tab is open.
-            Task::batch([
+            // the scoping here. The Chat tab is the project-scoped planning chat,
+            // so point it at the new project too.
+            let mut tasks = vec![
                 Task::done(Message::Processes(processes::Message::ProjectPicked(id))),
-                enter_screen(app),
-            ])
+                agenda_chat::set_project(&mut app.agenda.chat, &app.client, id)
+                    .map(|m| Message::Agenda(agenda::Message::Chat(m))),
+            ];
+            // Point the Coder at the project's sandbox folder. The server ensures
+            // the directory and hands back its absolute path; RootPicked re-roots
+            // the active session cleanly — it starts a fresh thread, so nothing
+            // collides on the server's `workspace_root` key. Unassigned (None)
+            // leaves the Coder on whatever folder it already has open.
+            if let Some(pid) = id {
+                let c = app.client.clone();
+                tasks.push(Task::perform(
+                    async move { c.project_workspace_info(pid, "").await.ok().map(|i| i.absolute_path) },
+                    |path| Message::Coder(coder::Message::RootPicked(path)),
+                ));
+            }
+            // Then reload whichever tab is open (its own set_project is a no-op
+            // if already in sync).
+            tasks.push(enter_screen(app));
+            Task::batch(tasks)
         }
         Message::Back => {
             // What is layered *over* the page is what Back means while it is
@@ -2132,6 +2165,8 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::Agenda(msg) => {
             agenda::update(&mut app.agenda, &app.client, msg).map(Message::Agenda)
         }
+        Message::Docs(docs::Message::TraceLogs(id)) => trace_logs_task(app, id),
+        Message::Docs(msg) => docs::update(&mut app.docs, &app.client, msg).map(Message::Docs),
         Message::ApiDocs(apidocs::Message::TraceLogs(id)) => trace_logs_task(app, id),
         Message::ApiDocs(msg) => {
             apidocs::update(&mut app.apidocs, &app.client, msg).map(Message::ApiDocs)
@@ -2463,9 +2498,10 @@ fn subscription(app: &App) -> Subscription<Message> {
     // queue — all three are voice mode, so text mode runs at 0 fps.
     // Settings → Appearance previews the picked animation, so it needs the beat
     // too — otherwise you choose between two still frames.
+    // The Workspace Chat tab now renders the project-scoped planning chat, not
+    // the E.V. HUD canvas, so it no longer needs the frame beat.
     let hud_live = (app.screen == Screen::Assistant && app.assistant.voice)
         || app.screen == Screen::Dashboard
-        || (app.screen == Screen::Workspace && app.workspace_tab == WorkspaceTab::Chat)
         || tab(SettingsTab::Appearance);
     if live && hud_live {
         // Frames, not a timer: this fires once per drawn frame at the display's

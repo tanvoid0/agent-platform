@@ -525,6 +525,43 @@ impl Client {
         Self::handle(resp).await
     }
 
+    /// List one directory in a project's file sandbox. `path` is relative to the
+    /// project root ("" is the root); entries are directories first, then files.
+    pub async fn project_files_list(
+        &self,
+        project: i64,
+        path: &str,
+    ) -> Result<WorkspaceListResponse> {
+        let url = if path.is_empty() {
+            format!("/api/v1/projects/{project}/files/list")
+        } else {
+            format!("/api/v1/projects/{project}/files/list?path={}", urlencode(path))
+        };
+        self.get_json(&url).await
+    }
+
+    /// Read one file from a project's sandbox. A `.pdf` is returned as its
+    /// derived markdown (extracted on the spot if not cached yet).
+    pub async fn project_file_read(&self, project: i64, path: &str) -> Result<WorkspaceFile> {
+        self.get_json(&format!(
+            "/api/v1/projects/{project}/files/file?path={}",
+            urlencode(path)
+        ))
+        .await
+    }
+
+    /// Ensure a project's sandbox directory exists and return its absolute path.
+    /// `path` is relative to the project root ("" = the root). The Code tab roots
+    /// the agent at the returned `absolute_path`.
+    pub async fn project_workspace_info(&self, project: i64, path: &str) -> Result<WorkspaceInfo> {
+        let url = if path.is_empty() {
+            format!("/api/v1/projects/{project}/files/info")
+        } else {
+            format!("/api/v1/projects/{project}/files/info?path={}", urlencode(path))
+        };
+        self.get_json(&url).await
+    }
+
     /// Synthesize speech through the server's configured backend, returning the
     /// audio bytes. The body is audio, not JSON, so this bypasses `handle`.
     ///

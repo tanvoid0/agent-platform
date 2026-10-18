@@ -576,14 +576,17 @@ fn workspace_view(app: &App) -> Element<'_, Message> {
     );
 
     let body = match app.workspace_tab {
+        // The project-scoped planning chat (same pane the Agenda screen uses),
+        // not the global E.V. — it follows `current_project`. Routed through the
+        // agenda module so an approved proposal still reloads its board.
         WorkspaceTab::Chat => {
-            crate::assistant_view::panel(&app.assistant, &theme, app.settings.hud_style)
-                .map(Message::Assistant)
+            crate::agenda_chat_view::pane(&app.agenda.chat, &theme, Length::Fill)
+                .map(|m| Message::Agenda(crate::agenda::Message::Chat(m)))
         }
         WorkspaceTab::Board => {
             crate::processes_view::view(&app.processes, &theme).map(Message::Processes)
         }
-        WorkspaceTab::Docs => workspace_docs(),
+        WorkspaceTab::Docs => crate::docs_view::view(&app.docs, &theme).map(Message::Docs),
         WorkspaceTab::Code => crate::coder_board::view(&app.coder, &theme).map(Message::Coder),
     };
 
@@ -609,26 +612,6 @@ fn workspace_view(app: &App) -> Element<'_, Message> {
     .height(Length::Fill)
     .style(ui::theme::app_background)
     .into()
-}
-
-/// The Docs tab for this stage: no project-files browser exists in the app yet
-/// (the server has the endpoints; the client has no list method), so rather than
-/// mislabel something else as docs, this says plainly where files live today and
-/// points at the Code surface. A real Confluence-style browser is the next stage.
-fn workspace_docs<'a>() -> Element<'a, Message> {
-    ui::page(
-        "Docs",
-        Some(ui::muted(
-            "A Confluence-style doc space is coming next. For now, a project's files live in \
-             its folder — open it on the Code tab.",
-        )),
-        None,
-        ui::empty_state_action(
-            Icon::Scroll,
-            "No docs here yet.",
-            ui::button_outline(Icon::Cpu, "Open Code", Message::OpenWorkspace(WorkspaceTab::Code)),
-        ),
-    )
 }
 
 /// Shared by the Status tab (this server's uptime) and the machine meters (the
@@ -2356,6 +2339,12 @@ mod tests {
     #[test]
     fn nav_groups_stay_short_and_home_is_first() {
         for (name, entries) in NAV {
+            // ADVANCED is the deliberate catch-all the reframe demoted the flat
+            // screens into — it is the dump, by design, so the "stay short" rule
+            // is for the primary groups above it.
+            if *name == "ADVANCED" {
+                continue;
+            }
             assert!(
                 entries.len() <= 4,
                 "{name} has {} entries — split the group rather than dump",
