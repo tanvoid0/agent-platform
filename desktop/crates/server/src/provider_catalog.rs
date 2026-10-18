@@ -438,6 +438,14 @@ pub struct CatalogOptions {
     pub probe_capabilities: bool,
 }
 
+/// A local backend that returned nothing — unreachable, or not set up at all —
+/// is offline: it has no models, imaginary or otherwise, and must not fall
+/// through the alias / UI-fallback / provider-default ladder, which exists for a
+/// cloud provider having a bad moment, not for "go start the app".
+fn is_offline_local(provider: &str, no_models: bool) -> bool {
+    matches!(provider, "local" | "ollama" | "lm_studio") && no_models
+}
+
 pub async fn build(http: &reqwest::Client, options: CatalogOptions) -> Value {
     let aliases_by_provider = aliases_by_provider();
     let defaults = resolved_defaults();
@@ -486,11 +494,7 @@ pub async fn build(http: &reqwest::Client, options: CatalogOptions) -> Value {
             }
         }
 
-        // A local backend we actually asked and could not reach has no models,
-        // imaginary or otherwise — the alias/UI-fallback/provider-default ladder
-        // is for a cloud provider having a bad moment, not "go start the app".
-        let offline_local =
-            matches!(provider, "ollama" | "lm_studio") && options.include_live && reachable == Some(false);
+        let offline_local = is_offline_local(provider, reachable == Some(false));
 
         if !offline_local {
             if models.is_empty() {
@@ -597,11 +601,7 @@ pub async fn build_admin(http: &reqwest::Client) -> Value {
 
         let discovered_any = discovered.as_ref().is_some_and(|ids| !ids.is_empty());
         let mut models: Vec<String> = discovered.unwrap_or_default();
-        // A local backend that is not running has no models, imaginary or
-        // otherwise — the alias/UI-fallback/provider-default ladder below exists
-        // for a cloud provider having a bad moment, not for "go start the app".
-        let is_local = matches!(*provider, "local" | "ollama" | "lm_studio");
-        let offline_local = is_local && configured && !discovered_any;
+        let offline_local = is_offline_local(*provider, !discovered_any);
 
         if !offline_local {
             if models.is_empty() && !aliases.is_empty() {
@@ -806,5 +806,18 @@ mod tests {
             dedupe(vec!["b".into(), "a".into(), " b ".into(), "".into()]),
             vec!["b".to_string(), "a".to_string()]
         );
+    }
+
+    #[test]
+    fn a_local_backend_with_no_models_is_offline_not_filled_from_the_ladder() {
+        // Local backends: nothing discovered means offline — no invented rows.
+        // A cloud provider's empty list still falls through to aliases/defaults.
+        for p in ["local", "ollama", "lm_studio"] {
+            assert!(is_offline_local(p, true), "{p} with no models is offline");
+            assert!(!is_offline_local(p, false), "{p} that answered is not offline");
+        }
+        for p in ["openai", "anthropic", "gemini", "aimlapi"] {
+            assert!(!is_offline_local(p, true), "{p} must still reach the fallback ladder");
+        }
     }
 }
