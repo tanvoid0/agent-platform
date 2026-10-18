@@ -120,8 +120,9 @@ impl Pending {
 /// Screens `open_screen` will move to, and what they hold. Doubles as the
 /// enum's allowed-values list in the tool spec, so the model cannot ask for a
 /// screen that does not exist.
-const SCREENS: [(&str, Screen, &str); 14] = [
+const SCREENS: [(&str, Screen, &str); 15] = [
     ("dashboard", Screen::Dashboard, "the run inbox: start a run, and anything waiting on you"),
+    ("workspace", Screen::Workspace, "the project workspace: chat, board, docs and code for one project"),
     ("processes", Screen::Processes, "agent runs, live and past"),
     ("projects", Screen::Projects, "projects"),
     ("teams", Screen::Teams, "team templates and their rosters"),

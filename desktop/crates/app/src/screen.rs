@@ -3,7 +3,7 @@
 
 use crate::ui::{self, space, Icon, Tone};
 use crate::shell::ResourceMode;
-use crate::{App, HudStyle, Message, Screen, ServerState, SettingsTab, ThemeMode};
+use crate::{App, HudStyle, Message, Screen, ServerState, SettingsTab, ThemeMode, WorkspaceTab};
 use agent_platform_client::types::ReadinessReport;
 use iced::widget::{column, container, row, scrollable, Column, Row};
 use iced::{Element, Length, Padding};
@@ -15,6 +15,7 @@ const NAV: &[(&str, &[(Screen, Icon, &str)])] = &[
         "WORK",
         &[
             (Screen::Dashboard, Icon::House, "Home"),
+            (Screen::Workspace, Icon::Folder, "Workspace"),
             (Screen::Processes, Icon::Activity, "Processes"),
             (Screen::Coder, Icon::Cpu, "Coder"),
         ],
@@ -61,6 +62,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Screen::Settings => settings_view(app),
         Screen::Logs => logs_view(app),
         _ if !app.view_available() => blocked_view(app, screen_title(app.screen)),
+        Screen::Workspace => workspace_view(app),
         Screen::Processes => crate::processes_view::view(&app.processes, &app.settings.theme.resolve())
             .map(Message::Processes),
         Screen::Projects => {
@@ -196,7 +198,8 @@ pub fn notice(app: &App) -> Option<(String, u64, Tone)> {
         // Home hosts the same run composer, so it has to show the same toast.
         // Missing here, "Started run #N." was raised and silently dropped, and
         // pressing Start looked like it had done nothing at all.
-        Screen::Processes | Screen::Dashboard => app.processes.notice.get(),
+        // The workspace's Board is the processes list, so it raises the same toast.
+        Screen::Processes | Screen::Dashboard | Screen::Workspace => app.processes.notice.get(),
         Screen::Workflows => app.workflows.notice.get(),
         Screen::Settings => match app.settings_tab {
             SettingsTab::Providers => app.providers.notice.get(),
@@ -418,13 +421,13 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
                     Icon::Cpu,
                     "Write code",
                     "Pair with the Coder on a repo.",
-                    Message::Nav(Screen::Coder),
+                    Message::OpenWorkspace(WorkspaceTab::Code),
                 ),
                 intent_card(
                     Icon::Activity,
                     "Run a project",
                     "Hand the crew a goal; they plan it and build it.",
-                    Message::Nav(Screen::Processes),
+                    Message::OpenWorkspace(WorkspaceTab::Board),
                 ),
             ]
             .spacing(space::MD)
@@ -434,13 +437,13 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
                     Icon::Scroll,
                     "Prepare a document",
                     "Brief the crew and get a written draft back.",
-                    Message::Nav(Screen::Processes),
+                    Message::OpenWorkspace(WorkspaceTab::Docs),
                 ),
                 intent_card(
                     Icon::Message,
                     "Make a decision",
                     "Talk it through with your crew and decide.",
-                    Message::Nav(Screen::Assistant),
+                    Message::OpenWorkspace(WorkspaceTab::Chat),
                 ),
             ]
             .spacing(space::MD)
@@ -537,6 +540,96 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
 /// say the same thing.
 fn owner_subtitle<'a>() -> Element<'a, Message> {
     ui::muted("You're the owner. Tell your crew what you need — they plan it, do it, and report back.")
+}
+
+// ---------------------------------------------------------------------------
+// Workspace — one project, four crew surfaces behind a tab strip
+// ---------------------------------------------------------------------------
+
+/// The unassigned project scope, shown in the switcher and mapped to `None`.
+const WORKSPACE_UNASSIGNED: &str = "Unassigned";
+
+/// The project workspace: a switcher for the scope, a tab strip for the four
+/// surfaces, then the selected surface filling the rest. Each surface delegates
+/// to the module view that already renders it — Chat is E.V., Board is the
+/// (project-scoped) process list, Code is the Coder IDE — so this is composition,
+/// not a rewrite. Modeled on `tabbed`/`settings_shell`; the body owns its own
+/// `ui::page`, so there is no outer scrollable around it.
+fn workspace_view(app: &App) -> Element<'_, Message> {
+    let theme = app.settings.theme.resolve();
+
+    // Project switcher over the projects the composer already fetched at boot.
+    let mut names = vec![WORKSPACE_UNASSIGNED.to_string()];
+    names.extend(app.processes.projects.iter().map(|p| p.name.clone()));
+    let selected = app
+        .current_project
+        .and_then(|id| app.processes.projects.iter().find(|p| p.id == id))
+        .map(|p| p.name.clone())
+        .or_else(|| Some(WORKSPACE_UNASSIGNED.to_string()));
+    let by_name: Vec<(String, i64)> =
+        app.processes.projects.iter().map(|p| (p.name.clone(), p.id)).collect();
+    let switcher = ui::select("Project", names, selected, move |name: String| {
+        Message::SetProject(by_name.iter().find(|(n, _)| *n == name).map(|(_, id)| *id))
+    });
+
+    let tabs = ui::segmented(
+        WorkspaceTab::ALL.map(|t| (t.label(), app.workspace_tab == t, Message::OpenWorkspace(t))),
+    );
+
+    let body = match app.workspace_tab {
+        WorkspaceTab::Chat => {
+            crate::assistant_view::panel(&app.assistant, &theme, app.settings.hud_style)
+                .map(Message::Assistant)
+        }
+        WorkspaceTab::Board => {
+            crate::processes_view::view(&app.processes, &theme).map(Message::Processes)
+        }
+        WorkspaceTab::Docs => workspace_docs(),
+        WorkspaceTab::Code => crate::coder_board::view(&app.coder, &theme).map(Message::Coder),
+    };
+
+    container(
+        column![
+            container(container(switcher).width(320)).padding(iced::Padding {
+                top: space::MD,
+                right: space::LG,
+                bottom: 0.0,
+                left: space::LG,
+            }),
+            container(tabs).padding(iced::Padding {
+                top: space::SM,
+                right: space::LG,
+                bottom: 0.0,
+                left: space::LG,
+            }),
+            container(body).height(Length::Fill),
+        ]
+        .spacing(space::SM),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(ui::theme::app_background)
+    .into()
+}
+
+/// The Docs tab for this stage: no project-files browser exists in the app yet
+/// (the server has the endpoints; the client has no list method), so rather than
+/// mislabel something else as docs, this says plainly where files live today and
+/// points at the Code surface. A real Confluence-style browser is the next stage.
+fn workspace_docs<'a>() -> Element<'a, Message> {
+    ui::page(
+        "Docs",
+        Some(ui::muted(
+            "A Confluence-style doc space is coming next. For now, a project's files live in \
+             its folder — open it on the Code tab.",
+        )),
+        None,
+        ui::empty_state_action(
+            Icon::Scroll,
+            "No docs here yet.",
+            ui::button_outline(Icon::Cpu, "Open Code", Message::OpenWorkspace(WorkspaceTab::Code)),
+        ),
+    )
 }
 
 /// Shared by the Status tab (this server's uptime) and the machine meters (the

@@ -100,6 +100,30 @@ pointed elsewhere.
 
 ## Backlog
 
+- **Reframe Stage A — the project workspace — landed 2026-10-18.** First
+  structural stage of the "company" reframe (plan:
+  `~/.claude/plans/delegated-stargazing-tower.md`). A new `Screen::Workspace`
+  hosts a `WorkspaceTab { Chat, Board, Docs, Code }` strip — the same
+  "tabs-in-one-destination" shape as `SettingsTab` — with a project switcher and
+  a shared `App::current_project` (the app had no shared selected-project before;
+  four screens each kept their own). Each tab **delegates to the existing module
+  view**, not a rewrite: Chat = `assistant_view::panel` (E.V.), Board =
+  `processes_view::view` scoped by project (reuses `processes::ProjectPicked`),
+  Code = `coder_board::view`, Docs = an honest placeholder (no client files-list
+  method exists yet). The front door's four intent cards now open the matching
+  tab (`Message::OpenWorkspace`). Subscriptions extended so embedded modules keep
+  polling under `Screen::Workspace` (Board run-list tick, Code browser-resize,
+  Chat HUD beat). `assistant_tools::SCREENS` gained `workspace` (14→15). The flat
+  sidebar is **kept** this stage — no regression; demoting it is Stage B.
+  Touchpoints: `main.rs` (enum, `WorkspaceTab`, `App` fields, `boot`, dispatch,
+  `enter_screen_inner`, `subscription`), `screen.rs` (`NAV`, `view`,
+  `workspace_view`, `notice`), `assistant_tools.rs`.
+  - **Left for Stage B/C:** demote the flat nav and make Workspace the landing;
+    a real Docs browser (server endpoints exist, client method does not); scope
+    Chat per-project (the `agenda_chat` endpoints already do `?project_id=`);
+    link Code to the project sandbox folder; Slack threads / board drag / git
+    graph depth.
+
 - **The front door, and a crew that ships with the app — landed 2026-10-18.**
   First slice of the "owner of a company" reframe the user asked for. The
   destination they picked is a full reframe (a workspace-per-project with

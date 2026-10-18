@@ -87,6 +87,9 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Dashboard,
+    /// The project workspace: one selected project, four crew surfaces behind
+    /// a tab strip (Chat / Board / Docs / Code). See [`WorkspaceTab`].
+    Workspace,
     Processes,
     Projects,
     Teams,
@@ -204,6 +207,40 @@ impl SettingsTab {
     }
 }
 
+/// Tabs within [`Screen::Workspace`], the company surfaces for the selected
+/// project: talk to the crew, watch their work, read the docs, open the code.
+/// The same "tabs inside one destination" shape as [`SettingsTab`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceTab {
+    Chat,
+    Board,
+    Docs,
+    Code,
+}
+
+impl WorkspaceTab {
+    pub const ALL: [WorkspaceTab; 4] =
+        [WorkspaceTab::Chat, WorkspaceTab::Board, WorkspaceTab::Docs, WorkspaceTab::Code];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WorkspaceTab::Chat => "Chat",
+            WorkspaceTab::Board => "Board",
+            WorkspaceTab::Docs => "Docs",
+            WorkspaceTab::Code => "Code",
+        }
+    }
+
+    pub fn icon(self) -> ui::Icon {
+        match self {
+            WorkspaceTab::Chat => ui::Icon::Message,
+            WorkspaceTab::Board => ui::Icon::Activity,
+            WorkspaceTab::Docs => ui::Icon::Scroll,
+            WorkspaceTab::Code => ui::Icon::Cpu,
+        }
+    }
+}
+
 /// What the UI may rely on right now. Derived on demand from the poll result and
 /// the child's liveness, so there is one answer and it cannot go stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +307,12 @@ pub struct App {
     pub screen: Screen,
     /// Which tab the Settings page shows; remembered across visits.
     pub settings_tab: SettingsTab,
+    /// Which surface the workspace shows; remembered across visits.
+    pub workspace_tab: WorkspaceTab,
+    /// The project the workspace is scoped to — the one shared "current project"
+    /// the app did not have before. `None` is the unassigned scope. Feeds the
+    /// workspace switcher and the Board's process filter.
+    pub current_project: Option<i64>,
     /// Where Back goes: every place the user has been, newest last. A desktop
     /// app with drill-downs and no history leaves "start over from the sidebar"
     /// as the only way out of one. Capped at [`BACK_MAX`] because nobody walks
@@ -427,6 +470,12 @@ pub enum Message {
     /// Home inbox: open this run on the Processes screen.
     OpenRun(i64),
     NavSettings(SettingsTab),
+    /// Open the workspace at a given surface — from the front door's intent
+    /// cards and from the workspace's own tab strip. Sets the tab, then enters.
+    OpenWorkspace(WorkspaceTab),
+    /// The workspace project switcher picked a project (or Unassigned). Sets the
+    /// shared scope and re-scopes the Board.
+    SetProject(Option<i64>),
     /// The back arrow (and Alt+Left): return to the last place, dismissing
     /// whatever is open over this one first — the same order Esc uses.
     Back,
@@ -820,6 +869,8 @@ fn boot() -> (App, Task<Message>) {
         tray_light_plate: shell::system_is_dark(),
         screen: Screen::Dashboard,
         settings_tab: SettingsTab::Providers,
+        workspace_tab: WorkspaceTab::Chat,
+        current_project: None,
         back: Vec::new(),
         resources: None,
         resource_ticks: 0,
@@ -1050,6 +1101,24 @@ fn enter_screen_inner(app: &mut App) -> Task<Message> {
         // pickers.
         Screen::Assistant => assistant::load_catalog(&app.client).map(Message::Assistant),
         Screen::Memory => Task::none(),
+        // Each surface loads what it shows: Chat the model catalog, Board the
+        // (project-scoped) run list, Code the coder sessions. Docs is a
+        // placeholder in this stage, so it fetches nothing.
+        Screen::Workspace => match app.workspace_tab {
+            WorkspaceTab::Chat => assistant::load_catalog(&app.client).map(Message::Assistant),
+            WorkspaceTab::Board => Task::done(Message::Processes(processes::Message::ListTick)),
+            WorkspaceTab::Docs => Task::none(),
+            WorkspaceTab::Code => {
+                let mut tasks = vec![
+                    coder::load_threads(&mut app.coder, &app.client).map(Message::Coder),
+                    coder::load_checkpoints(&mut app.coder).map(Message::Coder),
+                ];
+                if app.coder.catalog.is_empty() {
+                    tasks.push(coder::load_catalog(&app.client).map(Message::Coder));
+                }
+                Task::batch(tasks)
+            }
+        },
         Screen::Logs => Task::done(Message::LogsTick),
         Screen::Settings => match app.settings_tab {
             SettingsTab::ModelOps => Task::done(Message::ModelOps(modelops::Message::Refresh)),
@@ -1384,6 +1453,26 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.settings_tab = tab;
             app.copied = None;
             enter_screen(app)
+        }
+        Message::OpenWorkspace(tab) => {
+            if app.screen != Screen::Workspace {
+                app.remember();
+            }
+            app.screen = Screen::Workspace;
+            app.workspace_tab = tab;
+            app.help_open = false;
+            app.copied = None;
+            enter_screen(app)
+        }
+        Message::SetProject(id) => {
+            app.current_project = id;
+            // The Board is the process list scoped to a project; the processes
+            // module already owns that filter, so reuse it rather than duplicate
+            // the scoping here. Then reload whichever tab is open.
+            Task::batch([
+                Task::done(Message::Processes(processes::Message::ProjectPicked(id))),
+                enter_screen(app),
+            ])
         }
         Message::Back => {
             // What is layered *over* the page is what Back means while it is
@@ -2285,7 +2374,8 @@ fn subscription(app: &App) -> Subscription<Message> {
     }
     if app.window.is_some()
         && app.server_ready()
-        && matches!(app.screen, Screen::Processes | Screen::Dashboard)
+        && (matches!(app.screen, Screen::Processes | Screen::Dashboard)
+            || (app.screen == Screen::Workspace && app.workspace_tab == WorkspaceTab::Board))
     {
         subs.push(
             iced::time::every(std::time::Duration::from_secs(3))
@@ -2310,7 +2400,10 @@ fn subscription(app: &App) -> Subscription<Message> {
     // The preview's child window is positioned in window coordinates, so a
     // resize moves the hole out from under it until it is told. Only while it
     // is actually on screen: everywhere else it is hidden anyway.
-    if app.screen == Screen::Coder && app.coder.browser_open {
+    if (app.screen == Screen::Coder
+        || (app.screen == Screen::Workspace && app.workspace_tab == WorkspaceTab::Code))
+        && app.coder.browser_open
+    {
         subs.push(
             window::resize_events()
                 .map(|_| Message::Coder(coder::Message::BrowserSync)),
@@ -2372,6 +2465,7 @@ fn subscription(app: &App) -> Subscription<Message> {
     // too — otherwise you choose between two still frames.
     let hud_live = (app.screen == Screen::Assistant && app.assistant.voice)
         || app.screen == Screen::Dashboard
+        || (app.screen == Screen::Workspace && app.workspace_tab == WorkspaceTab::Chat)
         || tab(SettingsTab::Appearance);
     if live && hud_live {
         // Frames, not a timer: this fires once per drawn frame at the display's
