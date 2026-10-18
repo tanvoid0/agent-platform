@@ -26,10 +26,16 @@ incremental = false
 # `pub(crate)` and the widget exposes no accessor, so nothing outside that crate
 # can see what the terminal shows. The Coder screen needs to — an agent command
 # runs in the drawer and its output has to reach the model. The fork carries one
-# method, `Terminal::text()`, and nothing else; it is upstream as a PR and this
-# block comes out when that merges.
+# method, `Terminal::text()`, and nothing else.
+#
+# Pinned by `rev`, not `branch`: a branch is a moving target and a force-push on
+# the fork would silently change what this builds against. It is upstream as
+# kemokempo/iced_term#96 and this block comes out if that merges — but the pin
+# is not waiting on it, and review there asked for a restructure (move the
+# algorithm into `Backend`, reuse alacritty's `Term::bounds_to_string`) that
+# changes nothing about `text()`'s signature or our call site.
 [patch.crates-io]
-iced_term = { git = "https://github.com/tanvoid0/iced_term.git", branch = "feat/terminal-text" }
+iced_term = { git = "https://github.com/tanvoid0/iced_term.git", rev = "bfcdc1ac492a1d37e1d7ca539cd286ead42783dc" }
 
 # Windows MSVC writes a .pdb per crate and full debuginfo into every rlib; with
 # 1100+ dependencies that was 18G of .pdb alone in `target/debug`. Line tables

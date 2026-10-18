@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 
 use agent_platform_client::types::{
-    MediaGenerateRequest, MediaJob, MediaRequirement, MediaRequirements, MediaStatus,
+    MediaGenerateRequest, MediaJob, MediaRequirements, MediaStatus,
     MediaSuggestion,
 };
 use agent_platform_client::Client;
@@ -29,6 +29,25 @@ use iced::widget::image;
 use iced::Task;
 
 use crate::domain::err_string;
+
+/// Which half of Studio is open. Freeform generation and social ads share the
+/// backend, the job rows and the image cache — they differ only in who chooses
+/// the prompt and the size, which is a tab, not a screen.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    #[default]
+    Create,
+    Ads,
+}
+
+impl Tab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Create => "Create",
+            Tab::Ads => "Social ads",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -150,6 +169,11 @@ const COMFY_SITE: &str = "https://www.comfy.org/download";
 
 #[derive(Default)]
 pub struct State {
+    pub tab: Tab,
+    /// The Social ads tab's own state. Nested rather than a sibling screen
+    /// because its pictures are [`State::jobs`] and [`State::images`] — one
+    /// gallery, one poll, one cache (see `studio_ads.rs`).
+    pub ads: crate::studio_ads::State,
     pub prompt: String,
     pub negative: String,
     pub kind: Kind,
@@ -179,53 +203,16 @@ pub struct State {
     pub error: Option<String>,
 }
 
-/// Fetching the video models ComfyUI is missing.
+/// The confirm step in front of the video-model download.
 ///
 /// Ten gigabytes is not something a single click should start, so the button
-/// arms before it fires: [`Install::armed`] is the state between the first
-/// press and the confirm, and it is where the size and the destination are
-/// shown. Idle → armed → running, and any press of Cancel goes back to idle.
+/// arms before it fires: `armed` is the state between the first press and the
+/// confirm, and it is where the size and the destination are shown. The
+/// transfers themselves belong to [`crate::downloads`] — this screen only shows
+/// their rows, and `main::update` intercepts the confirm to queue them.
 #[derive(Default)]
 pub struct Install {
     pub armed: bool,
-    /// The file being fetched right now, and how far in — `None` when nothing
-    /// is running.
-    pub current: Option<InstallProgress>,
-    /// Still to fetch after the current one. Drained in order, because the
-    /// stream engine does one file at a time.
-    pub queue: Vec<MediaRequirement>,
-    pub handle: Option<iced::task::Handle>,
-    /// The half-written file, swept by hand on cancel — the transfer is
-    /// dropped mid-write, exactly as in [`crate::model_download`].
-    pub part: Option<std::path::PathBuf>,
-    pub done: usize,
-    pub total: usize,
-}
-
-pub struct InstallProgress {
-    pub file_name: String,
-    pub received: u64,
-    pub bytes: Option<u64>,
-}
-
-impl Install {
-    pub fn running(&self) -> bool {
-        self.current.is_some()
-    }
-
-    /// `0.0`–`1.0` across the whole set, not just the file in flight: a bar
-    /// that restarts at zero for each of three files reports three downloads,
-    /// which is not what the user pressed.
-    pub fn fraction(&self) -> f32 {
-        let Some(current) = &self.current else {
-            return 0.0;
-        };
-        let within = match current.bytes {
-            Some(total) if total > 0 => current.received as f32 / total as f32,
-            _ => 0.0,
-        };
-        ((self.done as f32 + within) / self.total.max(1) as f32).clamp(0.0, 1.0)
-    }
 }
 
 /// `9.3 GB`, `1.3 GB`, `812 MB`. Decimal units, because that is what a model
@@ -334,6 +321,13 @@ pub enum Message {
     /// "View logs" on a traced error banner — intercepted in `main::update`,
     /// so this arm exists only for exhaustiveness (as on every other screen).
     TraceLogs(String),
+    /// The settings link in this screen's header — the media backend lives in Settings.
+    /// Intercepted in `main::update` the same way, so this arm exists
+    /// only to satisfy exhaustiveness.
+    OpenSettings,
+    TabChanged(Tab),
+    /// The Social ads tab's own messages, forwarded through.
+    Ads(crate::studio_ads::Message),
     PromptChanged(String),
     NegativeChanged(String),
     KindChanged(Kind),
@@ -352,7 +346,11 @@ pub enum Message {
     InstallArm,
     InstallConfirm,
     InstallCancel,
-    InstallProgressed(crate::model_download::Progress),
+    /// A press on one of the download rows this screen embeds. Forwarded up:
+    /// the queue is the app's, not the screen's.
+    Downloads(crate::downloads::Action),
+    /// "All downloads" — the whole queue, not just this screen's share of it.
+    OpenDownloads,
     /// Screen entry and the running-job tick both land here.
     Refresh,
     StatusLoaded(Result<Box<MediaStatus>, String>),
@@ -372,7 +370,35 @@ pub enum Message {
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
-        Message::TraceLogs(_) => Task::none(),
+        Message::TraceLogs(_) | Message::OpenSettings | Message::OpenDownloads => Task::none(),
+        Message::TabChanged(tab) => {
+            state.tab = tab;
+            // The ads tab has its own lists to fetch, and only on the way in —
+            // loading projects and platforms for someone who never opens it
+            // would be three requests per screen entry for nothing.
+            match tab {
+                Tab::Ads => Task::done(Message::Ads(crate::studio_ads::Message::Refresh)),
+                Tab::Create => Task::none(),
+            }
+        }
+        // Forwarded up so `main::update` can intercept it, the way it does for
+        // every other screen's traced error bar.
+        Message::Ads(crate::studio_ads::Message::TraceLogs(id)) => Task::done(Message::TraceLogs(id)),
+        // The ads cards show video too, and opening one is the same
+        // write-to-temp-then-reveal this screen already does for the gallery.
+        Message::Ads(crate::studio_ads::Message::OpenMedia(id)) => open_output(state, client, id),
+        Message::Ads(msg) => {
+            // A new campaign starts media jobs this screen does not know about
+            // yet, and `polling()` reads the job list — so without this refresh
+            // the tick never starts and the pictures never appear.
+            let started_jobs = matches!(&msg, crate::studio_ads::Message::Generated(Ok(_)));
+            let task = crate::studio_ads::update(&mut state.ads, client, msg).map(Message::Ads);
+            if started_jobs {
+                Task::batch([task, load_jobs(client)])
+            } else {
+                task
+            }
+        }
         Message::PromptChanged(v) => {
             state.prompt = v;
             Task::none()
@@ -457,7 +483,13 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             // for the user to pick Video: the card that offers the download
             // should already be there when they get to it.
             let (a, b, c) = (load_status(client), load_jobs(client), load_requirements(client));
-            Task::batch([a, b, c])
+            let mut tasks = vec![a, b, c];
+            // Refresh means the tab in front of the user, not the one behind
+            // it — a press on Create must not re-fetch three ads lists.
+            if state.tab == Tab::Ads {
+                tasks.push(Task::done(Message::Ads(crate::studio_ads::Message::Refresh)));
+            }
+            Task::batch(tasks)
         }
         Message::RequirementsLoaded(Ok(reqs)) => {
             state.requirements = Some(*reqs);
@@ -474,9 +506,12 @@ pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Mess
             state.install.armed = true;
             Task::none()
         }
-        Message::InstallCancel => cancel_install(state),
-        Message::InstallConfirm => start_install(state),
-        Message::InstallProgressed(progress) => install_progressed(state, client, progress),
+        Message::InstallCancel => {
+            state.install.armed = false;
+            Task::none()
+        }
+        // Both are handled by `main::update`, which owns the download queue.
+        Message::InstallConfirm | Message::Downloads(_) => Task::none(),
         Message::StatusLoaded(Ok(status)) => {
             state.status = Some(*status);
             state.error = None;
@@ -578,128 +613,6 @@ fn generate(state: &mut State, client: &Client) -> Task<Message> {
         async move { err_string(client.generate_media(&req).await).map(Box::new) },
         Message::Generated,
     )
-}
-
-/// Begin the queue the confirm step just approved. One file at a time: the
-/// download engine streams a single URL, and three parallel multi-gigabyte
-/// transfers over one connection finish no sooner and report far worse.
-fn start_install(state: &mut State) -> Task<Message> {
-    let Some(reqs) = &state.requirements else {
-        return Task::none();
-    };
-    let Some(root) = reqs.models_root.clone() else {
-        state.error =
-            Some("ComfyUI's models folder could not be located, so there is nowhere to put these \
-                  files. Install them by hand, or set MEDIA_API_BASE to the instance you mean."
-                .into());
-        return Task::none();
-    };
-
-    let mut queue: Vec<MediaRequirement> = reqs.missing().cloned().collect();
-    if queue.is_empty() {
-        state.install = Install::default();
-        return Task::none();
-    }
-    queue.reverse(); // popped from the back, so the first listed goes first.
-
-    state.install = Install {
-        armed: false,
-        total: queue.len(),
-        queue,
-        ..Install::default()
-    };
-    next_download(state, &root)
-}
-
-/// Start the next file in the queue, or finish. `root` is threaded in rather
-/// than re-read because the requirements are refreshed at the end, and reading
-/// it from a half-updated state is how the last file lands in the wrong place.
-fn next_download(state: &mut State, root: &str) -> Task<Message> {
-    let Some(item) = state.install.queue.pop() else {
-        return Task::none();
-    };
-    let dir = std::path::PathBuf::from(root).join(&item.folder);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        state.error = Some(format!("Could not create {}: {e}", dir.display()));
-        state.install = Install::default();
-        return Task::none();
-    }
-
-    state.install.part = Some(crate::model_download::part_path(&dir, &item.file_name));
-    state.install.current = Some(InstallProgress {
-        file_name: item.file_name.clone(),
-        received: 0,
-        bytes: u64::try_from(item.size_bytes).ok(),
-    });
-
-    let (task, handle) = Task::stream(crate::model_download::download(
-        item.url.clone(),
-        dir,
-        item.file_name.clone(),
-    ))
-    .map(Message::InstallProgressed)
-    .abortable();
-    state.install.handle = Some(handle);
-    task
-}
-
-fn install_progressed(
-    state: &mut State,
-    client: &Client,
-    progress: crate::model_download::Progress,
-) -> Task<Message> {
-    use crate::model_download::Progress;
-    match progress {
-        Progress::Downloading { received, total } => {
-            if let Some(current) = state.install.current.as_mut() {
-                current.received = received;
-                // The server's size is the one shown before the press; the
-                // transfer's own is better once it exists.
-                current.bytes = total.or(current.bytes);
-            }
-            Task::none()
-        }
-        Progress::Done(_) => {
-            state.install.done += 1;
-            state.install.part = None;
-            state.install.current = None;
-            let root = state
-                .requirements
-                .as_ref()
-                .and_then(|r| r.models_root.clone())
-                .unwrap_or_default();
-            if state.install.queue.is_empty() {
-                // Re-ask rather than assume: ComfyUI has to see the file for
-                // the card to go away, and that is the thing worth confirming.
-                state.install = Install::default();
-                return load_requirements(client);
-            }
-            next_download(state, &root)
-        }
-        Progress::Failed(e) => {
-            state.error = Some(e);
-            sweep_part(state);
-            state.install = Install::default();
-            Task::none()
-        }
-    }
-}
-
-fn cancel_install(state: &mut State) -> Task<Message> {
-    if let Some(handle) = state.install.handle.take() {
-        handle.abort();
-    }
-    sweep_part(state);
-    state.install = Install::default();
-    Task::none()
-}
-
-/// The transfer is dropped mid-write, so the partial file is ours to remove —
-/// the same hand-sweep [`crate::model_download`] documents.
-fn sweep_part(state: &mut State) {
-    if let Some(part) = state.install.part.take() {
-        let _ = std::fs::remove_file(part);
-    }
 }
 
 fn load_requirements(client: &Client) -> Task<Message> {
@@ -827,11 +740,9 @@ mod tests {
 
         let _ = update(&mut s, &client(), Message::InstallArm);
         assert!(s.install.armed, "the first press only arms");
-        assert!(!s.install.running(), "nothing may be fetched before the confirm");
 
         let _ = update(&mut s, &client(), Message::InstallCancel);
-        assert!(!s.install.armed);
-        assert!(!s.install.running());
+        assert!(!s.install.armed, "backing out leaves no trace");
     }
 
     /// Only what is missing gets queued, and the size quoted is the sum of
@@ -851,36 +762,12 @@ mod tests {
         assert!(!none.can_install(), "nothing missing is nothing to install");
     }
 
-    /// No verified directory means no download, however much is missing.
+    /// No verified directory means no download, however much is missing. What
+    /// the press then does with that lives in `main::start_media_download`;
+    /// this is the flag it reads.
     #[test]
     fn without_a_models_root_nothing_may_be_installed() {
-        let blind = reqs(None, [false, false]);
-        assert!(!blind.can_install());
-
-        let mut s = State::default();
-        s.requirements = Some(blind);
-        let _ = update(&mut s, &client(), Message::InstallConfirm);
-        assert!(!s.install.running(), "a confirm without a destination starts nothing");
-        assert!(s.error.is_some(), "and says why");
-    }
-
-    /// The bar counts the whole set. Half of the first of two files is a
-    /// quarter of the job, not half of it.
-    #[test]
-    fn progress_spans_the_whole_queue() {
-        let mut i = Install { total: 2, ..Install::default() };
-        assert_eq!(i.fraction(), 0.0, "nothing running is no progress");
-
-        i.current = Some(InstallProgress { file_name: "a".into(), received: 50, bytes: Some(100) });
-        assert!((i.fraction() - 0.25).abs() < f32::EPSILON, "got {}", i.fraction());
-
-        i.done = 1;
-        i.current = Some(InstallProgress { file_name: "b".into(), received: 50, bytes: Some(100) });
-        assert!((i.fraction() - 0.75).abs() < f32::EPSILON, "got {}", i.fraction());
-
-        // An unknown length must not divide by zero or exceed the whole.
-        i.current = Some(InstallProgress { file_name: "b".into(), received: 50, bytes: None });
-        assert!((0.0..=1.0).contains(&i.fraction()));
+        assert!(!reqs(None, [false, false]).can_install());
     }
 
     #[test]

@@ -173,6 +173,10 @@ pub enum Message {
     /// "View logs" on a traced error banner — intercepted in `main::update`
     /// before it reaches here, so this arm exists only to satisfy exhaustiveness.
     TraceLogs(String),
+    /// The settings link in this screen's header — Search keys live in Settings.
+    /// Intercepted in `main::update` the same way, so this arm exists
+    /// only to satisfy exhaustiveness.
+    OpenSettings,
     AskChanged(String),
     /// The dork box was hand-typed.
     QueryChanged(String),
@@ -208,7 +212,7 @@ pub enum Message {
 
 pub fn update(state: &mut State, client: &Client, message: Message) -> Task<Message> {
     match message {
-        Message::TraceLogs(_) => Task::none(),
+        Message::TraceLogs(_) | Message::OpenSettings => Task::none(),
         Message::AskChanged(v) => {
             state.ask = v;
             state.mode = Mode::Ask;

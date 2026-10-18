@@ -139,6 +139,13 @@ fn subdecomp_max_new_tasks() -> i64 {
     env_count_or_zero("AGENT_PLATFORM_SUBDECOMP_MAX_NEW_TASKS", 48)
 }
 
+/// Read off the process row, not off the executor, so `PATCH /processes/{id}`
+/// takes effect on a run already in flight — and so a re-planned or
+/// startup-recovered process keeps the setting it was created with.
+fn should_auto_approve(process: &ProcessRow) -> bool {
+    process.auto_approve != 0 || env_auto_approve()
+}
+
 /// Tasks added by an expansion have depth parent+1; planner tasks are depth 0.
 fn subdecomp_max_depth() -> Option<i64> {
     env_positive_i64("AGENT_PLATFORM_SUBDECOMP_MAX_DEPTH")
@@ -463,6 +470,13 @@ same wave when possible. Use dependencies only for true ordering (B needs A's ou
 **model field:** Omit `model` unless you use a real model alias from the server. Never put role titles,
 programming languages, or skill labels (e.g. `typescript-expert`, `react-scaffolder`) in `model`—those belong in `role` / prompts only.
 
+**modality:** Omit `modality` (or use `"text"`) for a node that writes. Use `"image"` or `"video"` for a node
+whose deliverable *is* the picture — a hero image, a diagram, a short clip. Such a node's `instructions` are
+handed to the image model as the prompt, so write them as a description of the picture, not as a task, and
+give it dependencies whose output should inform it. It produces no prose, so nothing should depend on it for
+text. If no media backend is configured the node fails with that error, so only use it when the goal asks for
+a picture.
+
 **subdecompose:** Set `subdecompose`: true on nodes whose deliverable is likely to reveal follow-on work
 after execution (e.g. exploration, broad research, scaffolding) so the system can add subtasks from the
 completed output. Omit or false for tight, predictable leaf tasks.
@@ -479,6 +493,7 @@ Output valid JSON strictly adhering to this schema:
       "instructions": "Specific task for this agent. Mention that it will receive context from dependencies.",
       "dependencies": ["client_uuid_of_prior_agent"],
       "model": "optional; real model alias only (e.g. gemma4, gemini-flash). Omit to use server default. Never use role or skill slugs (e.g. typescript-expert, react-scaffolder).",
+      "modality": "optional; \"text\" (default), \"image\" or \"video\". image/video nodes render their instructions as a picture and produce no prose.",
       "subdecompose": "optional boolean; if true, after this node completes the server may append child subtasks from its output (within AGENT_PLATFORM_SUBDECOMP_* limits).",
       "requires_review": "optional boolean; if true, execution pauses for human review after this node's output."
     }
@@ -762,9 +777,12 @@ struct ProcessRow {
     dag_json: Option<String>,
     tool_invocations_used: i64,
     token_id: Option<i64>,
+    /// `INTEGER` 0/1 on both backends, for the same reason `requires_review` is.
+    auto_approve: i64,
 }
 
-const PROCESS_COLUMNS: &str = "goal, status, dag_json, tool_invocations_used, token_id";
+const PROCESS_COLUMNS: &str =
+    "goal, status, dag_json, tool_invocations_used, token_id, auto_approve";
 
 #[derive(Debug, FromRow)]
 struct TaskRow {
@@ -775,6 +793,9 @@ struct TaskRow {
     system_prompt: String,
     instructions: String,
     llm_model: Option<String>,
+    /// `text` | `image` | `video` (ADR 0018). Defaulted in the schema, so every
+    /// row that predates it reads as `text`.
+    modality: String,
     dependencies_json: String,
     /// `INTEGER` on both backends; `i64` for the same reason as
     /// [`crate::processes`]'s copy. Compared against 0 at its three use sites.
@@ -784,7 +805,8 @@ struct TaskRow {
 }
 
 const TASK_COLUMNS: &str = "id, client_uuid, parent_client_uuid, role, system_prompt, \
-     instructions, llm_model, dependencies_json, requires_review, draft_output, review_feedback";
+     instructions, llm_model, modality, dependencies_json, requires_review, draft_output, \
+     review_feedback";
 
 /// `dependencies_json` is written by this process and by Python, both as a JSON
 /// array of strings. A value that will not parse is a corrupt row, and treating
@@ -1002,8 +1024,9 @@ async fn insert_task_node(
     sqlx::query(&crate::db::sql(
         "INSERT INTO tasknode \
          (process_id, client_uuid, parent_client_uuid, role, system_prompt, instructions, \
-          llm_model, dependencies_json, status, requires_review, revision_count, tokens_used) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, 0)", backend)
+          llm_model, modality, dependencies_json, status, requires_review, revision_count, \
+          tokens_used) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, 0)", backend)
     )
     .bind(process_id)
     .bind(&agent.client_uuid)
@@ -1012,6 +1035,7 @@ async fn insert_task_node(
     .bind(&agent.system_prompt)
     .bind(&agent.instructions)
     .bind(agent.llm_model.as_deref())
+    .bind(&agent.modality)
     // `json.dumps(list)` — the space after the comma is echoed raw by
     // `GET /processes/{id}` as `dependencies_json`.
     .bind(python_json(&agent.dependencies, true))
@@ -1262,22 +1286,55 @@ fn deadlock_reason(snapshot: &DagSnapshot) -> String {
     // Sorted and de-duplicated so the message is stable across runs.
     let mut failed: BTreeSet<&str> = BTreeSet::new();
     let mut unknown: BTreeSet<&str> = BTreeSet::new();
-    let mut waiting: BTreeSet<&str> = BTreeSet::new();
 
+    // A pending task whose dep failed (or does not exist) is blocked, and so is
+    // everything downstream of it. Only what survives that propagation can be in
+    // a cycle: a dep that is merely `pending` proves nothing on its own.
+    let mut blocked: HashSet<&str> = HashSet::new();
     for task in &snapshot.pending_tasks {
         for dep in &task.dependencies {
             if snapshot.completed_uuids.contains(dep) {
                 continue;
             }
             match snapshot.status_by_uuid.get(dep.as_str()).map(String::as_str) {
-                Some("failed") => failed.insert(dep.as_str()),
-                // A dep that is itself pending here can never start: this task
-                // and that one are in a cycle (or behind one).
-                Some(_) => waiting.insert(task.client_uuid.as_str()),
-                None => unknown.insert(dep.as_str()),
-            };
+                Some("failed") => {
+                    failed.insert(dep.as_str());
+                    blocked.insert(task.client_uuid.as_str());
+                }
+                Some(_) => {}
+                None => {
+                    unknown.insert(dep.as_str());
+                    blocked.insert(task.client_uuid.as_str());
+                }
+            }
         }
     }
+    // Fixpoint: n passes over n tasks is fine at the sizes a planner emits.
+    loop {
+        let mut grew = false;
+        for task in &snapshot.pending_tasks {
+            if blocked.contains(task.client_uuid.as_str()) {
+                continue;
+            }
+            if task.dependencies.iter().any(|d| blocked.contains(d.as_str())) {
+                blocked.insert(task.client_uuid.as_str());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    // Anything still pending, not blocked, and not runnable is in or behind a
+    // cycle — a task with every dep satisfied would have been selected already.
+    let waiting: BTreeSet<&str> = snapshot
+        .pending_tasks
+        .iter()
+        .filter(|t| !blocked.contains(t.client_uuid.as_str()))
+        .filter(|t| !t.dependencies.iter().all(|d| snapshot.completed_uuids.contains(d)))
+        .map(|t| t.client_uuid.as_str())
+        .collect();
 
     let list = |set: BTreeSet<&str>| set.into_iter().collect::<Vec<_>>().join(", ");
     let mut parts: Vec<String> = Vec::new();
@@ -1486,7 +1543,6 @@ struct Subdecomp {
 struct Executor {
     state: Arc<AppState>,
     process_id: i64,
-    auto_approve: bool,
     /// `futures::lock::Mutex`, not `std`: it is held across the expansion's LLM
     /// call, exactly as Python's `asyncio.Lock` is, and a std guard across an
     /// `.await` makes the future `!Send`. (`tokio::sync` is not compiled in —
@@ -1495,17 +1551,12 @@ struct Executor {
 }
 
 impl Executor {
-    fn new(state: Arc<AppState>, process_id: i64, auto_approve: bool) -> Arc<Self> {
+    fn new(state: Arc<AppState>, process_id: i64) -> Arc<Self> {
         Arc::new(Self {
             state,
             process_id,
-            auto_approve,
             subdecomp: futures::lock::Mutex::new(Subdecomp::default()),
         })
-    }
-
-    fn should_auto_approve(&self) -> bool {
-        self.auto_approve || env_auto_approve()
     }
 
     async fn log(&self, event_type: &str, content: &str, task_id: Option<i64>) {
@@ -1562,9 +1613,7 @@ impl Executor {
         }
         self.log("status_change", "Process requires approval to execute DAG", None).await;
 
-        if self.should_auto_approve() {
-            self.auto_approve_and_execute().await;
-        }
+        self.auto_approve_and_execute().await;
     }
 
     /// `services/planner_runtime_service.apply_planner_success`.
@@ -1610,6 +1659,9 @@ impl Executor {
 
     async fn auto_approve_and_execute(self: Arc<Self>) {
         let Ok(Some(process)) = load_process(&self.state, self.process_id).await else { return };
+        if !should_auto_approve(&process) {
+            return;
+        }
         if process.status != "approval_required" {
             return;
         }
@@ -1777,6 +1829,16 @@ impl Executor {
             }
         };
 
+        // ADR 0018: an `image` / `video` node renders instead of writing. The
+        // prompt is the same user message a text node would have been given —
+        // instructions plus dependency context — because that is exactly what
+        // the node was planned to say, and a diffusion model reads it as a
+        // prompt.
+        if task.modality != crate::dag_schema::TEXT_MODALITY {
+            self.execute_media_task(&task, &user_message).await;
+            return;
+        }
+
         let messages =
             [("system", system_message.clone()), ("user", user_message)];
         match self.invoke_task_llm(task.llm_model.as_deref(), &messages).await {
@@ -1902,6 +1964,48 @@ impl Executor {
         Ok(user_message)
     }
 
+    /// The picture half of [`Self::execute_task`] (ADR 0018).
+    ///
+    /// Failure lands in the same `record_task_failure` path a model error does,
+    /// as `LlmFailure::Llm`: a backend that is not running, has no checkpoint,
+    /// or refused the graph is the same class of problem as a provider that
+    /// will not answer, and the node should be retryable for it.
+    async fn execute_media_task(&self, task: &TaskRow, prompt: &str) {
+        let kind = if task.modality == "video" { "video" } else { "image" };
+        let (job_id, route) =
+            match crate::media::generate_and_wait(&self.state, kind, prompt).await {
+                Ok(landed) => landed,
+                Err(e) => {
+                    self.record_task_failure(task, &LlmFailure::Llm(e.message)).await;
+                    return;
+                }
+            };
+
+        // The output is text because every consumer of a node output is —
+        // the review screen, the context a downstream node is handed, the
+        // process transcript. `media_job_id` is what a reader that wants the
+        // picture itself follows, so nothing has to parse this line.
+        let completion = Completion {
+            content: format!("Generated {kind} (media job {job_id}): {route}"),
+            tokens: 0,
+            cost: 0.0,
+        };
+        if let Err(e) = sqlx::query(&crate::db::sql(
+            "UPDATE tasknode SET media_job_id = ? WHERE id = ?",
+            self.state.backend,
+        ))
+        .bind(job_id)
+        .bind(task.id)
+        .execute(&self.state.any)
+        .await
+        {
+            logd!("task {} media_job_id could not be stored: {e}", task.id);
+        }
+        if let Err(e) = self.apply_task_success(task, &completion, 0).await {
+            logd!("task {} result could not be stored: {e}", task.id);
+        }
+    }
+
     /// `_invoke_task_llm`. The tool branch is refused rather than silently
     /// downgraded — see the module docs.
     async fn invoke_task_llm(
@@ -1946,7 +2050,8 @@ impl Executor {
             return Err(sqlx::Error::RowNotFound);
         };
 
-        let (status, completed_at, needs_expand) = if task.requires_review != 0 {
+        let review_gate = task.requires_review != 0 && !should_auto_approve(&process);
+        let (status, completed_at, needs_expand) = if review_gate {
             ("awaiting_review", None, false)
         } else {
             ("completed", Some(sql_now()), true)
@@ -1967,7 +2072,7 @@ impl Executor {
 
         // The review branch also moves the process; the completed branch leaves
         // its status alone and lets the wave loop decide.
-        let update = if task.requires_review != 0 {
+        let update = if review_gate {
             "UPDATE process SET total_tokens = total_tokens + ?, total_cost = total_cost + ?, \
              tool_invocations_used = tool_invocations_used + ?, status = 'task_review_required' \
              WHERE id = ?"
@@ -2289,9 +2394,8 @@ pub fn spawn_plan(
     process_id: i64,
     goal: String,
     team_context: Option<String>,
-    auto_approve: bool,
 ) {
-    let executor = Executor::new(Arc::clone(&state), process_id, auto_approve);
+    let executor = Executor::new(Arc::clone(&state), process_id);
     spawn_guarded(state, process_id, "Planning", async move {
         executor.plan(goal, team_context).await
     });
@@ -2300,7 +2404,7 @@ pub fn spawn_plan(
 /// `DAGExecutor(process_id).execute_dag()` on `BackgroundTasks`. Routes 5, 6, 8,
 /// 9 and 10.
 pub fn spawn_execute_dag(state: Arc<AppState>, process_id: i64) {
-    let executor = Executor::new(Arc::clone(&state), process_id, false);
+    let executor = Executor::new(Arc::clone(&state), process_id);
     spawn_guarded(state, process_id, "DAG execution", async move {
         executor.execute_dag().await
     });
@@ -2309,7 +2413,7 @@ pub fn spawn_execute_dag(state: Arc<AppState>, process_id: i64) {
 /// `DAGExecutor(process_id).expand_after_review_approval_and_continue(task_id)`.
 /// Route 6, on the approve branch of a task review.
 pub fn spawn_expand_after_review(state: Arc<AppState>, process_id: i64, task_id: i64) {
-    let executor = Executor::new(Arc::clone(&state), process_id, false);
+    let executor = Executor::new(Arc::clone(&state), process_id);
     spawn_guarded(state, process_id, "DAG execution", async move {
         executor.maybe_expand_subdag_after_success(task_id).await;
         executor.execute_dag().await;
@@ -2517,7 +2621,7 @@ async fn recover_interrupted_processes(
     }
 
     for (process_id, goal, team_context) in plans {
-        spawn_plan(Arc::clone(&state), process_id, goal, team_context, false);
+        spawn_plan(Arc::clone(&state), process_id, goal, team_context);
     }
     for process_id in executions {
         spawn_execute_dag(Arc::clone(&state), process_id);
@@ -2542,6 +2646,7 @@ mod tests {
             instructions: "i".into(),
             dependencies: deps.iter().map(|d| d.to_string()).collect(),
             llm_model: None,
+            modality: crate::dag_schema::TEXT_MODALITY.to_string(),
             subdecompose: false,
             requires_review: false,
         }
@@ -2646,6 +2751,22 @@ mod tests {
         };
         let Wave::Deadlock(reason) = plan_wave(&orphaned, None) else { panic!("expected deadlock") };
         assert!(reason.contains("blocked by failed task(s) a"), "{reason}");
+
+        // Downstream of a failed task is *not* a cycle: agent_2 failed, agent_3
+        // depends on it and agent_4 on agent_3. Reporting agent_4 as cyclic sent
+        // users hunting a graph bug that was not there.
+        let downstream = DagSnapshot {
+            pending_tasks: vec![pending(3, &["a2"]), pending(4, &["t3"])],
+            status_by_uuid: statuses(&[
+                ("a2", "failed"),
+                ("t3", "pending"),
+                ("t4", "pending"),
+            ]),
+            ..Default::default()
+        };
+        let Wave::Deadlock(reason) = plan_wave(&downstream, None) else { panic!("expected deadlock") };
+        assert!(reason.contains("blocked by failed task(s) a2"), "{reason}");
+        assert!(!reason.contains("cyclic"), "{reason}");
 
         // A dependency on a uuid that is not a task at all.
         let missing = DagSnapshot {

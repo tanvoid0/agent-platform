@@ -137,13 +137,15 @@ pub fn media_backend() -> MediaBackend {
 /// The backend base URL. Always present — the default is where the selected
 /// backend listens out of the box — so "configured" is never the question
 /// here; "reachable" is, and `GET /status` answers it.
+pub const DEFAULT_COMFY_BASE: &str = "http://127.0.0.1:8188";
+
 pub fn media_api_base() -> String {
     let base = crate::llm_config::from_env_or_dotenv("MEDIA_API_BASE");
     if !base.is_empty() {
         return base.trim_end_matches('/').to_string();
     }
     match media_backend() {
-        MediaBackend::Comfy => "http://127.0.0.1:8188".to_string(),
+        MediaBackend::Comfy => DEFAULT_COMFY_BASE.to_string(),
         MediaBackend::Sdcpp => crate::media_sdcpp::DEFAULT_BASE.to_string(),
     }
 }
@@ -216,7 +218,7 @@ async fn status(
             // sd-server's one loaded model *is* the image model; there is no
             // choice to make and no family to prefer.
             MediaBackend::Sdcpp => checkpoints.first().cloned(),
-            MediaBackend::Comfy => choose_checkpoint(&checkpoints),
+            MediaBackend::Comfy => preferred_checkpoint(&checkpoints),
         },
     }))
     .into_response())
@@ -240,6 +242,26 @@ async fn installed_checkpoints(state: &AppState, base: &str) -> Vec<String> {
         .and_then(Value::as_array)
         .map(|names| names.iter().filter_map(Value::as_str).map(str::to_string).collect())
         .unwrap_or_default()
+}
+
+/// [`choose_checkpoint`], with `MEDIA_IMAGE_MODEL` overriding it when that
+/// checkpoint is actually installed.
+///
+/// The override is the per-modality "default model" the settings page sets for
+/// images — the equivalent of `DEFAULT_MODEL` for chat. A name that is not
+/// installed falls back rather than failing the job: the checkpoint list moves
+/// under the user's feet (they delete files while both apps run), and refusing
+/// a render because a stale preference points at a deleted file is worse than
+/// rendering with the one that is there.
+fn preferred_checkpoint(installed: &[String]) -> Option<String> {
+    let wanted = crate::llm_config::from_env_or_dotenv("MEDIA_IMAGE_MODEL");
+    let wanted = wanted.trim();
+    if !wanted.is_empty() {
+        if let Some(name) = installed.iter().find(|n| n.eq_ignore_ascii_case(wanted)) {
+            return Some(name.clone());
+        }
+    }
+    choose_checkpoint(installed)
 }
 
 /// The checkpoint the image template gets. Preference order is the known
@@ -330,9 +352,6 @@ fn job_spec(req: &GenerateRequest) -> Result<JobSpec, ApiError> {
         .to_string();
 
     let (dw, dh) = if kind == "video" { (832, 480) } else { (1024, 1024) };
-    // Multiples of 16: both latent spaces require it, and rounding here beats
-    // ComfyUI's error naming a tensor shape.
-    let snap = |v: i64, d: i64| (v.clamp(256, 2048) / 16 * 16).max(256).min(d * 2);
     Ok(JobSpec {
         kind,
         prompt,
@@ -344,8 +363,78 @@ fn job_spec(req: &GenerateRequest) -> Result<JobSpec, ApiError> {
     })
 }
 
+/// Start a job, wait for it to land, and answer with its id and file route —
+/// the executor's door (ADR 0018).
+///
+/// Studio and `ads` both fire and forget, because a screen can poll. A task
+/// node cannot: it has to return an output, and the nodes downstream of it are
+/// waiting. So this polls the row rather than the backend — `watch_job` is
+/// already doing that, and two watchers on one job would fetch the same file
+/// twice.
+///
+/// `user_id` is `None`: `media_jobs` is master-key surface (ADR 0009,
+/// "Tenancy") and a process carries no user of its own — ownership hangs off
+/// its workspace, which the gallery does not filter on.
+pub(crate) async fn generate_and_wait(
+    state: &Arc<AppState>,
+    kind: &'static str,
+    prompt: &str,
+) -> Result<(i64, String), ApiError> {
+    let (dw, dh) = if kind == "video" { (832, 480) } else { (1024, 1024) };
+    let spec = JobSpec {
+        kind,
+        prompt: prompt.trim().to_string(),
+        negative: String::new(),
+        width: snap(dw, dw),
+        height: snap(dh, dh),
+        length: if kind == "video" { 49 } else { 0 },
+        seed: random_seed(),
+    };
+    let id = start_job(state, &spec, None, prompt.trim(), None).await?;
+
+    // `watch_job` gives up after an hour and writes `failed`, so this loop
+    // normally ends on a status change. The cap is for the case it cannot
+    // cover: a restart between submit and completion leaves no watcher, and a
+    // task node blocked forever would hold its whole wave open.
+    let deadline = std::time::Instant::now() + Duration::from_secs(4200);
+    loop {
+        let job = load_job(state, id).await?;
+        match job.status.as_str() {
+            "completed" => return Ok((id, format!("/api/v1/media/jobs/{id}/file"))),
+            "failed" => {
+                return Err(ApiError::coded(
+                    StatusCode::BAD_GATEWAY,
+                    "media_job_failed",
+                    job.error.unwrap_or_else(|| "The media job failed.".to_string()),
+                ))
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ApiError::coded(
+                StatusCode::GATEWAY_TIMEOUT,
+                "media_job_timeout",
+                format!("Media job {id} did not finish; it is still in the gallery."),
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// A dimension the latent space will actually accept: clamped to 256–2048,
+/// rounded down to a multiple of 16, and held within twice the kind's default
+/// so a stray zero or a five-figure number becomes a render rather than a 400.
+///
+/// Multiples of 16 because both latent spaces require it, and rounding here
+/// beats ComfyUI's error naming a tensor shape. `pub(crate)` because
+/// [`crate::ads`]'s platform presets are chosen to survive this untouched, and
+/// a test there asserts exactly that.
+pub(crate) fn snap(v: i64, default: i64) -> i64 {
+    (v.clamp(256, 2048) / 16 * 16).max(256).min(default * 2)
+}
+
 /// Non-cryptographic and non-repeating is all a diffusion seed needs.
-fn random_seed() -> i64 {
+pub(crate) fn random_seed() -> i64 {
     i64::from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -375,6 +464,30 @@ async fn generate(
         spec.prompt = better.clone();
     }
 
+    let original_prompt = req.prompt.as_deref().unwrap_or("").trim().to_string();
+    let user_id = crate::identity::stamp_user_id(&state, &principal);
+    let id = start_job(&state, &spec, enhanced, &original_prompt, user_id).await?;
+    Ok((StatusCode::CREATED, Json(load_job(&state, id).await?)).into_response())
+}
+
+/// Submit a spec to whichever backend is configured, store the row, and leave a
+/// waiter running — the whole of a generation minus the HTTP shell around it.
+///
+/// Extracted from [`generate`] because [`crate::ads`] is its second caller: a
+/// campaign starts one of these per variant, with dimensions the platform
+/// dictates rather than ones a user picked. Everything backend-specific still
+/// happens here and nowhere else, so an ad job and a Studio job are the same
+/// row, watched the same way, and served by the same file route.
+///
+/// Returns the new `media_jobs.id`. The caller decides what to do with it —
+/// `generate` renders the row, `ads` stores the id on its variant.
+pub(crate) async fn start_job(
+    state: &Arc<AppState>,
+    spec: &JobSpec,
+    enhanced: Option<String>,
+    original_prompt: &str,
+    user_id: Option<i64>,
+) -> Result<i64, ApiError> {
     let base = media_api_base();
     let backend = media_backend();
     // The one place the two backends diverge on the way in. ComfyUI is handed
@@ -382,20 +495,19 @@ async fn generate(
     // an id to poll, which is all the row stores.
     let backend_job_id = match backend {
         MediaBackend::Comfy => {
-            let graph = build_workflow(&state, &base, &spec).await?;
-            submit_workflow(&state, &base, &graph).await?
+            let graph = build_workflow(state, &base, spec).await?;
+            submit_workflow(state, &base, &graph).await?
         }
         MediaBackend::Sdcpp => {
             // The one place a generation may block on a download and a model
             // load. Deliberately here and not in the status probe: a gallery
             // refresh must never start a multi-gigabyte load (ADR 0011).
-            crate::media_sdcpp_process::ensure_running(&state, &base, spec.kind).await?;
-            crate::media_sdcpp::submit(&state, &base, &spec).await?
+            crate::media_sdcpp_process::ensure_running(state, &base, spec.kind).await?;
+            crate::media_sdcpp::submit(state, &base, spec).await?
         }
     };
 
     let now = sql_now();
-    let original_prompt = req.prompt.as_deref().unwrap_or("").trim();
     let id: i64 = sqlx::query_scalar(&db::sql(
         "INSERT INTO media_jobs (kind, prompt, enhanced_prompt, status, width, height, length, \
          seed, comfy_prompt_id, created_at, updated_at, user_id) \
@@ -415,7 +527,7 @@ async fn generate(
     .bind(&backend_job_id)
     .bind(&now)
     .bind(&now)
-    .bind(crate::identity::stamp_user_id(&state, &principal))
+    .bind(user_id)
     .fetch_one(&state.any)
     .await?;
 
@@ -423,7 +535,7 @@ async fn generate(
     // including a restarted app — finds out how it went.
     tokio::spawn(watch_job(state.clone(), id, backend, base, backend_job_id));
 
-    Ok((StatusCode::CREATED, Json(load_job(&state, id).await?)).into_response())
+    Ok(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -756,7 +868,7 @@ async fn build_workflow(state: &AppState, base: &str, spec: &JobSpec) -> Result<
     // cached — the user installs checkpoints while both apps are running.
     let model = if template.contains("__AGP_MODEL__") {
         let installed = installed_checkpoints(state, base).await;
-        Some(choose_checkpoint(&installed).ok_or_else(|| {
+        Some(preferred_checkpoint(&installed).ok_or_else(|| {
             ApiError::coded(
                 StatusCode::BAD_GATEWAY,
                 "media_no_models",

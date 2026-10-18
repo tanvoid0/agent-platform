@@ -61,14 +61,18 @@ Windows CUDA: a failed configure poisons the cmake cache
 ## Runtime contract
 
 - The app spawns the daemon from its own directory, so **build both**.
-- Attach-if-running probes unauthenticated `/api/v1/system/status` first
-  (open loopback, ADR 0013), then the leftover install key. A foreign keyed
-  server on 18410 is still `Foreign`. An open agent-platform on the port is
-  treated as ours — one listener, like Ollama.
+- **The spawn passes `master.key` as `AGENT_PLATFORM_MASTER_KEY` (ADR 0019),** so
+  the local API is keyed like the cloud one — this process runs commands and
+  holds the user's BYOK keys, which is not Ollama's threat model. Empty is the
+  degraded path (unreadable key file), not the default.
+- Attach-if-running probes unauthenticated `/api/v1/system/status` first, then
+  the install key. An open agent-platform on the port — a pre-0019 spawn or a
+  bare `cargo run -p agent-platform-server` — is still treated as ours, so an
+  upgrade need not kill what it finds; `client_key` sends it no bearer. A foreign
+  keyed server on 18410 is still `Foreign`.
 - Data lives in `%APPDATA%\com.tanvoid0.agentplatform` — SQLite, workspaces,
-  `settings.json`. The optional cloud session is `cloud.session.json` in that
-  dir (ADR 0013). A leftover `master.key` is only used when attaching to an
-  older keyed daemon; new spawns leave the local API open like Ollama.
+  `settings.json`, `master.key`. The optional cloud session is
+  `cloud.session.json` in that dir (ADR 0013).
 - **Every app-state file is rewritten whole, so write it with
   `shell::write_atomic`, never `fs::write`.** `settings.json`, `chats.json`,
   `memories.json` and `master.key` all load with a silent fallback to a default,

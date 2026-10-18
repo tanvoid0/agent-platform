@@ -43,8 +43,10 @@ fn connect_card<'a>(origin: &str, key: &str) -> Element<'a, Message> {
     ui::card_with_header(
         "Connect",
         Some(ui::muted(
-            "The local API is open on loopback, like Ollama. Other apps on this machine \
-             call it with no token. A bearer is only required if you expose the server.",
+            "The local API is bound to loopback and every /api/v1 route needs a bearer. \
+             Other apps on this machine send the key below — this server runs commands \
+             and holds your provider keys, so it is not open the way an inference \
+             endpoint is.",
         )),
         None,
         ui::stack(vec![
@@ -63,8 +65,9 @@ fn connect_card<'a>(origin: &str, key: &str) -> Element<'a, Message> {
                 "Keys",
                 ui::muted(
                     "The master key (Settings → Status) has full access. Scoped, \
-                     rate-limited workspace tokens start with `agp_` and are minted on the \
-                     /tokens page — use those for anything outside this machine.",
+                     rate-limited workspace tokens start with `agp_` and are minted \
+                     through POST /api/v1/workspaces/{workspace_id}/api-tokens \
+                     - use those for anything outside this machine.",
                 ),
             ),
             ui::field(

@@ -355,6 +355,9 @@ fn header(state: &State) -> Element<'_, Message> {
     let top = row![
         Row::with_children(top_row).spacing(space::SM).align_y(iced::Alignment::Center),
         space_widget::horizontal(),
+        // The pickers below choose a provider; the keys behind them are set on
+        // one page, and this is the screen that fails without them.
+        ui::button_ghost(Icon::Settings, "Providers", Message::OpenSettings),
         ui::button_outline(Icon::FolderOpen, "Open folder", Message::PickRoot),
     ]
     .spacing(space::SM)

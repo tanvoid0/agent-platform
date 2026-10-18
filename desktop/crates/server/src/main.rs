@@ -11,6 +11,9 @@ use agent_platform_server::{dotenv, logd, serve, Config};
 /// YAML before the runtime exists, because `set_var` is only sound while no
 /// other thread can be reading the environment.
 fn main() {
+    // Before the read: a `.env` that PowerShell's `>>` left as UTF-16 parses
+    // either way, but it stays broken until something rewrites it.
+    dotenv::repair_env_encoding();
     dotenv::load_env_files();
 
     let cfg = match Config::from_env() {

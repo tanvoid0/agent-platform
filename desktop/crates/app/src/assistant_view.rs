@@ -275,6 +275,9 @@ pub fn view<'a>(state: &'a State, iced_theme: &Theme, style: HudStyle) -> Elemen
     // No mode segment up here: the composer's mic button is the mode, and two
     // controls for one state is how you end up in voice mode with a shut mic.
     head.push(ui::spacer());
+    // Its name, its voice and the wake word are all one page away and were
+    // reachable only by guessing which Settings tab held them.
+    head.push(ui::button_ghost(Icon::Settings, "Voice & name", Message::OpenSettings));
     head.push(ui::button_ghost(Icon::Trash, "Clear", Message::Clear));
 
     ui::page_custom(ui::cluster(head), panel(state, iced_theme, style))

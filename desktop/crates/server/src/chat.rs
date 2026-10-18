@@ -14,8 +14,6 @@
 //!
 //! - **`chat:write`** — the one route in the assistant+chat half that checks a
 //!   scope.
-//! - **503 when the master key is unset**, before anything else. A handler that
-//!   calls into `llm` needs no key, but the status is user-visible.
 //! - **The request shaping** Python does: `fit_chat_messages_for_request`, the
 //!   model-alias sanitiser, a lowercased `provider` hint, and `max_tokens`
 //!   defaulted from the context budget.
@@ -36,7 +34,7 @@
 use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
-use axum::http::{header::CONTENT_TYPE, HeaderMap, StatusCode};
+use axum::http::{header::CONTENT_TYPE, HeaderMap};
 use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
@@ -75,12 +73,6 @@ async fn chat(
     let payload = payload_from(body)?;
 
     principal.require_scope("chat:write")?;
-    if state.master_key.is_none() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "AGENT_PLATFORM_MASTER_KEY is not set.",
-        ));
-    }
 
     let permit = limiter().acquire().await;
     let response = crate::llm::chat_completions(
@@ -284,6 +276,7 @@ fn limiter() -> &'static Limiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
 
     #[test]
     fn concurrency_cap_falls_back_the_way_python_does() {

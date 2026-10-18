@@ -1179,6 +1179,10 @@ pub enum Message {
     /// "View logs" on a traced error banner — intercepted in `main::update`
     /// before it reaches here, so this arm exists only to satisfy exhaustiveness.
     TraceLogs(String),
+    /// The settings link in this screen's header — its name, voice and wake word live in Settings.
+    /// Intercepted in `main::update` the same way, so this arm exists
+    /// only to satisfy exhaustiveness.
+    OpenSettings,
     DraftChanged(String),
     ProviderChanged(String),
     ModelChanged(String),
@@ -1223,7 +1227,7 @@ pub fn update(
     message: Message,
 ) -> Task<Message> {
     match message {
-        Message::TraceLogs(_) => Task::none(),
+        Message::TraceLogs(_) | Message::OpenSettings => Task::none(),
         Message::DraftChanged(v) => {
             state.draft = v;
             Task::none()

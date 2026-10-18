@@ -49,7 +49,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
             "Describe what you want. We turn it into a precise query you can edit, \
              then open it in the browser.",
         )),
-        None,
+        Some(ui::button_ghost(Icon::Settings, "Search settings", Message::OpenSettings)),
         ui::stack_lg(blocks),
     )
 }

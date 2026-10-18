@@ -967,23 +967,6 @@ fn build_executor(
         .map_err(|e| ApiError::bad_request(e.0))
 }
 
-/// Every streaming route refuses before it opens a stream, the way the routes
-/// do rather than the way the service functions do.
-///
-/// Not [`Principal::require_master_key`], despite the old name: that one rejects
-/// a *tenant* reaching an operator route (403). This one is the server having no
-/// master key at all, so the loop cannot call its own `/v1` surface — a 503 the
-/// operator fixes, not a credential the caller can change.
-fn require_master_key_configured(state: &AppState) -> Result<(), ApiError> {
-    if state.master_key.is_none() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "AGENT_PLATFORM_MASTER_KEY is not set.",
-        ));
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // POST /coder/chat/send — the non-streaming twin
 // ---------------------------------------------------------------------------
@@ -999,7 +982,6 @@ async fn chat_send(
     require_chat_write(&state, &principal).await?;
     let body: SendRequest = require_body(&body)?;
     let message = body.validate()?.to_string();
-    require_master_key_configured(&state)?;
 
     let thread = resolve_thread(&state, &principal, body.thread_id).await?;
     let mut title = thread.title.clone();
@@ -1100,7 +1082,6 @@ async fn chat_stream(
     require_chat_write(&state, &principal).await?;
     let body: SendRequest = require_body(&body)?;
     let message = body.validate()?.to_string();
-    require_master_key_configured(&state)?;
 
     // Resolved before the response starts, exactly as `stream_message` does:
     // the row (and, on an empty database, the row's creation) has to exist
@@ -1217,7 +1198,6 @@ async fn chat_retry(
     if !errors.is_empty() {
         return Err(ApiError::validation(errors));
     }
-    require_master_key_configured(&state)?;
 
     // `stream_retry` resolves the thread by id — no insert-on-read here, and a
     // missing one is a 404 before the stream opens.
@@ -1520,7 +1500,6 @@ async fn chat_approve_send(
 ) -> Result<Response, ApiError> {
     require_chat_write(&state, &principal).await?;
     let body = approval_request(&body)?;
-    require_master_key_configured(&state)?;
 
     let thread_id = body.thread_id.unwrap_or_default();
     let call_id = body.call_id.clone().unwrap_or_default();
@@ -1568,7 +1547,6 @@ async fn chat_approve(
 ) -> Result<Response, ApiError> {
     require_chat_write(&state, &principal).await?;
     let body = approval_request(&body)?;
-    require_master_key_configured(&state)?;
 
     let thread_id = body.thread_id.unwrap_or_default();
     let call_id = body.call_id.clone().unwrap_or_default();

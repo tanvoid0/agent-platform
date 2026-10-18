@@ -123,12 +123,16 @@ impl TeamRoster {
                 0,
                 32,
             );
-            if role.modality != "text" {
+            // Image and video landed with ADR 0018: the capability router
+            // resolves a media backend, and `executor` dispatches a node with
+            // one of these to `media::start_job`. Audio has a `Modality::Speech`
+            // in the router but no node path, so it is still not a roster
+            // answer.
+            if !crate::dag_schema::MODALITIES.contains(&role.modality.as_str()) {
                 errors.push(ApiError::field_error_at(
                     &["roster", "roles", &idx, "modality"],
                     "value_error",
-                    "Value error, Only modality 'text' is supported until the server resolves \
-                     audio, video, and image routing.",
+                    "Value error, modality must be 'text', 'image' or 'video'.",
                 ));
             }
         }
@@ -722,6 +726,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(roster.lead_role_id(), Some("a"));
+    }
+
+    /// ADR 0018 opened this gate; audio is still shut, because the router has
+    /// a speech modality but no node path to run it on.
+    #[test]
+    fn a_roster_may_ask_for_pictures_but_not_audio() {
+        let roster: TeamRoster = serde_json::from_str(
+            r#"{"roles":[{"id":"a","name":"A","modality":"image"},
+                          {"id":"b","name":"B","modality":"video"}]}"#,
+        )
+        .unwrap();
+        let mut errors = Vec::new();
+        roster.validate(&mut errors);
+        assert!(errors.is_empty(), "image and video roles validate: {errors:?}");
+
+        let audio: TeamRoster =
+            serde_json::from_str(r#"{"roles":[{"id":"a","name":"A","modality":"audio"}]}"#).unwrap();
+        let mut errors = Vec::new();
+        audio.validate(&mut errors);
+        assert_eq!(errors.len(), 1, "{errors:?}");
     }
 
     #[test]

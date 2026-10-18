@@ -212,6 +212,12 @@ fn is_role_slug(lowered: &str) -> bool {
 // The schema
 // ---------------------------------------------------------------------------
 
+/// The three things a node can produce. `teams::RosterRole` is validated
+/// against the same list — a roster role and a task node are the two places a
+/// modality is written, and one list keeps them from drifting.
+pub const MODALITIES: [&str; 3] = [TEXT_MODALITY, "image", "video"];
+pub const TEXT_MODALITY: &str = "text";
+
 /// Field order is pydantic's declaration order, because a derived `Serialize`
 /// is the only thing that gives it — `serde_json::Map` sorts. That order is
 /// what `planner_dag_to_json` writes into `process.dag_json`, which is a
@@ -227,6 +233,10 @@ pub struct SubagentSpec {
     /// proxy alias (`GET /v1/models`), not a role or skill label.
     #[serde(rename = "model")]
     pub llm_model: Option<String>,
+    /// What this node produces: `text` (the default, and everything that
+    /// existed before ADR 0018), `image` or `video`. The executor dispatches on
+    /// it — text to the chat proxy, the other two to `media::start_job`.
+    pub modality: String,
     pub subdecompose: bool,
     pub requires_review: bool,
 }
@@ -338,6 +348,7 @@ fn parse_subagent(raw: &Value, loc: &str, errors: &mut FieldErrors) -> SubagentS
             instructions: String::new(),
             dependencies: Vec::new(),
             llm_model: None,
+            modality: TEXT_MODALITY.to_string(),
             subdecompose: false,
             requires_review: false,
         };
@@ -378,6 +389,29 @@ fn parse_subagent(raw: &Value, loc: &str, errors: &mut FieldErrors) -> SubagentS
         }
     };
 
+    // Absent is `text`, so a planner that has never heard of this field keeps
+    // producing valid DAGs. An unknown value is rejected rather than coerced:
+    // silently rendering a "3d" node as text would look like a working run.
+    let modality = match raw.get("modality") {
+        None | Some(Value::Null) => TEXT_MODALITY.to_string(),
+        Some(Value::String(s)) => {
+            let value = s.trim().to_ascii_lowercase();
+            if MODALITIES.contains(&value.as_str()) {
+                value
+            } else {
+                errors.push(
+                    format!("{loc}modality"),
+                    "Input should be 'text', 'image' or 'video'",
+                );
+                TEXT_MODALITY.to_string()
+            }
+        }
+        Some(_) => {
+            errors.push(format!("{loc}modality"), "Input should be a valid string");
+            TEXT_MODALITY.to_string()
+        }
+    };
+
     let subdecompose = coerce_bool(raw.get("subdecompose"), format!("{loc}subdecompose"), errors);
     let requires_review =
         coerce_bool(raw.get("requires_review"), format!("{loc}requires_review"), errors);
@@ -389,6 +423,7 @@ fn parse_subagent(raw: &Value, loc: &str, errors: &mut FieldErrors) -> SubagentS
         instructions,
         dependencies,
         llm_model,
+        modality,
         subdecompose,
         requires_review,
     }
@@ -576,6 +611,34 @@ mod tests {
         })
     }
 
+    /// ADR 0018. The default matters as much as the accepted values: every
+    /// planner that has never heard of this field must keep producing text
+    /// nodes, and a typo must not quietly render as one.
+    #[test]
+    fn modality_defaults_to_text_and_rejects_anything_unknown() {
+        let plain = validate_subagent(&agent("a", &[])).unwrap();
+        assert_eq!(plain.modality, TEXT_MODALITY);
+
+        let mut raw = agent("a", &[]);
+        raw["modality"] = json!(" Image ");
+        assert_eq!(validate_subagent(&raw).unwrap().modality, "image");
+
+        raw["modality"] = json!("3d");
+        let err = validate_subagent(&raw).unwrap_err();
+        assert!(err.contains("modality"), "{err}");
+        assert!(err.contains("'text', 'image' or 'video'"), "{err}");
+
+        // The stored `dag_json` carries it, which is what lets a re-read of a
+        // process still know which nodes render.
+        let planner = validate_planner_dag(&dag(vec![{
+            let mut a = agent("a", &[]);
+            a["modality"] = json!("video");
+            a
+        }]))
+        .unwrap();
+        assert!(planner_dag_to_json(&planner, true).contains("\"modality\": \"video\""));
+    }
+
     fn dag(agents: Vec<Value>) -> Value {
         json!({ "team_name": "T", "goal_restatement": "G", "subagents": agents })
     }
@@ -706,9 +769,11 @@ mod tests {
         let json = planner_dag_to_json(&planner, false);
         // Declaration order, `model` not `llm_model`, and `json.dumps` spacing —
         // this string is stored on the process and echoed back by GET.
+        // `modality` joined it with ADR 0018: an added field changes this
+        // string, which is the point of pinning it here.
         assert_eq!(
             json,
-            r#"{"team_name": "T", "goal_restatement": "G", "subagents": [{"client_uuid": "a", "role": "R", "system_prompt": "s", "instructions": "i", "dependencies": [], "model": null, "subdecompose": false, "requires_review": false}, {"client_uuid": "b", "role": "R", "system_prompt": "s", "instructions": "i", "dependencies": ["a"], "model": null, "subdecompose": false, "requires_review": false}]}"#
+            r#"{"team_name": "T", "goal_restatement": "G", "subagents": [{"client_uuid": "a", "role": "R", "system_prompt": "s", "instructions": "i", "dependencies": [], "model": null, "modality": "text", "subdecompose": false, "requires_review": false}, {"client_uuid": "b", "role": "R", "system_prompt": "s", "instructions": "i", "dependencies": ["a"], "model": null, "modality": "text", "subdecompose": false, "requires_review": false}]}"#
         );
     }
 

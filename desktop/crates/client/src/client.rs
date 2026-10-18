@@ -236,6 +236,17 @@ impl Client {
         .await
     }
 
+    /// Flip auto-approve on a process already running. The server applies it at
+    /// the next gate; whatever gate the process is at now still needs its own
+    /// approve or review call.
+    pub async fn set_process_auto_approve(&self, id: i64, on: bool) -> Result<ProcessRecord> {
+        self.patch_json(
+            &format!("/api/v1/processes/{id}"),
+            &serde_json::json!({ "auto_approve": on }),
+        )
+        .await
+    }
+
     pub async fn cancel_process(&self, id: i64) -> Result<CancelProcessResponse> {
         self.post_json(&format!("/api/v1/processes/{id}/cancel"), &serde_json::json!({})).await
     }
@@ -307,6 +318,45 @@ impl Client {
 
     pub async fn delete_project(&self, id: i64) -> Result<Value> {
         self.delete_json(&format!("/api/v1/projects/{id}")).await
+    }
+
+    // -- Social advertisements (`/api/v1/ads/*`, ADR 0017) --------------------
+
+    /// A project's brand brief. An untouched project answers with every field
+    /// blank rather than a 404 — "no brief yet" is the ordinary state.
+    pub async fn project_brand(&self, project_id: i64) -> Result<AdBrand> {
+        self.get_json(&format!("/api/v1/projects/{project_id}/brand")).await
+    }
+
+    /// Whole-object replace, and the reply is the stored brief — so the editor
+    /// shows what the server kept rather than what it hoped it sent.
+    pub async fn set_project_brand(&self, project_id: i64, body: &AdBrand) -> Result<AdBrand> {
+        self.put_json(&format!("/api/v1/projects/{project_id}/brand"), body).await
+    }
+
+    /// Where an ad can go, and the size it has to be. Fetched rather than
+    /// hard-coded: the server's list is the one the media seam will honour.
+    pub async fn ad_platforms(&self) -> Result<AdPlatformsResponse> {
+        self.get_json("/api/v1/ads/platforms").await
+    }
+
+    pub async fn ad_campaigns(&self, project_id: Option<i64>) -> Result<AdCampaignsResponse> {
+        match project_id {
+            Some(id) => self.get_json(&format!("/api/v1/ads/campaigns?project_id={id}")).await,
+            None => self.get_json("/api/v1/ads/campaigns").await,
+        }
+    }
+
+    /// Writes the copy and starts one media job per variant. Slower than the
+    /// other posts here — it waits on a model round-trip — and it answers with
+    /// the finished campaign, whose pictures are still rendering.
+    pub async fn create_ad_campaign(&self, body: &AdCampaignCreate) -> Result<AdCampaign> {
+        self.post_json("/api/v1/ads/campaigns", body).await
+    }
+
+    /// Forgets the words. The pictures stay: they are Studio's gallery too.
+    pub async fn delete_ad_campaign(&self, id: i64) -> Result<Value> {
+        self.delete_json(&format!("/api/v1/ads/campaigns/{id}")).await
     }
 
     // Chat lives in `sse::chat_stream` — every caller wants the reply as it

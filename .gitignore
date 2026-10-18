@@ -1,6 +1,7 @@
 # Secrets — never commit
 .env
 .env.local
+.env.utf16.bak
 .neon
 .env.*.local
 *.env

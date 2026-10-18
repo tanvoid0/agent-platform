@@ -15,13 +15,26 @@ pub fn view(state: &State) -> Element<'_, Message> {
         blocks.push(ui::error_bar(err, Message::TraceLogs, Message::Dismiss, Vec::new()));
     }
 
+    // Grouped by what a provider *produces*, not by who sells it. A local
+    // install needs three different programs to cover what one cloud vendor
+    // used to, and "which of these writes and which of these draws" is the
+    // question the old flat catalog could not answer.
+    blocks.push(routing_card(state));
+    blocks.push(ui::heading("Text"));
     blocks.push(catalog_card(state));
-    blocks.push(search_card(state));
     blocks.push(defaults_card(state));
+    blocks.push(ui::heading("Images & video"));
+    blocks.push(media_card(state));
+    blocks.push(ui::heading("Speech"));
+    blocks.push(speech_card(state));
+    blocks.push(ui::heading("Other"));
+    blocks.push(search_card(state));
 
     let page = ui::page(
-        "Providers",
-        Some(ui::muted("API keys, local endpoints and the model used when none is named.")),
+        "Models",
+        Some(ui::muted(
+            "Who writes, who draws, who speaks — and the keys and endpoints behind each.",
+        )),
         Some(
             ui::cluster(vec![
                 if state.busy {
@@ -40,6 +53,54 @@ pub fn view(state: &State) -> Element<'_, Message> {
         Some(entry) => ui::modal(page, provider_modal(state, entry), 560.0),
         None => page,
     }
+}
+
+// ---------------------------------------------------------------------------
+// What runs what
+// ---------------------------------------------------------------------------
+
+/// One line per modality, naming the provider a request would actually reach.
+///
+/// The server resolves this per capability (`llm_config`'s router, ADR 0018),
+/// and until this card existed the answer was only visible by making a request
+/// and seeing what came back. A user with Ollama for text and ComfyUI for
+/// pictures should be able to read that off one line rather than infer it from
+/// three cards.
+fn routing_card(state: &State) -> Element<'_, Message> {
+    let text = match state.env.as_ref().map(|e| &e.resolved_defaults) {
+        Some(d) if !d.provider.is_empty() => {
+            let label = state
+                .entry(&d.provider)
+                .map(|e| e.label.clone())
+                .unwrap_or_else(|| d.provider.clone());
+            if d.model.is_empty() { label } else { format!("{label} · {}", d.model) }
+        }
+        _ => "not configured".to_string(),
+    };
+
+    let pictures = match state.media.as_ref() {
+        Some(status) if status.reachable => {
+            let name = media_label(&status.backend);
+            match status.image_model.as_deref() {
+                Some(model) => format!("{name} · {model}"),
+                None => format!("{name} · no checkpoint installed"),
+            }
+        }
+        Some(status) => format!("{} · not reachable", media_label(&status.backend)),
+        None => "checking…".to_string(),
+    };
+
+    let speech = if state.env_set("SPEECH_API_BASE") { "configured" } else { "not configured" };
+
+    ui::section(
+        "What runs what",
+        None,
+        ui::stack(vec![
+            ui::field("Text", ui::body(text)),
+            ui::field("Images & video", ui::body(pictures)),
+            ui::field("Speech", ui::body(speech.to_string())),
+        ]),
+    )
 }
 
 /// A local backend that answered with a model list is running. `build_admin`
@@ -218,6 +279,170 @@ fn search_card(state: &State) -> Element<'_, Message> {
         Some(ui::muted("Lets the Search screen (and E.V.) read results back, not just build the query.")),
         None,
         ui::stack(rows),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Media backend (ADR 0009 / 0011) — a provider for images and video, not chat,
+// so it is a card of its own for the same reason web search is: no key, no
+// model dropdown, no `ProviderMeta` row to hang it on.
+// ---------------------------------------------------------------------------
+
+const COMFY_URL: &str = "https://www.comfy.org/download";
+
+/// The two media backends by name. `MEDIA_BACKEND` names them `comfy` and
+/// `sdcpp` on the wire; nobody calls them that out loud.
+fn media_label(backend: &str) -> &'static str {
+    match backend {
+        "sdcpp" => "stable-diffusion.cpp",
+        _ => "ComfyUI",
+    }
+}
+
+fn media_card(state: &State) -> Element<'_, Message> {
+    let status = state.media.as_ref();
+    let reachable = status.is_some_and(|s| s.reachable);
+    let name = media_label(status.map(|s| s.backend.as_str()).unwrap_or_default());
+
+    let mut head = vec![
+        container(ui::body(name.to_string())).width(180).into(),
+        if reachable {
+            ui::badge_icon(Icon::Check, "running", Tone::Success)
+        } else {
+            ui::badge_icon(Icon::X, "not reachable", Tone::Warning)
+        },
+        ui::spacer(),
+    ];
+    if reachable {
+        if let Some(s) = status {
+            // What it can actually be asked for right now, which is the half
+            // "running" does not answer: sd-server binds one model at startup.
+            let modes = if s.modes.is_empty() {
+                "image, video".to_string()
+            } else {
+                s.modes
+                    .iter()
+                    .map(|m| if m == "vid_gen" { "video" } else { "image" })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            head.push(ui::caption(format!(
+                "{modes} · {}",
+                ui::count(s.checkpoints.len(), "checkpoint", "checkpoints")
+            )));
+        }
+    } else {
+        head.push(ui::button_secondary(Icon::Globe, "Install ComfyUI", Message::OpenUrl(COMFY_URL)));
+    }
+    head.push(ui::button_outline(Icon::Download, "Model files", Message::OpenDownloads));
+
+    let mut rows: Vec<Element<'_, Message>> = vec![
+        ui::cluster(head).into(),
+        ui::muted(
+            "Image and video generation for the Studio screen. Not an LLM provider — no key,              no model default; it is reachable or it is not.",
+        ),
+    ];
+
+    // sd.cpp is managed by the server, so its stage says more than "not
+    // reachable" does — downloading and not-installed are both unreachable.
+    if let Some(detail) = status.and_then(|s| s.backend_detail.clone()) {
+        rows.push(ui::caption(detail));
+    }
+    // The per-modality default for images: pick one of the installed
+    // checkpoints, or leave it unset and let the server prefer a known
+    // text-to-image family. Video has no twin — its template names its own
+    // model family, so there is nothing to choose.
+    let checkpoints = status.map(|s| s.checkpoints.clone()).unwrap_or_default();
+    if !checkpoints.is_empty() {
+        let chosen = if state.edited("MEDIA_IMAGE_MODEL") {
+            state.draft("MEDIA_IMAGE_MODEL").to_string()
+        } else {
+            state.env_key("MEDIA_IMAGE_MODEL").map(|k| k.value.clone()).unwrap_or_default()
+        };
+        rows.push(ui::field(
+            "Image model",
+            ui::select("Auto — first known family", checkpoints, Some(chosen).filter(|c| !c.is_empty()), |v| {
+                Message::FieldChanged("MEDIA_IMAGE_MODEL", v)
+            }),
+        ));
+    }
+    if let Some(model) = status.and_then(|s| s.image_model.clone()) {
+        rows.push(ui::caption(format!("Rendering with {model}.")));
+    }
+
+    let base = if state.edited("MEDIA_API_BASE") {
+        state.draft("MEDIA_API_BASE")
+    } else {
+        state.env_key("MEDIA_API_BASE").map(|k| k.value.as_str()).unwrap_or_default()
+    };
+    // The server always resolves a base, so the placeholder is what it is
+    // using right now rather than a guess — leaving the field empty keeps it.
+    let placeholder =
+        status.map(|s| s.base.as_str()).filter(|b| !b.is_empty()).unwrap_or(DEFAULT_MEDIA_BASE);
+    rows.push(ui::field(
+        "Base URL",
+        ui::input(placeholder, base, |v| Message::FieldChanged("MEDIA_API_BASE", v)),
+    ));
+
+    ui::card_with_header(
+        "Media backend",
+        Some(ui::muted("Where Studio sends image and video jobs.")),
+        None,
+        ui::stack(rows),
+    )
+}
+
+const DEFAULT_MEDIA_BASE: &str = "http://127.0.0.1:8188";
+
+// ---------------------------------------------------------------------------
+// Speech — `Modality::Speech` has been in the capability router since the port
+// and had nowhere to be set. Two fields, no models list, so it is a card of its
+// own for the same reason web search is.
+// ---------------------------------------------------------------------------
+
+fn speech_card(state: &State) -> Element<'_, Message> {
+    let configured = state.env_set("SPEECH_API_BASE");
+    let (glyph, label, tone) = if configured {
+        (Icon::CheckCircle, "configured", Tone::Success)
+    } else {
+        (Icon::XCircle, "not configured", Tone::Danger)
+    };
+
+    let base = if state.edited("SPEECH_API_BASE") {
+        state.draft("SPEECH_API_BASE")
+    } else {
+        state.env_key("SPEECH_API_BASE").map(|k| k.value.as_str()).unwrap_or_default()
+    };
+
+    let key_set = state.env_key("SPEECH_API_KEY").is_some_and(|k| k.set);
+    let key_placeholder = if key_set { "stored — type to replace" } else { "not set (often unused)" };
+    let mut key_cells = vec![container(ui::input(
+        key_placeholder,
+        state.draft("SPEECH_API_KEY"),
+        |v| Message::FieldChanged("SPEECH_API_KEY", v),
+    ))
+    .width(Length::Fill)
+    .into()];
+    if key_set && !state.edited("SPEECH_API_KEY") {
+        key_cells.push(ui::mono(
+            state.env_key("SPEECH_API_KEY").map(|k| k.masked.as_str()).unwrap_or_default(),
+        ));
+    }
+
+    ui::card_with_header(
+        "Text to speech",
+        Some(ui::muted(
+            "An OpenAI-shaped /v1/audio/speech backend. Unset, the proxy answers 501 for speech              and the app falls back to the system voice — not a failure state.",
+        )),
+        None,
+        ui::stack(vec![
+            ui::cluster(vec![ui::badge_icon(glyph, label, tone), ui::spacer()]).into(),
+            ui::field(
+                "Base URL",
+                ui::input("not set", base, |v| Message::FieldChanged("SPEECH_API_BASE", v)),
+            ),
+            ui::field("API key", ui::cluster(key_cells)),
+        ]),
     )
 }
 

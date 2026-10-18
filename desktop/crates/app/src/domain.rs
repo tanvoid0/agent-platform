@@ -331,13 +331,47 @@ pub fn relative_task_activity(row: &BoardRow) -> Option<String> {
     Some(if terminal { format!("Finished {rel}") } else { format!("Started {rel}") })
 }
 
+/// How long a task ran, from its own two timestamps. `None` until it finishes —
+/// a running node's elapsed changes every frame and belongs in relative time.
+pub fn task_duration_secs(task: &TaskNodeRecord) -> Option<i64> {
+    let (start, end) = (task.started_at.as_deref()?, task.completed_at.as_deref()?);
+    let secs = iso_to_epoch_secs(end)? - iso_to_epoch_secs(start)?;
+    (secs >= 0).then_some(secs)
+}
+
+/// `45s`, `3m 05s`, `2h 14m`.
+pub fn compact_duration(secs: i64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
+        s => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// Wall-clock a run has been going, or took. Falls back to nothing when the
+/// timestamps do not parse rather than showing a wrong number.
+pub fn process_elapsed(process: &agent_platform_client::types::ProcessRecord) -> Option<String> {
+    let start = iso_to_epoch_secs(&process.created_at)?;
+    let terminal = matches!(process.status.as_str(), "completed" | "failed" | "cancelled");
+    let end = if terminal {
+        iso_to_epoch_secs(&process.updated_at)?
+    } else {
+        chrono::Utc::now().timestamp()
+    };
+    (end >= start).then(|| compact_duration(end - start))
+}
+
 /// Seconds between an ISO-8601 timestamp and now. Parsed by hand: the only
 /// shapes the server emits are `YYYY-MM-DDTHH:MM:SS[.ffffff][Z]`, so a date
 /// crate would be a dependency for one format.
 fn seconds_since(iso: &str) -> Option<i64> {
     let epoch = iso_to_epoch_secs(iso)?;
-    // Server timestamps are naive local time, so compare against local now.
-    Some(chrono::Local::now().naive_local().and_utc().timestamp() - epoch)
+    // Server timestamps are naive **UTC** - `wire::sql_now` is
+    // `Utc::now().naive_utc()`, and the `Z`-suffixed ones this also parses are
+    // UTC by definition. Comparing against *local* now added the machine's
+    // offset to every age on screen: at UTC+1 a run started two seconds ago
+    // read "1h ago", which is also why the buckets looked too coarse.
+    Some(chrono::Utc::now().timestamp() - epoch)
 }
 
 fn iso_to_epoch_secs(iso: &str) -> Option<i64> {
@@ -503,7 +537,7 @@ mod tests {
     }
 }
 
-/// A screen's transient success message. Carries a generation counter so two
+/// A screen's transient message. Carries a generation counter so two
 /// identical messages in a row are two toasts: the toast timer keys its
 /// countdown on `(text, seq)`, and equal text alone would let the second one
 /// inherit what was left of the first one's five seconds.
@@ -511,11 +545,24 @@ mod tests {
 pub struct Toast {
     text: Option<String>,
     seq: u64,
+    tone: Option<crate::ui::Tone>,
 }
 
 impl Toast {
     pub fn set(&mut self, text: impl Into<String>) {
+        self.set_toned(text, crate::ui::Tone::Success);
+    }
+
+    /// An answer that is neither a failure nor something having happened — a
+    /// call the server accepted and declined to act on. Green there reads as
+    /// "done", which is the opposite of what it says.
+    pub fn set_info(&mut self, text: impl Into<String>) {
+        self.set_toned(text, crate::ui::Tone::Info);
+    }
+
+    fn set_toned(&mut self, text: impl Into<String>, tone: crate::ui::Tone) {
         self.text = Some(text.into());
+        self.tone = Some(tone);
         self.seq = self.seq.wrapping_add(1);
     }
 
@@ -523,9 +570,11 @@ impl Toast {
         self.text = None;
     }
 
-    /// The message and which showing of it this is; `None` when nothing is up.
-    pub fn get(&self) -> Option<(String, u64)> {
-        self.text.clone().map(|t| (t, self.seq))
+    /// The message, which showing of it this is, and how it should read;
+    /// `None` when nothing is up.
+    pub fn get(&self) -> Option<(String, u64, crate::ui::Tone)> {
+        let tone = self.tone.unwrap_or(crate::ui::Tone::Success);
+        self.text.clone().map(|t| (t, self.seq, tone))
     }
 
     pub fn is_none(&self) -> bool {

@@ -32,15 +32,17 @@ pub enum Modality {
     VisionInput,
     Embeddings,
     ImageGeneration,
+    VideoGeneration,
     Speech,
 }
 
 /// Declaration order is the `modalities` array `GET /v1/capabilities` returns.
-pub const MODALITIES: [Modality; 5] = [
+pub const MODALITIES: [Modality; 6] = [
     Modality::Chat,
     Modality::VisionInput,
     Modality::Embeddings,
     Modality::ImageGeneration,
+    Modality::VideoGeneration,
     Modality::Speech,
 ];
 
@@ -51,6 +53,7 @@ impl Modality {
             Modality::VisionInput => "vision_input",
             Modality::Embeddings => "embeddings",
             Modality::ImageGeneration => "image_generation",
+            Modality::VideoGeneration => "video_generation",
             Modality::Speech => "speech",
         }
     }
@@ -88,7 +91,7 @@ pub struct ProviderSpec {
     pub base_url_env: Option<&'static str>,
 }
 
-use Modality::{Chat, Embeddings, ImageGeneration, Speech, VisionInput};
+use Modality::{Chat, Embeddings, ImageGeneration, Speech, VideoGeneration, VisionInput};
 
 /// Declaration order is `SUPPORTED_PROVIDER_IDS ++ IMAGE_PROVIDER_IDS ++
 /// SPEECH_PROVIDER_IDS`, which is what Python's capability router sorts — stably
@@ -170,6 +173,25 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         default_model: "",
         modalities: &[Chat, VisionInput],
         sort_order: 6,
+    },
+    // The media domain (ADR 0009 / 0011) as a capability provider: ComfyUI or
+    // the managed sd-server, whichever `MEDIA_BACKEND` selects. It is the only
+    // entry declaring `VideoGeneration`, and it outranks `image_local` because
+    // a desktop that has a media backend wired should not need to be told to
+    // use it — that is the whole point of the capability router.
+    //
+    // It does **not** speak OpenAI's `/v1/images/generations` shape, so that
+    // proxy route pins `image_local` explicitly rather than asking the router;
+    // this provider's door is `POST /api/v1/media/jobs`.
+    ProviderSpec {
+        id: "media_local",
+        api_key_env: None,
+        base_url_env: Some("MEDIA_API_BASE"),
+        label: "Media (ComfyUI / sd.cpp)",
+        registry: Registry::Image,
+        default_model: "",
+        modalities: &[ImageGeneration, VideoGeneration],
+        sort_order: 0,
     },
     ProviderSpec {
         id: "image_local",
@@ -402,6 +424,11 @@ fn spec_configured(spec: &ProviderSpec) -> bool {
         "anthropic" => !anthropic_api_key().is_empty(),
         "gemini" => !gemini_api_key().is_empty(),
         "platform" => crate::accounts::platform_configured(),
+        // Same rule as the loopback chat backends above: "configured" is
+        // knowing a URL to try. `media_api_base` always resolves one, so this
+        // is always true on a desktop — reachability is `GET /media/status`,
+        // which is a probe and cannot be asked from a sync function.
+        "media_local" => !crate::media::media_api_base().is_empty(),
         "image_local" => !image_api_base().is_empty(),
         "speech_local" => !speech_api_base().is_empty(),
         _ => true,
@@ -855,18 +882,28 @@ mod tests {
         assert_eq!(resolve_provider_for_capability(Modality::Chat), Some("ollama"));
         assert_eq!(providers_for_capability(Modality::Embeddings), vec!["lm_studio"]);
 
-        // No image backend configured => 501 naming the one that could serve it.
-        let err = require_provider_for_capability(Modality::ImageGeneration, None).unwrap_err();
-        assert_eq!(err.status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(err.code, "capability_unavailable");
-        let extra = err.extra.unwrap();
-        assert_eq!(extra["providers_with_capability"], json!(["image_local"]));
-        assert_eq!(extra["configured_providers_with_capability"], json!([]));
+        // The media backend carries a loopback default like the chat ones, so
+        // both picture capabilities resolve with nothing configured — that is
+        // the wiring this router exists to do: a process asking for an image
+        // gets ComfyUI without anyone naming it. `image_local` stays declared
+        // and unconfigured behind it.
+        assert_eq!(
+            require_provider_for_capability(Modality::ImageGeneration, None).unwrap(),
+            "media_local"
+        );
+        assert_eq!(
+            require_provider_for_capability(Modality::VideoGeneration, None).unwrap(),
+            "media_local"
+        );
+        assert_eq!(providers_for_capability(Modality::VideoGeneration), vec!["media_local"]);
+        assert!(!is_configured("image_local"));
 
         std::env::set_var("IMAGE_API_BASE", "http://127.0.0.1:9000/");
         assert_eq!(image_api_base(), "http://127.0.0.1:9000");
+        // Still pinnable by name — which is how `/v1/images/generations` reaches
+        // the OpenAI-shaped backend past the media one that outranks it.
         assert_eq!(
-            require_provider_for_capability(Modality::ImageGeneration, None).unwrap(),
+            require_provider_for_capability(Modality::ImageGeneration, Some("image_local")).unwrap(),
             "image_local"
         );
         // A pin at a provider that cannot serve the capability is a 501, not a

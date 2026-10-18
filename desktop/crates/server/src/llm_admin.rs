@@ -56,7 +56,7 @@ const MASTER_KEY_ENV: &str = "AGENT_PLATFORM_MASTER_KEY";
 /// key") are here even though search has no `ProviderSpec` row: this is the
 /// set the `.env` editor (`GET`/`POST /env` below) will actually write, and
 /// there is no other list a search key could ride in on.
-const ENV_KEYS: [&str; 12] = [
+const ENV_KEYS: [&str; 16] = [
     MASTER_KEY_ENV,
     "GEMINI_API_KEY",
     "AIMLAPI_API_KEY",
@@ -69,6 +69,20 @@ const ENV_KEYS: [&str; 12] = [
     "DEFAULT_MODEL",
     "SEARCH_API_KEY",
     "SEARCH_CX",
+    // Not an LLM provider either: where the media backend (ComfyUI / sd-server,
+    // ADR 0009 / 0011) listens. Editable from the Providers screen so a
+    // ComfyUI on another port does not need a hand-edited `.env`.
+    "MEDIA_API_BASE",
+    // The image half of the per-modality defaults: which installed checkpoint
+    // the media backend renders with, the way `DEFAULT_MODEL` names the chat
+    // one. There is no video twin — the video template names its own model
+    // family (`media.rs`), so there is nothing to choose yet.
+    "MEDIA_IMAGE_MODEL",
+    // The speech backend (`Modality::Speech`). It has been in the capability
+    // router since the port and had nowhere to be set until the Models page
+    // grouped the settings by what they produce.
+    "SPEECH_API_BASE",
+    "SPEECH_API_KEY",
 ];
 
 /// Masked in `GET /env`; every other key returns its plaintext `value`. Also
@@ -254,6 +268,7 @@ async fn get_env(principal: Principal) -> Result<Response, ApiError> {
             "OLLAMA_API_BASE": DEFAULT_OLLAMA_BASE,
             "LM_STUDIO_API_BASE": DEFAULT_LM_STUDIO_BASE,
             "AIMLAPI_OPENAI_BASE": "https://api.aimlapi.com/v1",
+            "MEDIA_API_BASE": crate::media::DEFAULT_COMFY_BASE,
         },
         "persisted_defaults": persisted_defaults(),
         "resolved_defaults": resolved_defaults(),

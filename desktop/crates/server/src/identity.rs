@@ -1,7 +1,10 @@
 //! One user row for every install — OS username locally, magic-link in the cloud.
 //!
-//! Local loopback stays open ([ADR 0013](../../../../docs/adr/0013-desktop-local-open-cloud-account.md));
-//! the unauthenticated caller is this machine user rather than `user_id = None`.
+//! The local install is keyed ([ADR 0019](../../../../docs/adr/0019-key-the-local-api.md));
+//! its master-key caller is stamped with this machine user rather than
+//! `user_id = None`, as the unauthenticated caller was under
+//! [ADR 0013](../../../../docs/adr/0013-desktop-local-open-cloud-account.md).
+//! A pre-0019 open daemon still resolves the same way.
 //! Cloud JWT callers use the same `users` / `workspace.user_id` columns, so
 //! list/get shapes do not fork. See [ADR 0014](../../../../docs/adr/0014-user-owned-data-local-and-cloud.md).
 

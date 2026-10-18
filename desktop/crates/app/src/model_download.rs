@@ -27,18 +27,13 @@ pub enum Progress {
     Failed(String),
 }
 
-/// What the card needs to draw the row, all of it derived from [`Progress`].
+/// The paste box on the Settings card. Everything about the transfer itself —
+/// bytes, handle, `.part` — moved to [`crate::downloads`] when the queue became
+/// shared; what is left is the text and why the last press was refused.
 #[derive(Default)]
 pub struct State {
     pub input: String,
-    pub active: bool,
-    pub received: u64,
-    pub total: Option<u64>,
     pub error: Option<String>,
-    /// Aborts the transfer. Dropping the stream is the whole cancel — but it
-    /// drops it mid-write, so the half-file below has to be swept by hand.
-    pub handle: Option<iced::task::Handle>,
-    pub part: Option<PathBuf>,
 }
 
 /// A pasted reference to a GGUF → the URL to fetch and the name to save it as.

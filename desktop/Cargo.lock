@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "agent-platform-desktop"
-version = "0.7.0"
+version = "0.7.3"
 dependencies = [
  "agent-platform-client",
  "agent-platform-local-llm",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "agent-platform-server"
-version = "0.7.0"
+version = "0.7.3"
 dependencies = [
  "async-stream",
  "axum",
@@ -3284,7 +3284,7 @@ dependencies = [
 [[package]]
 name = "iced_term"
 version = "0.8.0"
-source = "git+https://github.com/tanvoid0/iced_term.git?branch=feat%2Fterminal-text#bfcdc1ac492a1d37e1d7ca539cd286ead42783dc"
+source = "git+https://github.com/tanvoid0/iced_term.git?rev=bfcdc1ac492a1d37e1d7ca539cd286ead42783dc#bfcdc1ac492a1d37e1d7ca539cd286ead42783dc"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

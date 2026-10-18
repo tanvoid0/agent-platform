@@ -2683,16 +2683,6 @@ async fn agent_chat(
     }
     messages.push(json!({ "role": "user", "content": message }));
 
-    // The call below is in-process and needs no credential, but Python's client
-    // does, and a user who never set the key sees this 503 rather than a reply.
-    // Dropping the check would change the status on that machine.
-    if state.master_key.is_none() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "AGENT_PLATFORM_MASTER_KEY is not set.",
-        ));
-    }
-
     let (fitted, _) = crate::context_budget::fit_chat_messages_for_request(messages);
     let mut payload = Map::new();
     payload.insert("messages".into(), Value::Array(fitted));

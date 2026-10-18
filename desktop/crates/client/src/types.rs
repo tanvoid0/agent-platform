@@ -61,6 +61,14 @@ pub struct ProcessRecord {
     pub updated_at: String,
     #[serde(default)]
     pub project_id: Option<i64>,
+    /// Whether the plan gate and every task review gate clear themselves.
+    /// Defaulted: a server older than the column omits it.
+    #[serde(default)]
+    pub auto_approve: bool,
+}
+
+fn text_modality() -> String {
+    "text".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +82,14 @@ pub struct TaskNodeRecord {
     pub system_prompt: String,
     pub instructions: String,
     pub llm_model: Option<String>,
+    /// `text` | `image` | `video` (ADR 0018). Defaulted, so a server that
+    /// predates it still deserializes.
+    #[serde(default = "text_modality")]
+    pub modality: String,
+    /// The media job an `image` / `video` node started, ready to fetch from
+    /// `/api/v1/media/jobs/{id}/file`.
+    #[serde(default)]
+    pub media_job_id: Option<i64>,
     pub dependencies_json: String,
     pub status: String,
     #[serde(default)]
@@ -692,6 +708,20 @@ pub struct EnvUpdate {
     /// round-trips as plain text through `EnvKey::value` rather than a mask.
     #[serde(rename = "SEARCH_CX", skip_serializing_if = "Option::is_none")]
     pub search_cx: Option<String>,
+    /// Where the media backend (ComfyUI / sd-server) listens. Not a chat
+    /// provider, so no `ProviderMeta` row — the Providers screen carries it in
+    /// its own Media card, same as the search pair above.
+    #[serde(rename = "MEDIA_API_BASE", skip_serializing_if = "Option::is_none")]
+    pub media_api_base: Option<String>,
+    /// Which installed checkpoint the media backend renders images with — the
+    /// image half of the per-modality defaults, `DEFAULT_MODEL`'s twin. No
+    /// video twin: that template names its own model family.
+    #[serde(rename = "MEDIA_IMAGE_MODEL", skip_serializing_if = "Option::is_none")]
+    pub media_image_model: Option<String>,
+    #[serde(rename = "SPEECH_API_BASE", skip_serializing_if = "Option::is_none")]
+    pub speech_api_base: Option<String>,
+    #[serde(rename = "SPEECH_API_KEY", skip_serializing_if = "Option::is_none")]
+    pub speech_api_key: Option<String>,
     #[serde(rename = "DEFAULT_PROVIDER", skip_serializing_if = "Option::is_none")]
     pub default_provider: Option<String>,
     #[serde(rename = "DEFAULT_MODEL", skip_serializing_if = "Option::is_none")]
@@ -1444,6 +1474,202 @@ pub struct MediaGenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub length: Option<i64>,
     pub enhance: bool,
+}
+
+// -- Social advertisements (`/api/v1/ads/*`, ADR 0017) -----------------------
+
+/// A project's brand brief — the standing facts every ad it produces is
+/// written from. Every field is free text; the server caps the whole thing at
+/// 8 KB because it all becomes one prompt.
+///
+/// `Serialize` as well as `Deserialize`: the same bare object goes both ways,
+/// so what the editor PUTs is what a later GET returns.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdBrand {
+    #[serde(default)]
+    pub company: String,
+    #[serde(default)]
+    pub product: String,
+    #[serde(default)]
+    pub audience: String,
+    #[serde(default)]
+    pub voice: String,
+    #[serde(default)]
+    pub link: String,
+    #[serde(default)]
+    pub avoid: String,
+}
+
+impl AdBrand {
+    /// Whether there is anything for an ad to be about. The server refuses a
+    /// campaign against an empty brief, and the screen should say so before
+    /// spending a round-trip to find out.
+    pub fn is_empty(&self) -> bool {
+        [&self.company, &self.product, &self.audience, &self.voice, &self.link, &self.avoid]
+            .iter()
+            .all(|f| f.trim().is_empty())
+    }
+}
+
+/// One place an ad can go, and the shape it has to be in. The server owns this
+/// list (`GET /api/v1/ads/platforms`) so a client cannot ask for a size the
+/// media seam would silently rewrite.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdPlatform {
+    pub id: String,
+    pub label: String,
+    /// `image` or `video`.
+    pub kind: String,
+    pub width: i64,
+    pub height: i64,
+    pub caption_limit: i64,
+    pub hashtag_max: i64,
+    /// Video only: frames at 24fps, `0` for an image. Defaulted so a desktop
+    /// can talk to a server that predates the video preset.
+    #[serde(default)]
+    pub length: i64,
+    pub note: String,
+}
+
+impl AdPlatform {
+    pub fn is_video(&self) -> bool {
+        self.kind == "video"
+    }
+
+    /// The clip length as the screen says it: seconds at 24fps.
+    pub fn seconds(&self) -> f32 {
+        self.length as f32 / 24.0
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdPlatformsResponse {
+    pub platforms: Vec<AdPlatform>,
+}
+
+/// One finished ad: the words, and the media job drawing the picture.
+///
+/// `media_job_id` is `None` when the backend refused that picture — the copy
+/// cost a model round-trip and is kept either way, with `media_error` saying
+/// what happened.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdVariant {
+    pub caption: String,
+    #[serde(default)]
+    pub hashtags: Vec<String>,
+    #[serde(default)]
+    pub cta: String,
+    pub image_prompt: String,
+    #[serde(default)]
+    pub negative: String,
+    #[serde(default)]
+    pub media_job_id: Option<i64>,
+    #[serde(default)]
+    pub media_error: Option<String>,
+}
+
+impl AdVariant {
+    /// Caption, hashtags and call to action as one block, which is what
+    /// actually gets pasted into a post box.
+    pub fn post_text(&self) -> String {
+        let mut parts: Vec<String> = vec![self.caption.trim().to_string()];
+        if !self.cta.trim().is_empty() {
+            parts.push(self.cta.trim().to_string());
+        }
+        if !self.hashtags.is_empty() {
+            parts.push(self.hashtags.join(" "));
+        }
+        parts.retain(|p| !p.is_empty());
+        parts.join("\n\n")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdCampaign {
+    pub id: i64,
+    pub project_id: i64,
+    #[serde(default)]
+    pub team_template_id: Option<i64>,
+    pub platform: String,
+    #[serde(default)]
+    pub platform_label: Option<String>,
+    #[serde(default)]
+    pub width: Option<i64>,
+    #[serde(default)]
+    pub height: Option<i64>,
+    pub brief: String,
+    #[serde(default)]
+    pub variants: Vec<AdVariant>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdCampaignsResponse {
+    pub campaigns: Vec<AdCampaign>,
+}
+
+/// The body of `POST /api/v1/ads/campaigns` — mirrors `ads.rs`'s
+/// `CampaignCreate`. `team_template_id` omitted uses the server's built-in
+/// social media marketing roster.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdCampaignCreate {
+    pub project_id: i64,
+    pub platform: String,
+    pub brief: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team_template_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variants: Option<i64>,
+}
+
+#[cfg(test)]
+mod ad_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// What lands on the clipboard: the caption, then the call to action, then
+    /// the tags — blank parts skipped rather than leaving empty lines a user
+    /// has to delete out of the post box.
+    #[test]
+    fn post_text_joins_what_is_there_and_skips_what_is_not() {
+        let full: AdVariant = serde_json::from_value(json!({
+            "caption": "Ship it on a Friday.", "hashtags": ["#devtools", "#rust"],
+            "cta": "Try it at example.com", "image_prompt": "p", "negative": ""
+        }))
+        .unwrap();
+        assert_eq!(
+            full.post_text(),
+            "Ship it on a Friday.\n\nTry it at example.com\n\n#devtools #rust"
+        );
+
+        let bare: AdVariant =
+            serde_json::from_value(json!({ "caption": "Just this.", "image_prompt": "p" })).unwrap();
+        assert_eq!(bare.post_text(), "Just this.", "no CTA and no tags is no blank lines");
+        assert_eq!(bare.media_job_id, None);
+    }
+
+    /// A campaign whose pictures were refused still decodes, because the copy
+    /// is worth showing on its own.
+    #[test]
+    fn a_campaign_without_pictures_still_decodes() {
+        let campaign: AdCampaign = serde_json::from_value(json!({
+            "id": 1, "project_id": 2, "platform": "ig_feed", "brief": "launch",
+            "variants": [{ "caption": "c", "image_prompt": "p", "media_job_id": null,
+                           "media_error": "ComfyUI is not running" }],
+            "created_at": "2026-08-30T00:00:00", "updated_at": "2026-08-30T00:00:00"
+        }))
+        .unwrap();
+        assert_eq!(campaign.variants.len(), 1);
+        assert!(campaign.variants[0].media_error.is_some());
+    }
+
+    #[test]
+    fn an_untouched_brand_is_empty_and_one_word_is_not() {
+        assert!(AdBrand::default().is_empty());
+        assert!(AdBrand { company: "   ".into(), ..AdBrand::default() }.is_empty());
+        assert!(!AdBrand { company: "Devstrail".into(), ..AdBrand::default() }.is_empty());
+    }
 }
 
 #[cfg(test)]
