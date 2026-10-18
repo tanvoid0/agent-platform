@@ -354,75 +354,42 @@ fn footer_controls(app: &App) -> Vec<Element<'_, Message>> {
 }
 
 // ---------------------------------------------------------------------------
-// Home — compact HUD, start a run, anything waiting on you
+// Home — the front door: say what you want, your crew takes it from there
 // ---------------------------------------------------------------------------
 
-/// The landing page: a compact HUD, the same start-a-run form as Processes,
-/// then the runs that have stopped for a human. Stats stay as a thin row so
-/// the inbox is the thing you actually look at.
+/// One choice on the front door: an icon, a title and a line of what it does,
+/// as one full-width clickable card. `list_item` is the kit's clickable row, so
+/// the door is four of them, two to a line.
+fn intent_card<'a>(
+    glyph: Icon,
+    title: &'a str,
+    subtitle: &'a str,
+    msg: Message,
+) -> Element<'a, Message> {
+    ui::list_item(
+        ui::stack(vec![
+            ui::cluster(vec![ui::icon::glyph(glyph), ui::body(title)]).into(),
+            ui::muted(subtitle),
+        ]),
+        false,
+        msg,
+    )
+}
+
+/// The landing page, reframed as a front door: the owner says what they want —
+/// write code, run a project, draft a document, or make a decision — and each
+/// choice opens the surface the crew does it on. Below the door, the runs in
+/// flight (blocked ones first) so "report back" has a home too. The run composer
+/// itself lives on Processes now, one click behind "Run a project" — Home is for
+/// choosing, not for a form.
 fn dashboard_view(app: &App) -> Element<'_, Message> {
-    let mode = app.assistant.mode();
-    let (mode_label, mode_tone) = match mode {
-        crate::assistant::Mode::Idle => (crate::assistant_view::mode_label(mode), Tone::Success),
-        crate::assistant::Mode::Armed => (crate::assistant_view::mode_label(mode), Tone::Info),
-        crate::assistant::Mode::Listening => (crate::assistant_view::mode_label(mode), Tone::Danger),
-        crate::assistant::Mode::Thinking => (crate::assistant_view::mode_label(mode), Tone::Warning),
-        crate::assistant::Mode::Speaking => (crate::assistant_view::mode_label(mode), Tone::Info),
-    };
-    let (srv_label, srv_tone) = server_label(app.server_state());
+    let mut blocks: Vec<Element<'_, Message>> = Vec::new();
 
-    let mut blocks: Vec<Element<'_, Message>> = vec![
-        crate::assistant_view::hud(
-            &app.assistant,
-            180.0,
-            app.settings.hud_style,
-            &app.settings.theme.resolve(),
-        )
-        .map(Message::Assistant),
-        ui::cluster(vec![
-            ui::badge(mode_label, mode_tone),
-            ui::badge(srv_label, srv_tone),
-            ui::spacer(),
-            ui::button_default(
-                Icon::Message,
-                crate::assistant::talk_label(),
-                Message::Nav(Screen::Assistant),
-            ),
-        ])
-        .into(),
-    ];
-
-    let mut tiles = vec![ui::stat(
-        Icon::Sparkles,
-        "Memories",
-        app.memory.items.len().to_string(),
-    )];
-    match &app.status {
-        Some(status) => {
-            tiles.push(ui::stat(
-                Icon::Activity,
-                "Active processes",
-                status.processes.active.to_string(),
-            ));
-            tiles.push(ui::stat(Icon::Server, "Server", srv_label));
-        }
-        None => {
-            tiles.push(ui::stat(Icon::Activity, "Active processes", "—"));
-            tiles.push(ui::stat(Icon::Server, "Server", srv_label));
-        }
-    }
-    blocks.push(ui::cluster(tiles).into());
-    blocks.push(
-        ui::cluster(vec![
-            ui::caption("Also"),
-            ui::button_ghost(Icon::ListChecks, "Plans", Message::Nav(Screen::Plans)),
-            ui::button_ghost(Icon::Zap, "Workflows", Message::Nav(Screen::Workflows)),
-            ui::button_ghost(Icon::Clock, "Agenda", Message::Nav(Screen::Agenda)),
-        ])
-        .into(),
-    );
-
-    if app.status.is_none() {
+    // Three of the four doors need the API, so with the server down the page is
+    // the one thing it still can be: a plain account of why the crew is offline
+    // and the way to fix it. Dashboard renders against a dead API on purpose —
+    // see `Screen::needs_server`.
+    if !app.server_ready() {
         blocks.push(match app.server_state() {
             ServerState::Conflict => ui::empty_state_icon(
                 Icon::Alert,
@@ -434,93 +401,142 @@ fn dashboard_view(app: &App) -> Element<'_, Message> {
             ),
             _ => ui::empty_state_icon(
                 Icon::Clock,
-                "Platform stats appear as soon as the server answers.",
+                "Your crew comes online as soon as the server answers.",
             ),
         });
+        return ui::page("Home", Some(owner_subtitle()), None, ui::stack_lg(blocks));
     }
 
-    if app.server_ready() {
-        blocks.push(
-            crate::processes_view::new_run_composer(&app.processes).map(Message::Processes),
-        );
-        // Everything in flight, not just what is blocked. A run spends its
-        // first minute planning, and this card said "No runs waiting on you"
-        // through all of it — pressing Start looked like it had done nothing.
-        // Blocked runs still come first and still read louder; they are the
-        // ones that stay stopped until someone answers.
-        let mut live: Vec<_> = app
-            .processes
-            .processes
-            .iter()
-            .filter(|p| crate::processes::is_live(p.status))
-            .collect();
-        live.sort_by_key(|p| !crate::processes::needs_user(p.status));
-
-        let inbox: Element<'_, Message> = if live.is_empty() {
-            ui::empty_state_action(
-                Icon::Inbox,
-                "Nothing running. Start a run above.",
-                ui::button_outline(Icon::Activity, "All runs", Message::Nav(Screen::Processes)),
-            )
-        } else {
-            ui::stack(
-                live.iter()
-                    .map(|p| {
-                        let blocked = crate::processes::needs_user(p.status);
-                        let mut lines = vec![
-                            ui::cluster(vec![
-                                ui::badge(
-                                    crate::domain::process_status_label(p.status.as_str()),
-                                    crate::domain::process_status_tone(p.status.as_str()),
-                                ),
-                                ui::caption(format!("#{}", p.id)),
-                                ui::spacer(),
-                                ui::caption(
-                                    crate::domain::relative_time(&p.updated_at)
-                                        .unwrap_or_default(),
-                                ),
-                            ])
-                            .into(),
-                            ui::body(crate::domain::truncate(&p.goal, 90)),
-                        ];
-                        match crate::domain::process_waiting_hint(p.status.as_str()) {
-                            Some(hint) => lines.push(ui::caption(hint)),
-                            // A run that is still moving says so rather than
-                            // leaving the row looking like it has stalled.
-                            None => lines.push(ui::caption("Working — nothing to answer yet.")),
-                        }
-                        // `selected` is the kit's own emphasis; a blocked run is
-                        // the one row on this card that is asking for something.
-                        ui::list_item(ui::stack(lines), blocked, Message::OpenRun(p.id))
-                    })
-                    .collect(),
-            )
-            .into()
-        };
-        let blocked = live.iter().filter(|p| crate::processes::needs_user(p.status)).count();
-        blocks.push(ui::card_with_header(
-            "Active runs",
-            Some(ui::muted(match blocked {
-                0 => "Everything in flight. Nothing is waiting on you.".to_string(),
-                n => format!(
-                    "Everything in flight. {} — the run will not move until you answer.",
-                    ui::count(n, "run needs you", "runs need you"),
+    // The door itself.
+    blocks.push(ui::card_with_header(
+        "What do you want to do?",
+        Some(ui::muted("Pick one — your Product Owner takes it from there.")),
+        None,
+        ui::stack(vec![
+            row![
+                intent_card(
+                    Icon::Cpu,
+                    "Write code",
+                    "Pair with the Coder on a repo.",
+                    Message::Nav(Screen::Coder),
                 ),
-            })),
-            None,
-            inbox,
-        ));
-    }
+                intent_card(
+                    Icon::Activity,
+                    "Run a project",
+                    "Hand the crew a goal; they plan it and build it.",
+                    Message::Nav(Screen::Processes),
+                ),
+            ]
+            .spacing(space::MD)
+            .into(),
+            row![
+                intent_card(
+                    Icon::Scroll,
+                    "Prepare a document",
+                    "Brief the crew and get a written draft back.",
+                    Message::Nav(Screen::Processes),
+                ),
+                intent_card(
+                    Icon::Message,
+                    "Make a decision",
+                    "Talk it through with your crew and decide.",
+                    Message::Nav(Screen::Assistant),
+                ),
+            ]
+            .spacing(space::MD)
+            .into(),
+        ]),
+    ));
+
+    // Where the work and the crew live, for when the door is not enough.
+    blocks.push(
+        ui::cluster(vec![
+            ui::caption("Also"),
+            ui::button_ghost(Icon::Users, "Meet your crew", Message::Nav(Screen::Teams)),
+            ui::button_ghost(Icon::Folder, "Projects", Message::Nav(Screen::Projects)),
+            ui::button_ghost(Icon::ListChecks, "Plans", Message::Nav(Screen::Plans)),
+        ])
+        .into(),
+    );
+
+    // Everything in flight, not just what is blocked. Blocked runs come first
+    // and read louder; they are the ones that stay stopped until someone
+    // answers. This is the owner's "report back" surface.
+    let mut live: Vec<_> = app
+        .processes
+        .processes
+        .iter()
+        .filter(|p| crate::processes::is_live(p.status))
+        .collect();
+    live.sort_by_key(|p| !crate::processes::needs_user(p.status));
+
+    let inbox: Element<'_, Message> = if live.is_empty() {
+        ui::empty_state_action(
+            Icon::Inbox,
+            "Nothing running yet. Start a project to put your crew to work.",
+            ui::button_outline(Icon::Activity, "Run a project", Message::Nav(Screen::Processes)),
+        )
+    } else {
+        ui::stack(
+            live.iter()
+                .map(|p| {
+                    let blocked = crate::processes::needs_user(p.status);
+                    let mut lines = vec![
+                        ui::cluster(vec![
+                            ui::badge(
+                                crate::domain::process_status_label(p.status.as_str()),
+                                crate::domain::process_status_tone(p.status.as_str()),
+                            ),
+                            ui::caption(format!("#{}", p.id)),
+                            ui::spacer(),
+                            ui::caption(
+                                crate::domain::relative_time(&p.updated_at).unwrap_or_default(),
+                            ),
+                        ])
+                        .into(),
+                        ui::body(crate::domain::truncate(&p.goal, 90)),
+                    ];
+                    match crate::domain::process_waiting_hint(p.status.as_str()) {
+                        Some(hint) => lines.push(ui::caption(hint)),
+                        // A run that is still moving says so rather than leaving
+                        // the row looking like it has stalled.
+                        None => lines.push(ui::caption("Working — nothing to answer yet.")),
+                    }
+                    // `selected` is the kit's own emphasis; a blocked run is the
+                    // one row on this card that is asking for something.
+                    ui::list_item(ui::stack(lines), blocked, Message::OpenRun(p.id))
+                })
+                .collect(),
+        )
+        .into()
+    };
+    let blocked = live.iter().filter(|p| crate::processes::needs_user(p.status)).count();
+    blocks.push(ui::card_with_header(
+        "In progress",
+        Some(ui::muted(match blocked {
+            0 => "What your crew is working on. Nothing is waiting on you.".to_string(),
+            n => format!(
+                "What your crew is working on. {} — the run will not move until you answer.",
+                ui::count(n, "run needs you", "runs need you"),
+            ),
+        })),
+        None,
+        inbox,
+    ));
 
     ui::page(
         "Home",
-        Some(ui::muted(format!(
-            "Start a run, or pick up one already going. {} is standing by.",
-            crate::assistant::name()
-        ))),
+        Some(owner_subtitle()),
         Some(ui::button_ghost(Icon::Activity, "All runs", Message::Nav(Screen::Processes))),
         ui::stack_lg(blocks),
     )
+}
+
+/// The one line that sets the frame everywhere Home is drawn: the user is the
+/// owner, the crew does the work. Shared so the server-down and the ready page
+/// say the same thing.
+fn owner_subtitle<'a>() -> Element<'a, Message> {
+    ui::muted("You're the owner. Tell your crew what you need — they plan it, do it, and report back.")
 }
 
 /// Shared by the Status tab (this server's uptime) and the machine meters (the

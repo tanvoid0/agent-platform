@@ -100,6 +100,41 @@ pointed elsewhere.
 
 ## Backlog
 
+- **The front door, and a crew that ships with the app — landed 2026-10-18.**
+  First slice of the "owner of a company" reframe the user asked for. The
+  destination they picked is a full reframe (a workspace-per-project with
+  Slack-style chat, a board, docs and a repo browser inside it, the technical
+  screens tucked behind); this slice is the door and the crew.
+  - **Home is a front door, not a HUD.** `screen::dashboard_view` leads with
+    "What do you want to do?" — four intent cards (Write code → Coder, Run a
+    project and Prepare a document → Processes, Make a decision → Assistant)
+    over an "In progress" list of live runs (blocked first), the owner's "report
+    back" surface. The run composer moved fully to Processes, one click behind
+    "Run a project"; the orb, stat tiles and mode badges came off Home to cut
+    the noise the user was getting lost in. Still renders against a dead API.
+    New kit-composed helper `intent_card` (a `ui::list_item`), no raw widgets.
+  - **A fresh install gets a working crew.** `teams::ensure_default_crew` (wired
+    in `serve`, beside `seed_admin_emails`) seeds one global `teamtemplate`
+    "Core Crew" when the library is empty — Product Owner (lead) → Lead
+    Developer → Developer + QA Reviewer, the `parent_id` chain the planner reads
+    as the reporting line. Seeded with a no-id insert (the DB owns `id`, so an
+    explicit id would collide with the Postgres sequence), idempotent, guarded
+    on an empty library so editing or deleting it sticks across restarts. The
+    composer already auto-selects the first team (`processes.rs`
+    `TeamsLoaded`), so the crew is the default for a new run with no extra
+    wiring. Closes the old "fresh install has no teams, picker is empty" gap.
+    Tested: roster validates, PO leads, seeds once, no reseed over an existing
+    team (`teams::tests`, lib-only).
+  - **The crew is also four real subagents.** `.claude/agents/{product-owner,
+    lead-developer,developer,qa-reviewer}.md` mirror the roster, each pointing
+    at the skills that fit its job (ponytail everywhere; ship-feature /
+    repo-onboarding / debug-live-issue / update-project-docs / prove-domain for
+    build; code-review / security-review / break-ui for QA; the design skills
+    for UI). They have the `Skill` tool so they can invoke those.
+  - **Left undone:** the full reframe itself. "Prepare a document" routes to a
+    run for now; docs get a real home there. A global, skill-aware agent suite
+    in `~/.claude` plus hooks is a separate follow-up (the user floated it).
+
 - **The API document is readable from another repo, and a failed start says why
   — landed 2026-08-31.** All four found by pointing a second project
   (`portal_equalizer`) at this server and watching what it could not work out.
