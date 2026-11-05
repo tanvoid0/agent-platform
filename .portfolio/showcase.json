@@ -1,0 +1,42 @@
+{
+  "product": {
+    "tagline": "One AI server on your own machine that gives any OpenAI-compatible app seven hosted providers and your local models through a single API.",
+    "summary": "Agent Platform is a small server that sits between your apps and the AI providers you use. Anything written for the OpenAI API works against it unchanged, whether the model is hosted by one of seven providers or running on your desk in Ollama or LM Studio. A desktop app starts the server for you and lets you plan multi-agent runs, keep teams of agents and ask questions about any run.",
+    "features": [
+      {
+        "title": "One API for every provider",
+        "detail": "OpenAI-compatible endpoints in front of OpenAI, Anthropic, Gemini, Mistral, Groq, OpenRouter and AIML API, so an app needs no code of its own per provider."
+      },
+      {
+        "title": "Local models through the same door",
+        "detail": "Ollama and LM Studio answer on the same endpoint, with no key issued and nothing leaving the machine. Inside Docker, local addresses are pointed at the host for you."
+      },
+      {
+        "title": "Bring your own key",
+        "detail": "Send your own provider key with a request and the server uses it instead of its own. A custom upstream address must be https and on an allowlist."
+      },
+      {
+        "title": "Multi-agent runs you can follow",
+        "detail": "A run is planned as a graph of subagents. Follow it as a graph, a board, a timeline or the raw event log, and export the whole run as JSON."
+      },
+      {
+        "title": "Ask about one run",
+        "detail": "A chat scoped to a run, or to one subagent inside it, already knows its goal, status, failure reason and output, so the answer is about that run."
+      },
+      {
+        "title": "Reusable teams",
+        "detail": "Save rosters of agents for the planner to draw from, built role by role or started from a bundled template."
+      },
+      {
+        "title": "Desktop app, server or Docker",
+        "detail": "Run the desktop app with a tray icon that starts and stops the server, or run the server on its own, from an installer or as one Docker image."
+      }
+    ],
+    "platforms": [
+      "Windows: desktop app and server",
+      "macOS server, Apple Silicon and Intel",
+      "Linux server",
+      "Docker"
+    ]
+  }
+}
