@@ -117,7 +117,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         label: "Ollama",
         registry: Registry::Chat,
         default_model: "llama3",
-        modalities: &[Chat, VisionInput],
+        // embeddings: Ollama serves /v1/embeddings for an embedding model (e.g. nomic-embed-text)
+        modalities: &[Chat, VisionInput, Embeddings],
         sort_order: 1,
     },
     ProviderSpec {
@@ -877,10 +878,10 @@ mod tests {
             std::env::remove_var(key);
         }
 
-        // Ollama declares chat and sorts first; nothing serves embeddings but
-        // LM Studio, which also has a loopback default.
+        // Ollama declares chat and sorts first; Ollama and LM Studio both serve
+        // embeddings (via an embedding model), and both carry a loopback default.
         assert_eq!(resolve_provider_for_capability(Modality::Chat), Some("ollama"));
-        assert_eq!(providers_for_capability(Modality::Embeddings), vec!["lm_studio"]);
+        assert_eq!(providers_for_capability(Modality::Embeddings), vec!["ollama", "lm_studio"]);
 
         // The media backend carries a loopback default like the chat ones, so
         // both picture capabilities resolve with nothing configured — that is
