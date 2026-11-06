@@ -100,6 +100,106 @@ pointed elsewhere.
 
 ## Backlog
 
+- **Reframe Stage B — the tabs do real work — landed 2026-10-18.** The three
+  surfaces that were stubs or global in Stage A are now project-scoped and real
+  (plan: `~/.claude/plans/delegated-stargazing-tower.md`). One branch/PR
+  (`feat/coder-approve-json-twin`), on top of the Stage A shell and the sidebar
+  demote (`3142b7c`).
+  - **Chat is the project's planning chat, not the global E.V.** The Workspace
+    Chat tab now renders `agenda_chat_view::pane` (the same pane the Agenda
+    screen uses, `?project_id=` endpoints) instead of `assistant_view::panel`.
+    It follows `current_project`: set on `Message::SetProject` and on entering
+    the Chat tab (both via `agenda_chat::set_project`, routed up through
+    `Message::Agenda(Chat(..))` so an approved proposal still reloads its board).
+    `agenda_chat_view::pane` grew a `width` param (Agenda keeps the 460px column,
+    Workspace fills). The HUD frame-beat no longer fires for the Chat tab — the
+    planning chat has no HUD canvas.
+  - **Docs is a real file browser.** New client methods `project_files_list` /
+    `project_file_read` over `/projects/{id}/files/{list,file}` (shapes in
+    `client::types`: `WorkspaceEntry`/`WorkspaceListResponse`/`WorkspaceFile`).
+    New app module `docs.rs`/`docs_view.rs`: a folder rail on the left (folders
+    first, drill in, Up), the selected file's text rendered as markdown on the
+    right — ingested PDFs show up as their derived markdown. Scoped to
+    `current_project` via `docs::set_project` in the Workspace/Docs enter arm.
+    One unit test on the list-response parse.
+  - **Code is rooted at the project sandbox.** `Message::SetProject(Some(id))`
+    now ensures `<app_dir>/workspaces/project-{id}/` via the new
+    `project_workspace_info` (the server `files/info` route creates it and
+    returns the absolute path) and re-roots the Coder with the existing
+    `coder::Message::RootPicked`. RootPicked starts a fresh session/thread, so
+    nothing collides on the server's `workspace_root` key. Unassigned (None)
+    leaves the Coder's current folder.
+  - Also fixed a pre-existing red test from `3142b7c`: `nav_groups_stay_short`
+    asserted ≤4 entries per NAV group, but the demote deliberately made
+    `ADVANCED` a 9-entry catch-all; the test now exempts that bucket.
+  - Touchpoints: `client/src/{client,types}.rs`, `main.rs` (mod, `App.docs`,
+    `boot`, `Message::Docs`, dispatch, `SetProject`, `enter_screen_inner` Chat +
+    Docs arms, `subscription` hud gate), `screen.rs` (Workspace Chat/Docs arms,
+    dropped `workspace_docs`), `docs.rs`/`docs_view.rs`, `agenda_chat_view.rs`,
+    `agenda_view.rs`.
+  - **Left for Stage C:** Slack-style threads/mentions across agents in Chat;
+    board drag/interaction; Bitbucket-style git graph + diffs in Code; Docs
+    write/edit (it is read-only).
+
+- **Reframe Stage A — the project workspace — landed 2026-10-18.** First
+  structural stage of the "company" reframe (plan:
+  `~/.claude/plans/delegated-stargazing-tower.md`). A new `Screen::Workspace`
+  hosts a `WorkspaceTab { Chat, Board, Docs, Code }` strip — the same
+  "tabs-in-one-destination" shape as `SettingsTab` — with a project switcher and
+  a shared `App::current_project` (the app had no shared selected-project before;
+  four screens each kept their own). Each tab **delegates to the existing module
+  view**, not a rewrite: Chat = `assistant_view::panel` (E.V.), Board =
+  `processes_view::view` scoped by project (reuses `processes::ProjectPicked`),
+  Code = `coder_board::view`, Docs = an honest placeholder (no client files-list
+  method exists yet). The front door's four intent cards now open the matching
+  tab (`Message::OpenWorkspace`). Subscriptions extended so embedded modules keep
+  polling under `Screen::Workspace` (Board run-list tick, Code browser-resize,
+  Chat HUD beat). `assistant_tools::SCREENS` gained `workspace` (14→15). The flat
+  sidebar is **kept** this stage — no regression; demoting it is Stage B.
+  Touchpoints: `main.rs` (enum, `WorkspaceTab`, `App` fields, `boot`, dispatch,
+  `enter_screen_inner`, `subscription`), `screen.rs` (`NAV`, `view`,
+  `workspace_view`, `notice`), `assistant_tools.rs`.
+  - **Left for Stage B/C:** demote the flat nav and make Workspace the landing;
+    a real Docs browser (server endpoints exist, client method does not); scope
+    Chat per-project (the `agenda_chat` endpoints already do `?project_id=`);
+    link Code to the project sandbox folder; Slack threads / board drag / git
+    graph depth.
+
+- **The front door, and a crew that ships with the app — landed 2026-10-18.**
+  First slice of the "owner of a company" reframe the user asked for. The
+  destination they picked is a full reframe (a workspace-per-project with
+  Slack-style chat, a board, docs and a repo browser inside it, the technical
+  screens tucked behind); this slice is the door and the crew.
+  - **Home is a front door, not a HUD.** `screen::dashboard_view` leads with
+    "What do you want to do?" — four intent cards (Write code → Coder, Run a
+    project and Prepare a document → Processes, Make a decision → Assistant)
+    over an "In progress" list of live runs (blocked first), the owner's "report
+    back" surface. The run composer moved fully to Processes, one click behind
+    "Run a project"; the orb, stat tiles and mode badges came off Home to cut
+    the noise the user was getting lost in. Still renders against a dead API.
+    New kit-composed helper `intent_card` (a `ui::list_item`), no raw widgets.
+  - **A fresh install gets a working crew.** `teams::ensure_default_crew` (wired
+    in `serve`, beside `seed_admin_emails`) seeds one global `teamtemplate`
+    "Core Crew" when the library is empty — Product Owner (lead) → Lead
+    Developer → Developer + QA Reviewer, the `parent_id` chain the planner reads
+    as the reporting line. Seeded with a no-id insert (the DB owns `id`, so an
+    explicit id would collide with the Postgres sequence), idempotent, guarded
+    on an empty library so editing or deleting it sticks across restarts. The
+    composer already auto-selects the first team (`processes.rs`
+    `TeamsLoaded`), so the crew is the default for a new run with no extra
+    wiring. Closes the old "fresh install has no teams, picker is empty" gap.
+    Tested: roster validates, PO leads, seeds once, no reseed over an existing
+    team (`teams::tests`, lib-only).
+  - **The crew is also four real subagents.** `.claude/agents/{product-owner,
+    lead-developer,developer,qa-reviewer}.md` mirror the roster, each pointing
+    at the skills that fit its job (ponytail everywhere; ship-feature /
+    repo-onboarding / debug-live-issue / update-project-docs / prove-domain for
+    build; code-review / security-review / break-ui for QA; the design skills
+    for UI). They have the `Skill` tool so they can invoke those.
+  - **Left undone:** the full reframe itself. "Prepare a document" routes to a
+    run for now; docs get a real home there. A global, skill-aware agent suite
+    in `~/.claude` plus hooks is a separate follow-up (the user floated it).
+
 - **The API document is readable from another repo, and a failed start says why
   — landed 2026-08-31.** All four found by pointing a second project
   (`portal_equalizer`) at this server and watching what it could not work out.

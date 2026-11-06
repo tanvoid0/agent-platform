@@ -15,10 +15,11 @@ use iced::widget::{column, container, markdown, scrollable};
 use iced::{Element, Length, Theme};
 
 /// Wide enough for a two-column form row and a readable line of prose; the board
-/// beside it keeps the rest of the window.
+/// beside it keeps the rest of the window. The Workspace Chat tab has no board
+/// beside it, so it passes `Length::Fill` instead.
 pub const WIDTH: f32 = 460.0;
 
-pub fn pane<'a>(state: &'a State, theme: &Theme) -> Element<'a, Message> {
+pub fn pane<'a>(state: &'a State, theme: &Theme, width: Length) -> Element<'a, Message> {
     let mut blocks: Vec<Element<'a, Message>> = vec![header(state)];
 
     if let Some(usage) = &state.usage {
@@ -44,7 +45,7 @@ pub fn pane<'a>(state: &'a State, theme: &Theme) -> Element<'a, Message> {
     blocks.push(composer(state));
 
     container(column(blocks).spacing(space::MD).height(Length::Fill))
-        .width(WIDTH)
+        .width(width)
         .height(Length::Fill)
         .into()
 }

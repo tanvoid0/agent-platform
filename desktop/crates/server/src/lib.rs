@@ -790,6 +790,10 @@ pub async fn serve(cfg: Config) -> Result<(), BoxError> {
     db::ensure_schema(&state.any).await?;
     identity::bootstrap(&state).await?;
     accounts::seed_admin_emails(&state).await;
+    // A fresh library gets a working crew (Product Owner + developers) so the
+    // owner can start a run without first hand-building a roster. Idempotent and
+    // non-fatal; see `teams::ensure_default_crew`.
+    teams::ensure_default_crew(&state).await;
     state.catalog.clone().spawn_refresh(state.http.clone());
     workflow_engine::spawn_scheduler(state.clone());
     // Executors are in-process tasks and do not survive a restart, so whatever

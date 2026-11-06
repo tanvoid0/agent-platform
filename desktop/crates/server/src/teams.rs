@@ -560,6 +560,118 @@ async fn create_team(
     Ok((StatusCode::CREATED, Json(row_to_out(load_row(&state, id).await?)?)).into_response())
 }
 
+// ---------------------------------------------------------------------------
+// Default crew
+// ---------------------------------------------------------------------------
+
+/// The team description for the seeded crew — the owner-facing framing, not a
+/// role persona. Kept short; the roster carries the detail.
+const CORE_CREW_DESCRIPTION: &str = "Your core crew. You are the owner: brief the Product Owner and \
+they plan the work, delegate to the developers, and report back for your sign-off. Add or change \
+members here in Teams.";
+
+/// The starter roster a fresh install gets: a Product Owner that plans and talks
+/// to the owner, with a Lead Developer under it and a Developer and QA Reviewer
+/// under the Lead. The `parent_id` chain is the reporting line the planner reads,
+/// and it is also what makes the developers hand work to each other rather than
+/// all report to the top. Mirrored by `.claude/agents/` in this repo.
+fn core_crew_roster() -> TeamRoster {
+    let role = |id: &str, name: &str, parent: Option<&str>, description: &str| RosterRole {
+        id: id.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        modality: text_modality(),
+        parent_id: parent.map(str::to_string),
+        accent_color: None,
+    };
+    TeamRoster {
+        roles: vec![
+            role(
+                "product_owner",
+                "Product Owner",
+                None,
+                "You lead the crew and are the owner's single point of contact. Turn the owner's \
+                 goal into a concrete plan, ask the owner when a decision is theirs to make rather \
+                 than guessing, delegate the work to the Lead Developer, keep the owner updated in \
+                 plain language, and sign off on the result before it ships.",
+            ),
+            role(
+                "lead_developer",
+                "Lead Developer",
+                Some("product_owner"),
+                "You own the technical plan. Break the Product Owner's plan into small, buildable \
+                 tasks, make the architecture and approach calls, hand specific tasks to the \
+                 Developer, and review what comes back — with the QA Reviewer — before it reaches \
+                 the Product Owner.",
+            ),
+            role(
+                "developer",
+                "Developer",
+                Some("lead_developer"),
+                "You build what the Lead Developer assigns. Implement each task end to end, keep \
+                 changes small and working, write the code or content the task asks for, and flag \
+                 blockers to the Lead Developer early rather than stalling.",
+            ),
+            role(
+                "qa_reviewer",
+                "QA Reviewer",
+                Some("lead_developer"),
+                "You check the Developer's work against the task it was for. Describe or run the \
+                 tests, confirm what works, and report clearly what passes and what needs another \
+                 pass before the Lead Developer signs off.",
+            ),
+        ],
+    }
+}
+
+/// Seed one global "Core Crew" team the first time the app starts against an
+/// empty library, so a fresh owner has a working crew to run without building a
+/// roster by hand. Guarded on the library being *entirely* empty, so editing or
+/// deleting the crew sticks across restarts. Global (`workspace_id` NULL), so
+/// every workspace and the local desktop see it. Non-fatal: a seed that fails
+/// must not stop the server from starting — the user can still make a team by
+/// hand. Mirrors `accounts::seed_admin_emails`, which runs beside it.
+pub async fn ensure_default_crew(state: &AppState) {
+    let existing: i64 = match sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM teamtemplate")
+        .fetch_one(&state.any)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            logd!("default crew: could not count teams, skipping seed: {e}");
+            return;
+        }
+    };
+    if existing > 0 {
+        return;
+    }
+
+    let (roster, team_color) = assign_missing_accents(&core_crew_roster(), None);
+    let roster_json =
+        serde_json::to_string(&roster).unwrap_or_else(|_| "{\"roles\":[]}".into());
+    let now = sql_now();
+    let result = sqlx::query(&crate::db::sql(
+        "INSERT INTO teamtemplate \
+         (workspace_id, name, description, color, category, roster_json, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        state.backend,
+    ))
+    .bind(Option::<i64>::None)
+    .bind("Core Crew")
+    .bind(CORE_CREW_DESCRIPTION)
+    .bind(&team_color)
+    .bind("company")
+    .bind(&roster_json)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.any)
+    .await;
+    match result {
+        Ok(_) => logd!("seeded the default Core Crew team ({} roles)", roster.roles.len()),
+        Err(e) => logd!("default crew: insert failed, skipping seed: {e}"),
+    }
+}
+
 fn missing_fields() -> ApiError {
     ApiError::validation(vec![
         ApiError::field_error("name", "missing", "Field required"),
@@ -763,5 +875,71 @@ mod tests {
         let mut errors = Vec::new();
         orphan.validate(&mut errors);
         assert!(!errors.is_empty(), "an unknown parent must not validate");
+    }
+
+    /// The seeded crew has to pass the same validator a hand-built roster does,
+    /// and the Product Owner has to be the lead — the planner reads the first
+    /// root as the one it talks to, so a crew whose lead is a developer would
+    /// quietly put the wrong role in front of the owner.
+    #[test]
+    fn the_seeded_crew_is_valid_and_product_owner_leads() {
+        let roster = core_crew_roster();
+        let mut errors = Vec::new();
+        roster.validate(&mut errors);
+        assert!(errors.is_empty(), "the seeded roster must validate: {errors:?}");
+        assert_eq!(roster.roles.len(), 4);
+        assert_eq!(roster.lead_role_id(), Some("product_owner"));
+    }
+
+    /// Seed once on an empty library, never twice, and never over a library that
+    /// already has a team — so editing or deleting the crew sticks across
+    /// restarts rather than reappearing every boot.
+    #[tokio::test]
+    async fn the_default_crew_seeds_once_and_only_when_empty() {
+        let path = std::env::temp_dir()
+            .join(format!("agp-crew-{}-{}.db", std::process::id(), line!()));
+        let _ = std::fs::remove_file(&path);
+        let state = AppState::new(&path, None);
+        crate::db::ensure_schema(&state.any).await.unwrap();
+
+        // Twice: a second start must not seed a second crew.
+        ensure_default_crew(&state).await;
+        ensure_default_crew(&state).await;
+
+        let total: i64 = sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM teamtemplate")
+            .fetch_one(&state.any)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "exactly one team seeded");
+        let global_crew: i64 = sqlx::query_scalar(
+            "SELECT CAST(COUNT(*) AS BIGINT) FROM teamtemplate \
+             WHERE name = 'Core Crew' AND workspace_id IS NULL",
+        )
+        .fetch_one(&state.any)
+        .await
+        .unwrap();
+        assert_eq!(global_crew, 1, "the crew is a single global template");
+        let roster_json: String =
+            sqlx::query_scalar("SELECT roster_json FROM teamtemplate WHERE name = 'Core Crew'")
+                .fetch_one(&state.any)
+                .await
+                .unwrap();
+        assert_eq!(parse_roster(&roster_json).unwrap().roles.len(), 4);
+
+        // A library that already has a team is left untouched: delete the crew,
+        // leave a user's team behind, re-run — nothing is re-seeded.
+        sqlx::query("UPDATE teamtemplate SET name = 'Mine' WHERE name = 'Core Crew'")
+            .execute(&state.any)
+            .await
+            .unwrap();
+        ensure_default_crew(&state).await;
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM teamtemplate ORDER BY name")
+            .fetch_all(&state.any)
+            .await
+            .unwrap();
+        assert_eq!(names, vec!["Mine".to_string()], "no reseed when a team exists");
+
+        state.any.close().await;
+        let _ = std::fs::remove_file(&path);
     }
 }
