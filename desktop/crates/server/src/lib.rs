@@ -363,8 +363,12 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
 /// mistypes a path gets a JSON error from every *other* status code and should
 /// not have to special-case this one.
 async fn not_found(req: Request) -> Response {
-    error::ApiError::not_found(format!("No route for {} {}", req.method(), req.uri().path()))
-        .into_response()
+    error::ApiError::not_found(format!(
+        "No route for {} {}. See GET /openapi.json for the full surface, or /openapi.json?index for a table of contents.",
+        req.method(),
+        req.uri().path()
+    ))
+    .into_response()
 }
 
 /// `GET /openapi.json` — the API reference the desktop's Settings → API screen

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, Request, State};
@@ -100,8 +100,11 @@ pub fn static_router() -> Router<Arc<AppState>> {
 
 async fn accounts_path(Path(path): Path<String>) -> Response {
     if path.starts_with("api/") {
-        return crate::error::ApiError::not_found(format!("No route for GET /accounts/{path}"))
-            .into_response();
+        return crate::error::ApiError::not_found(format!(
+            "No route for GET /accounts/{path}. See GET /openapi.json for the full surface, \
+             or /openapi.json?index for a table of contents."
+        ))
+        .into_response();
     }
     embedded_index().await.into_response()
 }
@@ -387,7 +390,9 @@ async fn magic_link(
     // Same gate as `principal_from_dev_header`: a local/desktop install with no
     // JWT secret configured has no other user to protect the link from, so hand
     // it back directly. A hosted deployment (JWT secret set) still only logs it.
-    if jwt_secret().is_none() && loopback_bind() {
+    // `jwt_secret_configured`, not `jwt_secret` — the latter's auto-generated
+    // fallback must not make this branch think it is hosted.
+    if jwt_secret_configured().is_none() && loopback_bind() {
         return Ok(Json(json!({ "ok": true, "message": MAGIC_COPY, "dev_link": page })));
     }
     Ok(Json(json!({ "ok": true, "message": MAGIC_COPY })))
@@ -768,7 +773,7 @@ pub async fn principal_from_jwt(state: &AppState, token: &str) -> Result<Princip
 }
 
 pub async fn principal_from_dev_header(state: &AppState, email: &str) -> Result<Principal, crate::auth::AuthError> {
-    if jwt_secret().is_some() || !loopback_bind() {
+    if jwt_secret_configured().is_some() || !loopback_bind() {
         return Err(crate::auth::AuthError::invalid_pub("Invalid API key"));
     }
     let Ok(email) = normalize_email(email) else {
@@ -817,8 +822,55 @@ fn sign_access(user: &UserRow) -> Result<String, ApiError> {
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-pub fn jwt_secret() -> Option<String> {
+/// The literal env var — distinguishes a hosted deployment (a real secret
+/// configured) from a local/desktop install, independent of the
+/// auto-generated fallback `jwt_secret` falls back to. This is the signal the
+/// `dev_link` branch above and `principal_from_dev_header` gate on.
+fn jwt_secret_configured() -> Option<String> {
     env_opt("AGENT_PLATFORM_JWT_SECRET")
+}
+
+/// The secret that actually signs and verifies session JWTs. A hosted
+/// deployment with `AGENT_PLATFORM_JWT_SECRET` set gets exactly that, same as
+/// before. A local/desktop install (loopback, nobody set one) has no operator
+/// to configure a secret, so `sign_access`/`principal_from_jwt` used to
+/// hard-fail even on the exact gate that hands out a `dev_link` — one
+/// generated here, persisted beside the sqlite db so it survives a restart,
+/// fixes that without weakening a hosted deployment that has a real secret.
+pub fn jwt_secret() -> Option<String> {
+    if let Some(s) = jwt_secret_configured() {
+        return Some(s);
+    }
+    if !loopback_bind() {
+        return None;
+    }
+    static LOCAL: OnceLock<String> = OnceLock::new();
+    Some(LOCAL.get_or_init(load_or_create_local_jwt_secret).clone())
+}
+
+fn local_jwt_secret_path() -> PathBuf {
+    let db_path = env_opt("AGENT_PLATFORM_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data/agent_platform.db"));
+    db_path.with_file_name("jwt_secret")
+}
+
+fn load_or_create_local_jwt_secret() -> String {
+    let path = local_jwt_secret_path();
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            return existing.to_string();
+        }
+    }
+    let secret = random_hex(32);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, &secret) {
+        logd!("[accounts] could not persist local jwt secret to {path:?}: {e}");
+    }
+    secret
 }
 
 pub fn loopback_bind() -> bool {

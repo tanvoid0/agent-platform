@@ -114,10 +114,13 @@ async fn auth_tiers_and_unknown_paths() {
     assert_eq!(status, 404, "{body}");
     assert_eq!(code_of(&body), "not_found");
 
-    // The 404 message names the method and path, and not the query string.
+    // The 404 message names the method and path, and not the query string, and
+    // points a lost caller at the one machine-readable map of the surface.
     let (_, body) = get(&origin, "/api/v1/proxy-probe?limit=5", Some(MASTER)).await;
     let v: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["error"]["message"], "No route for GET /api/v1/proxy-probe");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.starts_with("No route for GET /api/v1/proxy-probe"), "{msg}");
+    assert!(msg.contains("/openapi.json"), "{msg}");
 
     // Missing credentials name themselves (ADR 0014); a wrong token stays TOKEN_INVALID.
     let (status, body) = get(&origin, guarded, None).await;
