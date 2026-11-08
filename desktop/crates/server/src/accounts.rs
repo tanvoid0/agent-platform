@@ -382,6 +382,14 @@ async fn magic_link(
         None => format!("{}/accounts/#/verify?token={}", public_base(), raw),
     };
     logd!("[accounts] magic link for {email}: {page}");
+    // No real mailer exists yet (the log line above is the only delivery), and
+    // reading that log needs a token a fresh sign-in doesn't have — a dead end.
+    // Same gate as `principal_from_dev_header`: a local/desktop install with no
+    // JWT secret configured has no other user to protect the link from, so hand
+    // it back directly. A hosted deployment (JWT secret set) still only logs it.
+    if jwt_secret().is_none() && loopback_bind() {
+        return Ok(Json(json!({ "ok": true, "message": MAGIC_COPY, "dev_link": page })));
+    }
     Ok(Json(json!({ "ok": true, "message": MAGIC_COPY })))
 }
 

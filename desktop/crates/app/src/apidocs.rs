@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 
 /// The routes that answer without a bearer token. Everything else needs one —
 /// `/api/v1/*` through the auth layer, `/v1/*` through each handler's own check.
-const OPEN_ROUTES: &[&str] = &["/health", "/ready", "/v1/health", "/v1/health/readiness"];
+const OPEN_ROUTES: &[&str] = &["/health", "/v1/health", "/v1/health/readiness"];
 
 /// Header parameters every route inherits from its auth dependency. They are
 /// documented once, in the Connect card, not 192 times.
