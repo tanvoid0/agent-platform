@@ -57,9 +57,13 @@ precise-builds = true
 # signing story. The daemon is a single file with its migrations embedded, so
 # an installer is a download and a PATH entry.
 installers = ["shell", "powershell"]
+# aarch64-apple-darwin dropped 2026-11-09: GitHub stopped granting this repo
+# its macOS ARM runner ("macos-14-arm64-us-default" not supported), which
+# cancelled the whole release (v0.7.4) mid-build. Apple Silicon still gets a
+# working build through x86_64-apple-darwin under Rosetta. Revisit if GitHub
+# restores the runner or this repo gets an entitlement for it.
 targets = [
     "x86_64-unknown-linux-gnu",
-    "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-pc-windows-msvc",
 ]
