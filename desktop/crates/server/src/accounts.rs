@@ -719,13 +719,8 @@ struct Claims {
 }
 
 pub async fn principal_from_jwt(state: &AppState, token: &str) -> Result<Principal, crate::auth::AuthError> {
-    let secret = jwt_secret().ok_or_else(|| {
-        crate::auth::AuthError::new(
-            axum::http::StatusCode::UNAUTHORIZED,
-            "TOKEN_INVALID",
-            "This server has no JWT secret configured, so a session token cannot be verified. \
-             Use an agp_ workspace token or the master key, or set AGENT_PLATFORM_JWT_SECRET.",
-        )
+    let secret = jwt_secret().map_err(|why| {
+        crate::auth::AuthError::new(axum::http::StatusCode::UNAUTHORIZED, "TOKEN_INVALID", why)
     })?;
     let data = decode::<Claims>(
         token,
@@ -802,13 +797,8 @@ fn user_principal(row: &UserRow) -> Principal {
 }
 
 fn sign_access(user: &UserRow) -> Result<String, ApiError> {
-    let secret = jwt_secret().ok_or_else(|| {
-        ApiError::coded(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "JWT_UNCONFIGURED",
-            "AGENT_PLATFORM_JWT_SECRET is not set.",
-        )
-    })?;
+    let secret = jwt_secret()
+        .map_err(|why| ApiError::coded(StatusCode::SERVICE_UNAVAILABLE, "JWT_UNCONFIGURED", why))?;
     let now = Utc::now().timestamp() as usize;
     let claims = Claims {
         sub: user.id.to_string(),
@@ -830,22 +820,38 @@ fn jwt_secret_configured() -> Option<String> {
     env_opt("AGENT_PLATFORM_JWT_SECRET")
 }
 
-/// The secret that actually signs and verifies session JWTs. A hosted
-/// deployment with `AGENT_PLATFORM_JWT_SECRET` set gets exactly that, same as
-/// before. A local/desktop install (loopback, nobody set one) has no operator
-/// to configure a secret, so `sign_access`/`principal_from_jwt` used to
-/// hard-fail even on the exact gate that hands out a `dev_link` — one
-/// generated here, persisted beside the sqlite db so it survives a restart,
-/// fixes that without weakening a hosted deployment that has a real secret.
-pub fn jwt_secret() -> Option<String> {
-    if let Some(s) = jwt_secret_configured() {
-        return Some(s);
+/// What a caller is told when there is no secret to sign with: the variable,
+/// how to make a value, where it is read, and what still works meanwhile.
+const JWT_UNSET: &str = "AGENT_PLATFORM_JWT_SECRET is not set, and a server bound beyond the \
+    loopback will not invent one. Generate a long random value (e.g. `openssl rand -hex 32`), \
+    set it in the server's environment or .env, and restart; use the same value on every \
+    instance. Only a loopback-bound server with no secret makes its own (and offers the \
+    dev_link sign-in). Until then, use the master key or an agp_ workspace token.";
+
+/// Where the session-JWT secret comes from, decided once for every caller: a
+/// configured one verbatim; else, on a loopback-only bind, whatever `local`
+/// mints (generated once, persisted, reused on restart); else none — an
+/// exposed server must not sign sessions with a key it made up.
+fn resolve_jwt_secret(
+    configured: Option<String>,
+    loopback: bool,
+    local: impl FnOnce() -> String,
+) -> Result<String, &'static str> {
+    match configured {
+        Some(s) => Ok(s),
+        None if loopback => Ok(local()),
+        None => Err(JWT_UNSET),
     }
-    if !loopback_bind() {
-        return None;
-    }
+}
+
+/// The secret that signs (`sign_access`) and verifies (`principal_from_jwt`)
+/// session JWTs. A local/desktop install has no operator to set one, so it
+/// gets the generated one, read off disk once per process.
+pub fn jwt_secret() -> Result<String, &'static str> {
     static LOCAL: OnceLock<String> = OnceLock::new();
-    Some(LOCAL.get_or_init(load_or_create_local_jwt_secret).clone())
+    resolve_jwt_secret(jwt_secret_configured(), loopback_bind(), || {
+        LOCAL.get_or_init(|| load_or_create_local_jwt_secret(&local_jwt_secret_path())).clone()
+    })
 }
 
 fn local_jwt_secret_path() -> PathBuf {
@@ -855,11 +861,16 @@ fn local_jwt_secret_path() -> PathBuf {
     db_path.with_file_name("jwt_secret")
 }
 
-fn load_or_create_local_jwt_secret() -> String {
-    let path = local_jwt_secret_path();
-    if let Ok(existing) = std::fs::read_to_string(&path) {
+fn load_or_create_local_jwt_secret(path: &std::path::Path) -> String {
+    if let Ok(existing) = std::fs::read_to_string(path) {
         let existing = existing.trim();
         if !existing.is_empty() {
+            // The build that first wrote this left it world-readable.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
             return existing.to_string();
         }
     }
@@ -867,7 +878,16 @@ fn load_or_create_local_jwt_secret() -> String {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Err(e) = std::fs::write(&path, &secret) {
+    // Whoever can read this can mint a session for any user, so no other local
+    // account may. ponytail: 0600 is unix-only. Windows keeps the data dir's
+    // inherited ACL (under %APPDATA%: this user, SYSTEM, admins — master.key's
+    // footing too); add an explicit ACL via windows-sys if the db is ever put in
+    // a shared dir.
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+    if let Err(e) = file.open(path).and_then(|mut f| std::io::Write::write_all(&mut f, secret.as_bytes())) {
         logd!("[accounts] could not persist local jwt secret to {path:?}: {e}");
     }
     secret
@@ -1302,5 +1322,41 @@ mod tests {
         assert!(validate_loopback_redirect("http://example.com/callback").is_err());
         assert!(validate_loopback_redirect("http://127.0.0.1.evil.test/callback").is_err());
         assert!(validate_loopback_redirect("http://user:pass@127.0.0.1/callback").is_err());
+    }
+
+    #[test]
+    fn jwt_secret_is_minted_on_loopback_only_and_a_configured_one_wins() {
+        let dir = std::env::temp_dir().join(format!("agp-jwt-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("jwt_secret");
+        let local = || load_or_create_local_jwt_secret(&file);
+
+        // Configured: used as given, and the disk is never touched.
+        assert_eq!(resolve_jwt_secret(Some("from-env".into()), true, local).unwrap(), "from-env");
+        assert!(!file.exists());
+
+        // Exposed bind, nothing configured: refuses, and names the variable to set.
+        let why = resolve_jwt_secret(None, false, local).unwrap_err();
+        assert!(why.contains("AGENT_PLATFORM_JWT_SECRET"), "{why}");
+        assert!(!file.exists());
+
+        // Loopback, nothing configured: minted once, persisted, and the same on
+        // the next resolve — which is what a restart is.
+        let first = resolve_jwt_secret(None, true, local).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
+        assert_eq!(resolve_jwt_secret(None, true, local).unwrap(), first);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&file), 0o600);
+            // A file the earlier build left world-readable is tightened on load.
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(resolve_jwt_secret(None, true, local).unwrap(), first);
+            assert_eq!(mode(&file), 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
