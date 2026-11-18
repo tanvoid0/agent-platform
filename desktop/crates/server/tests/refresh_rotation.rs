@@ -1,6 +1,7 @@
 //! Board #1081: a refresh token must survive a refresh that fails after its session was
 //! checked (the 503 `JWT_UNCONFIGURED` of a hosted box with no secret), and one refresh
-//! token must rotate exactly once however many requests present it at once.
+//! token must rotate exactly once however many requests present it at once. And a revoke that
+//! lands while a refresh holds its claim (`revoked = 2`) must not be undone by that refresh.
 //!
 //! One test, because it owns the process-wide env (`AGENT_PLATFORM_HOST`,
 //! `AGENT_PLATFORM_JWT_SECRET`) — which is also why it is its own `tests/*.rs`
@@ -10,6 +11,7 @@ mod common;
 
 use std::sync::Arc;
 
+use agent_platform_server::accounts::revoke_sessions;
 use agent_platform_server::auth::hash_token;
 use agent_platform_server::{db, router, AppState};
 use serde_json::{json, Value};
@@ -95,7 +97,10 @@ async fn a_failed_refresh_keeps_the_token_and_one_token_rotates_once() {
     assert_eq!(status, 401, "{body}");
     assert_eq!(body["error"]["code"], "SESSION_REVOKED");
 
-    // (c) Eight refreshes of one fresh token at once: exactly one wins the claim.
+    // (c) Eight refreshes of one fresh token at once: exactly one wins the claim. Best effort for
+    // the atomic claim itself: a request that arrives after the winner's claim is already stopped by
+    // the SELECT check, so only requests that overlap exercise `AND revoked = 0` (before the fix
+    // this minted 3 to 8 sessions).
     let results = futures::future::join_all((0..8).map(|_| refresh(&origin, &second))).await;
     let wins = results.iter().filter(|(status, _)| *status == 200).count();
     assert_eq!(
@@ -112,6 +117,57 @@ async fn a_failed_refresh_keeps_the_token_and_one_token_rotates_once() {
             .await
             .unwrap();
     assert_eq!(live, 1, "the rotation left {live} live sessions");
+
+    // (d) A revoke that lands between the claim and the settle must survive a failed refresh. The
+    // trigger stands in for a logout at exactly that point (it flips a freshly claimed row to 1
+    // inside the claim statement, so nothing is raced); a settle that handed the claim back
+    // blindly, `SET revoked = 0 WHERE id = ?`, would revive the session here.
+    let third = results
+        .iter()
+        .find(|(status, _)| *status == 200)
+        .map(|(_, body)| body["refresh_token"].as_str().unwrap().to_string())
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER revoked_in_flight AFTER UPDATE OF revoked ON sessions \
+         WHEN NEW.revoked = 2 BEGIN UPDATE sessions SET revoked = 1 WHERE id = NEW.id; END",
+    )
+    .execute(&state.any)
+    .await
+    .unwrap();
+    std::env::remove_var("AGENT_PLATFORM_JWT_SECRET");
+    let (status, body) = refresh(&origin, &third).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(
+        revoked(&state, &third).await,
+        1,
+        "a failed refresh revived a session that was revoked mid-flight"
+    );
+    sqlx::query("DROP TRIGGER revoked_in_flight")
+        .execute(&state.any)
+        .await
+        .unwrap();
+    std::env::set_var("AGENT_PLATFORM_JWT_SECRET", SECRET);
+    let (status, body) = refresh(&origin, &third).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["error"]["code"], "SESSION_REVOKED");
+
+    // (e) Revoke-all must take a session whose refresh holds the claim too, or that refresh's
+    // settle would hand it back. Seed one at 2, as if a refresh were in flight.
+    sqlx::query(
+        "INSERT INTO sessions (user_id, refresh_token_hash, expires_at, revoked, created_at) \
+         SELECT id, ?, '2099-01-01 00:00:00.000000', 2, '2026-01-01 00:00:00.000000' \
+         FROM users WHERE email = 'rotate@example.com'",
+    )
+    .bind(hash_token("in-flight-refresh-token"))
+    .execute(&state.any)
+    .await
+    .unwrap();
+    let taken = revoke_sessions(&state, "rotate@example.com").await.unwrap();
+    assert_eq!(
+        taken, 1,
+        "revoke-all skipped a session whose refresh holds the claim"
+    );
+    assert_eq!(revoked(&state, "in-flight-refresh-token").await, 1);
 
     let _ = std::fs::remove_file(&db);
 }
