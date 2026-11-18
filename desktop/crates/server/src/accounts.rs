@@ -457,12 +457,46 @@ async fn complete_verify(state: &AppState, raw: &str) -> Result<(Value, Option<S
     if expired(Some(&expires)) {
         return Err(ApiError::coded(StatusCode::UNAUTHORIZED, "LINK_EXPIRED", "This link has expired."));
     }
-    sqlx::query(&crate::db::sql("UPDATE magic_links SET used = 1 WHERE id = ?", state.backend))
-        .bind(id)
-        .execute(&state.any)
-        .await?;
-    let user = upsert_user_on_login(state, &email).await?;
-    let Json(session) = issue_session(state, &user).await?;
+    // Claim the link before minting: `AND used = 0` makes check-then-burn atomic, so of N
+    // concurrent redeems exactly one sees rows_affected == 1 (the SELECT above alone let
+    // all N through). If minting then fails — JWT_UNCONFIGURED on a hosted box with no
+    // secret, or a DB error — no token was shown (`issue_session` signs before it inserts
+    // and returns right after), so the link is handed back and a retry beats LINK_USED.
+    // ponytail: a crash between the claim and the release still leaves the link burned, as
+    // before; one tx threaded through upsert_user_on_login / find_user_by_email /
+    // ensure_user_workspace / slug_taken / issue_session would close it — not worth that
+    // plumbing for a 15-minute link the user can re-request.
+    let claimed = sqlx::query(&crate::db::sql(
+        "UPDATE magic_links SET used = 1 WHERE id = ? AND used = 0",
+        state.backend,
+    ))
+    .bind(id)
+    .execute(&state.any)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Err(ApiError::coded(StatusCode::UNAUTHORIZED, "LINK_USED", "This link was already used."));
+    }
+    let minted = async {
+        let user = upsert_user_on_login(state, &email).await?;
+        issue_session(state, &user).await
+    }
+    .await;
+    let Json(session) = match minted {
+        Ok(session) => session,
+        Err(e) => {
+            let release = sqlx::query(&crate::db::sql(
+                "UPDATE magic_links SET used = 0 WHERE id = ?",
+                state.backend,
+            ))
+            .bind(id)
+            .execute(&state.any)
+            .await;
+            if let Err(why) = release {
+                logd!("[accounts] could not release magic link {id} after a failed sign-in: {why}");
+            }
+            return Err(e);
+        }
+    };
     Ok((session, redirect.filter(|s| !s.is_empty())))
 }
 
