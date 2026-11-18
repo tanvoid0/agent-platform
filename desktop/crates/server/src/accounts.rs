@@ -1269,18 +1269,35 @@ fn is_self_origin(raw: &str) -> bool {
     port == ours
 }
 
+/// One platform token refresh in flight per process: `/auth/refresh` rotates the refresh token, so
+/// callers that each POST the one in the session file get one 200 and SESSION_REVOKED for the rest.
+static PLATFORM_REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The cached platform access token, while it has more than a minute left.
+fn fresh_platform_access(state: &AppState) -> Option<String> {
+    let now = Utc::now().timestamp();
+    let guard = state.platform_access.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().filter(|(_, exp)| *exp > now + 60).map(|(token, _)| token.clone())
+}
+
 /// A live access JWT for provider `platform`. Refreshes the session file when
 /// the cached one is within a minute of expiry.
 pub async fn ensure_platform_access(state: &AppState) -> Result<String, ApiError> {
-    let now = Utc::now().timestamp();
-    {
-        let guard = state.platform_access.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((token, exp)) = guard.as_ref() {
-            if *exp > now + 60 {
-                return Ok(token.clone());
-            }
-        }
+    if let Some(token) = fresh_platform_access(state) {
+        return Ok(token);
     }
+    // Single-flight: the origin honours a refresh token once (#1081), so callers that overlap at
+    // expiry must not each POST the one in the session file. Whoever takes the lock refreshes; the
+    // rest wake to a fresh cache or session file and reuse it. Held across the refresh only, and
+    // the guard drops on every return, so a failed refresh lets the next caller try again.
+    // ponytail: one lock per process. An origin that hangs makes the queue pay one timeout per
+    // caller (share the first result through a watch channel if that ever matters), and a caller
+    // dropped between the POST and the file write loses the rotated token (spawn the refresh then).
+    let _refreshing = PLATFORM_REFRESH.lock().await;
+    if let Some(token) = fresh_platform_access(state) {
+        return Ok(token);
+    }
+    let now = Utc::now().timestamp();
     let mut session = read_cloud_session().ok_or_else(|| {
         ApiError::coded(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1306,6 +1323,8 @@ pub async fn ensure_platform_access(state: &AppState) -> Result<String, ApiError
         .http
         .post(&url)
         .json(&json!({ "refresh_token": session.refresh_token }))
+        // Bounded because PLATFORM_REFRESH is held: a wedged POST would block every later caller.
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(|e| {
@@ -1318,6 +1337,21 @@ pub async fn ensure_platform_access(state: &AppState) -> Result<String, ApiError
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or(json!({}));
     if !status.is_success() {
+        // The lock covers this process only. If another one rotated the token between our read and
+        // this POST, the file now holds its tokens: take those. A refresh token that differs from
+        // the one we sent is the only signal, so a truly revoked or expired one still ends below.
+        if body.pointer("/error/code").and_then(Value::as_str) == Some("SESSION_REVOKED") {
+            let theirs = read_cloud_session().filter(|s| {
+                s.refresh_token != session.refresh_token
+                    && !s.access_token.is_empty()
+                    && s.access_expires_at > now + 60
+            });
+            if let Some(theirs) = theirs {
+                let mut guard = state.platform_access.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some((theirs.access_token.clone(), theirs.access_expires_at));
+                return Ok(theirs.access_token);
+            }
+        }
         let msg = body
             .pointer("/error/message")
             .and_then(Value::as_str)
