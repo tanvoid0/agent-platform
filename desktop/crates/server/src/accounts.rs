@@ -519,14 +519,43 @@ async fn refresh(
     if revoked != 0 || expired(Some(&expires)) {
         return Err(ApiError::coded(StatusCode::UNAUTHORIZED, "SESSION_REVOKED", "Refresh token expired."));
     }
-    sqlx::query(&crate::db::sql("UPDATE sessions SET revoked = 1 WHERE id = ?", state.backend))
-        .bind(sid)
-        .execute(&state.any)
-        .await?;
     let user = load_user(&state, user_id).await?.ok_or_else(|| {
         ApiError::coded(StatusCode::UNAUTHORIZED, "SESSION_INVALID", "Account missing.")
     })?;
-    issue_session(&state, &user).await
+    // Claim the session before minting its replacement: `AND revoked = 0` makes check-then-revoke
+    // atomic, so of N concurrent refreshes exactly one sees rows_affected == 1 (the SELECT above
+    // alone let all N through, each minting a session). If minting then fails — JWT_UNCONFIGURED on
+    // a hosted box with no secret, or a DB error — no token was shown (`issue_session` signs before
+    // it inserts and returns right after), so the claim is handed back and a retry beats a forced
+    // magic link. The claim writes 2, not 1: it still reads as revoked, but the settle below only
+    // touches a row still at 2, so a logout (writes 1) or `revoke_sessions` (matches `!= 1`) that
+    // lands in the window is not undone. Settled, the column is 0 or 1 again.
+    // ponytail: a crash (or a dropped request) between the claim and the settle leaves the row at
+    // 2, which reads as revoked, as before; one tx through issue_session would close it — not worth
+    // that plumbing for a token the user can replace with a magic link.
+    let claimed = sqlx::query(&crate::db::sql(
+        "UPDATE sessions SET revoked = 2 WHERE id = ? AND revoked = 0",
+        state.backend,
+    ))
+    .bind(sid)
+    .execute(&state.any)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Err(ApiError::coded(StatusCode::UNAUTHORIZED, "SESSION_REVOKED", "Refresh token expired."));
+    }
+    let minted = issue_session(&state, &user).await;
+    let settled = sqlx::query(&crate::db::sql(
+        "UPDATE sessions SET revoked = ? WHERE id = ? AND revoked = 2",
+        state.backend,
+    ))
+    .bind(i64::from(minted.is_ok()))
+    .bind(sid)
+    .execute(&state.any)
+    .await;
+    if let Err(why) = settled {
+        logd!("[accounts] could not settle session {sid} after a refresh: {why}");
+    }
+    minted
 }
 
 async fn logout(
@@ -712,8 +741,10 @@ pub async fn revoke_sessions(state: &AppState, email: &str) -> Result<u64, ApiEr
     let Some(user) = find_user_by_email(state, email).await? else {
         return Ok(0);
     };
+    // `!= 1`, not `= 0`: a refresh in flight holds its session at 2 (see `refresh`), and this
+    // must take it, or the refresh's settle would hand it back.
     let res = sqlx::query(&crate::db::sql(
-        "UPDATE sessions SET revoked = 1 WHERE user_id = ? AND revoked = 0",
+        "UPDATE sessions SET revoked = 1 WHERE user_id = ? AND revoked != 1",
         state.backend,
     ))
     .bind(user.id)
