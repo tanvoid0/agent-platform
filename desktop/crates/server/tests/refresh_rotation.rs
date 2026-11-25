@@ -169,5 +169,34 @@ async fn a_failed_refresh_keeps_the_token_and_one_token_rotates_once() {
     );
     assert_eq!(revoked(&state, "in-flight-refresh-token").await, 1);
 
+    // (f) #1098: a revoke that lands while a *successful* refresh mints must take the session it
+    // mints too, or the account keeps one live session the admin just revoked. Same trigger as (d)
+    // standing in for revoke-all at that instant, but this time the mint succeeds.
+    sqlx::query(
+        "INSERT INTO sessions (user_id, refresh_token_hash, expires_at, revoked, created_at) \
+         SELECT id, ?, '2099-01-01 00:00:00.000000', 0, '2026-01-01 00:00:00.000000' \
+         FROM users WHERE email = 'rotate@example.com'",
+    )
+    .bind(hash_token("revoked-while-minting"))
+    .execute(&state.any)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER revoked_mid_mint AFTER UPDATE OF revoked ON sessions \
+         WHEN NEW.revoked = 2 BEGIN UPDATE sessions SET revoked = 1 WHERE id = NEW.id; END",
+    )
+    .execute(&state.any)
+    .await
+    .unwrap();
+    let (status, body) = refresh(&origin, "revoked-while-minting").await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["error"]["code"], "SESSION_REVOKED");
+    let live: i64 =
+        sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM sessions WHERE revoked = 0")
+            .fetch_one(&state.any)
+            .await
+            .unwrap();
+    assert_eq!(live, 0, "a refresh revoked mid-mint left {live} live sessions");
+
     let _ = std::fs::remove_file(&db);
 }

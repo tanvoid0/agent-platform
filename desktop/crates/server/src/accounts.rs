@@ -552,8 +552,25 @@ async fn refresh(
     .bind(sid)
     .execute(&state.any)
     .await;
-    if let Err(why) = settled {
-        logd!("[accounts] could not settle session {sid} after a refresh: {why}");
+    match settled {
+        // A logout or `revoke_sessions` took the claimed row while we minted (#1098). The
+        // replacement is already inserted (or never will be), so revoking it here closes the window:
+        // a revoke-all after the settle matches it by user_id anyway.
+        Ok(done) if done.rows_affected() == 0 => {
+            if let Ok(Json(body)) = &minted {
+                let fresh = body["refresh_token"].as_str().unwrap_or_default();
+                sqlx::query(&crate::db::sql(
+                    "UPDATE sessions SET revoked = 1 WHERE refresh_token_hash = ?",
+                    state.backend,
+                ))
+                .bind(hash_token(fresh))
+                .execute(&state.any)
+                .await?;
+                return Err(ApiError::coded(StatusCode::UNAUTHORIZED, "SESSION_REVOKED", "Refresh token expired."));
+            }
+        }
+        Ok(_) => {}
+        Err(why) => logd!("[accounts] could not settle session {sid} after a refresh: {why}"),
     }
     minted
 }
