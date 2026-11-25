@@ -83,6 +83,12 @@ fn save_session(dir: &Path, session: &Session) -> Result<(), String> {
     shell::write_atomic(&session_path(dir), &body).map_err(|e| e.to_string())
 }
 
+/// The refresh token to revoke at sign-out. The daemon rotates it in the session file
+/// (`ensure_platform_access`), so the copy this window read at sign-in may already be dead.
+fn current_refresh_token(dir: &Path, held: String) -> String {
+    read_session(dir).map(|s| s.refresh_token).unwrap_or(held)
+}
+
 fn clear_session(dir: &Path) {
     let _ = std::fs::remove_file(session_path(dir));
 }
@@ -209,7 +215,7 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 .as_ref()
                 .map(|s| s.url.clone())
                 .unwrap_or_else(|| state.url.trim().trim_end_matches('/').to_string());
-            let refresh = state
+            let held = state
                 .session
                 .as_ref()
                 .map(|s| s.refresh_token.clone())
@@ -218,6 +224,7 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             let dir = state.dir.clone();
             Task::perform(
                 async move {
+                    let refresh = current_refresh_token(&dir, held);
                     let _ = logout_remote(&url, &refresh).await;
                     clear_session(&dir);
                     Ok(())
@@ -403,6 +410,24 @@ mod tests {
             extract_magic_token("https://api.example.com/accounts/#/verify?token=abc123").as_deref(),
             Some("abc123")
         );
+    }
+
+    #[test]
+    fn sign_out_revokes_the_token_the_daemon_rotated_to() {
+        let dir = std::env::temp_dir().join(format!("agp-signout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // No file: fall back to what the window holds.
+        assert_eq!(current_refresh_token(&dir, "held".into()), "held");
+        // The daemon rotated it on disk: the file wins over the stale copy.
+        let rotated = Session {
+            url: "https://cloud.example".into(),
+            refresh_token: "rotated".into(),
+            ..Default::default()
+        };
+        save_session(&dir, &rotated).unwrap();
+        assert_eq!(current_refresh_token(&dir, "held".into()), "rotated");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
