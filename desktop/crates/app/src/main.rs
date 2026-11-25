@@ -2178,7 +2178,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                     | account::Message::SignedIn(Ok(_))
                     | account::Message::SignOut
             );
-            let task = account::update(&mut app.account, msg).map(Message::Account);
+            let task = account::update(&mut app.account, &app.client, msg).map(Message::Account);
             if persist {
                 app.settings.cloud_url = app.account.url.clone();
                 save_settings(app);

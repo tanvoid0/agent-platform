@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use agent_platform_client::Client;
 use iced::Task;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -136,7 +137,7 @@ pub enum Message {
     Dismiss,
 }
 
-pub fn update(state: &mut State, msg: Message) -> Task<Message> {
+pub fn update(state: &mut State, client: &Client, msg: Message) -> Task<Message> {
     match msg {
         Message::UrlChanged(v) => {
             state.url = v;
@@ -222,11 +223,16 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 .unwrap_or_default();
             state.busy = true;
             let dir = state.dir.clone();
+            let client = client.clone();
             Task::perform(
                 async move {
-                    let refresh = current_refresh_token(&dir, held);
-                    let _ = logout_remote(&url, &refresh).await;
-                    clear_session(&dir);
+                    // The daemon signs out under its refresh lock, with a rotation it could not
+                    // save. Unreachable, or it reads another file: revoke what is on disk here.
+                    if client.platform_sign_out().await.is_err() || read_session(&dir).is_some() {
+                        let refresh = current_refresh_token(&dir, held);
+                        let _ = logout_remote(&url, &refresh).await;
+                        clear_session(&dir);
+                    }
                     Ok(())
                 },
                 Message::SignedOut,

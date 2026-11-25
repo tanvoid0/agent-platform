@@ -75,6 +75,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/accounts/api/v1/auth/verify", post(verify).get(verify_get))
         .route("/accounts/api/v1/auth/refresh", post(refresh))
         .route("/accounts/api/v1/auth/logout", post(logout))
+        // The daemon's own sign-out, behind the install key (`/api/v1/`), for the Account card.
+        .route("/api/v1/platform/sign-out", post(platform_sign_out))
         .route("/accounts/api/v1/me", get(me))
         .route("/accounts/api/v1/me/usage", get(me_usage))
         .route("/accounts/api/v1/billing/quote", post(billing_quote))
@@ -1434,6 +1436,46 @@ pub async fn ensure_platform_access(state: &AppState) -> Result<String, ApiError
     let mut guard = state.platform_access.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some((access.clone(), session.access_expires_at));
     Ok(access)
+}
+
+/// Sign-out for the desktop Account card. Under `PLATFORM_REFRESH` so no refresh can rotate the
+/// token between the revoke and the delete and then write the session back, and from
+/// `UNSAVED_SESSION` when the live token never reached the file (#1128).
+pub async fn sign_out_platform(state: &AppState) -> Result<(), ApiError> {
+    let path = cloud_session_path().ok_or_else(|| {
+        ApiError::coded(StatusCode::SERVICE_UNAVAILABLE, "platform_unconfigured", "No cloud session file.")
+    })?;
+    let _refreshing = PLATFORM_REFRESH.lock().await;
+    let session = read_cloud_session().map(|file| {
+        let unsaved = UNSAVED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        pick_session(file, unsaved.as_ref())
+    });
+    if let Some(s) = session {
+        let url = format!("{}/accounts/api/v1/auth/logout", s.url.trim_end_matches('/'));
+        let resp = state
+            .http
+            .post(&url)
+            .json(&json!({ "refresh_token": s.refresh_token }))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await;
+        if let Err(e) = resp {
+            logd!("warn: cloud logout failed ({e}); clearing the local session anyway");
+        }
+    }
+    *UNSAVED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *state.platform_access.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn platform_sign_out(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    sign_out_platform(&state).await?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 pub fn cached_platform_access(state: &AppState) -> Result<String, ApiError> {

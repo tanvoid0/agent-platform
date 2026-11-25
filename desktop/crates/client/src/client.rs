@@ -174,6 +174,11 @@ impl Client {
         Self::handle(resp).await
     }
 
+    /// Revoke and delete the cloud session the daemon reads, under its refresh lock.
+    pub async fn platform_sign_out(&self) -> Result<Value> {
+        self.post_json("/api/v1/platform/sign-out", &serde_json::json!({})).await
+    }
+
     // -- Processes ----------------------------------------------------------
 
     pub async fn processes(&self, limit: u32, filter: ProcessListFilter) -> Result<ProcessesListResponse> {
