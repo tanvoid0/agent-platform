@@ -1273,6 +1273,21 @@ fn is_self_origin(raw: &str) -> bool {
 /// callers that each POST the one in the session file get one 200 and SESSION_REVOKED for the rest.
 static PLATFORM_REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// A rotated session this process could not write to the session file, keyed by the refresh
+/// token the file still holds (#1128). The origin has already revoked that one, so without this
+/// the next refresh would end in `platform_session_expired`.
+static UNSAVED_SESSION: std::sync::Mutex<Option<(String, CloudSessionFile)>> =
+    std::sync::Mutex::new(None);
+
+/// The session to refresh from: the unsaved rotation while the file still holds the token it
+/// replaced, else the file (a new sign-in rewrote it, or a later write caught up).
+fn pick_session(file: CloudSessionFile, unsaved: Option<&(String, CloudSessionFile)>) -> CloudSessionFile {
+    match unsaved {
+        Some((stale, rotated)) if *stale == file.refresh_token => rotated.clone(),
+        _ => file,
+    }
+}
+
 /// The cached platform access token, while it has more than a minute left.
 fn fresh_platform_access(state: &AppState) -> Option<String> {
     let now = Utc::now().timestamp();
@@ -1298,13 +1313,18 @@ pub async fn ensure_platform_access(state: &AppState) -> Result<String, ApiError
         return Ok(token);
     }
     let now = Utc::now().timestamp();
-    let mut session = read_cloud_session().ok_or_else(|| {
+    let file = read_cloud_session().ok_or_else(|| {
         ApiError::coded(
             StatusCode::SERVICE_UNAVAILABLE,
             "platform_unconfigured",
             "Sign in under Settings → Account to use Platform AI.",
         )
     })?;
+    let file_token = file.refresh_token.clone();
+    let mut session = {
+        let unsaved = UNSAVED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        pick_session(file, unsaved.as_ref())
+    };
     let base = session.url.trim_end_matches('/').to_string();
     if is_self_origin(&base) {
         return Err(ApiError::coded(
@@ -1343,6 +1363,7 @@ pub async fn ensure_platform_access(state: &AppState) -> Result<String, ApiError
         if body.pointer("/error/code").and_then(Value::as_str) == Some("SESSION_REVOKED") {
             let theirs = read_cloud_session().filter(|s| {
                 s.refresh_token != session.refresh_token
+                    && s.refresh_token != file_token
                     && !s.access_token.is_empty()
                     && s.access_expires_at > now + 60
             });
@@ -1381,7 +1402,17 @@ pub async fn ensure_platform_access(state: &AppState) -> Result<String, ApiError
         session.entitlement = ent.to_string();
     }
     if let Some(path) = cloud_session_path() {
-        let _ = write_cloud_session(&path, &session);
+        // The origin has rotated: the old refresh token is dead. If the write fails (disk full,
+        // a locked file on Windows), keep the new pair in memory so this process carries on, and
+        // retry the write on the next refresh.
+        let mut unsaved = UNSAVED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        match write_cloud_session(&path, &session) {
+            Ok(()) => *unsaved = None,
+            Err(e) => {
+                logd!("warn: could not save the rotated cloud session ({}); keeping it in memory", e.message);
+                *unsaved = Some((file_token, session.clone()));
+            }
+        }
     }
     let mut guard = state.platform_access.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some((access.clone(), session.access_expires_at));
@@ -1421,6 +1452,16 @@ mod tests {
         assert!(validate_loopback_redirect("http://example.com/callback").is_err());
         assert!(validate_loopback_redirect("http://127.0.0.1.evil.test/callback").is_err());
         assert!(validate_loopback_redirect("http://user:pass@127.0.0.1/callback").is_err());
+    }
+
+    #[test]
+    fn an_unsaved_rotation_wins_only_while_the_file_holds_the_token_it_replaced() {
+        let s = |t: &str| CloudSessionFile { refresh_token: t.into(), ..Default::default() };
+        let unsaved = ("old".to_string(), s("rotated"));
+        assert_eq!(pick_session(s("old"), Some(&unsaved)).refresh_token, "rotated");
+        // A fresh sign-in (or another process) rewrote the file: the file wins.
+        assert_eq!(pick_session(s("new"), Some(&unsaved)).refresh_token, "new");
+        assert_eq!(pick_session(s("old"), None).refresh_token, "old");
     }
 
     #[test]
